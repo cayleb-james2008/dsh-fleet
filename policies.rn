@@ -1,0 +1,20 @@
+// Fleet session policies — loaded by fleet-rs at startup and consulted on
+// every session hand-out. This file is behaviour, not decoration: the app
+// enforces max_parallel() and falls back to default_check(project) whenever
+// a task is handed out without an explicit check command.
+
+/// Maximum number of agent sessions allowed to run at the same time.
+/// Sessions handed out beyond this wait in the queue until a slot frees.
+pub fn max_parallel() {
+    4
+}
+
+/// The verification command for a project when the user did not attach one
+/// to the task. A session is only "done" when this command passes in its
+/// worktree.
+pub fn default_check(project) {
+    match project {
+        "fixture" => "test -s output.txt",
+        _ => "cargo test",
+    }
+}
