@@ -131,6 +131,10 @@ struct App {
     policy: Policy,
     agent_cmd: String,
     data_dir: PathBuf,
+    /// Tag unique to this server run, baked into session ids and branch
+    /// names so a restarted server can never collide with worktrees or
+    /// branches a previous run left in the target repo.
+    run_tag: String,
     sessions: Mutex<Vec<Session>>,
     counter: Mutex<u64>,
 }
@@ -256,6 +260,20 @@ impl App {
                 return;
             }
         };
+        // Drain stderr on its own thread into the transcript: a piped but
+        // unread stderr would fill its buffer and wedge the agent.
+        let stderr_thread = child.stderr.take().map(|stderr| {
+            let app = self.clone();
+            let id = id.to_string();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines() {
+                    match line {
+                        Ok(l) => app.log(&id, format!("stderr: {l}")),
+                        Err(_) => break,
+                    }
+                }
+            })
+        });
         if let Some(stdout) = child.stdout.take() {
             for line in BufReader::new(stdout).lines() {
                 match line {
@@ -265,6 +283,9 @@ impl App {
             }
         }
         let agent_ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        if let Some(t) = stderr_thread {
+            let _ = t.join();
+        }
         if !agent_ok {
             self.log(id, "agent exited non-zero — handing back to you".to_string());
             self.set_status(id, Status::NeedsYou);
@@ -450,7 +471,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 *counter += 1;
                 *counter
             };
-            let id = format!("s{n}");
+            let id = format!("s{}-{n}", app.run_tag);
             let session = Session {
                 id: id.clone(),
                 task,
@@ -525,10 +546,15 @@ fn main() {
         .unwrap_or_else(|_| PathBuf::from("./fleet-data"));
     let _ = std::fs::create_dir_all(data_dir.join("worktrees"));
 
+    let run_tag = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "run".to_string());
     let app = Arc::new(App {
         policy,
         agent_cmd,
         data_dir,
+        run_tag,
         sessions: Mutex::new(Vec::new()),
         counter: Mutex::new(0),
     });
@@ -613,6 +639,7 @@ mod tests {
             policy: Policy::load(SCRIPT).unwrap(),
             agent_cmd: agent.to_string_lossy().to_string(),
             data_dir: dir.join("data"),
+            run_tag: "test".to_string(),
             sessions: Mutex::new(Vec::new()),
             counter: Mutex::new(0),
         });

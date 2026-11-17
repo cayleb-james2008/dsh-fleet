@@ -53,14 +53,18 @@ echo "== worktrees are separate =="
 ls "$WORK/data/worktrees"
 git -C "$WORK/repo" worktree list
 
+ID1=$(api /api/sessions | jq -r '.[0].id')
+ID2=$(api /api/sessions | jq -r '.[1].id')
+echo "session ids: $ID1 $ID2"
+
 echo "== diffs served by the app =="
-api /api/sessions/s1 | jq -r '.diff'
-api /api/sessions/s2 | jq -r '.diff'
+api "/api/sessions/$ID1" | jq -r '.diff'
+api "/api/sessions/$ID2" | jq -r '.diff'
 
 echo "== checks recorded as passed =="
 api /api/sessions | jq -r '.[] | "\(.id): check_passed=\(.check_passed) status=\(.status)"'
 
-echo "== merge session s1 =="
-post /api/sessions/s1/merge '{}'; echo
+echo "== merge first session =="
+post "/api/sessions/$ID1/merge" '{}'; echo
 echo "repo now contains:"; cat "$WORK/repo/output.txt"
 grep -q "alpha task" "$WORK/repo/output.txt" && echo "PROOF OK: merged work is in the repo" || { echo "PROOF FAILED: merge missing"; exit 1; }
