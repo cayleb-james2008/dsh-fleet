@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fleet — your agents, one screen</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; background: #0f1115; color: #e6e6e6; display: flex; height: 100vh; }
+  #sidebar { width: 300px; border-right: 1px solid #262a33; display: flex; flex-direction: column; background: #15181f; }
+  #sidebar h1 { font-size: 15px; margin: 14px 16px 4px; font-weight: 600; }
+  #policy { font-size: 11px; color: #8a8f98; margin: 0 16px 10px; }
+  #sessions { flex: 1; overflow-y: auto; }
+  .session { padding: 10px 16px; border-bottom: 1px solid #1d2027; cursor: pointer; }
+  .session:hover { background: #1a1e26; }
+  .session.selected { background: #1f2733; }
+  .session .task { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chip { display: inline-block; font-size: 10px; padding: 1px 7px; border-radius: 8px; margin-top: 4px; text-transform: uppercase; letter-spacing: .04em; }
+  .chip.working { background: #2b3a55; color: #9db8e8; }
+  .chip.needs-you { background: #553a2b; color: #e8b89d; }
+  .chip.done { background: #2b553a; color: #9de8b8; }
+  #composer { border-top: 1px solid #262a33; padding: 12px 16px; }
+  #composer input, #composer textarea { width: 100%; background: #0f1115; border: 1px solid #2c313c; border-radius: 6px; color: #e6e6e6; padding: 7px 9px; margin-bottom: 8px; font-size: 13px; }
+  #composer button, .mergebtn { background: #2563eb; color: #fff; border: 0; border-radius: 6px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
+  .mergebtn { background: #1d7a43; margin-top: 10px; }
+  #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  #detail { padding: 18px 22px; overflow-y: auto; flex: 1; }
+  #detail h2 { font-size: 16px; margin: 0 0 4px; }
+  .meta { color: #8a8f98; font-size: 12px; margin-bottom: 14px; }
+  pre { background: #15181f; border: 1px solid #262a33; border-radius: 6px; padding: 12px; font-size: 12px; overflow-x: auto; white-space: pre-wrap; }
+  .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #8a8f98; margin: 16px 0 6px; }
+  .empty { color: #8a8f98; margin: auto; font-size: 14px; }
+  .pass { color: #9de8b8; } .fail { color: #e89d9d; }
+</style>
+</head>
+<body>
+  <div id="sidebar">
+    <h1>Fleet</h1>
+    <p id="policy">loading policy…</p>
+    <div id="sessions"></div>
+    <form id="composer">
+      <input id="repo" placeholder="git repo path" required>
+      <input id="project" placeholder="project (policy picks the check)" value="fixture">
+      <textarea id="task" rows="2" placeholder="Hand out work…" required></textarea>
+      <input id="check" placeholder="check command (optional)">
+      <button type="submit">Hand it out</button>
+    </form>
+  </div>
+  <div id="main"><div id="detail"><p class="empty">Pick a session, or hand out work below.</p></div></div>
+<script>
+let selected = null;
+async function refresh() {
+  const pol = await (await fetch('/api/policy')).json();
+  document.getElementById('policy').textContent =
+    `agent: ${pol.agent_cmd} · max parallel: ${pol.max_parallel} · policy: ${pol.source}`;
+  const sessions = await (await fetch('/api/sessions')).json();
+  const list = document.getElementById('sessions');
+  list.innerHTML = '';
+  for (const s of sessions) {
+    const div = document.createElement('div');
+    div.className = 'session' + (s.id === selected ? ' selected' : '');
+    div.innerHTML = `<div class="task"></div><span class="chip ${s.bucket}">${s.status}</span>`;
+    div.querySelector('.task').textContent = s.task;
+    div.onclick = () => { selected = s.id; refresh(); };
+    list.appendChild(div);
+  }
+  if (selected) {
+    const s = sessions.find(x => x.id === selected);
+    if (s) renderDetail(s);
+  }
+}
+function renderDetail(s) {
+  const d = document.getElementById('detail');
+  let html = `<h2></h2><div class="meta">branch ${s.branch} · status ${s.status} · check: <code></code></div>`;
+  html += `<div class="label">Transcript</div><pre id="tr"></pre>`;
+  if (s.check_passed !== undefined && s.check_passed !== null) {
+    html += `<div class="label">Check — <span class="${s.check_passed ? 'pass' : 'fail'}">${s.check_passed ? 'PASSED' : 'FAILED'}</span></div><pre id="co"></pre>`;
+  }
+  if (s.diff) html += `<div class="label">Diff</div><pre id="df"></pre>`;
+  if (s.status === 'done') html += `<button class="mergebtn" onclick="merge('${s.id}')">Merge this work</button>`;
+  d.innerHTML = html;
+  d.querySelector('h2').textContent = s.task;
+  d.querySelector('.meta code').textContent = s.check_cmd;
+  d.querySelector('#tr').textContent = s.transcript.join('\n');
+  if (d.querySelector('#co')) d.querySelector('#co').textContent = s.check_output || '';
+  if (d.querySelector('#df')) d.querySelector('#df').textContent = s.diff;
+}
+async function merge(id) {
+  const r = await fetch(`/api/sessions/${id}/merge`, { method: 'POST' });
+  if (!r.ok) alert((await r.json()).error);
+  refresh();
+}
+document.getElementById('composer').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = {
+    repo: document.getElementById('repo').value,
+    project: document.getElementById('project').value,
+    task: document.getElementById('task').value,
+    check: document.getElementById('check').value,
+  };
+  const r = await fetch('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!r.ok) { alert((await r.json()).error); return; }
+  const s = await r.json();
+  selected = s.id;
+  document.getElementById('task').value = '';
+  refresh();
+});
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
