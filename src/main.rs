@@ -21,7 +21,13 @@ struct Policy {
     unit: Arc<rune::Unit>,
     runtime: Arc<rune::runtime::RuntimeContext>,
     max_parallel: i64,
+    /// Agent/check execution cap in seconds. Read from the policy's
+    /// optional timeout_secs(); a policy that doesn't define it gets
+    /// DEFAULT_TIMEOUT_SECS — never infinity.
+    timeout_secs: u64,
 }
+
+const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
 impl Policy {
     fn load(script: &str) -> Result<Policy, String> {
@@ -42,8 +48,16 @@ impl Policy {
             unit,
             runtime,
             max_parallel: 1,
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
         };
         policy.max_parallel = policy.call_i64("max_parallel", ())?;
+        // timeout_secs is optional in the policy file; absent or
+        // unusable means the default, never "no timeout".
+        if let Ok(secs) = policy.call_i64("timeout_secs", ()) {
+            if secs > 0 {
+                policy.timeout_secs = secs as u64;
+            }
+        }
         Ok(policy)
     }
 
@@ -253,6 +267,31 @@ struct App {
     counter: Mutex<u64>,
 }
 
+/// Collect a child process stream into a shared buffer on its own
+/// thread (an unread pipe would wedge the child). Works for both
+/// stdout and stderr handles.
+fn collect_stream<R: std::io::Read + Send + 'static>(
+    stream: Option<R>,
+) -> (Arc<Mutex<String>>, Option<std::thread::JoinHandle<()>>) {
+    let buf = Arc::new(Mutex::new(String::new()));
+    let thread = stream.map(|s| {
+        let buf = buf.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(s).lines() {
+                match line {
+                    Ok(l) => {
+                        let mut b = buf.lock().unwrap();
+                        b.push_str(&l);
+                        b.push('\n');
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    });
+    (buf, thread)
+}
+
 impl App {
     /// Snapshot all session state to disk (atomic rename), so a server
     /// restart loses nothing. The per-session log files are the durable
@@ -447,6 +486,32 @@ impl App {
         self.run_agent_and_check(id, &session, &wt);
     }
 
+    /// Wait for a child with a deadline. Some(true/false) is the exit
+    /// status's success; None means the deadline passed and the child
+    /// was killed — a hung agent or check must never hold its session
+    /// (and its parallel slot) forever.
+    fn wait_with_timeout(
+        child: &mut std::process::Child,
+        timeout_secs: u64,
+    ) -> Option<bool> {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status.success()),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(_) => return Some(false),
+            }
+        }
+    }
+
     /// Steps 2–4 of a session: run the agent in its worktree, run the
     /// task's check, record the outcome. Entered with the worktree ready
     /// (freshly created, or reused on a retry).
@@ -472,8 +537,24 @@ impl App {
                 return;
             }
         };
-        // Drain stderr on its own thread into the transcript: a piped but
-        // unread stderr would fill its buffer and wedge the agent.
+        // Drain both pipes on their own threads into the transcript: a
+        // piped but unread stream would fill its buffer and wedge the
+        // agent. The main thread only watches the clock and the exit.
+        let drain = |stream: Option<std::process::ChildStdout>| {
+            stream.map(|s| {
+                let app = self.clone();
+                let id = id.to_string();
+                std::thread::spawn(move || {
+                    for line in BufReader::new(s).lines() {
+                        match line {
+                            Ok(l) => app.log(&id, l),
+                            Err(_) => break,
+                        }
+                    }
+                })
+            })
+        };
+        let stdout_thread = drain(child.stdout.take());
         let stderr_thread = child.stderr.take().map(|stderr| {
             let app = self.clone();
             let id = id.to_string();
@@ -486,18 +567,28 @@ impl App {
                 }
             })
         });
-        if let Some(stdout) = child.stdout.take() {
-            for line in BufReader::new(stdout).lines() {
-                match line {
-                    Ok(l) => self.log(id, l),
-                    Err(_) => break,
-                }
-            }
+        let timeout = self.policy.timeout_secs;
+        let agent_result = Self::wait_with_timeout(&mut child, timeout);
+        if agent_result.is_none() {
+            // Do not join the drain threads here: whatever the agent
+            // spawned may still hold the pipes, and joining would hang
+            // the session the timeout just freed. The threads end when
+            // the pipes close.
+            self.log(
+                id,
+                format!("agent timed out after {timeout}s — killed; handing back to you"),
+            );
+            self.set_needs_you(id, &format!("agent timed out after {timeout}s"));
+            self.pump_queue();
+            return;
         }
-        let agent_ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        if let Some(t) = stdout_thread {
+            let _ = t.join();
+        }
         if let Some(t) = stderr_thread {
             let _ = t.join();
         }
+        let agent_ok = agent_result.unwrap_or(false);
         if !agent_ok {
             self.log(id, "agent exited non-zero — handing back to you".to_string());
             self.set_needs_you(id, "agent exited non-zero");
@@ -508,21 +599,46 @@ impl App {
 
         // 3. Verified done: the app runs the task's check itself.
         self.set_status(id, Status::Checking);
-        let check = Command::new("sh")
+        let timeout = self.policy.timeout_secs;
+        let check_child = Command::new("sh")
             .arg("-c")
             .arg(&session.check_cmd)
             .current_dir(wt)
-            .output();
-        let (passed, output) = match check {
-            Ok(o) => (
-                o.status.success(),
-                format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&o.stdout),
-                    String::from_utf8_lossy(&o.stderr)
-                ),
-            ),
-            Err(e) => (false, format!("check could not run: {e}")),
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let (passed, output, check_timed_out) = match check_child {
+            Ok(mut child) => {
+                // Collect both streams on threads (an unread pipe would
+                // wedge the check); the main thread watches the clock.
+                let (out_buf, out_t) = collect_stream(child.stdout.take());
+                let (err_buf, err_t) = collect_stream(child.stderr.take());
+                match Self::wait_with_timeout(&mut child, timeout) {
+                    Some(ok) => {
+                        if let Some(t) = out_t {
+                            let _ = t.join();
+                        }
+                        if let Some(t) = err_t {
+                            let _ = t.join();
+                        }
+                        let text = format!(
+                            "{}{}",
+                            out_buf.lock().unwrap(),
+                            err_buf.lock().unwrap()
+                        );
+                        (ok, text, false)
+                    }
+                    None => {
+                        let text = format!(
+                            "{}{}\n(check timed out after {timeout}s and was killed)",
+                            out_buf.lock().unwrap(),
+                            err_buf.lock().unwrap()
+                        );
+                        (false, text, true)
+                    }
+                }
+            }
+            Err(e) => (false, format!("check could not run: {e}"), false),
         };
 
         // 4. Capture the diff and commit the worktree so it can be merged.
@@ -591,6 +707,15 @@ impl App {
         } else if passed {
             self.log(id, "check passed — verified done".to_string());
             self.set_status(id, Status::Done);
+        } else if check_timed_out {
+            self.log(
+                id,
+                format!("check TIMED OUT after {timeout}s — this needs you"),
+            );
+            self.set_needs_you(
+                id,
+                &format!("check timed out after {timeout}s: {}", session.check_cmd),
+            );
         } else {
             self.log(id, "check FAILED — this needs you".to_string());
             self.set_needs_you(id, &format!("check failed: {}", session.check_cmd));
@@ -838,6 +963,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 "max_parallel": app.policy.max_parallel,
                 "agents": app.agents,
                 "default_agent": app.default_agent,
+                "timeout_secs": app.policy.timeout_secs,
                 "source": app.policy_source
             })
             .to_string(),
@@ -1106,6 +1232,7 @@ mod tests {
     fn policy_loads_and_drives_values() {
         let policy = Policy::load(SCRIPT).unwrap();
         assert_eq!(policy.max_parallel, 4);
+        assert_eq!(policy.timeout_secs, 1800);
         assert_eq!(policy.default_check("fixture").unwrap(), "test -s output.txt");
         assert_eq!(policy.default_check("anything-else").unwrap(), "cargo test");
     }
@@ -1115,6 +1242,9 @@ mod tests {
         let script = "pub fn max_parallel() { 1 }\npub fn default_check(p) { \"true\" }";
         let policy = Policy::load(script).unwrap();
         assert_eq!(policy.max_parallel, 1);
+        // No timeout_secs in this policy: the app default applies —
+        // a policy can never mean "no timeout" by omission.
+        assert_eq!(policy.timeout_secs, DEFAULT_TIMEOUT_SECS);
     }
 
     #[test]

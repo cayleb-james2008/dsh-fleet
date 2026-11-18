@@ -9,6 +9,14 @@ pub fn max_parallel() {
     4
 }
 
+/// How long (seconds) an agent run or a check may take before the
+/// session is handed back as needs-you with the timeout named. A hung
+/// agent must never hold its slot — or the operator's attention —
+/// forever. Optional: a policy without it gets the app default.
+pub fn timeout_secs() {
+    1800
+}
+
 /// The verification command for a project when the user did not attach one
 /// to the task. A session is only "done" when this command passes in its
 /// worktree.
