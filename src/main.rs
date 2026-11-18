@@ -7,6 +7,7 @@
 //! are executed through Rune — they drive behaviour, they are not metadata.
 
 use serde::Serialize;
+use std::os::unix::ffi::OsStrExt as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,8 @@ const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 const TRANSCRIPT_CAP: usize = 2000;
 /// Stored-transcript byte budget per session (see log()).
 const TRANSCRIPT_BYTES: usize = 512 * 1024;
+/// The largest run timeout a policy may set (one week).
+const MAX_TIMEOUT_SECS: u64 = 604_800;
 /// Stored check output / diff cap, in characters.
 const OUTPUT_CAP: usize = 256_000;
 
@@ -102,7 +105,11 @@ impl Policy {
         // unusable means the default, never "no timeout".
         if let Ok(secs) = policy.call_i64("timeout_secs", ()) {
             if secs > 0 {
-                policy.timeout_secs = secs as u64;
+                // Clamped: a policy value near i64::MAX would
+                // overflow Instant + Duration in the runner and
+                // panic the worker, leaving the session working
+                // forever. A week is beyond any real run.
+                policy.timeout_secs = (secs as u64).min(MAX_TIMEOUT_SECS);
             }
         }
         Ok(policy)
@@ -418,7 +425,12 @@ fn run_bounded(
         }
     }
     drop(tx);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(timeout_secs))
+        .unwrap_or_else(|| {
+            std::time::Instant::now()
+                + std::time::Duration::from_secs(MAX_TIMEOUT_SECS)
+        });
     let mut lines: Vec<String> = Vec::new();
     let mut child_status: Option<bool> = None;
     // After the child exits, the pipes get a grace — but measured as
@@ -635,7 +647,13 @@ impl App {
             .append(true)
             .open(logs_dir.join(format!("{id}.log")))
         {
-            let _ = writeln!(f, "{line}");
+            let stored =
+                if line == "--- check output ---" || line == "--- end check output ---" {
+                    format!(" {line}")
+                } else {
+                    line.clone()
+                };
+            let _ = writeln!(f, "{stored}");
         }
         let _ = count;
         let since = self
@@ -803,6 +821,99 @@ impl App {
         false
     }
 
+    /// Index bits (assume-unchanged, skip-worktree) make git blind
+    /// to real worktree changes: `git add -A` skips a flagged file,
+    /// the commit silently omits it, and a check reading the file
+    /// would then certify content that was never committed. Clear
+    /// both bits on every tracked path that carries one, before
+    /// staging anything.
+    fn clear_index_bits(wt: &Path) {
+        for (list_args, flag) in [
+            (["ls-files", "-v", "-z"], "--no-assume-unchanged"),
+            (["ls-files", "-t", "-z"], "--no-skip-worktree"),
+        ] {
+            let out = Command::new("git").arg("-C").arg(wt).args(list_args).output();
+            let Ok(o) = out else { continue };
+            if !o.status.success() {
+                continue;
+            }
+            let mut paths: Vec<&[u8]> = Vec::new();
+            for entry in o.stdout.split(|b| *b == 0) {
+                if entry.len() < 3 {
+                    continue;
+                }
+                let tag = entry[0];
+                let flagged = if flag == "--no-assume-unchanged" {
+                    tag.is_ascii_lowercase()
+                } else {
+                    tag == b'S'
+                };
+                if flagged {
+                    paths.push(&entry[2..]);
+                }
+            }
+            if paths.is_empty() {
+                continue;
+            }
+            let mut cmd = Command::new("git");
+            cmd.arg("-C").arg(wt).args(["update-index", flag, "--"]);
+            for p in &paths {
+                cmd.arg(std::ffi::OsStr::from_bytes(p));
+            }
+            let _ = cmd.output();
+        }
+    }
+
+    /// Kill processes that survived a run by detaching from its
+    /// process group (setsid) but still hold the worktree: their
+    /// working directory is inside it, or they hold a file open in
+    /// it. A group kill cannot reach them, and leaving them means a
+    /// settled session's worktree keeps changing underneath the
+    /// operator — a retry would then commit a ghost's writes as the
+    /// agent's work. (A process that also leaves the tree and closes
+    /// its files escapes this sweep; it can no longer touch the
+    /// worktree's contents either, short of reopening them by path.)
+    fn sweep_detached(&self, id: &str, dir: &Path) {
+        let me = std::process::id() as i32;
+        let mut killed = 0;
+        let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+            return;
+        };
+        for entry in proc_dir.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
+                continue;
+            };
+            if pid == me {
+                continue;
+            }
+            let base = entry.path();
+            let holds = std::fs::read_link(base.join("cwd"))
+                .map(|p| p.starts_with(dir))
+                .unwrap_or(false)
+                || std::fs::read_dir(base.join("fd"))
+                    .map(|fds| {
+                        fds.flatten().any(|fd| {
+                            std::fs::read_link(fd.path())
+                                .map(|p| p.starts_with(dir))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+            if holds && unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
+                killed += 1;
+            }
+        }
+        if killed > 0 {
+            self.log(
+                id,
+                format!(
+                    "killed {killed} detached process(es) still holding the worktree after the run settled"
+                ),
+            );
+        }
+    }
+
     /// Steps 2–4 of a session: run the agent in its worktree, run the
     /// task's check, record the outcome. Entered with the worktree ready
     /// (freshly created, or reused on a retry).
@@ -826,6 +937,7 @@ impl App {
         let mut agent_cmd = Command::new(&session.agent);
         agent_cmd.arg(&session.task).current_dir(wt);
         let outcome = run_bounded(agent_cmd, timeout, &mut on_line);
+        self.sweep_detached(id, wt);
         match outcome.end {
             RunEnd::SpawnFailed(e) => {
                 self.log(id, format!("agent failed to start: {e}"));
@@ -874,6 +986,7 @@ impl App {
         // files during the commit changes that tree — the check must
         // judge the tree as committed, not the one the agent left.
         self.clear_stale_index_lock(id, wt);
+        Self::clear_index_bits(wt);
         let _ = Command::new("git").arg("-C").arg(wt).args(["add", "-A"]).output();
         // Files the agent produced that this repo gitignores are not in
         // the commit and can never be merged — surface them, by name.
@@ -939,18 +1052,89 @@ impl App {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
 
+        // The commit must HOLD the work: if the worktree still
+        // differs from the committed tree (index bits the clearing
+        // missed, a writer racing the commit), the check would be
+        // judging state a merge cannot land.
+        let dirty_after_commit: Vec<String> = Command::new("git")
+            .arg("-C")
+            .arg(wt)
+            .args(["status", "--porcelain"])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(|l| l.to_string())
+                    .filter(|l| !l.trim().is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // 4. Verified done: the app runs the task's check itself, on
         // the committed tree (the worktree now matches the commit).
         self.set_status(id, Status::Checking);
         let timeout = self.policy.timeout_secs;
+        // The check judges the pinned commit, literally: it runs in
+        // a pristine checkout of that commit (a throwaway worktree),
+        // never in the session's mutable worktree. A check that
+        // writes files — a formatter, a codegen step — then cannot
+        // change the thing it is judging, and the tree it sees is
+        // byte-for-byte the tree a merge would land.
+        let verify_dir: Option<PathBuf> = match (&tip, &commit_error) {
+            (Some(t), None) => {
+                let dir = self
+                    .data_dir
+                    .join("verify")
+                    .join(format!("{}-{}", id, std::process::id()));
+                let _ = std::fs::create_dir_all(self.data_dir.join("verify"));
+                let out = Command::new("git")
+                    .arg("-C")
+                    .arg(&session.repo)
+                    .args(["worktree", "add", "--detach"])
+                    .arg(&dir)
+                    .arg(t)
+                    .output();
+                match out {
+                    Ok(o) if o.status.success() => Some(dir),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let pristine_failed =
+            tip.is_some() && commit_error.is_none() && verify_dir.is_none();
+        let check_dir: &Path = verify_dir.as_deref().unwrap_or(wt);
         let mut sink = |_: bool, _: &str| {};
         let mut check_cmd_proc = Command::new("sh");
         check_cmd_proc
             .arg("-c")
             .arg(&session.check_cmd)
-            .current_dir(wt);
+            .current_dir(check_dir);
         let outcome = run_bounded(check_cmd_proc, timeout, &mut sink);
-        let (passed, output, check_timed_out, check_pipes_held) = match outcome.end {
+        self.sweep_detached(id, check_dir);
+        if let Some(dir) = &verify_dir {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(&session.repo)
+                .args(["worktree", "remove", "--force"])
+                .arg(dir)
+                .output();
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(&session.repo)
+                .args(["worktree", "prune"])
+                .output();
+        }
+        let (passed, output, check_timed_out, check_pipes_held) = if pristine_failed {
+            (
+                false,
+                "fleet could not create a pristine checkout of the verified commit to run the check in — the check was not run"
+                    .to_string(),
+                false,
+                false,
+            )
+        } else {
+            match outcome.end {
             RunEnd::SpawnFailed(e) => (false, format!("check could not run: {e}"), false, false),
             RunEnd::Exited(ok) => (ok, outcome.lines.join("\n"), false, false),
             RunEnd::TimedOut => (
@@ -971,6 +1155,7 @@ impl App {
                 false,
                 true,
             ),
+            }
         };
 
         // 5. The diff the operator reviews before merging must be
@@ -986,12 +1171,12 @@ impl App {
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
-        // Problems inside the committed tree itself: a nested repo
-        // (bare gitlink) or an escaping symlink would make "merged"
-        // a lie no matter what the check said.
+        // Problems inside the session's own delta of the committed
+        // tree: a nested repo (bare gitlink) or an escaping symlink
+        // would make "merged" a lie no matter what the check said.
         let tree_problems = tip
             .as_deref()
-            .map(|t| Self::tree_problems(wt, t))
+            .map(|t| Self::tree_problems(&session.repo, t))
             .unwrap_or_default();
         // The full check output goes to the session's log file before
         // the stored copy is capped — the cap must never lose it.
@@ -1012,6 +1197,18 @@ impl App {
             // the usual cause) — never let it be called done.
             self.log(id, format!("commit failed: {err}"));
             self.set_needs_you(id, &format!("could not commit the session's work: {err}"));
+        } else if !dirty_after_commit.is_empty() {
+            let named = dirty_after_commit.join("; ");
+            self.log(
+                id,
+                format!("the worktree still differs from the committed tree after committing: {named}"),
+            );
+            self.set_needs_you(
+                id,
+                &format!(
+                    "the commit does not hold all the work — the worktree still differs from the committed tree: {named}"
+                ),
+            );
         } else if !tree_problems.is_empty() {
             let named = tree_problems.join("; ");
             self.log(id, format!("the committed tree cannot be merged as work: {named}"));
@@ -1019,21 +1216,41 @@ impl App {
                 id,
                 &format!("the committed tree cannot be merged as work: {named}"),
             );
-        } else if passed && !new_ignored.is_empty() {
-            self.log(
-                id,
-                format!(
-                    "check passed, but the agent produced files this repo gitignores — they cannot be committed or merged: {}",
-                    new_ignored.join(", ")
-                ),
-            );
-            self.set_needs_you(
-                id,
-                &format!(
-                    "agent produced files this repo gitignores — they cannot be committed or merged: {}",
-                    new_ignored.join(", ")
-                ),
-            );
+        } else if !new_ignored.is_empty() {
+            // The agent produced files this repo gitignores: they
+            // are not in the commit, can never be merged, and the
+            // check (judging the committed tree) could not see them.
+            // Name them whichever way the check went — "check failed"
+            // alone would bury the real problem.
+            let named = new_ignored.join(", ");
+            if passed {
+                self.log(
+                    id,
+                    format!(
+                        "check passed, but the agent produced files this repo gitignores — they cannot be committed or merged: {named}"
+                    ),
+                );
+                self.set_needs_you(
+                    id,
+                    &format!(
+                        "agent produced files this repo gitignores — they cannot be committed or merged: {named}"
+                    ),
+                );
+            } else {
+                self.log(
+                    id,
+                    format!(
+                        "check failed, and the agent produced files this repo gitignores — they cannot be committed or merged: {named}"
+                    ),
+                );
+                self.set_needs_you(
+                    id,
+                    &format!(
+                        "check failed: {} — and the agent produced files this repo gitignores, which cannot be committed or merged and so were not in the tree the check judged: {named}",
+                        session.check_cmd
+                    ),
+                );
+            }
         } else if passed && diff.trim().is_empty() {
             // The check passed on state the session did not change —
             // there is no work to verify or merge, and calling it
@@ -1117,35 +1334,78 @@ impl App {
         Self::ignored_files(wt).into_iter().collect()
     }
 
-    /// Problems in the committed tree that would make "merged" a lie:
-    /// a nested git repository commits as a bare gitlink (its content
-    /// never enters this repo), and a symlink whose target is absolute
-    /// or escapes the repo lands as a pointer to somewhere else.
-    fn tree_problems(wt: &Path, commit: &str) -> Vec<String> {
+    /// Problems in the session's own delta that would make
+    /// "merged" a lie: a nested git repository commits as a bare
+    /// gitlink (its content never enters this repo), and a symlink
+    /// whose target is absolute or escapes the repo lands as a
+    /// pointer to somewhere else. Only paths this branch changed
+    /// against the repo HEAD it diverged from are gated — a problem
+    /// the repo already had (a pre-existing submodule) is not this
+    /// session's doing and must not block its work forever. All git
+    /// output is read NUL-separated: the default quoting of
+    /// non-ASCII paths would otherwise hand the gate a literal
+    /// quoted string that matches nothing, and the path would slip
+    /// through ungated.
+    fn tree_problems(repo: &str, commit: &str) -> Vec<String> {
+        let mut problems = Vec::new();
         let out = Command::new("git")
             .arg("-C")
-            .arg(wt)
-            .args(["ls-tree", "-r", commit])
+            .arg(repo)
+            .args(["diff", "--name-status", "-z", &format!("HEAD...{commit}")])
             .output();
-        let mut problems = Vec::new();
         let Ok(o) = out else { return problems };
-        for line in String::from_utf8_lossy(&o.stdout).lines() {
-            // "<mode> <type> <hash>\t<path>"
-            let Some((meta, path)) = line.split_once('\t') else { continue };
-            let mode = meta.split_whitespace().next().unwrap_or("");
-            if mode == "160000" {
+        if !o.status.success() {
+            return problems;
+        }
+        let fields: Vec<&[u8]> = o
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|f| !f.is_empty())
+            .collect();
+        let mut i = 0;
+        while i < fields.len() {
+            let status = fields[i].first().copied().unwrap_or(b'?');
+            // Renames and copies carry two paths; the new one gates.
+            let npaths = if status == b'R' || status == b'C' { 2 } else { 1 };
+            if i + npaths > fields.len() - 1 {
+                break;
+            }
+            let path_bytes = fields[i + npaths];
+            i += 1 + npaths;
+            let path = String::from_utf8_lossy(path_bytes).to_string();
+            let mut lst = Command::new("git");
+            lst.arg("-C").arg(repo).args(["ls-tree", "-z", commit, "--"]);
+            lst.arg(std::ffi::OsStr::from_bytes(path_bytes));
+            let mode = lst
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| {
+                    o.stdout
+                        .split(|b| *b == b' ')
+                        .next()
+                        .map(|m| String::from_utf8_lossy(m).to_string())
+                })
+                .unwrap_or_default();
+            if mode == "160000" && status == b'A' {
                 problems.push(format!(
                     "{path} is a nested git repository — it commits as a bare pointer and its content never enters this repo"
                 ));
             } else if mode == "120000" {
+                let mut rev: Vec<u8> = Vec::new();
+                rev.extend_from_slice(commit.as_bytes());
+                rev.push(b':');
+                rev.extend_from_slice(path_bytes);
                 let target = Command::new("git")
                     .arg("-C")
-                    .arg(wt)
-                    .args(["cat-file", "-p", &format!("{commit}:{path}")])
+                    .arg(repo)
+                    .arg("cat-file")
+                    .arg("-p")
+                    .arg(std::ffi::OsStr::from_bytes(&rev))
                     .output()
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                     .unwrap_or_default();
-                if symlink_escapes(path, &target) {
+                if symlink_escapes(&path, &target) {
                     problems.push(format!(
                         "{path} is a symlink to '{target}', outside this repo — merging it would land a pointer, not the work"
                     ));
@@ -1171,6 +1431,12 @@ impl App {
                     s.status
                 ));
             }
+            if s.repo.is_empty() {
+                return Err(
+                    "this session was recovered from its log after the session store was lost — it is a record, not a runnable session; its repo and check settings are gone"
+                        .to_string(),
+                );
+            }
             s.check_output = None;
             s.check_passed = None;
             s.reason = None;
@@ -1184,7 +1450,7 @@ impl App {
         Ok(())
     }
 
-    fn merge(&self, id: &str) -> Result<String, String> {
+    fn merge(&self, id: &str) -> Result<(String, String), String> {
         let session = {
             let sessions = self.sessions.lock().unwrap();
             sessions
@@ -1261,6 +1527,15 @@ impl App {
                     .to_string(),
             );
         }
+        let target_branch = Command::new("git")
+            .arg("-C")
+            .arg(&session.repo)
+            .args(["symbolic-ref", "--short", "-q", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
         let out = Command::new("git")
             .arg("-C")
             .arg(&session.repo)
@@ -1323,7 +1598,11 @@ impl App {
             );
         }
         self.set_status(id, Status::Merged);
-        Ok(pin)
+        self.log(
+            id,
+            format!("merged into {target_branch} at {pin}"),
+        );
+        Ok((pin, target_branch))
     }
 }
 
@@ -1420,10 +1699,18 @@ fn read_request(
             String::new(),
         ));
     }
-    let mut body = vec![0u8; content_length];
+    let mut body: Vec<u8> = Vec::with_capacity(content_length);
     if content_length > 0 {
-        arm(stream)?;
-        reader.read_exact(&mut body).ok()?;
+        let mut chunk = [0u8; 8192];
+        while body.len() < content_length {
+            arm(stream)?;
+            let want = (content_length - body.len()).min(chunk.len());
+            match reader.read(&mut chunk[..want]) {
+                Ok(0) => return None,
+                Ok(n) => body.extend_from_slice(&chunk[..n]),
+                Err(_) => return None,
+            }
+        }
     }
     Some((
         method,
@@ -1529,7 +1816,15 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                     )
                 }
             };
-            if !Path::new(&repo).join(".git").exists() {
+            let repo_ok = Path::new(&repo).join(".git").exists()
+                && Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(["rev-parse", "--git-dir"])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+            if !repo_ok {
                 return error_response(400, "repo is not a git repository");
             }
             let check_cmd = match req["check"].as_str() {
@@ -1598,9 +1893,14 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
         ("POST", route) if route.starts_with("/api/sessions/") && route.ends_with("/merge") => {
             let id = &route["/api/sessions/".len()..route.len() - "/merge".len()];
             match app.merge(id) {
-                Ok(commit) => json_response(
+                Ok((commit, branch)) => json_response(
                     200,
-                    &format!("{{\"merged\":true,\"commit\":\"{commit}\"}}"),
+                    &serde_json::json!({
+                        "merged": true,
+                        "commit": commit,
+                        "branch": branch
+                    })
+                    .to_string(),
                 ),
                 Err(e) => error_response(409, &e),
             }
@@ -1639,6 +1939,13 @@ fn transcript_lines_from_log(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_check_block = false;
     for line in text.lines() {
+        if line == " --- check output ---" || line == " --- end check output ---" {
+            // A line the agent itself printed that happens to equal a
+            // check-block marker — escaped with a leading space when
+            // written to the log, so it cannot forge a block boundary.
+            out.push(line[1..].to_string());
+            continue;
+        }
         if line == "--- check output ---" {
             in_check_block = true;
             continue;
@@ -1654,17 +1961,34 @@ fn transcript_lines_from_log(text: &str) -> Vec<String> {
     out
 }
 
-/// Cap a restored transcript exactly as log() caps a live one: the
-/// restart must not resurrect lines the cap had already dropped.
+/// Cap a restored transcript exactly as log() caps a live one — BOTH
+/// caps: the restart must not resurrect lines the cap had already
+/// dropped, by count or by bytes.
 fn cap_transcript(lines: Vec<String>) -> Vec<String> {
-    if lines.len() <= TRANSCRIPT_CAP {
-        return lines;
+    let mut kept = if lines.len() <= TRANSCRIPT_CAP {
+        lines
+    } else {
+        let mut kept: Vec<String> = vec![
+            "… earlier lines are in this session's log file on disk — this view keeps the most recent lines"
+                .to_string(),
+        ];
+        kept.extend(lines.into_iter().rev().take(TRANSCRIPT_CAP - 1).rev());
+        kept
+    };
+    let bytes: usize = kept.iter().map(|l| l.len() + 1).sum();
+    if bytes > TRANSCRIPT_BYTES {
+        let mut over = bytes - TRANSCRIPT_BYTES;
+        let start = if kept.first().is_some_and(|l| l.starts_with('…')) {
+            1
+        } else {
+            0
+        };
+        let mut idx = start;
+        while over > 0 && kept.len() > idx + 1 {
+            over = over.saturating_sub(kept[idx].len() + 1);
+            kept.remove(idx);
+        }
     }
-    let mut kept: Vec<String> = vec![
-        "… earlier lines are in this session's log file on disk — this view keeps the most recent lines"
-            .to_string(),
-    ];
-    kept.extend(lines.into_iter().rev().take(TRANSCRIPT_CAP - 1).rev());
     kept
 }
 
