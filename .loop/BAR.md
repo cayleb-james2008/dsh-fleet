@@ -53,6 +53,42 @@ the state machine produced).
 - C11 (owner): The look and feel of the finished screen. The loop never
   marks this passed.
 
+## Completion pass conditions (18 Nov 2026 — see COMPLETION.md)
+
+- C12 (cmd): Real engines are driven through an adapter, not a bare
+  name. With a recording stand-in binary named `opencode` on PATH, a
+  hand-out naming agent "opencode" invokes it as
+  `run --model opencode-go/deepseek-v4.1-flash <task>` (the model from
+  policies.rn `agent_model()`, exposed by /api/policy) and the session
+  reaches verified done through the normal gate. With the real codex
+  binary present but not logged in, a hand-out naming "codex" spawns
+  the real process, streams its output, and lands needs-you naming the
+  failure — never done, never hung. Sessions record their engine kind;
+  a path agent is labelled custom/test mode in the API and the page.
+  (`.loop/checks/engines.sh`)
+- C13 (cmd): Steer and stop are real. A steer posted while a session
+  works is delivered as a continuation run before commit+check (the
+  fixture records both invocations; the final tree reflects the steer;
+  the session still reaches verified done, and the transcript shows the
+  operator's message). A stop posted while a session works kills the
+  run within seconds — long before the agent's own sleep would end —
+  and lands the session needs-you with "stopped by you" as the reason.
+  Steer on a merged session and stop on a settled session are refused.
+  (`.loop/checks/steer_stop.sh`)
+- C14 (cmd): Successor work self-claims. A hand-out with `next` fires
+  the successor automatically when — and only when — the session
+  reaches verified done: the successor session exists with its origin
+  recorded, runs, and reaches done itself; a chain of two fires in
+  order. A session that lands needs-you fires nothing.
+  (`.loop/checks/successor.sh`)
+- C15 (cmd): The elevated front end (Hallmark-Rune pass) holds at 8
+  viewport widths in both themes: no horizontal overflow, the three
+  status groups and the detail view render, the theme toggle persists.
+  (`.loop/checks/widths.sh`)
+- C16 (cmd): Elevation breaks no flow: after the front-end pass, the
+  full kit (`bash .loop/verify final`) is green end to end, including
+  C12–C14.
+
 ## DIRECTION v1 (interface)
 
 - Product: one screen where Cayleb supervises several AI coding agents

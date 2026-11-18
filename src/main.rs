@@ -26,6 +26,11 @@ struct Policy {
     /// optional timeout_secs(); a policy that doesn't define it gets
     /// DEFAULT_TIMEOUT_SECS — never infinity.
     timeout_secs: u64,
+    /// The house model route, from the policy's optional
+    /// agent_model() — one config point for which model agent
+    /// sessions run. Passed to the engine that speaks that provider
+    /// namespace (opencode). Absent means the engine's own default.
+    model: Option<String>,
 }
 
 const DEFAULT_TIMEOUT_SECS: u64 = 1800;
@@ -94,7 +99,15 @@ impl Policy {
             runtime,
             max_parallel: 1,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
+            model: None,
         };
+        // agent_model is optional in the policy file; absent or
+        // unusable means the engine's own default model.
+        if let Ok(m) = policy.call_string("agent_model", ()) {
+            if !m.is_empty() {
+                policy.model = Some(m);
+            }
+        }
         policy.max_parallel = policy.call_i64("max_parallel", ())?;
         if policy.max_parallel < 1 {
             // A cap of zero would queue every session forever with
@@ -128,6 +141,18 @@ impl Policy {
             .call([name], args)
             .map_err(|e| format!("policy call {name} failed: {e}"))?;
         rune::from_value::<i64>(value).map_err(|e| format!("policy {name} returned non-integer: {e}"))
+    }
+
+    fn call_string<A>(&self, name: &str, args: A) -> Result<String, String>
+    where
+        A: rune::runtime::Args + rune::runtime::GuardedArgs,
+    {
+        let value = self
+            .vm()
+            .call([name], args)
+            .map_err(|e| format!("policy call {name} failed: {e}"))?;
+        rune::from_value::<String>(value)
+            .map_err(|e| format!("policy {name} returned non-string: {e}"))
     }
 
     fn default_check(&self, project: &str) -> Result<String, String> {
@@ -241,6 +266,113 @@ fn resolve_agent(app: &App, requested: Option<&str>) -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Engine adapter — how a session's agent is actually invoked
+// ---------------------------------------------------------------------------
+
+/// The kind of engine behind a session's agent string. The three
+/// known names are real CLI agents, each with its own non-interactive
+/// invocation; anything else (an executable path) is a custom command
+/// that receives the prompt as its single argument — that is the
+/// contract fixture/test agents are written to, and the UI labels it
+/// as test mode so a fixture never wears a real engine's name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EngineKind {
+    Opencode,
+    Claude,
+    Codex,
+    Custom,
+}
+
+fn engine_kind(agent: &str) -> EngineKind {
+    match agent {
+        "opencode" => EngineKind::Opencode,
+        "claude" => EngineKind::Claude,
+        "codex" => EngineKind::Codex,
+        _ => EngineKind::Custom,
+    }
+}
+
+impl EngineKind {
+    /// The stable label the API and UI carry.
+    fn label(self) -> &'static str {
+        match self {
+            EngineKind::Opencode => "opencode",
+            EngineKind::Claude => "claude",
+            EngineKind::Codex => "codex",
+            EngineKind::Custom => "custom",
+        }
+    }
+}
+
+/// Build the argv for one agent run: the program to spawn and its
+/// arguments, with `prompt` as the work text. `continuation` selects
+/// the engine's own resume mechanism, used when the operator steers a
+/// session: the engine continues its previous conversation in the
+/// same worktree instead of starting over.
+///
+/// - opencode: `opencode run [--model M] [--continue] <prompt>`
+///   (the invocation proven live on the operator's desktop; the model
+///   is the house route from policies.rn agent_model() — DeepSeek
+///   V4.1 Flash via OpenCode Go — and opencode is the engine that
+///   speaks that provider namespace, so it is the one that gets it).
+/// - claude: `claude -p [--continue] <prompt>` (print mode).
+/// - codex: `codex exec --sandbox workspace-write --color never
+///   <prompt>`; continuation `codex exec resume --last <prompt>`
+///   (the resumed session keeps the sandbox of its first run).
+/// - custom: `<path> <prompt>` for both — the worktree itself carries
+///   the state between runs.
+fn engine_command(
+    agent: &str,
+    model: Option<&str>,
+    prompt: &str,
+    continuation: bool,
+) -> (String, Vec<String>) {
+    let args: Vec<String> = match engine_kind(agent) {
+        EngineKind::Opencode => {
+            let mut a = vec!["run".to_string()];
+            if let Some(m) = model {
+                a.push("--model".to_string());
+                a.push(m.to_string());
+            }
+            if continuation {
+                a.push("--continue".to_string());
+            }
+            a.push(prompt.to_string());
+            a
+        }
+        EngineKind::Claude => {
+            let mut a = vec!["-p".to_string()];
+            if continuation {
+                a.push("--continue".to_string());
+            }
+            a.push(prompt.to_string());
+            a
+        }
+        EngineKind::Codex => {
+            if continuation {
+                vec![
+                    "exec".to_string(),
+                    "resume".to_string(),
+                    "--last".to_string(),
+                    prompt.to_string(),
+                ]
+            } else {
+                vec![
+                    "exec".to_string(),
+                    "--sandbox".to_string(),
+                    "workspace-write".to_string(),
+                    "--color".to_string(),
+                    "never".to_string(),
+                    prompt.to_string(),
+                ]
+            }
+        }
+        EngineKind::Custom => vec![prompt.to_string()],
+    };
+    (agent.to_string(), args)
+}
+
+// ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------
 
@@ -308,6 +440,28 @@ struct Session {
     /// verified work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     verified_commit: Option<String>,
+    /// Operator messages waiting to be delivered to the agent as a
+    /// continuation run. Drained by the runner between agent runs —
+    /// before commit and check — so a session never settles "done"
+    /// on a tree the operator has since steered away from. Persisted:
+    /// a message must survive a server restart like everything else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    steer: Vec<String>,
+    /// Successor work named at hand-out, in order. When this session
+    /// reaches verified done, the front item is handed out
+    /// automatically (carrying the rest of the chain) — a finished
+    /// session pulls the next item instead of idling. Fires ONLY on
+    /// verified done: failed work must not cascade.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    next_queue: Vec<String>,
+    /// The session whose verified finish handed this one out, when
+    /// this session is a successor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spawned_from: Option<String>,
+    /// The successor session this one handed out on finishing, once
+    /// it has fired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    successor: Option<String>,
     transcript: Vec<String>,
 }
 
@@ -328,6 +482,11 @@ struct App {
     /// cadence counter (see log()).
     lines_since_persist: std::sync::atomic::AtomicU64,
     counter: Mutex<u64>,
+    /// Per-session stop flags. A session's worker thread holds a
+    /// clone of its flag and hands it to the bounded runner; the stop
+    /// endpoint sets it. In-memory only — a restart already lands
+    /// every live session in needs-you with the reason stated.
+    stops: Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 /// How a bounded run ended.
@@ -343,6 +502,9 @@ enum RunEnd {
     PipesHeld,
     /// The process could not be spawned at all.
     SpawnFailed(String),
+    /// The operator stopped the run; its whole process group was
+    /// killed at their word, not the clock's.
+    Stopped,
 }
 
 struct RunOutcome {
@@ -379,7 +541,11 @@ fn kill_group(pid: u32) {
 }
 
 /// Run a command in its OWN process group, streaming lines to
-/// `on_line` as they arrive. The timeout bounds everything: the
+/// `on_line` as they arrive. Its stdin is /dev/null, always: a run
+/// is non-interactive, and an agent that reads stdin when it is not
+/// a TTY (codex exec appends piped stdin to the prompt) would
+/// otherwise block forever on the server's inherited stdin, which
+/// nothing ever closes. The timeout bounds everything: the
 /// process itself, and — after it exits — a short grace for its pipes
 /// to close. A descendant that inherited the pipes (or detached into
 /// the worktree) can therefore hold a session for at most the timeout
@@ -387,10 +553,12 @@ fn kill_group(pid: u32) {
 fn run_bounded(
     mut cmd: Command,
     timeout_secs: u64,
+    stop: Option<&std::sync::atomic::AtomicBool>,
     on_line: &mut dyn FnMut(bool, &str),
 ) -> RunOutcome {
     use std::os::unix::process::CommandExt;
-    cmd.stdout(Stdio::piped())
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
     let mut child = match cmd.spawn() {
@@ -442,7 +610,15 @@ fn run_bounded(
     // prints forever).
     let mut exited_at: Option<std::time::Instant> = None;
     let mut last_line_at = std::time::Instant::now();
+    let stopped = || {
+        stop.is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+    };
     let end = loop {
+        if child_status.is_none() && stopped() {
+            kill_group(pid);
+            let _ = child.kill();
+            break RunEnd::Stopped;
+        }
         if child_status.is_none() {
             match child.try_wait() {
                 Ok(Some(st)) => {
@@ -479,7 +655,14 @@ fn run_bounded(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 // Both pipes are closed. The process may still be
                 // finishing; give it until the main deadline.
+                let mut stop_hit = false;
                 loop {
+                    if stopped() {
+                        kill_group(pid);
+                        let _ = child.kill();
+                        stop_hit = true;
+                        break;
+                    }
                     match child.try_wait() {
                         Ok(Some(st)) => {
                             child_status = Some(st.success());
@@ -499,6 +682,9 @@ fn run_bounded(
                             break;
                         }
                     }
+                }
+                if stop_hit {
+                    break RunEnd::Stopped;
                 }
                 match child_status {
                     Some(ok) => break RunEnd::Exited(ok),
@@ -574,6 +760,42 @@ impl App {
             .iter()
             .find(|s| s.id == id)
             .map(|s| s.status.clone())
+    }
+
+    /// The session's stop flag, created on first use. The worker
+    /// thread clones it before a run; the stop endpoint sets it.
+    fn stop_flag(&self, id: &str) -> Arc<std::sync::atomic::AtomicBool> {
+        self.stops
+            .lock()
+            .unwrap()
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .clone()
+    }
+
+    /// Take all pending steering messages for a session, leaving the
+    /// queue empty. Called by the runner between agent runs.
+    fn take_steer(&self, id: &str) -> Vec<String> {
+        let taken = {
+            let mut sessions = self.sessions.lock().unwrap();
+            match sessions.iter_mut().find(|s| s.id == id) {
+                Some(s) => std::mem::take(&mut s.steer),
+                None => Vec::new(),
+            }
+        };
+        if !taken.is_empty() {
+            self.persist();
+        }
+        taken
+    }
+
+    fn steer_pending(&self, id: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.id == id)
+            .is_some_and(|s| !s.steer.is_empty())
     }
     /// Append text to a session's on-disk log file (the transcript of
     /// record). Used for content too big for the in-memory view, like a
@@ -721,7 +943,7 @@ impl App {
                 id,
                 format!("reusing existing worktree on branch {}", session.branch),
             );
-            return self.run_agent_and_check(id, &session, &wt);
+            return self.run_agent_and_check(id, &session, &wt, true);
         }
         if let Some(parent) = wt.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -781,7 +1003,7 @@ impl App {
             }
         }
 
-        self.run_agent_and_check(id, &session, &wt);
+        self.run_agent_and_check(id, &session, &wt, false);
     }
 
     /// Clear a stale index.lock in a worktree's git dir, if one is
@@ -914,16 +1136,20 @@ impl App {
         }
     }
 
-    /// Steps 2–4 of a session: run the agent in its worktree, run the
-    /// task's check, record the outcome. Entered with the worktree ready
-    /// (freshly created, or reused on a retry).
-    fn run_agent_and_check(self: &Arc<Self>, id: &str, session: &Session, wt: &Path) {
-        // Baseline of ignored files before the agent touches anything,
-        // so step 4 can tell agent-produced ignored files from the
-        // repo's pre-existing ones.
-        let ignored_baseline = self.ignored_baseline(id, wt);
-        // 2. Run the agent in the worktree, streaming its output.
-        self.log(id, format!("agent started: {}", session.task));
+    /// One agent run inside a session's worktree, through the engine
+    /// adapter, streamed and bounded (timeout and the operator's stop
+    /// flag both apply). Returns true when the agent exited cleanly.
+    /// On any other ending the session has already been handed to
+    /// needs-you with the reason recorded, the queue pumped, and the
+    /// caller must stop.
+    fn run_one(
+        self: &Arc<Self>,
+        id: &str,
+        session: &Session,
+        wt: &Path,
+        prompt: &str,
+        continuation: bool,
+    ) -> bool {
         let timeout = self.policy.timeout_secs;
         let app_lines = self.clone();
         let id_lines = id.to_string();
@@ -934,16 +1160,38 @@ impl App {
                 app_lines.log(&id_lines, line.to_string());
             }
         };
-        let mut agent_cmd = Command::new(&session.agent);
-        agent_cmd.arg(&session.task).current_dir(wt);
-        let outcome = run_bounded(agent_cmd, timeout, &mut on_line);
+        let (prog, args) = engine_command(
+            &session.agent,
+            self.policy.model.as_deref(),
+            prompt,
+            continuation,
+        );
+        let mut agent_cmd = Command::new(&prog);
+        agent_cmd.args(&args).current_dir(wt);
+        // A stop flag belongs to the run it was set against: clear
+        // it as a new run starts, or a retried session would stop
+        // itself instantly on a stale flag. (The flag is deliberately
+        // NOT cleared before the check that follows this run — a stop
+        // pressed in the settle window still lands there.)
+        let flag = self.stop_flag(id);
+        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        let outcome = run_bounded(agent_cmd, timeout, Some(&flag), &mut on_line);
         self.sweep_detached(id, wt);
         match outcome.end {
             RunEnd::SpawnFailed(e) => {
                 self.log(id, format!("agent failed to start: {e}"));
                 self.set_needs_you(id, &format!("agent failed to start: {}", session.agent));
                 self.pump_queue();
-                return;
+                false
+            }
+            RunEnd::Stopped => {
+                self.log(
+                    id,
+                    "stopped by you — the agent's whole process group was killed".to_string(),
+                );
+                self.set_needs_you(id, "stopped by you mid-run");
+                self.pump_queue();
+                false
             }
             RunEnd::TimedOut => {
                 self.log(
@@ -952,7 +1200,7 @@ impl App {
                 );
                 self.set_needs_you(id, &format!("agent timed out after {timeout}s"));
                 self.pump_queue();
-                return;
+                false
             }
             RunEnd::PipesHeld => {
                 self.log(
@@ -964,15 +1212,69 @@ impl App {
                     "agent exited but a detached process kept its output open past the limit — the run cannot be trusted complete",
                 );
                 self.pump_queue();
-                return;
+                false
             }
             RunEnd::Exited(false) => {
                 self.log(id, "agent exited non-zero — handing back to you".to_string());
                 self.set_needs_you(id, "agent exited non-zero");
                 self.pump_queue();
+                false
+            }
+            RunEnd::Exited(true) => true,
+        }
+    }
+
+    /// Steps 2–4 of a session: run the agent in its worktree
+    /// (delivering any steering first on a resumed pass, and draining
+    /// the steering queue between runs), run the task's check, record
+    /// the outcome. Entered with the worktree ready (freshly created,
+    /// or reused on a retry).
+    fn run_agent_and_check(
+        self: &Arc<Self>,
+        id: &str,
+        session: &Session,
+        wt: &Path,
+        resumed: bool,
+    ) {
+        // Baseline of ignored files before the agent touches anything,
+        // so step 4 can tell agent-produced ignored files from the
+        // repo's pre-existing ones.
+        let ignored_baseline = self.ignored_baseline(id, wt);
+        // 2. Run the agent in the worktree, streaming its output. A
+        // resumed pass (retry / steer-reopen) whose operator already
+        // left steering messages delivers those FIRST, as a
+        // continuation of the work already in the tree — re-running
+        // the original task prompt at an agent that has moved past
+        // it would waste the run.
+        let steer_first = resumed && self.steer_pending(id);
+        if !steer_first {
+            self.log(id, format!("agent started: {}", session.task));
+            if !self.run_one(id, session, wt, &session.task, false) {
                 return;
             }
-            RunEnd::Exited(true) => {}
+        }
+        // Drain the steering queue before anything is committed or
+        // checked: each batch of pending messages becomes one
+        // continuation run through the engine's own resume mechanism,
+        // and messages that arrive during a continuation are picked
+        // up by the next pass of this loop. "Done" below therefore
+        // always describes a tree the operator has not since steered
+        // away from.
+        loop {
+            let msgs = self.take_steer(id);
+            if msgs.is_empty() {
+                break;
+            }
+            for m in &msgs {
+                self.log(id, format!("you: {m}"));
+            }
+            self.log(
+                id,
+                "steering: handing your message to the agent before the check runs".to_string(),
+            );
+            if !self.run_one(id, session, wt, &msgs.join("\n\n"), true) {
+                return;
+            }
         }
         self.log(
             id,
@@ -1110,7 +1412,8 @@ impl App {
             .arg("-c")
             .arg(&session.check_cmd)
             .current_dir(check_dir);
-        let outcome = run_bounded(check_cmd_proc, timeout, &mut sink);
+        let flag = self.stop_flag(id);
+        let outcome = run_bounded(check_cmd_proc, timeout, Some(&flag), &mut sink);
         self.sweep_detached(id, check_dir);
         if let Some(dir) = &verify_dir {
             let _ = Command::new("git")
@@ -1125,18 +1428,19 @@ impl App {
                 .args(["worktree", "prune"])
                 .output();
         }
-        let (passed, output, check_timed_out, check_pipes_held) = if pristine_failed {
+        let (passed, output, check_timed_out, check_pipes_held, check_stopped) = if pristine_failed {
             (
                 false,
                 "fleet could not create a pristine checkout of the verified commit to run the check in — the check was not run"
                     .to_string(),
                 false,
                 false,
+                false,
             )
         } else {
             match outcome.end {
-            RunEnd::SpawnFailed(e) => (false, format!("check could not run: {e}"), false, false),
-            RunEnd::Exited(ok) => (ok, outcome.lines.join("\n"), false, false),
+            RunEnd::SpawnFailed(e) => (false, format!("check could not run: {e}"), false, false, false),
+            RunEnd::Exited(ok) => (ok, outcome.lines.join("\n"), false, false, false),
             RunEnd::TimedOut => (
                 false,
                 format!(
@@ -1145,6 +1449,7 @@ impl App {
                 ),
                 true,
                 false,
+                false,
             ),
             RunEnd::PipesHeld => (
                 false,
@@ -1152,6 +1457,17 @@ impl App {
                     "{}\n(check's output stayed open past the limit — a detached process held it; the process group was killed)",
                     outcome.lines.join("\n")
                 ),
+                false,
+                true,
+                false,
+            ),
+            RunEnd::Stopped => (
+                false,
+                format!(
+                    "{}\n(check stopped by you and killed)",
+                    outcome.lines.join("\n")
+                ),
+                false,
                 false,
                 true,
             ),
@@ -1287,9 +1603,33 @@ impl App {
                 id,
                 &format!("check timed out after {timeout}s: {}", session.check_cmd),
             );
+        } else if check_stopped {
+            self.log(id, "check stopped by you — this needs you".to_string());
+            self.set_needs_you(id, "stopped by you while the check was running");
         } else {
             self.log(id, "check FAILED — this needs you".to_string());
             self.set_needs_you(id, &format!("check failed: {}", session.check_cmd));
+        }
+        // Steering that arrived while the check ran must not be
+        // stranded on a settled session. If the session finished
+        // verified-done with messages still pending, reopen it: the
+        // messages are delivered on the next pass and the work is
+        // re-verified before it can be merged. (On a needs-you
+        // settle the messages simply wait — the operator's next
+        // steer or retry runs them.) A clean verified finish with
+        // nothing pending pulls the next item of the chain, if the
+        // hand-out named one.
+        if self.status_of(id).as_deref() == Some("done") {
+            if self.steer_pending(id) {
+                self.log(
+                    id,
+                    "your steering arrived while the check ran — reopening so it is delivered and the work re-checked"
+                        .to_string(),
+                );
+                self.requeue(id);
+            } else {
+                self.fire_successor(id);
+            }
         }
         self.pump_queue();
     }
@@ -1437,17 +1777,185 @@ impl App {
                         .to_string(),
                 );
             }
-            s.check_output = None;
-            s.check_passed = None;
-            s.reason = None;
-            s.diff = String::new();
-            s.status = Status::Queued.label().to_string();
-            s.bucket = Status::Queued.bucket().to_string();
         }
         self.log(id, "retry: handed back to the agent".to_string());
+        self.requeue(id);
+        Ok(())
+    }
+
+    /// Put a settled session back in the queue with its check state
+    /// cleared; its worktree (with the agent's earlier work in it) is
+    /// reused by the next pass. Shared by retry (from needs-you) and
+    /// by steering (which reopens even a verified-done session — its
+    /// verified-commit pin is cleared here, so nothing unverified
+    /// can ever be merged off a reopened session).
+    fn requeue(self: &Arc<Self>, id: &str) {
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
+                s.check_output = None;
+                s.check_passed = None;
+                s.reason = None;
+                s.diff = String::new();
+                s.verified_commit = None;
+                s.status = Status::Queued.label().to_string();
+                s.bucket = Status::Queued.bucket().to_string();
+            }
+        }
         self.persist();
         self.maybe_start(id);
+    }
+
+    /// Hand out the next item of a finished session's successor
+    /// chain. Called ONLY on a verified-done settle — failed or
+    /// unfinished work never cascades. The successor inherits the
+    /// repo, project, agent and the resolved check command, and
+    /// carries the rest of the chain with it.
+    fn fire_successor(self: &Arc<Self>, id: &str) {
+        let n = {
+            let mut counter = self.counter.lock().unwrap();
+            *counter += 1;
+            *counter
+        };
+        let new_id = format!("s{}-{n}", self.run_tag);
+        let built = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let Some(parent) = sessions.iter_mut().find(|s| s.id == id) else {
+                return;
+            };
+            if parent.next_queue.is_empty() {
+                return;
+            }
+            let task = parent.next_queue.remove(0);
+            let rest = std::mem::take(&mut parent.next_queue);
+            parent.successor = Some(new_id.clone());
+            let child = Session {
+                id: new_id.clone(),
+                task: task.clone(),
+                project: parent.project.clone(),
+                repo: parent.repo.clone(),
+                branch: format!("fleet/{new_id}"),
+                worktree: self
+                    .data_dir
+                    .join("worktrees")
+                    .join(&new_id)
+                    .to_string_lossy()
+                    .to_string(),
+                status: Status::Queued.label().to_string(),
+                bucket: Status::Queued.bucket().to_string(),
+                agent: parent.agent.clone(),
+                check_cmd: parent.check_cmd.clone(),
+                check_output: None,
+                check_passed: None,
+                diff: String::new(),
+                reason: None,
+                verified_commit: None,
+                steer: Vec::new(),
+                next_queue: rest,
+                spawned_from: Some(id.to_string()),
+                successor: None,
+                transcript: Vec::new(),
+            };
+            sessions.push(child);
+            task
+        };
+        self.persist();
+        self.log(
+            id,
+            format!(
+                "verified done — the next item was handed out automatically: {built} (session {new_id})"
+            ),
+        );
+        self.log(
+            &new_id,
+            format!("handed out automatically: session {id} finished verified done"),
+        );
+        self.maybe_start(&new_id);
+    }
+
+    /// Record an operator steering message for a session. What
+    /// happens next depends on where the session stands:
+    /// - queued / working / checking: the message waits in the
+    ///   queue; the runner delivers it as a continuation run before
+    ///   anything is committed or checked (or, if it lands after the
+    ///   check on a done settle, by reopening the session).
+    /// - needs-you: the message is queued AND the session is retried
+    ///   — the resumed pass delivers pending steering first.
+    /// - done: the session is reopened (pin cleared) so the message
+    ///   is delivered and the work re-verified.
+    /// - merged: refused — the work already landed; steer new work.
+    fn steer(self: &Arc<Self>, id: &str, message: &str) -> Result<(), String> {
+        let status = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let s = sessions
+                .iter_mut()
+                .find(|s| s.id == id)
+                .ok_or("no such session")?;
+            if s.status == "merged" {
+                return Err(
+                    "this session's work is already merged — hand out new work instead of steering it"
+                        .to_string(),
+                );
+            }
+            if s.repo.is_empty() {
+                return Err(
+                    "this session was recovered from its log after the session store was lost — it is a record, not a runnable session"
+                        .to_string(),
+                );
+            }
+            if s.steer.len() >= 10 {
+                return Err(
+                    "ten steering messages are already waiting for this session — let the agent catch up before sending more"
+                        .to_string(),
+                );
+            }
+            s.steer.push(message.to_string());
+            s.status.clone()
+        };
+        self.persist();
+        match status.as_str() {
+            "needs-you" => {
+                self.log(id, "steering a waiting session — retrying it with your message".to_string());
+                self.requeue(id);
+            }
+            "done" => {
+                self.log(
+                    id,
+                    "your steering reopens this finished session — the work will be re-checked before it can be merged"
+                        .to_string(),
+                );
+                self.requeue(id);
+            }
+            _ => {}
+        }
         Ok(())
+    }
+
+    /// Stop a session at the operator's word. A live run (agent or
+    /// check) is killed through its stop flag — the bounded runner
+    /// kills the whole process group and lands the session in
+    /// needs-you with "stopped by you" as the reason. A queued
+    /// session is cancelled before it ever starts. A settled session
+    /// cannot be stopped; the refusal names its status.
+    fn stop(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        let status = self.status_of(id).ok_or("no such session")?;
+        match status.as_str() {
+            "queued" => {
+                self.log(id, "stopped by you while queued — it never started".to_string());
+                self.set_needs_you(id, "cancelled by you before it started");
+                self.pump_queue();
+                Ok(())
+            }
+            "working" | "checking" => {
+                self.stop_flag(id)
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.log(id, "stop requested by you — killing the run".to_string());
+                Ok(())
+            }
+            other => Err(format!(
+                "session is '{other}' — only a queued, working or checking session can be stopped"
+            )),
+        }
     }
 
     fn merge(&self, id: &str) -> Result<(String, String), String> {
@@ -1751,6 +2259,13 @@ fn sessions_json(sessions: &[Session]) -> serde_json::Value {
         .iter()
         .map(|s| {
             let mut v = serde_json::to_value(s).unwrap();
+            // The engine kind is derived from the agent string, never
+            // stored — it cannot desync from what actually ran. A
+            // custom command (any executable path) is test mode, and
+            // the API says so on every session it labels.
+            let kind = engine_kind(&s.agent);
+            v["engine"] = serde_json::json!(kind.label());
+            v["test_mode"] = serde_json::json!(kind == EngineKind::Custom);
             if s.status == "queued" {
                 pos += 1;
                 v["queue_position"] = serde_json::json!(pos);
@@ -1784,6 +2299,12 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 "max_parallel": app.policy.max_parallel,
                 "agents": app.agents,
                 "default_agent": app.default_agent,
+                "default_agent_engine": app
+                    .default_agent
+                    .as_deref()
+                    .map(|a| engine_kind(a).label()),
+                "model": app.policy.model,
+                "model_engine": "opencode",
                 "timeout_secs": app.policy.timeout_secs,
                 "source": app.policy_source
             })
@@ -1834,6 +2355,37 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                     Err(e) => return error_response(500, &e),
                 },
             };
+            // Successor work named with the order: a single task
+            // string, or an array for a chain. Each item must be a
+            // non-empty string; anything else is refused up front.
+            let mut next_queue: Vec<String> = Vec::new();
+            match &req["next"] {
+                serde_json::Value::Null => {}
+                serde_json::Value::String(s) if !s.trim().is_empty() => {
+                    next_queue.push(s.clone());
+                }
+                serde_json::Value::Array(items) => {
+                    for it in items {
+                        match it.as_str() {
+                            Some(s) if !s.trim().is_empty() => {
+                                next_queue.push(s.to_string())
+                            }
+                            _ => {
+                                return error_response(
+                                    400,
+                                    "next must be a task string or an array of task strings",
+                                )
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    return error_response(
+                        400,
+                        "next must be a task string or an array of task strings",
+                    )
+                }
+            }
             let n = {
                 let mut counter = app.counter.lock().unwrap();
                 *counter += 1;
@@ -1861,6 +2413,10 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 diff: String::new(),
                 reason: None,
                 verified_commit: None,
+                steer: Vec::new(),
+                next_queue,
+                spawned_from: None,
+                successor: None,
                 transcript: Vec::new(),
             };
             app.sessions.lock().unwrap().push(session.clone());
@@ -1909,6 +2465,33 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
             let id = &route["/api/sessions/".len()..route.len() - "/retry".len()];
             match app.retry(id) {
                 Ok(()) => json_response(200, "{\"retried\":true}"),
+                Err(e) => error_response(409, &e),
+            }
+        }
+        ("POST", route) if route.starts_with("/api/sessions/") && route.ends_with("/steer") => {
+            let id = &route["/api/sessions/".len()..route.len() - "/steer".len()];
+            let req: serde_json::Value = match serde_json::from_str(body) {
+                Ok(v) => v,
+                Err(e) => return error_response(400, &format!("bad json: {e}")),
+            };
+            let message = req["message"].as_str().unwrap_or("").trim().to_string();
+            if message.is_empty() {
+                return error_response(400, "a steering message is required");
+            }
+            if message.chars().count() > LINE_CAP {
+                return error_response(400, "steering message is too long");
+            }
+            match app.steer(id, &message) {
+                Ok(()) => json_response(200, "{\"steered\":true}"),
+                Err(e) if e == "no such session" => error_response(404, &e),
+                Err(e) => error_response(409, &e),
+            }
+        }
+        ("POST", route) if route.starts_with("/api/sessions/") && route.ends_with("/stop") => {
+            let id = &route["/api/sessions/".len()..route.len() - "/stop".len()];
+            match app.stop(id) {
+                Ok(()) => json_response(200, "{\"stopped\":true}"),
+                Err(e) if e == "no such session" => error_response(404, &e),
                 Err(e) => error_response(409, &e),
             }
         }
@@ -2041,6 +2624,10 @@ fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
                     .to_string(),
             ),
             verified_commit: None,
+            steer: Vec::new(),
+            next_queue: Vec::new(),
+            spawned_from: None,
+            successor: None,
             transcript: cap_transcript(lines),
         });
     }
@@ -2133,6 +2720,7 @@ fn main() {
         sessions: Mutex::new(restored),
         lines_since_persist: std::sync::atomic::AtomicU64::new(0),
         counter: Mutex::new(restored_counter),
+        stops: Mutex::new(std::collections::HashMap::new()),
     });
 
     // Recovery: a session that was mid-work when the server died cannot
@@ -2231,6 +2819,61 @@ mod tests {
         assert_eq!(policy.timeout_secs, 1800);
         assert_eq!(policy.default_check("fixture").unwrap(), "test -s output.txt");
         assert_eq!(policy.default_check("anything-else").unwrap(), "cargo test");
+        // The model route is read from the policy, not hardcoded.
+        assert_eq!(
+            policy.model.as_deref(),
+            Some("opencode-go/deepseek-v4.1-flash")
+        );
+    }
+
+    #[test]
+    fn policy_without_agent_model_means_engine_default() {
+        let script = "pub fn max_parallel() { 1 }\npub fn default_check(p) { \"true\" }";
+        let policy = Policy::load(script).unwrap();
+        assert_eq!(policy.model, None);
+    }
+
+    #[test]
+    fn engine_commands_drive_real_clis_noninteractively() {
+        let model = Some("opencode-go/deepseek-v4.1-flash");
+        // opencode: `run`, the house model, the prompt last.
+        let (prog, args) = engine_command("opencode", model, "do it", false);
+        assert_eq!(prog, "opencode");
+        assert_eq!(
+            args,
+            vec!["run", "--model", "opencode-go/deepseek-v4.1-flash", "do it"]
+        );
+        // Steering continues the same conversation.
+        let (_, args) = engine_command("opencode", model, "also this", true);
+        assert_eq!(
+            args,
+            vec!["run", "--model", "opencode-go/deepseek-v4.1-flash", "--continue", "also this"]
+        );
+        // claude: print mode; the OpenCode Go model id is NOT passed —
+        // it names a provider claude does not speak.
+        let (_, args) = engine_command("claude", model, "do it", false);
+        assert_eq!(args, vec!["-p", "do it"]);
+        let (_, args) = engine_command("claude", model, "also this", true);
+        assert_eq!(args, vec!["-p", "--continue", "also this"]);
+        // codex: exec with a workspace-write sandbox; resume --last
+        // continues (and keeps the first run's sandbox).
+        let (_, args) = engine_command("codex", model, "do it", false);
+        assert_eq!(
+            args,
+            vec!["exec", "--sandbox", "workspace-write", "--color", "never", "do it"]
+        );
+        let (_, args) = engine_command("codex", model, "also this", true);
+        assert_eq!(args, vec!["exec", "resume", "--last", "also this"]);
+        // A custom command (any path) gets the prompt as its single
+        // argument, initial and continuation alike — and is labelled
+        // custom, i.e. test mode.
+        let (prog, args) = engine_command("/tmp/agent.sh", model, "do it", false);
+        assert_eq!(prog, "/tmp/agent.sh");
+        assert_eq!(args, vec!["do it"]);
+        assert_eq!(engine_kind("/tmp/agent.sh"), EngineKind::Custom);
+        assert_eq!(engine_kind("opencode"), EngineKind::Opencode);
+        assert_eq!(engine_kind("claude"), EngineKind::Claude);
+        assert_eq!(engine_kind("codex"), EngineKind::Codex);
     }
 
     #[test]
@@ -2286,6 +2929,7 @@ mod tests {
             sessions: Mutex::new(Vec::new()),
             lines_since_persist: std::sync::atomic::AtomicU64::new(0),
             counter: Mutex::new(0),
+            stops: Mutex::new(std::collections::HashMap::new()),
         });
         // Drive the same path the HTTP layer drives.
         let session = Session {
@@ -2304,6 +2948,10 @@ mod tests {
             diff: String::new(),
             reason: None,
             verified_commit: None,
+            steer: Vec::new(),
+            next_queue: Vec::new(),
+            spawned_from: None,
+            successor: None,
             transcript: Vec::new(),
         };
         app.sessions.lock().unwrap().push(session);
