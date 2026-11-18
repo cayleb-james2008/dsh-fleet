@@ -167,7 +167,7 @@ async function refresh() {
   } catch (e) { return; }
   const agentBits = (pol.agents || []).map(a => `${a.name} ${a.found ? 'found' : 'not found'}`).join(' · ');
   document.getElementById('policy').textContent =
-    `Agents: ${agentBits}. Default: ${pol.default_agent ?? 'none'}. Up to ${pol.max_parallel} sessions run at once; checks come from ${pol.source}.`;
+    `Agents: ${agentBits}. Default: ${pol.default_agent ?? 'none'}. Up to ${pol.max_parallel} sessions run at once; an agent or check past ${pol.timeout_secs}s is handed back as needs-you; checks come from ${pol.source}.`;
   const sel = document.getElementById('agent');
   if (sel.options.length <= 1) {
     for (const a of (pol.agents || []).filter(a => a.found)) {
