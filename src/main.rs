@@ -1253,7 +1253,7 @@ impl App {
         match outcome.end {
             RunEnd::SpawnFailed(e) => {
                 self.log(id, format!("agent failed to start: {e}"));
-                self.set_needs_you(id, &format!("agent failed to start: {}", session.agent));
+                self.set_needs_you(id, &format!("agent failed to start: {}: {e}", session.agent));
                 self.pump_queue();
                 AgentRun::NotStarted
             }
@@ -2378,6 +2378,8 @@ fn origin_is_local(origin: &str) -> bool {
 
 /// Largest request body the API accepts (hand-outs are small JSON).
 const MAX_BODY_BYTES: usize = 1_048_576;
+/// Largest task text a hand-out may carry, in bytes.
+const MAX_TASK_BYTES: usize = 100_000;
 /// How long a connection may take to deliver its request before the
 /// handler drops it — a stalled request must not hold a thread forever.
 const READ_TIMEOUT_SECS: u64 = 10;
@@ -2451,11 +2453,20 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 Ok(v) => v,
                 Err(e) => return error_response(400, &format!("bad json: {e}")),
             };
-            let task = req["task"].as_str().unwrap_or("").to_string();
-            let repo = req["repo"].as_str().unwrap_or("").to_string();
+            let task = req["task"].as_str().unwrap_or("").trim().to_string();
+            let repo = req["repo"].as_str().unwrap_or("").trim().to_string();
             let project = req["project"].as_str().unwrap_or("default").to_string();
             if task.is_empty() || repo.is_empty() {
                 return error_response(400, "task and repo are required");
+            }
+            if task.contains('\0') {
+                return error_response(400, "the task contains a NUL byte, which an agent cannot receive — remove it");
+            }
+            if task.len() > MAX_TASK_BYTES {
+                return error_response(
+                    400,
+                    &format!("the task is over {MAX_TASK_BYTES} bytes — split it into smaller tasks"),
+                );
             }
             // The agent is resolved and validated before anything is
             // created: an unavailable agent is a refusal, not a session
@@ -3227,6 +3238,71 @@ mod tests {
         let s9 = restored.iter().find(|s| s.id == "s9").unwrap();
         assert_eq!(s9.bucket, "needs-you");
         assert!(s9.reason.as_deref().unwrap_or("").contains("recovered"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn git_repo(dir: &Path) -> PathBuf {
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success())
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "x").unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"]);
+        repo
+    }
+
+    #[test]
+    fn task_input_is_validated_at_the_api() {
+        let dir = std::env::temp_dir().join(format!("fleet-f2-{}", std::process::id()));
+        let app = test_app(dir.join("data"), Vec::new());
+        let post = |task: String| {
+            handle(
+                &app,
+                "POST",
+                "/api/sessions",
+                &serde_json::json!({ "task": task, "repo": "/nonexistent" }).to_string(),
+            )
+        };
+        for (task, message) in [
+            ("   \n\t".to_string(), "task and repo are required"),
+            ("fix\0it".to_string(), "NUL byte"),
+            ("x".repeat(100_001), "100000 bytes"),
+        ] {
+            let resp = post(task);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{}", resp.lines().next().unwrap_or(""));
+            assert!(resp.contains(message), "expected '{message}' in {resp}");
+        }
+        assert!(app.sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn spawn_failure_reason_carries_the_os_error() {
+        let dir = std::env::temp_dir().join(format!("fleet-f2b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir);
+        let gone = dir.join("gone-agent.sh");
+        std::fs::write(&gone, "#!/bin/sh\n").unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        let mut s = test_session("s1", Status::Queued, &dir);
+        s.repo = repo.to_string_lossy().to_string();
+        s.agent = gone.to_string_lossy().to_string();
+        let app = test_app(dir.join("data"), vec![s]);
+        app.set_status("s1", Status::Working);
+        app.run_session("s1");
+        assert_eq!(app.status_of("s1").as_deref(), Some("needs-you"));
+        let sessions = app.sessions.lock().unwrap();
+        let reason = sessions[0].reason.clone().unwrap_or_default();
+        assert!(reason.contains("No such file or directory"), "reason was: {reason}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
