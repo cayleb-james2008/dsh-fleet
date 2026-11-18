@@ -585,6 +585,27 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, Str
     Some((method, path, String::from_utf8_lossy(&body).to_string()))
 }
 
+/// Serialize sessions for the API with queue positions computed in:
+/// a queued session's position is its place among the queued, in
+/// hand-out order. Non-queued sessions carry null.
+fn sessions_json(sessions: &[Session]) -> serde_json::Value {
+    let mut pos = 0usize;
+    let arr: Vec<serde_json::Value> = sessions
+        .iter()
+        .map(|s| {
+            let mut v = serde_json::to_value(s).unwrap();
+            if s.status == "queued" {
+                pos += 1;
+                v["queue_position"] = serde_json::json!(pos);
+            } else {
+                v["queue_position"] = serde_json::Value::Null;
+            }
+            v
+        })
+        .collect();
+    serde_json::Value::Array(arr)
+}
+
 fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
     let (route, query) = match path.split_once('?') {
         Some((r, q)) => (r, q),
@@ -605,7 +626,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
         ),
         ("GET", "/api/sessions") => {
             let sessions = app.sessions.lock().unwrap();
-            json_response(200, &serde_json::to_string(&*sessions).unwrap())
+            json_response(200, &sessions_json(&sessions).to_string())
         }
         ("POST", "/api/sessions") => {
             let req: serde_json::Value = match serde_json::from_str(body) {
@@ -671,13 +692,27 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
             app.sessions.lock().unwrap().push(session.clone());
             app.persist();
             app.maybe_start(&id);
-            json_response(201, &serde_json::to_string(&session).unwrap())
+            let sessions = app.sessions.lock().unwrap();
+            let all = sessions_json(&sessions);
+            let mine = all
+                .as_array()
+                .and_then(|a| {
+                    a.iter()
+                        .find(|v| v["id"].as_str() == Some(id.as_str()))
+                        .cloned()
+                })
+                .unwrap_or_else(|| serde_json::to_value(&session).unwrap());
+            json_response(201, &mine.to_string())
         }
         ("GET", route) if route.starts_with("/api/sessions/") => {
             let id = &route["/api/sessions/".len()..];
             let sessions = app.sessions.lock().unwrap();
-            match sessions.iter().find(|s| s.id == id) {
-                Some(s) => json_response(200, &serde_json::to_string(s).unwrap()),
+            let all = sessions_json(&sessions);
+            match all
+                .as_array()
+                .and_then(|a| a.iter().find(|v| v["id"].as_str() == Some(id)).cloned())
+            {
+                Some(v) => json_response(200, &v.to_string()),
                 None => json_response(404, "{\"error\":\"no such session\"}"),
             }
         }
