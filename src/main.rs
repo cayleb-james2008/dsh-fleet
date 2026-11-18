@@ -29,6 +29,22 @@ struct Policy {
 
 const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
+/// In-memory transcript cap per session (the on-disk log is uncapped).
+const TRANSCRIPT_CAP: usize = 2000;
+/// Stored check output / diff cap, in characters.
+const OUTPUT_CAP: usize = 256_000;
+
+/// Truncate stored text to OUTPUT_CAP chars with an honest note.
+fn truncate_output(text: String) -> String {
+    if text.chars().count() > OUTPUT_CAP {
+        let mut t: String = text.chars().take(OUTPUT_CAP).collect();
+        t.push_str("\n… truncated here — the full text is in the session's log file on disk");
+        t
+    } else {
+        text
+    }
+}
+
 impl Policy {
     fn load(script: &str) -> Result<Policy, String> {
         let context = rune::Context::with_default_modules().map_err(|e| e.to_string())?;
@@ -342,12 +358,45 @@ impl App {
             .find(|s| s.id == id)
             .map(|s| s.status.clone())
     }
+    /// Append text to a session's on-disk log file (the transcript of
+    /// record). Used for content too big for the in-memory view, like a
+    /// full check output.
+    fn append_log_text(&self, id: &str, text: &str) {
+        let logs_dir = self.data_dir.join("logs");
+        let _ = std::fs::create_dir_all(&logs_dir);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(logs_dir.join(format!("{id}.log")))
+        {
+            let _ = write!(f, "{text}");
+            if !text.ends_with('\n') {
+                let _ = writeln!(f);
+            }
+        }
+    }
+
     fn log(&self, id: &str, line: String) {
         let count = {
             let mut sessions = self.sessions.lock().unwrap();
             match sessions.iter_mut().find(|s| s.id == id) {
                 Some(s) => {
                     s.transcript.push(line.clone());
+                    // Cap the in-memory transcript: a flooding agent
+                    // must not grow memory, the snapshot file, or every
+                    // API response without limit. Nothing is lost —
+                    // the log file below keeps every line; this view
+                    // keeps the most recent TRANSCRIPT_CAP lines behind
+                    // a marker saying where the rest lives.
+                    if s.transcript.len() > TRANSCRIPT_CAP {
+                        let excess = s.transcript.len() - TRANSCRIPT_CAP + 1;
+                        s.transcript.drain(0..excess);
+                        s.transcript.insert(
+                            0,
+                            "… earlier lines are in this session's log file on disk — this view keeps the most recent lines"
+                                .to_string(),
+                        );
+                    }
                     s.transcript.len()
                 }
                 None => return,
@@ -675,12 +724,15 @@ impl App {
             Err(e) => Some(format!("could not run git commit: {e}")),
         };
 
+        // The full check output goes to the session's log file before
+        // the stored copy is capped — the cap must never lose it.
+        self.append_log_text(id, &format!("--- check output ---\n{output}"));
         {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
-                s.check_output = Some(output);
+                s.check_output = Some(truncate_output(output));
                 s.check_passed = Some(passed);
-                s.diff = diff;
+                s.diff = truncate_output(diff);
             }
         }
         self.persist();
