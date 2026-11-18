@@ -17,6 +17,15 @@ pub fn timeout_secs() {
     1800
 }
 
+/// The house model route for agent sessions: DeepSeek V4.1 Flash via
+/// OpenCode Go, Cayleb's standing model plan. One config point — the
+/// engine adapter passes it to the engine that speaks this provider
+/// namespace (opencode, as --model). Optional: a policy without it
+/// leaves each engine on its own default.
+pub fn agent_model() {
+    "opencode-go/deepseek-v4.1-flash"
+}
+
 /// The verification command for a project when the user did not attach one
 /// to the task. A session is only "done" when this command passes in its
 /// worktree.
