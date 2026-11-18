@@ -93,7 +93,7 @@ finished session pulls it instead of idling.
 - The composer gains a "Then" field; session rows/detail show the
   chain link.
 
-### G5 — FRONT END (ordered 18 Nov, sequenced LAST)
+### G5 — FRONT END (ordered 18 Nov, sequenced LAST) — DONE 18 Nov: elevation landed under Hallmark-Rune, checker FAIL on two findings (F1/F2), fixed, fresh re-grade PASS; kit 22/22, lint 0/0 (ledger C3/C4 waves)
 Cayleb graded the current front ends "very underwhelming". After the
 functionality above lands and is checker-proven, the whole UI gets an
 elevation pass under the Hallmark-Rune skill
@@ -103,7 +103,7 @@ must keep every proven flow working: checker rounds grade BOTH
 directions — the new look at 8 widths in both themes, and the full
 verify kit still green.
 
-### G6 — PUBLIC SURFACES
+### G6 — PUBLIC SURFACES — IN PROGRESS 18 Nov (README + repo push + site page; captures/video flagged stale, not re-recorded)
 README + the public repo (github.com/cayleb-james2008/dsh-fleet) and
 the site page (landing-work/site, projects/dsh-fleet.html) are updated
 to checker-proven facts only — including the honest engine limit:

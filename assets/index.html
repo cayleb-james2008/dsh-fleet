@@ -4,97 +4,137 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Fleet — your agents, one screen</title>
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('fleet-theme') || 'dark'; } catch (e) {}</script>
 <style>
+/* hallmark-rune · app: fleet · vernacular: ops board · nav: session rail (the list is the work) · signature: session board · tokens: hr-template v1 (Fleet anchor row) · critique: weakest State coverage — this pass adds the board's loading and connection-error states */
   :root, [data-theme="dark"] {
-    --bg: #0e1218; --panel: #141a22; --panel-2: #1a222d; --border: #232c38;
-    --text: #e8edf3; --dim: #94a3b5; --accent: #6ea8e1; --accent-ink: #0b1522;
-    --verified: #4cc38a; --warn: #d99a4e; --danger: #e06c60;
-    --chip-working: #22354d; --chip-needs: #453214; --chip-done: #173d2a;
-    --pre-bg: #10151c;
+    color-scheme: dark;
+    --bg: #0e1218; --panel: #141a22; --panel-2: #1a222d; --field: #10151c;
+    --ink: #e8edf3; --muted: #94a3b5; --faint: #7e8a9c; --rule: #232c38;
+    --accent: #6ea8e1; --accent-hover: #5b97d4; --accent-ink: #0b1522; --accent-bg: #22354d;
+    --ok: #4cc38a; --ok-bg: #173d2a; --ok-ink: #08130d;
+    --warn: #d99a4e; --warn-bg: #453214;
+    --err: #e06c60; --err-bg: #3a1d1a;
+    --font-body: "Barlow", "Inter", "Segoe UI", -apple-system, Roboto, "Helvetica Neue", sans-serif;
+    --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --text-meta: 11px; --text-label: 12px; --text-small: 13px; --text-dense: 14px;
+    --text-body: 15px; --text-title: 18px; --text-screen: 20px; --text-display: 24px;
+    --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px; --sp-7: 48px;
+    --r-control: 6px; --r-card: 8px; --r-panel: 12px; --r-chip: 999px;
+    --dur-micro: 120ms; --dur-short: 200ms; --dur-panel: 280ms;
+    --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
   }
   [data-theme="light"] {
-    --bg: #f4f6f9; --panel: #ffffff; --panel-2: #eef2f7; --border: #d8dfe8;
-    --text: #17222e; --dim: #50637a; --accent: #1f66c2; --accent-ink: #ffffff;
-    --verified: #177a4c; --warn: #96600f; --danger: #b3382e;
-    --chip-working: #dcebfb; --chip-needs: #f7e3c2; --chip-done: #d3efdf;
-    --pre-bg: #f0f3f7;
+    color-scheme: light;
+    --bg: #f4f6f9; --panel: #ffffff; --panel-2: #eef2f7; --field: #f0f3f7;
+    --ink: #17222e; --muted: #50637a; --faint: #57687d; --rule: #d8dfe8;
+    --accent: #1f66c2; --accent-hover: #1a57a6; --accent-ink: #ffffff; --accent-bg: #dcebfb;
+    --ok: #146c43; --ok-bg: #dcf0e4; --ok-ink: #ffffff;
+    --warn: #8a580c; --warn-bg: #f7e3c2;
+    --err: #b3382e; --err-bg: #f9e3e0;
   }
   * { box-sizing: border-box; }
-  html, body { height: 100%; }
-  body { margin: 0; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); display: flex; font-size: 14px; }
+  html, body { height: 100%; overflow-x: clip; }
+  body { margin: 0; font-family: var(--font-body); background: var(--bg); color: var(--ink); display: flex; font-size: var(--text-dense); line-height: 1.5; }
   ::selection { background: var(--accent); color: var(--accent-ink); }
-  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  html { scrollbar-color: var(--rule) transparent; caret-color: var(--accent); }
   button { font: inherit; }
   svg.ic { width: 14px; height: 14px; flex: none; vertical-align: -2px; }
+  code { font-family: var(--font-mono); }
 
-  #sidebar { width: 320px; border-right: 1px solid var(--border); display: flex; flex-direction: column; background: var(--panel); min-height: 0; }
-  #sidebar header { display: flex; align-items: center; justify-content: space-between; padding: 16px 16px 4px; }
-  #sidebar h1 { font-size: 16px; margin: 0; font-weight: 600; }
-  #inboxBtn { display: inline-flex; align-items: center; gap: 6px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; cursor: pointer; min-height: 32px; }
+  #sidebar { width: 320px; border-right: 1px solid var(--rule); display: flex; flex-direction: column; background: var(--panel); min-height: 0; flex: none; }
+  #sidebar header { display: flex; align-items: center; justify-content: space-between; padding: var(--sp-4) var(--sp-4) var(--sp-1); }
+  #sidebar h1 { font-size: var(--text-screen); margin: 0; font-weight: 600; }
+  #inboxBtn { display: inline-flex; align-items: center; gap: var(--sp-2); background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: var(--r-control); padding: var(--sp-2) var(--sp-3); cursor: pointer; min-height: 32px; font-size: var(--text-small); }
   #inboxBtn:hover { border-color: var(--accent); }
   #inboxBtn .count { font-variant-numeric: tabular-nums; font-weight: 600; }
   #inboxBtn.attn { border-color: var(--warn); color: var(--warn); }
-  #policy { font-size: 12px; color: var(--dim); margin: 4px 16px 12px; line-height: 1.5; }
-  #inboxPanel { border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 8px 16px 12px; background: var(--panel-2); }
-  #inboxPanel h2 { font-size: 13px; margin: 6px 0 8px; font-weight: 600; }
-  .inboxItem { padding: 8px 0; border-top: 1px solid var(--border); }
+  #policy { font-size: var(--text-label); color: var(--muted); margin: var(--sp-1) var(--sp-4) var(--sp-3); line-height: 1.5; font-variant-numeric: tabular-nums; }
+  .connnote { font-size: var(--text-label); color: var(--err); margin: 0 var(--sp-4) var(--sp-3); line-height: 1.5; }
+  #inboxPanel { border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); padding: var(--sp-2) var(--sp-4) var(--sp-3); background: var(--panel-2); }
+  #inboxPanel h2 { font-size: var(--text-small); margin: var(--sp-2) 0 var(--sp-2); font-weight: 600; }
+  .inboxItem { padding: var(--sp-2) 0; border-top: 1px solid var(--rule); }
   .inboxItem:first-of-type { border-top: 0; }
-  .inboxItem .t { font-size: 13px; }
-  .inboxItem .r { font-size: 12px; color: var(--warn); margin: 2px 0 6px; }
-  .inboxItem button { background: none; border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 4px 10px; cursor: pointer; min-height: 28px; margin-right: 6px; }
+  .inboxItem .t { font-size: var(--text-small); }
+  .inboxItem .r { font-size: var(--text-label); color: var(--warn); margin: var(--sp-1) 0 var(--sp-2); }
+  .inboxItem button { background: none; border: 1px solid var(--rule); color: var(--ink); border-radius: var(--r-control); padding: var(--sp-1) var(--sp-3); cursor: pointer; min-height: 32px; margin-right: var(--sp-2); font-size: var(--text-small); }
   .inboxItem button:hover { border-color: var(--accent); }
+  .inboxEmpty { color: var(--muted); font-size: var(--text-small); margin: var(--sp-1) 0; }
 
-  #sessions { flex: 1; overflow-y: auto; padding-bottom: 8px; scrollbar-color: var(--border) transparent; }
-  .group { font-size: 12px; color: var(--dim); margin: 14px 16px 4px; font-weight: 600; }
-  .session { padding: 10px 16px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  #sessions { flex: 1; overflow-y: auto; padding-bottom: var(--sp-2); scrollbar-color: var(--rule) transparent; }
+  .group { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--text-label); color: var(--muted); margin: var(--sp-4) var(--sp-4) var(--sp-1); font-weight: 600; }
+  .gcount { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-weight: 500; background: var(--panel-2); border-radius: var(--r-chip); padding: 0 var(--sp-2); }
+  .session { padding: var(--sp-3) var(--sp-4); border-bottom: 1px solid var(--rule); cursor: pointer; }
   .session:hover { background: var(--panel-2); }
   .session.selected { background: var(--panel-2); box-shadow: inset 2px 0 0 var(--accent); }
-  .session .task { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .statusrow { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 12px; color: var(--dim); }
-  .chip { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 999px; }
-  .chip.working { background: var(--chip-working); color: var(--accent); }
-  .chip.needs-you { background: var(--chip-needs); color: var(--warn); }
-  .chip.done { background: var(--chip-done); color: var(--verified); }
-  .checkline { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 12px; color: var(--verified); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .checkline.failed { color: var(--danger); }
+  .session .task { font-size: var(--text-small); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .statusrow { display: flex; align-items: center; gap: var(--sp-2); margin-top: var(--sp-1); font-size: var(--text-label); color: var(--muted); }
+  .chip { display: inline-block; font-size: var(--text-label); padding: var(--sp-1) var(--sp-2); border-radius: var(--r-chip); line-height: 1.25; }
+  .chip.working { background: var(--accent-bg); color: var(--accent); }
+  .chip.needs-you { background: var(--warn-bg); color: var(--warn); }
+  .chip.done { background: var(--ok-bg); color: var(--ok); }
+  .tmode { border: 1px solid var(--rule); border-radius: var(--r-chip); padding: 0 var(--sp-2); line-height: 1.4; }
+  .checkline { display: flex; align-items: center; gap: var(--sp-2); margin-top: var(--sp-1); font-size: var(--text-label); color: var(--ok); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .checkline .cmd { font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; }
+  .checkline.failed { color: var(--err); }
   .checkline.noted { color: var(--warn); }
   .checkbanner.noted { border-color: var(--warn); color: var(--warn); }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
   .dot.live { background: var(--accent); animation: pulse 1.6s ease-in-out infinite; }
   @keyframes pulse { 50% { opacity: .35; } }
-  @media (prefers-reduced-motion: reduce) { .dot.live { animation: none; } }
 
-  #composer { border-top: 1px solid var(--border); padding: 12px 16px; }
-  #composer label { display: block; font-size: 12px; color: var(--dim); margin: 8px 0 4px; }
+  #composer { border-top: 1px solid var(--rule); padding: var(--sp-3) var(--sp-4); }
+  #composer label { display: block; font-size: var(--text-label); color: var(--muted); margin: var(--sp-2) 0 var(--sp-1); }
   #composer label:first-child { margin-top: 0; }
-  #composer input, #composer textarea, #composer select { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 8px; font: inherit; font-size: 13px; }
-  #composer button[type="submit"] { background: var(--accent); color: var(--accent-ink); border: 0; border-radius: 6px; padding: 8px 14px; cursor: pointer; margin-top: 12px; min-height: 36px; font-weight: 600; }
-  .err { color: var(--danger); font-size: 12px; margin: 8px 0 0; }
+  #composer input, #composer textarea, #composer select { width: 100%; background: var(--field); border: 1px solid var(--rule); border-radius: var(--r-control); color: var(--ink); padding: var(--sp-2); font: inherit; font-size: var(--text-small); }
+  #composer button[type="submit"] { background: var(--accent); color: var(--accent-ink); border: 0; border-radius: var(--r-control); padding: var(--sp-2) var(--sp-4); cursor: pointer; margin-top: var(--sp-3); min-height: 36px; font-weight: 600; }
+  #composer button[type="submit"]:hover { background: var(--accent-hover); }
+  .err { color: var(--err); font-size: var(--text-label); margin: var(--sp-2) 0 0; }
 
-  #settings { border-top: 1px solid var(--border); padding: 10px 16px; display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: var(--dim); }
-  #themeBtn { display: inline-flex; align-items: center; gap: 6px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer; min-height: 30px; }
+  #settings { border-top: 1px solid var(--rule); padding: var(--sp-3) var(--sp-4); display: flex; align-items: center; justify-content: space-between; font-size: var(--text-label); color: var(--muted); }
+  #themeBtn { display: inline-flex; align-items: center; gap: var(--sp-2); background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: var(--r-control); padding: var(--sp-2) var(--sp-3); cursor: pointer; min-height: 32px; font-size: var(--text-small); }
+  #themeBtn:hover { border-color: var(--accent); }
 
   #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
-  #detail { padding: 20px 24px; overflow-y: auto; flex: 1; scrollbar-color: var(--border) transparent; }
-  #detail h2 { font-size: 17px; margin: 0 0 4px; font-weight: 600; }
-  .meta { color: var(--dim); font-size: 12px; margin-bottom: 16px; }
-  .checkbanner { display: flex; gap: 8px; align-items: baseline; border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin-bottom: 8px; background: var(--panel); }
+  #detail { padding: var(--sp-5) var(--sp-5); overflow-y: auto; flex: 1; scrollbar-color: var(--rule) transparent; }
+  #detail h2 { font-size: var(--text-title); margin: 0 0 var(--sp-1); font-weight: 600; line-height: 1.25; }
+  .meta { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-5); color: var(--muted); font-size: var(--text-label); font-variant-numeric: tabular-nums; }
+  .meta .k { color: var(--faint); margin-right: var(--sp-1); }
+  .chain { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-4); color: var(--muted); font-size: var(--text-label); margin-top: var(--sp-1); }
+  .checkbanner { display: flex; gap: var(--sp-2); align-items: baseline; border: 1px solid var(--rule); border-radius: var(--r-card); padding: var(--sp-3) var(--sp-4); margin: var(--sp-4) 0 var(--sp-2); background: var(--field); }
   .checkbanner .v { font-weight: 600; }
-  .checkbanner.pass .v { color: var(--verified); }
-  .checkbanner.fail .v { color: var(--danger); }
-  .checkbanner code { color: var(--dim); font-size: 12px; }
-  pre { background: var(--pre-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-size: 12px; overflow-x: auto; white-space: pre-wrap; margin: 0; }
-  .label { font-size: 12px; color: var(--dim); margin: 20px 0 6px; font-weight: 600; }
-  .empty { color: var(--dim); margin: auto; font-size: 14px; padding: 24px; }
-  .actions { margin-top: 16px; display: flex; gap: 8px; }
-  .actions button { border: 0; border-radius: 6px; padding: 8px 14px; cursor: pointer; min-height: 36px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
-  .mergebtn { background: var(--verified); color: #08130d; }
-  [data-theme="light"] .mergebtn { color: #ffffff; }
-  .retrybtn { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
-  .stopbtn { background: none; color: var(--danger); border: 1px solid var(--danger); }
-  #detail textarea { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 8px; font: inherit; font-size: 13px; }
-  .hint { color: var(--dim); font-size: 12px; margin: 6px 0 0; line-height: 1.5; }
-  @media (max-width: 700px) { #sidebar { width: 240px; } #detail { padding: 16px; } }
+  .checkbanner.pass .v { color: var(--ok); }
+  .checkbanner.fail .v { color: var(--err); }
+  .checkbanner code { color: var(--muted); font-size: var(--text-label); }
+  pre { background: var(--field); border: 1px solid var(--rule); border-radius: var(--r-card); padding: var(--sp-3); font-family: var(--font-mono); font-size: var(--text-label); line-height: 1.5; overflow-x: auto; white-space: pre-wrap; margin: 0; }
+  .label { font-size: var(--text-label); color: var(--muted); margin: var(--sp-5) 0 var(--sp-2); font-weight: 600; }
+  .empty { color: var(--muted); margin: auto; font-size: var(--text-dense); padding: var(--sp-5); }
+  .actions { margin-top: var(--sp-4); display: flex; gap: var(--sp-2); flex-wrap: wrap; }
+  .actions button { border: 0; border-radius: var(--r-control); padding: var(--sp-2) var(--sp-4); cursor: pointer; min-height: 36px; font-weight: 600; display: inline-flex; align-items: center; gap: var(--sp-2); }
+  .mergebtn { background: var(--ok); color: var(--ok-ink); }
+  .retrybtn { background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); }
+  .retrybtn:hover { border-color: var(--accent); }
+  .stopbtn { background: none; color: var(--err); border: 1px solid var(--err); }
+  #detail textarea { width: 100%; background: var(--field); border: 1px solid var(--rule); border-radius: var(--r-control); color: var(--ink); padding: var(--sp-2); font: inherit; font-size: var(--text-small); }
+  .hint { color: var(--muted); font-size: var(--text-label); margin: var(--sp-2) 0 0; line-height: 1.5; }
+  .backbtn { display: none; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+    .dot.live { animation: none; }
+  }
+  @media (max-width: 768px) {
+    html, body { height: auto; }
+    body { flex-direction: column; min-height: 100vh; }
+    #sidebar { width: 100%; border-right: 0; border-bottom: 1px solid var(--rule); }
+    #sessions { max-height: 38vh; }
+    #main { flex: none; height: 100vh; }
+    #detail { padding: var(--sp-4); }
+    .backbtn { display: inline-flex; align-items: center; gap: var(--sp-2); background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: var(--r-control); padding: var(--sp-2) var(--sp-3); min-height: 44px; cursor: pointer; font-weight: 600; margin-bottom: var(--sp-3); }
+    #inboxBtn, #themeBtn, .inboxItem button, .actions button, #composer button[type="submit"] { min-height: 44px; }
+    #composer input, #composer select, #detail textarea { min-height: 44px; }
+  }
 </style>
 </head>
 <body>
@@ -109,22 +149,24 @@
     <symbol id="i-merge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></symbol>
     <symbol id="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
     <symbol id="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="m12 19-7-7 7-7"/></symbol>
   </svg>
 
   <div id="sidebar">
     <header>
       <h1>Fleet</h1>
       <button id="inboxBtn" aria-label="Open the needs-you inbox">
-        <svg class="ic"><use href="#i-tray"/></svg> Needs you <span class="count" id="inboxCount">0</span>
+        <svg class="ic"><use href="#i-tray"/></svg> Needs you <span class="count" id="inboxCount"></span>
       </button>
     </header>
     <p id="policy">Loading policy…</p>
+    <p id="connNote" class="connnote" hidden>Cannot reach the server — retrying on its own.</p>
     <div id="inboxPanel" hidden>
       <h2>Needs you</h2>
       <div id="inboxItems"></div>
       <p id="inboxError" class="err" hidden></p>
     </div>
-    <div id="sessions" role="list"></div>
+    <div id="sessions" role="list"><p class="empty">Loading the board…</p></div>
     <form id="composer">
       <label for="repo">Git repo path</label>
       <input id="repo" required autocomplete="off">
@@ -166,7 +208,16 @@ document.getElementById('themeBtn').addEventListener('click', () => {
 
 let selected = null;
 let inboxOpen = false;
+let boardLoaded = false;
+let boardErrShown = false;
 const esc = (s) => { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; };
+// On the phone layout the detail sits below the whole sidebar;
+// selecting a session must bring it into view or the tap looks dead.
+function revealDetail() {
+  if (window.matchMedia('(max-width: 768px)').matches) {
+    document.getElementById('main').scrollIntoView();
+  }
+}
 
 async function refresh() {
   let pol, sessions, inbox;
@@ -174,8 +225,25 @@ async function refresh() {
     pol = await (await fetch('/api/policy')).json();
     sessions = await (await fetch('/api/sessions')).json();
     inbox = await (await fetch('/api/inbox')).json();
-  } catch (e) { return; }
-  const agentBits = (pol.agents || []).map(a => `${a.name} ${a.found ? 'found' : 'not found'}`).join(' · ');
+  } catch (e) {
+    // The board's error state: say what broke and what happens next,
+    // and (before the first successful load) replace the loading
+    // placeholder with it. A later poll failure keeps the last good
+    // board on screen and only lights the note.
+    document.getElementById('connNote').hidden = false;
+    if (!boardLoaded && !boardErrShown) {
+      boardErrShown = true;
+      lastListKey = '__connerr';
+      document.getElementById('policy').textContent = 'Policy unavailable — the server is not answering.';
+      document.getElementById('sessions').innerHTML =
+        '<p class="empty">The board cannot reach the server. Check that Fleet is running — it reconnects on its own.</p>';
+    }
+    return;
+  }
+  document.getElementById('connNote').hidden = true;
+  boardLoaded = true;
+  boardErrShown = false;
+  const agentBits = (pol.agents || []).map(a => `${a.name} ${a.found ? 'found' : 'not found'}`).join(', ');
   const modelBit = pol.model ? ` Model for opencode sessions: ${pol.model}.` : '';
   const defaultBit = pol.default_agent
     ? `Default: ${pol.default_agent}${pol.default_agent_engine === 'custom' ? ' (custom command — test mode)' : ''}.`
@@ -220,7 +288,7 @@ function renderInbox(inbox) {
   if (errEl) { errEl.textContent = inboxError; errEl.hidden = !inboxError; }
   box.innerHTML = '';
   if (!inbox.length) {
-    box.innerHTML = '<p style="color:var(--dim);font-size:13px;margin:4px 0">Nothing needs you right now.</p>';
+    box.innerHTML = '<p class="inboxEmpty">Nothing needs you right now.</p>';
     return;
   }
   for (const s of inbox) {
@@ -230,7 +298,7 @@ function renderInbox(inbox) {
       <button data-act="view">View</button><button data-act="retry">Retry</button>`;
     div.querySelector('.t').textContent = s.task;
     div.querySelector('.r').textContent = s.reason || 'needs you';
-    div.querySelector('[data-act="view"]').onclick = () => { selected = s.id; detailError = ''; lastDetailKey = ''; inboxOpen = false; refresh(); };
+    div.querySelector('[data-act="view"]').onclick = () => { selected = s.id; detailError = ''; lastDetailKey = ''; inboxOpen = false; refresh(); revealDetail(); };
     div.querySelector('[data-act="retry"]').onclick = async () => {
       // A refused retry (409 — the session already moved on) must be
       // SEEN, not swallowed: post() reports the server's own words.
@@ -245,7 +313,7 @@ document.getElementById('inboxBtn').addEventListener('click', () => { inboxOpen 
 
 function statusChip(s) {
   if (s.bucket === 'working' && s.status === 'queued')
-    return `<span class="chip working">queued · #${s.queue_position ?? '?'}</span>`;
+    return `<span class="chip working">queued #${s.queue_position ?? '?'}</span>`;
   return `<span class="chip ${s.bucket}">${s.status.replace('-', ' ')}</span>`;
 }
 function renderSessions(sessions) {
@@ -267,7 +335,8 @@ function renderSessions(sessions) {
     if (!inGroup.length) continue;
     const h = document.createElement('div');
     h.className = 'group';
-    h.textContent = `${label} · ${inGroup.length}`;
+    h.innerHTML = `<span></span><span class="gcount">${inGroup.length}</span>`;
+    h.querySelector('span').textContent = label;
     list.appendChild(h);
     for (const s of inGroup) {
       const div = document.createElement('div');
@@ -278,17 +347,17 @@ function renderSessions(sessions) {
       div.setAttribute('aria-label', `Open session: ${s.task}`);
       let inner = `<div class="task"></div><div class="statusrow">`;
       inner += (s.bucket === 'working' && s.status !== 'queued') ? '<span class="dot live"></span>' : '<span class="dot"></span>';
-      inner += statusChip(s) + `<span>${esc(s.agent || '')}${s.test_mode ? ' · test mode' : ''}</span></div>`;
+      inner += statusChip(s) + `<span>${esc(s.agent || '')}</span>${s.test_mode ? '<span class="tmode">test mode</span>' : ''}</div>`;
       if ((s.steer || []).length) inner += `<div class="checkline noted"><svg class="ic"><use href="#i-alert"/></svg><span>${s.steer.length} steering message${s.steer.length > 1 ? 's' : ''} waiting</span></div>`;
       if (s.check_passed === true) inner += (s.status === 'done' || s.status === 'merged')
-        ? `<div class="checkline"><svg class="ic"><use href="#i-check"/></svg><span></span></div>`
-        : `<div class="checkline noted"><svg class="ic"><use href="#i-alert"/></svg><span></span></div>`;
-      if (s.check_passed === false) inner += `<div class="checkline failed"><svg class="ic"><use href="#i-x"/></svg><span></span></div>`;
+        ? `<div class="checkline"><svg class="ic"><use href="#i-check"/></svg><span class="cmd"></span></div>`
+        : `<div class="checkline noted"><svg class="ic"><use href="#i-alert"/></svg><span class="cmd"></span></div>`;
+      if (s.check_passed === false) inner += `<div class="checkline failed"><svg class="ic"><use href="#i-x"/></svg><span class="cmd"></span></div>`;
       div.innerHTML = inner;
       div.querySelector('.task').textContent = s.task;
-      const cl = div.querySelector('.checkline span');
+      const cl = div.querySelector('.checkline .cmd');
       if (cl) cl.textContent = s.check_cmd;
-      div.onclick = () => { selected = s.id; detailError = ''; lastDetailKey = ''; refresh(); };
+      div.onclick = () => { selected = s.id; detailError = ''; lastDetailKey = ''; refresh(); revealDetail(); };
       div.onkeydown = (e) => {
         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); div.onclick(); }
       };
@@ -315,11 +384,17 @@ function renderDetail(s) {
   const prevTrAtBottom = prevTr ? (prevTr.scrollHeight - prevTr.scrollTop - prevTr.clientHeight < 24) : true;
   const activeId = (document.activeElement && d.contains(document.activeElement)) ? document.activeElement.id : '';
   lastDetailKey = key;
+  const facts = [];
+  facts.push(`<span class="fact"><span class="k">Branch</span><code>${esc(s.branch)}</code></span>`);
+  facts.push(`<span class="fact"><span class="k">Agent</span>${esc(s.agent || 'unknown')}${s.test_mode ? ' (custom command — test mode)' : ''}</span>`);
+  facts.push(`<span class="fact"><span class="k">Status</span>${esc(s.status)}</span>`);
+  if (s.queue_position) facts.push(`<span class="fact"><span class="k">Queue</span>#${s.queue_position}</span>`);
   const chainBits = [];
   if (s.spawned_from) chainBits.push(`handed out automatically when ${s.spawned_from} finished`);
   if (s.successor) chainBits.push(`its finish handed out ${s.successor}`);
-  if ((s.next_queue || []).length) chainBits.push(`then: ${s.next_queue.join(' → ')}`);
-  let html = `<h2></h2><div class="meta">branch ${esc(s.branch)} · agent ${esc(s.agent || 'unknown')}${s.test_mode ? ' (custom command — test mode)' : ''} · status ${esc(s.status)}${s.queue_position ? ` · queue #${s.queue_position}` : ''}${chainBits.length ? ' · ' + esc(chainBits.join(' · ')) : ''}</div>`;
+  if ((s.next_queue || []).length) chainBits.push(`then: ${s.next_queue.join(', ')}`);
+  let html = `<button class="backbtn" id="backBtn"><svg class="ic"><use href="#i-back"/></svg> Back to the board</button><h2></h2><div class="meta">${facts.join('')}</div>`;
+  if (chainBits.length) html += `<div class="chain">${chainBits.map(b => `<span>${esc(b)}</span>`).join('')}</div>`;
   if (s.check_passed !== undefined && s.check_passed !== null) {
     // "Verified done" is a claim about the SESSION, not just the
     // check: a session the gates refused (status needs-you) whose
@@ -355,6 +430,8 @@ function renderDetail(s) {
   html += `<p class="err" id="actErr" hidden></p>`;
   d.innerHTML = html;
   d.querySelector('h2').textContent = s.task;
+  const bb = d.querySelector('#backBtn');
+  if (bb) bb.onclick = () => { document.getElementById('sidebar').scrollIntoView(); };
   const code = d.querySelector('.checkbanner code');
   if (code) code.textContent = s.check_cmd;
   const reasonEl = d.querySelector('.reasonbanner .v');
@@ -443,9 +520,14 @@ document.getElementById('composer').addEventListener('submit', async (e) => {
   document.getElementById('task').value = '';
   document.getElementById('next').value = '';
   refresh();
+  revealDetail();
 });
 refresh();
 setInterval(refresh, 2000);
 </script>
+<!-- hallmark-rune override log — Fleet elevation (18 Nov 2026)
+override · R9 · guard: the session list is the primary work surface — every session is a destination in it, and the inbox, composer and settings live with it · reason: in Fleet the rail is the board, not chrome
+override · R1 · guard: transcript, check output, diff, branch name and check command are data returned by the API · reason: mono carries the data surfaces only; every label, heading and control stays in the body face
+-->
 </body>
 </html>
