@@ -2383,7 +2383,7 @@ const READ_DEADLINE_SECS: u64 = 30;
 
 fn read_request(
     stream: &mut std::net::TcpStream,
-) -> Option<(String, String, String, String, String)> {
+) -> Option<(String, String, String, String, String, String)> {
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(READ_DEADLINE_SECS);
     let mut reader = BufReader::new(stream.try_clone().ok()?);
@@ -2424,10 +2424,25 @@ fn read_request(
     let mut content_length = 0usize;
     let mut content_type = String::new();
     let mut origin = String::new();
+    let mut host = String::new();
+    let mut header_count = 0usize;
+    let mut header_bytes = 0usize;
     loop {
         let line = read_line_by_byte(&mut reader, stream)?;
         if line == "\r\n" || line.is_empty() {
             break;
+        }
+        header_count += 1;
+        header_bytes += line.len();
+        if header_count > MAX_HEADERS || header_bytes > MAX_HEADER_BYTES {
+            return Some((
+                "__headers_too_large__".to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ));
         }
         let lower = line.to_lowercase();
         if let Some(v) = lower.strip_prefix("content-length:") {
@@ -2436,6 +2451,8 @@ fn read_request(
             content_type = v.trim().to_string();
         } else if let Some(v) = lower.strip_prefix("origin:") {
             origin = v.trim().to_string();
+        } else if let Some(v) = lower.strip_prefix("host:") {
+            host = v.trim().to_string();
         }
     }
     // A declared body over the cap is refused without being read —
@@ -2448,6 +2465,7 @@ fn read_request(
             String::new(),
             String::new(),
             String::new(),
+            host,
         ));
     }
     let mut body: Vec<u8> = Vec::with_capacity(content_length);
@@ -2469,6 +2487,7 @@ fn read_request(
         String::from_utf8_lossy(&body).to_string(),
         content_type,
         origin,
+        host,
     ))
 }
 
@@ -2486,6 +2505,28 @@ fn origin_is_local(origin: &str) -> bool {
         .unwrap_or("");
     matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
 }
+
+/// Is a Host header one this server answers to? Its hostname (port
+/// ignored, case ignored) must be a loopback name, or listed in the
+/// comma-separated FLEET_ALLOWED_HOSTS. Anything else is a name a
+/// browser was pointed at by someone other than the operator.
+fn host_allowed(host: &str, extra: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(rest) => format!("[{}]", rest.split(']').next().unwrap_or("")),
+        None => host.split(':').next().unwrap_or("").to_string(),
+    }
+    .to_lowercase();
+    matches!(name.as_str(), "localhost" | "127.0.0.1" | "[::1]")
+        || extra
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .any(|h| !h.is_empty() && h == name)
+}
+
+/// Header limits: more header lines, or more header bytes, than these
+/// is refused with 431 before any header is acted on.
+const MAX_HEADERS: usize = 100;
+const MAX_HEADER_BYTES: usize = 32 * 1024;
 
 /// Largest request body the API accepts (hand-outs are small JSON).
 const MAX_BODY_BYTES: usize = 1_048_576;
@@ -3089,6 +3130,7 @@ fn main() {
     app.pump_queue();
 
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind failed");
+    let allowed_hosts = std::env::var("FLEET_ALLOWED_HOSTS").unwrap_or_default();
     let detected: Vec<String> = app
         .agents
         .iter()
@@ -3104,14 +3146,19 @@ fn main() {
         match stream {
             Ok(mut stream) => {
                 let app = app.clone();
+                let allowed_hosts = allowed_hosts.clone();
                 std::thread::spawn(move || {
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(
                         READ_TIMEOUT_SECS,
                     )));
-                    if let Some((method, path, body, content_type, origin)) =
+                    if let Some((method, path, body, content_type, origin, host)) =
                         read_request(&mut stream)
                     {
-                        let response = if method == "__too_large__" {
+                        let response = if method == "__headers_too_large__" {
+                            error_response(431, "request headers are too large")
+                        } else if !host_allowed(&host, &allowed_hosts) {
+                            error_response(403, "this board answers only to its own host name")
+                        } else if method == "__too_large__" {
                             error_response(413, "request body too large")
                         } else if method == "POST"
                             && !content_type.starts_with("application/json")
@@ -3594,6 +3641,55 @@ mod tests {
         let resp = handle(&app, "POST", "/api/sessions/nope/dismiss", "{}");
         assert!(resp.starts_with("HTTP/1.1 404"), "{}", resp.lines().next().unwrap_or(""));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Send raw request bytes over a real socket and parse them with
+    /// the server's own request reader.
+    fn read_raw(request: Vec<u8>) -> Option<(String, String, String, String, String, String)> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            let _ = c.write_all(&request);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let parsed = read_request(&mut stream);
+        client.join().unwrap();
+        parsed
+    }
+
+    #[test]
+    fn request_headers_are_bounded() {
+        let mut many = String::from("GET / HTTP/1.1\r\nHost: 127.0.0.1:9840\r\n");
+        for i in 0..101 {
+            many.push_str(&format!("X-Pad-{i}: a\r\n"));
+        }
+        many.push_str("\r\n");
+        let parsed = read_raw(many.into_bytes()).unwrap();
+        assert_eq!(parsed.0, "__headers_too_large__");
+        let big = format!(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1:9840\r\nX-A: {0}\r\nX-B: {0}\r\nX-C: {0}\r\n\r\n",
+            "a".repeat(12_000)
+        );
+        let parsed = read_raw(big.into_bytes()).unwrap();
+        assert_eq!(parsed.0, "__headers_too_large__");
+        let small = "GET / HTTP/1.1\r\nHost: 127.0.0.1:9840\r\n\r\n".to_string();
+        assert_eq!(read_raw(small.into_bytes()).unwrap().0, "GET");
+    }
+
+    #[test]
+    fn host_header_must_name_this_machine() {
+        assert!(host_allowed("127.0.0.1:9840", ""));
+        assert!(host_allowed("localhost:9840", ""));
+        assert!(host_allowed("[::1]:9840", ""));
+        assert!(!host_allowed("evil.example:9840", ""));
+        assert!(!host_allowed("127.0.0.1.evil.example:9840", ""));
+        assert!(!host_allowed("", ""));
+        assert!(host_allowed("fleet.lan:9840", "fleet.lan, other.lan"));
+        assert!(!host_allowed("fleet.lan:9840", ""));
+        let raw = "GET / HTTP/1.1\r\nHost: Evil.Example:9840\r\n\r\n".to_string();
+        assert_eq!(read_raw(raw.into_bytes()).unwrap().5, "evil.example:9840");
     }
 
     #[test]
