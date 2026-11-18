@@ -368,7 +368,16 @@ impl App {
         let repo = PathBuf::from(&session.repo);
         let wt = PathBuf::from(&session.worktree);
 
-        // 1. Isolated worktree on its own branch.
+        // 1. Isolated worktree on its own branch. On a retry the
+        // worktree already exists with the agent's earlier work in it —
+        // reuse it, so the agent continues from what it already did.
+        if wt.join(".git").exists() {
+            self.log(
+                id,
+                format!("reusing existing worktree on branch {}", session.branch),
+            );
+            return self.run_agent_and_check(id, &session, &wt);
+        }
         if let Some(parent) = wt.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -403,11 +412,18 @@ impl App {
             }
         }
 
+        self.run_agent_and_check(id, &session, &wt);
+    }
+
+    /// Steps 2–4 of a session: run the agent in its worktree, run the
+    /// task's check, record the outcome. Entered with the worktree ready
+    /// (freshly created, or reused on a retry).
+    fn run_agent_and_check(self: &Arc<Self>, id: &str, session: &Session, wt: &Path) {
         // 2. Run the agent in the worktree, streaming its output.
         self.log(id, format!("agent started: {}", session.task));
         let child = Command::new(&session.agent)
             .arg(&session.task)
-            .current_dir(&wt)
+            .current_dir(wt)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn();
@@ -459,7 +475,7 @@ impl App {
         let check = Command::new("sh")
             .arg("-c")
             .arg(&session.check_cmd)
-            .current_dir(&wt)
+            .current_dir(wt)
             .output();
         let (passed, output) = match check {
             Ok(o) => (
@@ -474,17 +490,17 @@ impl App {
         };
 
         // 4. Capture the diff and commit the worktree so it can be merged.
-        let _ = Command::new("git").arg("-C").arg(&wt).args(["add", "-A"]).output();
+        let _ = Command::new("git").arg("-C").arg(wt).args(["add", "-A"]).output();
         let diff = Command::new("git")
             .arg("-C")
-            .arg(&wt)
+            .arg(wt)
             .args(["diff", "--cached"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
         let _ = Command::new("git")
             .arg("-C")
-            .arg(&wt)
+            .arg(wt)
             .args(["-c", "user.email=fleet@localhost", "-c", "user.name=fleet-rs"])
             .args(["commit", "--allow-empty", "-m", &format!("fleet session {}: {}", id, session.task)])
             .output();
@@ -506,6 +522,35 @@ impl App {
             self.set_needs_you(id, &format!("check failed: {}", session.check_cmd));
         }
         self.pump_queue();
+    }
+
+    /// Hand a needs-you session back to its agent: the check state is
+    /// cleared and the session re-queues; its worktree (with the agent's
+    /// earlier work in it) is reused by run_session.
+    fn retry(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            let s = sessions
+                .iter_mut()
+                .find(|s| s.id == id)
+                .ok_or("no such session")?;
+            if s.status != "needs-you" {
+                return Err(format!(
+                    "session is '{}' — only a needs-you session can be retried",
+                    s.status
+                ));
+            }
+            s.check_output = None;
+            s.check_passed = None;
+            s.reason = None;
+            s.diff = String::new();
+            s.status = Status::Queued.label().to_string();
+            s.bucket = Status::Queued.bucket().to_string();
+        }
+        self.log(id, "retry: handed back to the agent".to_string());
+        self.persist();
+        self.maybe_start(id);
+        Ok(())
     }
 
     fn merge(&self, id: &str) -> Result<(), String> {
@@ -722,6 +767,25 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 Ok(()) => json_response(200, "{\"merged\":true}"),
                 Err(e) => json_response(409, &format!("{{\"error\":\"{e}\"}}")),
             }
+        }
+        ("POST", route) if route.starts_with("/api/sessions/") && route.ends_with("/retry") => {
+            let id = &route["/api/sessions/".len()..route.len() - "/retry".len()];
+            match app.retry(id) {
+                Ok(()) => json_response(200, "{\"retried\":true}"),
+                Err(e) => json_response(409, &format!("{{\"error\":\"{e}\"}}")),
+            }
+        }
+        ("GET", "/api/inbox") => {
+            let sessions = app.sessions.lock().unwrap();
+            let all = sessions_json(&sessions);
+            let inbox: Vec<serde_json::Value> = all
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|v| v["status"].as_str() == Some("needs-you"))
+                .collect();
+            json_response(200, &serde_json::Value::Array(inbox).to_string())
         }
         _ => json_response(404, "{\"error\":\"not found\"}"),
     }
