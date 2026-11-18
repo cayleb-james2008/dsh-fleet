@@ -185,6 +185,10 @@ async function refresh() {
   }
 }
 
+let lastListKey = '';
+let lastDetailKey = '';
+let detailError = '';
+
 function renderInbox(inbox) {
   const panel = document.getElementById('inboxPanel');
   panel.hidden = !inboxOpen;
@@ -201,7 +205,7 @@ function renderInbox(inbox) {
       <button data-act="view">View</button><button data-act="retry">Retry</button>`;
     div.querySelector('.t').textContent = s.task;
     div.querySelector('.r').textContent = s.reason || 'needs you';
-    div.querySelector('[data-act="view"]').onclick = () => { selected = s.id; inboxOpen = false; refresh(); };
+    div.querySelector('[data-act="view"]').onclick = () => { selected = s.id; detailError = ''; lastDetailKey = ''; inboxOpen = false; refresh(); };
     div.querySelector('[data-act="retry"]').onclick = async () => { await post(`/api/sessions/${s.id}/retry`); refresh(); };
     box.appendChild(div);
   }
@@ -214,6 +218,12 @@ function statusChip(s) {
   return `<span class="chip ${s.bucket}">${s.status.replace('-', ' ')}</span>`;
 }
 function renderSessions(sessions) {
+  // Skip the rebuild when nothing visible changed: rebuilding the
+  // list every poll would drop keyboard focus from a row the operator
+  // is tabbing through.
+  const key = JSON.stringify(sessions.map(s => [s.id, s.status, s.bucket, s.check_passed, s.queue_position, s.id === selected]));
+  if (key === lastListKey) return;
+  lastListKey = key;
   const list = document.getElementById('sessions');
   list.innerHTML = '';
   if (!sessions.length) {
@@ -231,7 +241,10 @@ function renderSessions(sessions) {
     for (const s of inGroup) {
       const div = document.createElement('div');
       div.className = 'session' + (s.id === selected ? ' selected' : '');
-      div.setAttribute('role', 'listitem');
+      // Keyboard-operable: a session row is an action, not furniture.
+      div.setAttribute('role', 'button');
+      div.setAttribute('tabindex', '0');
+      div.setAttribute('aria-label', `Open session: ${s.task}`);
       let inner = `<div class="task"></div><div class="statusrow">`;
       inner += (s.bucket === 'working' && s.status !== 'queued') ? '<span class="dot live"></span>' : '<span class="dot"></span>';
       inner += statusChip(s) + `<span>${esc(s.agent || '')}</span></div>`;
@@ -241,7 +254,10 @@ function renderSessions(sessions) {
       div.querySelector('.task').textContent = s.task;
       const cl = div.querySelector('.checkline span');
       if (cl) cl.textContent = s.check_cmd;
-      div.onclick = () => { selected = s.id; refresh(); };
+      div.onclick = () => { selected = s.id; detailError = ''; lastDetailKey = ''; refresh(); };
+      div.onkeydown = (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); div.onclick(); }
+      };
       list.appendChild(div);
     }
   }
@@ -249,6 +265,19 @@ function renderSessions(sessions) {
 
 function renderDetail(s) {
   const d = document.getElementById('detail');
+  // Rebuilding the detail DOM on every 2s poll destroys the scroll
+  // position, keyboard focus, and any error the operator is reading.
+  // Render only when the session's visible state actually changed;
+  // when a render does happen, put scroll and focus back.
+  const key = JSON.stringify([s.id, s.status, s.check_passed, s.reason, s.queue_position,
+    s.transcript.length, (s.check_output || '').length, (s.diff || '').length, detailError]);
+  if (key === lastDetailKey) return;
+  const prevScroll = d.scrollTop;
+  const prevTr = d.querySelector('#tr');
+  const prevTrScroll = prevTr ? prevTr.scrollTop : 0;
+  const prevTrAtBottom = prevTr ? (prevTr.scrollHeight - prevTr.scrollTop - prevTr.clientHeight < 24) : true;
+  const activeId = (document.activeElement && d.contains(document.activeElement)) ? document.activeElement.id : '';
+  lastDetailKey = key;
   let html = `<h2></h2><div class="meta">branch ${esc(s.branch)} · agent ${esc(s.agent || 'unknown')} · status ${esc(s.status)}${s.queue_position ? ` · queue #${s.queue_position}` : ''}</div>`;
   if (s.check_passed !== undefined && s.check_passed !== null) {
     html += `<div class="checkbanner ${s.check_passed ? 'pass' : 'fail'}">
@@ -273,18 +302,30 @@ function renderDetail(s) {
   d.querySelector('#tr').textContent = s.transcript.join('\n');
   if (d.querySelector('#co')) d.querySelector('#co').textContent = s.check_output || '';
   if (d.querySelector('#df')) d.querySelector('#df').textContent = s.diff;
+  // The action error lives in detailError, outside the DOM, so a
+  // re-render can never erase it before it is read.
+  const errEl = d.querySelector('#actErr');
+  if (errEl && detailError) { errEl.textContent = detailError; errEl.hidden = false; }
   const mb = d.querySelector('#mergeBtn');
   if (mb) mb.onclick = async () => {
     const r = await post(`/api/sessions/${s.id}/merge`);
-    if (r) showErr('#actErr', r);
+    detailError = r || '';
     refresh();
   };
   const rb = d.querySelector('#retryBtn');
   if (rb) rb.onclick = async () => {
     const r = await post(`/api/sessions/${s.id}/retry`);
-    if (r) showErr('#actErr', r);
+    detailError = r || '';
     refresh();
   };
+  // Restore what the rebuild disturbed.
+  d.scrollTop = prevScroll;
+  const tr = d.querySelector('#tr');
+  if (tr) tr.scrollTop = prevTrAtBottom ? tr.scrollHeight : prevTrScroll;
+  if (activeId) {
+    const again = d.querySelector('#' + CSS.escape(activeId));
+    if (again) again.focus();
+  }
 }
 function showErr(sel, msg) {
   const el = document.querySelector(sel);
