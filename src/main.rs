@@ -2136,7 +2136,18 @@ fn retry_prompt_text(
         }
     }
 
-    fn merge(&self, id: &str) -> Result<(String, String), String> {
+    fn merge(&self, id: &str) -> Result<(String, String), MergeError> {
+        let mut detail = String::new();
+        self.merge_landing(id, &mut detail).map_err(|message| MergeError {
+            status: if message == "no such session" { 404 } else { 409 },
+            message,
+            detail: (!detail.is_empty()).then_some(detail),
+        })
+    }
+
+    /// The merge itself. A refusal carries a plain sentence; git's own
+    /// text for a refusal git made is left in `detail`.
+    fn merge_landing(&self, id: &str, detail: &mut String) -> Result<(String, String), String> {
         let session = {
             let sessions = self.sessions.lock().unwrap();
             sessions
@@ -2242,12 +2253,30 @@ fn retry_prompt_text(
             // refusal, and the filename lives past the first line.
             // Git writes conflict markers to stdout and refusals to
             // stderr — read both.
-            let detail = format!(
+            let raw = format!(
                 "{}{}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
-            let lines: Vec<&str> = detail
+            *detail = raw.trim().to_string();
+            if raw.contains("identity unknown")
+                || raw.contains("Please tell me who you are")
+                || raw.contains("auto-detection is disabled")
+            {
+                return Err("Git has no name and email for the merge commit. Set them with git config user.name and git config user.email in this repo, then merge again. Nothing was merged.".to_string());
+            }
+            if raw.contains("CONFLICT") {
+                let files: Vec<&str> = raw
+                    .lines()
+                    .filter_map(|l| l.split_once("Merge conflict in ").map(|(_, f)| f.trim()))
+                    .collect();
+                return Err(if files.is_empty() {
+                    "Merge conflict. Nothing was merged.".to_string()
+                } else {
+                    format!("Merge conflict in {}. Nothing was merged.", files.join(", "))
+                });
+            }
+            let lines: Vec<&str> = raw
                 .lines()
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty())
@@ -2258,11 +2287,6 @@ fn retry_prompt_text(
             } else {
                 lines.join(" — ")
             };
-            if detail.contains("CONFLICT") {
-                return Err(format!(
-                    "merge conflict: {summary} — the merge was aborted and nothing was merged"
-                ));
-            }
             return Err(format!(
                 "merge refused: {summary} — nothing was merged"
             ));
@@ -2295,6 +2319,14 @@ fn retry_prompt_text(
 // ---------------------------------------------------------------------------
 // HTTP layer (std-only, one request per connection)
 // ---------------------------------------------------------------------------
+
+/// A refused merge: the HTTP status, the plain message for the
+/// operator, and git's own text when git made the refusal.
+struct MergeError {
+    status: u16,
+    message: String,
+    detail: Option<String>,
+}
 
 fn json_response(status: u16, body: &str) -> String {
     format!(
@@ -2648,7 +2680,13 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                     })
                     .to_string(),
                 ),
-                Err(e) => error_response(409, &e),
+                Err(e) => {
+                    let mut body = serde_json::json!({ "error": e.message });
+                    if let Some(d) = e.detail {
+                        body["detail"] = serde_json::json!(d);
+                    }
+                    json_response(e.status, &body.to_string())
+                }
             }
         }
         ("POST", route) if route.starts_with("/api/sessions/") && route.ends_with("/retry") => {
@@ -3397,5 +3435,83 @@ mod tests {
         assert!(prompt.contains("echo boom-output; false"), "prompt was: {prompt}");
         assert!(prompt.contains("boom-output"), "prompt was: {prompt}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn git_run(cwd: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn response_body(resp: &str) -> serde_json::Value {
+        serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap_or_default()
+    }
+
+    #[test]
+    fn merge_refusals_are_plain_and_keep_git_text() {
+        let dir = std::env::temp_dir().join(format!("fleet-f4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A real content conflict on README.md.
+        let repo = git_repo(&dir);
+        git_run(&repo, &["checkout", "-b", "fleet/s1"]);
+        std::fs::write(repo.join("README.md"), "branch change\n").unwrap();
+        git_run(&repo, &["commit", "-am", "branch"]);
+        let pin = git_run(&repo, &["rev-parse", "HEAD"]);
+        git_run(&repo, &["checkout", "main"]);
+        std::fs::write(repo.join("README.md"), "main change\n").unwrap();
+        git_run(&repo, &["commit", "-am", "main"]);
+        let mut s = test_session("s1", Status::Done, &dir);
+        s.repo = repo.to_string_lossy().to_string();
+        s.branch = "fleet/s1".to_string();
+        s.verified_commit = Some(pin);
+        let app = test_app(dir.join("data"), vec![s]);
+        let resp = handle(&app, "POST", "/api/sessions/s1/merge", "{}");
+        assert!(resp.starts_with("HTTP/1.1 409"), "{}", resp.lines().next().unwrap_or(""));
+        let body = response_body(&resp);
+        assert_eq!(body["error"], "Merge conflict in README.md. Nothing was merged.", "{body}");
+        assert!(body["detail"].as_str().unwrap_or("").contains("CONFLICT"), "{body}");
+
+        // A merge commit with no identity configured: the refusal names
+        // the two settings to fix. Global config is switched off for
+        // this process so the outcome does not depend on the machine.
+        let dir2 = std::env::temp_dir().join(format!("fleet-f4b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).unwrap();
+        let repo2 = git_repo(&dir2);
+        git_run(&repo2, &["config", "user.useConfigOnly", "true"]);
+        git_run(&repo2, &["checkout", "-b", "fleet/s1"]);
+        std::fs::write(repo2.join("new.txt"), "new\n").unwrap();
+        git_run(&repo2, &["add", "-A"]);
+        git_run(&repo2, &["commit", "-m", "branch"]);
+        let pin2 = git_run(&repo2, &["rev-parse", "HEAD"]);
+        git_run(&repo2, &["checkout", "main"]);
+        std::fs::write(repo2.join("other.txt"), "other\n").unwrap();
+        git_run(&repo2, &["add", "-A"]);
+        git_run(&repo2, &["commit", "-m", "main"]);
+        let mut s2 = test_session("s2", Status::Done, &dir2);
+        s2.repo = repo2.to_string_lossy().to_string();
+        s2.branch = "fleet/s1".to_string();
+        s2.verified_commit = Some(pin2);
+        let app2 = test_app(dir2.join("data"), vec![s2]);
+        std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        let resp = handle(&app2, "POST", "/api/sessions/s2/merge", "{}");
+        assert!(resp.starts_with("HTTP/1.1 409"), "{}", resp.lines().next().unwrap_or(""));
+        let body = response_body(&resp);
+        let msg = body["error"].as_str().unwrap_or("");
+        assert!(msg.contains("git config user.name") && msg.contains("git config user.email"), "{body}");
+        assert!(body["detail"].as_str().unwrap_or("").contains("identity unknown"), "{body}");
+
+        // An unknown session is a 404, as GET answers.
+        let resp = handle(&app2, "POST", "/api/sessions/nope/merge", "{}");
+        assert!(resp.starts_with("HTTP/1.1 404"), "{}", resp.lines().next().unwrap_or(""));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }
