@@ -523,7 +523,8 @@ function statusCls(s) {
 // check's runner ends its output ("3 passed in 4.12s").
 function receiptLine(s) {
   const lines = (s.check_output || '').split('\n').map(x => x.trim()).filter(Boolean);
-  return lines.length ? lines[lines.length - 1] : (s.check_cmd || '');
+  if (lines.length) return lines[lines.length - 1];
+  return s.check_passed === true ? 'Check passed (no output)' : (s.check_cmd || '');
 }
 function diffStat(d) {
   let files = 0, add = 0, del = 0;
