@@ -1,0 +1,85 @@
+#!/bin/bash
+# C7: merge is safe. A dirty repo is refused untouched; a repo with a
+# merge already in progress is refused; a conflicting merge aborts
+# cleanly (no MERGE_HEAD left, tree clean, session still done); a clean
+# merge still succeeds.
+set -u
+cd "$(dirname "$0")/../.."
+PORT=8485
+WORK=$(mktemp -d)
+PIDS=""
+cleanup() { for p in $PIDS; do kill -9 $p 2>/dev/null; done; rm -rf "$WORK"; }
+trap cleanup EXIT
+
+[ -x ./target/debug/fleet-rs ] || cargo build >/dev/null 2>&1
+
+git init -q -b main "$WORK/repo"
+echo "seed" > "$WORK/repo/README.md"
+git -C "$WORK/repo" add -A
+git -C "$WORK/repo" -c user.email=p@p -c user.name=proof commit -qm init
+
+cat > "$WORK/agent.sh" <<'EOF'
+#!/bin/bash
+printf 'agent version\n' > output.txt
+EOF
+chmod +x "$WORK/agent.sh"
+
+FLEET_AGENT="$WORK/agent.sh" FLEET_DATA="$WORK/data" PORT=$PORT \
+  ./target/debug/fleet-rs policies.rn > "$WORK/server.log" 2>&1 &
+PIDS="$PIDS $!"
+api() { curl -s "http://127.0.0.1:$PORT$1"; }
+post() { curl -s -w "\n%{http_code}" -X POST "http://127.0.0.1:$PORT$1" -H 'Content-Type: application/json' -d "$2"; }
+for i in $(seq 1 20); do api /api/sessions >/dev/null 2>&1 && break; sleep 0.5; done
+
+post /api/sessions "{\"repo\":\"$WORK/repo\",\"project\":\"fixture\",\"task\":\"alpha task\"}" >/dev/null
+for i in $(seq 1 40); do
+  st=$(api /api/sessions | jq -r '.[0].status')
+  [ "$st" = "done" ] && break
+  sleep 0.5
+done
+[ "$st" = "done" ] || { echo "FAIL: session reached '$st', expected done"; exit 1; }
+ID=$(api /api/sessions | jq -r '.[0].id')
+BR=$(api /api/sessions | jq -r '.[0].branch')
+
+# 1. Dirty repo: refused, untouched.
+echo "operator's uncommitted edit" >> "$WORK/repo/README.md"
+resp=$(post "/api/sessions/$ID/merge" '{}')
+code=$(echo "$resp" | tail -1); body=$(echo "$resp" | sed '$d')
+[ "$code" = "409" ] || { echo "FAIL: dirty-repo merge returned $code, expected 409: $body"; exit 1; }
+echo "$body" | grep -qi "uncommitted" || { echo "FAIL: dirty refusal does not say why: $body"; exit 1; }
+[ ! -f "$WORK/repo/output.txt" ] || { echo "FAIL: dirty-repo merge went ahead anyway"; exit 1; }
+grep -q "operator's uncommitted edit" "$WORK/repo/README.md" || { echo "FAIL: operator's edit was disturbed"; exit 1; }
+git -C "$WORK/repo" checkout -- README.md
+
+# 2. Conflicting state on main + a merge already in progress: refused.
+printf 'main version\n' > "$WORK/repo/output.txt"
+git -C "$WORK/repo" add -A
+git -C "$WORK/repo" -c user.email=p@p -c user.name=proof commit -qm "main output"
+git -C "$WORK/repo" merge "$BR" >/dev/null 2>&1 || true
+[ -f "$WORK/repo/.git/MERGE_HEAD" ] || { echo "FAIL: test setup could not create an in-progress merge"; exit 1; }
+resp=$(post "/api/sessions/$ID/merge" '{}')
+code=$(echo "$resp" | tail -1); body=$(echo "$resp" | sed '$d')
+[ "$code" = "409" ] || { echo "FAIL: in-progress merge returned $code, expected 409: $body"; exit 1; }
+echo "$body" | grep -qi "in progress" || { echo "FAIL: in-progress refusal does not say why: $body"; exit 1; }
+git -C "$WORK/repo" merge --abort
+
+# 3. A merge the app attempts that conflicts: aborted cleanly.
+resp=$(post "/api/sessions/$ID/merge" '{}')
+code=$(echo "$resp" | tail -1); body=$(echo "$resp" | sed '$d')
+[ "$code" = "409" ] || { echo "FAIL: conflicting merge returned $code, expected 409: $body"; exit 1; }
+echo "$body" | grep -qi "conflict" || { echo "FAIL: conflict error does not name the conflict: $body"; exit 1; }
+[ ! -f "$WORK/repo/.git/MERGE_HEAD" ] || { echo "FAIL: repo left mid-merge (MERGE_HEAD present)"; exit 1; }
+[ -z "$(git -C "$WORK/repo" status --porcelain)" ] || { echo "FAIL: repo left dirty after aborted merge"; exit 1; }
+st=$(api /api/sessions | jq -r '.[0].status')
+[ "$st" = "done" ] || { echo "FAIL: session became '$st' after aborted merge, expected done"; exit 1; }
+grep -q "main version" "$WORK/repo/output.txt" || { echo "FAIL: main's version was overwritten by the aborted merge"; exit 1; }
+
+# 4. Remove the collision: the same merge now succeeds.
+git -C "$WORK/repo" rm -q output.txt
+git -C "$WORK/repo" -c user.email=p@p -c user.name=proof commit -qm "remove main output"
+resp=$(post "/api/sessions/$ID/merge" '{}')
+code=$(echo "$resp" | tail -1)
+[ "$code" = "200" ] || { echo "FAIL: clean merge returned $code: $resp"; exit 1; }
+grep -q "agent version" "$WORK/repo/output.txt" || { echo "FAIL: merged content is not the agent's version"; exit 1; }
+
+echo "MERGE SAFETY OK: dirty and in-progress repos refused, conflicts abort clean, clean merges land"
