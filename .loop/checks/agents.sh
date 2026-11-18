@@ -50,6 +50,23 @@ n=$(api /api/sessions | jq 'length')
 [ ! -d "$WORK/data/worktrees" ] || [ -z "$(ls -A "$WORK/data/worktrees" 2>/dev/null)" ] \
   || { echo "FAIL: refused hand-out created a worktree"; exit 1; }
 
+# A directory is not an executable file: refused up front too.
+resp=$(post /api/sessions "{\"repo\":\"$WORK/repo\",\"project\":\"fixture\",\"task\":\"x\",\"agent\":\"/tmp\"}")
+code=$(echo "$resp" | tail -1)
+[ "$code" = "400" ] || { echo "FAIL: directory-as-agent hand-out returned $code, expected 400: $resp"; exit 1; }
+n=$(api /api/sessions | jq 'length')
+[ "$n" = "0" ] || { echo "FAIL: directory-as-agent refusal still created a session"; exit 1; }
+
+# /api/policy's source names the policy file actually loaded.
+src=$(api /api/policy | jq -r '.source')
+[ "$src" = "policies.rn" ] || { echo "FAIL: policy source is '$src', expected the loaded file 'policies.rn'"; exit 1; }
+cp policies.rn "$WORK/alt-policies.rn"
+FLEET_DATA="$WORK/data2" PORT=8492 ./target/debug/fleet-rs "$WORK/alt-policies.rn" > "$WORK/server2.log" 2>&1 &
+PIDS="$PIDS $!"
+for i in $(seq 1 20); do curl -s "http://127.0.0.1:8492/api/policy" >/dev/null 2>&1 && break; sleep 0.5; done
+src2=$(curl -s "http://127.0.0.1:8492/api/policy" | jq -r '.source')
+case "$src2" in *alt-policies.rn) : ;; *) echo "FAIL: alt policy source is '$src2'"; exit 1;; esac
+
 # A hand-out naming a real executable path runs under that agent.
 resp=$(post /api/sessions "{\"repo\":\"$WORK/repo\",\"project\":\"fixture\",\"task\":\"alpha\",\"agent\":\"$WORK/agent.sh\"}")
 code=$(echo "$resp" | tail -1)
