@@ -1654,9 +1654,22 @@ impl App {
                     "stopped by you — the stop landed before this session settled".to_string(),
                 );
                 self.set_needs_you(id, "stopped by you");
+            } else if self.stop_flag(id).load(std::sync::atomic::Ordering::Relaxed) {
+                // The last-moment re-read: a stop that landed
+                // during the settle's final steps is honoured too.
+                self.log(
+                    id,
+                    "stopped by you — the stop landed before this session settled".to_string(),
+                );
+                self.set_needs_you(id, "stopped by you");
             } else {
-                self.log(id, "check passed — verified done".to_string());
+                // Publish first, then log: a stop that lands after
+                // this point arrives after the settle and is
+                // refused as a stop on a settled session.
+                // (set_status itself is an unconditional write —
+                // the residual no-CAS shape is named in the ledger.)
                 self.set_status(id, Status::Done);
+                self.log(id, "check passed — verified done".to_string());
             }
         } else if check_pipes_held {
             self.log(
@@ -1866,6 +1879,14 @@ impl App {
     /// verified-commit pin is cleared here, so nothing unverified
     /// can ever be merged off a reopened session).
     fn requeue(self: &Arc<Self>, id: &str) {
+        // A new lifecycle starts here: clear the stop flag BEFORE
+        // the queued status is published, so a pump that claims the
+        // session the moment it appears can never meet the previous
+        // run's stale flag. (A stop cannot be accepted while the
+        // session sits in needs-you, so nothing is lost by clearing
+        // first.)
+        self.stop_flag(id)
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
@@ -1879,10 +1900,6 @@ impl App {
             }
         }
         self.persist();
-        // A new lifecycle starts here: a stop pressed against the
-        // previous run must not kill this one on sight.
-        self.stop_flag(id)
-            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.maybe_start(id);
     }
 
@@ -1906,8 +1923,14 @@ impl App {
             // Re-verify the precondition inside the lock: a steer
             // that landed after the settle's own status read has
             // already reopened this session — a chain must never
-            // fire for work that is being re-verified.
-            if parent.status != "done" || parent.next_queue.is_empty() {
+            // fire for work that is being re-verified, nor while
+            // steering is still waiting to be delivered. The chain
+            // fires when the reopened session settles verified done
+            // with its steering delivered.
+            if parent.status != "done"
+                || parent.next_queue.is_empty()
+                || !parent.steer.is_empty()
+            {
                 return;
             }
             let task = parent.next_queue.remove(0);
@@ -2831,6 +2854,27 @@ fn main() {
         );
         app.set_needs_you(&id, &format!("server restarted while {was}"));
     }
+    // A verified-done session with steering still waiting was
+    // mid-reopen when the server stopped: the operator's message
+    // supersedes its settle. It comes back needs-you — a retry
+    // delivers the steering, and its chain (if any) fires when it
+    // settles verified done again.
+    let steered_done: Vec<String> = {
+        let sessions = app.sessions.lock().unwrap();
+        sessions
+            .iter()
+            .filter(|s| s.status == "done" && !s.steer.is_empty())
+            .map(|s| s.id.clone())
+            .collect()
+    };
+    for id in steered_done {
+        app.log(
+            &id,
+            "server restarted while this session had steering waiting — retry it to deliver your message"
+                .to_string(),
+        );
+        app.set_needs_you(&id, "server restarted while steering was waiting");
+    }
     // A verified-done session whose successor never fired (the
     // server died in the settle-to-fire window) must not stall in
     // silence: fire its chain now — fire_successor re-verifies the
@@ -2839,7 +2883,7 @@ fn main() {
         let sessions = app.sessions.lock().unwrap();
         sessions
             .iter()
-            .filter(|s| s.status == "done" && !s.next_queue.is_empty())
+            .filter(|s| s.status == "done" && !s.next_queue.is_empty() && s.steer.is_empty())
             .map(|s| s.id.clone())
             .collect()
     };
