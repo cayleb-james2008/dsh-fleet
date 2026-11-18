@@ -724,6 +724,19 @@ impl App {
             Err(e) => Some(format!("could not run git commit: {e}")),
         };
 
+        // The diff the operator reviews before merging must be
+        // everything the merge will land: the branch's whole history
+        // against the repo, not just this run's staged changes. A
+        // retried session commits across runs; showing only the last
+        // run's diff would misstate the merge.
+        let diff = Command::new("git")
+            .arg("-C")
+            .arg(&session.repo)
+            .arg("diff")
+            .arg(format!("HEAD...{}", session.branch))
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or(diff);
         // The full check output goes to the session's log file before
         // the stored copy is capped — the cap must never lose it.
         self.append_log_text(id, &format!("--- check output ---\n{output}"));
@@ -902,10 +915,35 @@ impl App {
                 .arg(&session.repo)
                 .args(["merge", "--abort"])
                 .output();
-            let detail = String::from_utf8_lossy(&out.stderr);
-            let first = detail.lines().next().unwrap_or("merge failed").trim();
+            // Name the failure for what it is, with enough of git's
+            // message to act on: a content conflict is a conflict; an
+            // untracked-file collision (or any other refusal) is a
+            // refusal, and the filename lives past the first line.
+            // Git writes conflict markers to stdout and refusals to
+            // stderr — read both.
+            let detail = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let lines: Vec<&str> = detail
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .take(3)
+                .collect();
+            let summary = if lines.is_empty() {
+                "merge failed".to_string()
+            } else {
+                lines.join(" — ")
+            };
+            if detail.contains("CONFLICT") {
+                return Err(format!(
+                    "merge conflict: {summary} — the merge was aborted and nothing was merged"
+                ));
+            }
             return Err(format!(
-                "merge conflict: {first} — the merge was aborted and nothing was merged"
+                "merge refused: {summary} — nothing was merged"
             ));
         }
         // Verify the landing, don't trust the merge's exit code alone:

@@ -55,6 +55,18 @@ done
 [ "$st2" = "working" ] || { echo "FAIL: slow session never reached working (got $st2)"; exit 1; }
 ID_B=$(api /api/sessions | jq -r '.[1].id')
 
+# Wait until the slow agent's first line is actually in its log file:
+# the kill must land mid-work WITH output produced, or the C3
+# assertion below tests a state that never existed. (Since B10 the
+# agent's stdout drains on its own thread; under load the "working"
+# status can be visible a moment before the first line lands.)
+for i in $(seq 1 30); do
+  grep -q "fixture agent received task" "$WORK/data/logs/$ID_B.log" 2>/dev/null && break
+  sleep 0.5
+done
+grep -q "fixture agent received task" "$WORK/data/logs/$ID_B.log" 2>/dev/null \
+  || { echo "FAIL: slow agent's first line never reached its log file while working"; exit 1; }
+
 # Kill the server mid-work, hard.
 kill -9 $! 2>/dev/null; sleep 0.5
 start_server 2

@@ -103,4 +103,30 @@ api /api/sessions | jq -e '.[1].reason | test("gitignore"; "i")' >/dev/null \
 api /api/sessions | jq -e '.[1].check_passed == true' >/dev/null \
   || { echo "FAIL: the check did pass in the worktree and should be recorded as passed"; exit 1; }
 
-echo "MERGE SAFETY OK: dirty and in-progress repos refused, conflicts abort clean, clean merges land, gitignored work is never called done"
+# 6. An untracked-file collision is a refusal, not a conflict — and
+# the error must name the file it is about. The operator's untracked
+# file stays untouched and the session stays done.
+git init -q -b main "$WORK/repo3"
+echo "seed" > "$WORK/repo3/README.md"
+git -C "$WORK/repo3" add -A
+git -C "$WORK/repo3" -c user.email=p@p -c user.name=proof commit -qm init
+printf 'operator version\n' > "$WORK/repo3/output.txt"
+post /api/sessions "{\"repo\":\"$WORK/repo3\",\"project\":\"fixture\",\"task\":\"collide task\"}" >/dev/null
+for i in $(seq 1 40); do
+  st3=$(api /api/sessions | jq -r '.[2].status')
+  [ "$st3" = "done" ] && break
+  sleep 0.5
+done
+[ "$st3" = "done" ] || { echo "FAIL: collision session reached '$st3', expected done"; exit 1; }
+ID3=$(api /api/sessions | jq -r '.[2].id')
+resp=$(post "/api/sessions/$ID3/merge" '{}')
+code=$(echo "$resp" | tail -1)
+[ "$code" = "409" ] || { echo "FAIL: untracked-collision merge returned $code, expected 409: $resp"; exit 1; }
+err=$(echo "$resp" | head -1 | jq -r '.error')
+case "$err" in *"merge conflict"*) echo "FAIL: an untracked collision is mislabelled a conflict: $err"; exit 1;; esac
+case "$err" in *output.txt*) : ;; *) echo "FAIL: collision error does not name the file: $err"; exit 1;; esac
+grep -q "operator version" "$WORK/repo3/output.txt" || { echo "FAIL: the operator's untracked file was touched"; exit 1; }
+st3=$(api /api/sessions | jq -r '.[2].status')
+[ "$st3" = "done" ] || { echo "FAIL: session left '$st3' after the refused merge, expected done"; exit 1; }
+
+echo "MERGE SAFETY OK: dirty and in-progress repos refused, conflicts abort clean, clean merges land, gitignored work is never called done, untracked collisions are named refusals"
