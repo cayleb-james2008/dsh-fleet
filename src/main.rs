@@ -2511,6 +2511,16 @@ fn sessions_json(sessions: &[Session]) -> serde_json::Value {
             let kind = engine_kind(&s.agent);
             v["engine"] = serde_json::json!(kind.label());
             v["test_mode"] = serde_json::json!(kind == EngineKind::Custom);
+            // A needs-you session whose steering is still waiting says
+            // so in its reason: the message is not silently pending.
+            if s.status == "needs-you" && !s.steer.is_empty() {
+                let msg = &s.steer[0];
+                let shown: String = msg.chars().take(120).collect();
+                let cut = if msg.chars().count() > 120 { "…" } else { "" };
+                let note = format!("Your message is still waiting: \"{shown}{cut}\".");
+                let base = s.reason.clone().unwrap_or_default();
+                v["reason"] = serde_json::json!(format!("{base} {note}").trim_start());
+            }
             if s.status == "queued" {
                 pos += 1;
                 v["queue_position"] = serde_json::json!(pos);
@@ -3584,5 +3594,19 @@ mod tests {
         let resp = handle(&app, "POST", "/api/sessions/nope/dismiss", "{}");
         assert!(resp.starts_with("HTTP/1.1 404"), "{}", resp.lines().next().unwrap_or(""));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn waiting_steering_is_named_on_a_needs_you_reason() {
+        let mut s = test_session("s1", Status::NeedsYou, Path::new("."));
+        s.reason = Some("check failed: false".to_string());
+        s.steer = vec!["also fix the tests".to_string()];
+        let v = sessions_json(&[s]);
+        let reason = v[0]["reason"].as_str().unwrap_or("");
+        assert!(reason.starts_with("check failed: false"), "{reason}");
+        assert!(
+            reason.contains("Your message is still waiting: \"also fix the tests\""),
+            "{reason}"
+        );
     }
 }
