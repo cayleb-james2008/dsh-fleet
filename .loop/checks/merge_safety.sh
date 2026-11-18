@@ -82,4 +82,25 @@ code=$(echo "$resp" | tail -1)
 [ "$code" = "200" ] || { echo "FAIL: clean merge returned $code: $resp"; exit 1; }
 grep -q "agent version" "$WORK/repo/output.txt" || { echo "FAIL: merged content is not the agent's version"; exit 1; }
 
-echo "MERGE SAFETY OK: dirty and in-progress repos refused, conflicts abort clean, clean merges land"
+# 5. Gitignored work product can never land: the session must NOT be
+# allowed to call itself verified done. Its check passes in the
+# worktree (the file exists there), but the repo gitignores the file,
+# so nothing could ever be committed or merged.
+git init -q -b main "$WORK/repo2"
+echo "seed" > "$WORK/repo2/README.md"
+printf 'output.txt\n' > "$WORK/repo2/.gitignore"
+git -C "$WORK/repo2" add -A
+git -C "$WORK/repo2" -c user.email=p@p -c user.name=proof commit -qm init
+post /api/sessions "{\"repo\":\"$WORK/repo2\",\"project\":\"fixture\",\"task\":\"ignored task\"}" >/dev/null
+for i in $(seq 1 40); do
+  st2=$(api /api/sessions | jq -r '.[1].status')
+  [ "$st2" = "needs-you" ] || [ "$st2" = "done" ] && break
+  sleep 0.5
+done
+[ "$st2" = "needs-you" ] || { echo "FAIL: session whose work product is gitignored reached '$st2' — it can never land, so 'done' would be invented"; exit 1; }
+api /api/sessions | jq -e '.[1].reason | test("gitignore"; "i")' >/dev/null \
+  || { echo "FAIL: gitignored-output session's reason does not name the gitignore problem: $(api /api/sessions | jq -c '.[1].reason')"; exit 1; }
+api /api/sessions | jq -e '.[1].check_passed == true' >/dev/null \
+  || { echo "FAIL: the check did pass in the worktree and should be recorded as passed"; exit 1; }
+
+echo "MERGE SAFETY OK: dirty and in-progress repos refused, conflicts abort clean, clean merges land, gitignored work is never called done"

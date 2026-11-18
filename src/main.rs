@@ -419,6 +419,10 @@ impl App {
     /// task's check, record the outcome. Entered with the worktree ready
     /// (freshly created, or reused on a retry).
     fn run_agent_and_check(self: &Arc<Self>, id: &str, session: &Session, wt: &Path) {
+        // Baseline of ignored files before the agent touches anything,
+        // so step 4 can tell agent-produced ignored files from the
+        // repo's pre-existing ones.
+        let ignored_baseline = self.ignored_baseline(id, wt);
         // 2. Run the agent in the worktree, streaming its output.
         self.log(id, format!("agent started: {}", session.task));
         let child = Command::new(&session.agent)
@@ -498,12 +502,30 @@ impl App {
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
-        let _ = Command::new("git")
+        // Files the agent produced that this repo gitignores are not in
+        // the diff and can never be committed — surface them, by name.
+        let new_ignored: Vec<String> = Self::ignored_files(wt)
+            .into_iter()
+            .filter(|p| !ignored_baseline.contains(p))
+            .collect();
+        let commit = Command::new("git")
             .arg("-C")
             .arg(wt)
             .args(["-c", "user.email=fleet@localhost", "-c", "user.name=fleet-rs"])
             .args(["commit", "--allow-empty", "-m", &format!("fleet session {}: {}", id, session.task)])
             .output();
+        let commit_error = match &commit {
+            Ok(o) if o.status.success() => None,
+            Ok(o) => Some(
+                String::from_utf8_lossy(&o.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("git commit failed")
+                    .trim()
+                    .to_string(),
+            ),
+            Err(e) => Some(format!("could not run git commit: {e}")),
+        };
 
         {
             let mut sessions = self.sessions.lock().unwrap();
@@ -514,7 +536,27 @@ impl App {
             }
         }
         self.persist();
-        if passed {
+        if let Some(err) = commit_error {
+            // The work cannot land at all (a failing pre-commit hook is
+            // the usual cause) — never let it be called done.
+            self.log(id, format!("commit failed: {err}"));
+            self.set_needs_you(id, &format!("could not commit the session's work: {err}"));
+        } else if passed && !new_ignored.is_empty() {
+            self.log(
+                id,
+                format!(
+                    "check passed, but the agent produced files this repo gitignores — they cannot be committed or merged: {}",
+                    new_ignored.join(", ")
+                ),
+            );
+            self.set_needs_you(
+                id,
+                &format!(
+                    "agent produced files this repo gitignores — they cannot be committed or merged: {}",
+                    new_ignored.join(", ")
+                ),
+            );
+        } else if passed {
             self.log(id, "check passed — verified done".to_string());
             self.set_status(id, Status::Done);
         } else {
@@ -522,6 +564,40 @@ impl App {
             self.set_needs_you(id, &format!("check failed: {}", session.check_cmd));
         }
         self.pump_queue();
+    }
+
+    /// The ignored *files* (not directories) in a worktree. An agent's
+    /// work product that the repo gitignores can never be committed or
+    /// merged — the app must notice, or "done" would be invented.
+    fn ignored_files(wt: &Path) -> Vec<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(wt)
+            .args(["status", "--porcelain", "--ignored=matching"])
+            .output();
+        match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.strip_prefix("!! "))
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.ends_with('/'))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// The ignored-files baseline for a session: snapshotted before the
+    /// agent first runs and kept on disk, so a retry compares against
+    /// the same baseline and only flags files the agent produced.
+    fn ignored_baseline(&self, id: &str, wt: &Path) -> std::collections::HashSet<String> {
+        let meta = self.data_dir.join("meta").join(format!("{id}.ignored"));
+        if let Ok(text) = std::fs::read_to_string(&meta) {
+            return text.lines().map(|l| l.to_string()).collect();
+        }
+        let files = Self::ignored_files(wt);
+        let _ = std::fs::create_dir_all(self.data_dir.join("meta"));
+        let _ = std::fs::write(&meta, files.join("\n"));
+        files.into_iter().collect()
     }
 
     /// Hand a needs-you session back to its agent: the check state is
@@ -612,6 +688,22 @@ impl App {
             return Err(format!(
                 "merge conflict: {first} — the merge was aborted and nothing was merged"
             ));
+        }
+        // Verify the landing, don't trust the merge's exit code alone:
+        // the session's branch tip must now be part of the repo's
+        // history, or nothing was actually merged.
+        let landed = Command::new("git")
+            .arg("-C")
+            .arg(&session.repo)
+            .args(["merge-base", "--is-ancestor", &session.branch, "HEAD"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !landed {
+            return Err(
+                "merge ran but the session's commit is not in the repo's history — nothing was landed"
+                    .to_string(),
+            );
         }
         self.set_status(id, Status::Merged);
         Ok(())
