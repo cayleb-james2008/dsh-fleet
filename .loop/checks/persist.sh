@@ -73,10 +73,12 @@ b=$(echo "$sessions" | jq -r ".[] | select(.id==\"$ID_B\") | .status")
 echo "$sessions" | jq -e ".[] | select(.id==\"$ID_B\") | select(.transcript | join(\" \") | test(\"restart\"; \"i\"))" >/dev/null \
   || { echo "FAIL: interrupted session's transcript does not give the restart reason"; exit 1; }
 
-# C3: per-session log files on disk contain the transcript.
+# C3: per-session log files on disk contain the transcript. (The log
+# file is data/logs/<id>.log specifically — other per-session files,
+# e.g. the meta/<id>.ignored baseline B7 added, are not the log.)
 for id in "$ID_A" "$ID_B"; do
-  log=$(find "$WORK/data" -name "*$id*" -type f | grep -v worktrees | head -1)
-  [ -n "$log" ] || { echo "FAIL: no log file found for session $id"; exit 1; }
+  log="$WORK/data/logs/$id.log"
+  [ -f "$log" ] || { echo "FAIL: no log file found for session $id at $log"; exit 1; }
   grep -q "fixture agent received task" "$log" || { echo "FAIL: log file for $id lacks transcript lines"; exit 1; }
 done
 
