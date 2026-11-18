@@ -103,3 +103,10 @@ the state machine produced).
 - Signature: every done session carries its check line — the command that
   was run and its verdict — as part of its identity in the list, not
   buried in detail. No other product on his screen shows that.
+- C17 (cmd): The settle boundary holds (thermonuclear fix wave): a
+  successor fired at a verified-done settle joins the queue in
+  hand-out order and never jumps a session queued earlier; steering
+  leaves the persisted queue only after the run that carries it, so
+  a kill -9 mid-delivery loses nothing and the retry re-delivers;
+  a verified-done session whose chain never fired has it fired by
+  startup recovery. (`.loop/checks/settle_races.sh`)

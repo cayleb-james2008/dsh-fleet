@@ -445,22 +445,22 @@ struct Session {
     /// before commit and check — so a session never settles "done"
     /// on a tree the operator has since steered away from. Persisted:
     /// a message must survive a server restart like everything else.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     steer: Vec<String>,
     /// Successor work named at hand-out, in order. When this session
     /// reaches verified done, the front item is handed out
     /// automatically (carrying the rest of the chain) — a finished
     /// session pulls the next item instead of idling. Fires ONLY on
     /// verified done: failed work must not cascade.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     next_queue: Vec<String>,
     /// The session whose verified finish handed this one out, when
     /// this session is a successor.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     spawned_from: Option<String>,
     /// The successor session this one handed out on finishing, once
     /// it has fired.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     successor: Option<String>,
     transcript: Vec<String>,
 }
@@ -490,6 +490,17 @@ struct App {
 }
 
 /// How a bounded run ended.
+/// How an agent run ended, as the caller needs to know it. A
+/// steering batch counts as delivered in every outcome except
+/// NotStarted — the process never spawned, so its prompt never
+/// reached an agent.
+#[derive(PartialEq)]
+enum AgentRun {
+    Clean,
+    Failed,
+    NotStarted,
+}
+
 enum RunEnd {
     /// The process exited; the bool is its success.
     Exited(bool),
@@ -773,20 +784,37 @@ impl App {
             .clone()
     }
 
-    /// Take all pending steering messages for a session, leaving the
-    /// queue empty. Called by the runner between agent runs.
-    fn take_steer(&self, id: &str) -> Vec<String> {
-        let taken = {
-            let mut sessions = self.sessions.lock().unwrap();
-            match sessions.iter_mut().find(|s| s.id == id) {
-                Some(s) => std::mem::take(&mut s.steer),
-                None => Vec::new(),
-            }
-        };
-        if !taken.is_empty() {
-            self.persist();
+    /// Look at a session's pending steering messages WITHOUT taking
+    /// them. The runner removes a batch only after the run that
+    /// carried it (drop_steer): a server crash mid-delivery must not
+    /// lose the operator's words — after a restart the messages are
+    /// still in the persisted queue and the resumed pass delivers
+    /// them.
+    fn peek_steer(&self, id: &str) -> Vec<String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.steer.clone())
+            .unwrap_or_default()
+    }
+
+    /// Remove the first `n` steering messages — the batch a finished
+    /// continuation run just delivered. Messages that arrived during
+    /// the run sit behind them and stay queued.
+    fn drop_steer(&self, id: &str, n: usize) {
+        if n == 0 {
+            return;
         }
-        taken
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
+                let n = n.min(s.steer.len());
+                s.steer.drain(..n);
+            }
+        }
+        self.persist();
     }
 
     fn steer_pending(&self, id: &str) -> bool {
@@ -901,13 +929,29 @@ impl App {
     /// otherwise it stays queued. Called on creation and whenever a
     /// session settles.
     fn maybe_start(self: &Arc<Self>, id: &str) {
-        if self.status_of(id).as_deref() != Some("queued") {
-            return;
+        // Claim the session under one lock hold: the status check,
+        // the cap check and the move to Working are one atomic step,
+        // so two concurrent callers (a settle pumping the queue, an
+        // HTTP retry) can never both spawn a worker for one session.
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            let active = sessions
+                .iter()
+                .filter(|x| x.bucket == "working" && x.status != "queued")
+                .count() as i64;
+            let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
+                return;
+            };
+            if s.status != "queued" {
+                return;
+            }
+            if active >= self.policy.max_parallel {
+                return;
+            }
+            s.status = Status::Working.label().to_string();
+            s.bucket = Status::Working.bucket().to_string();
         }
-        if self.active_count() >= self.policy.max_parallel {
-            return;
-        }
-        self.set_status(id, Status::Working);
+        self.persist();
         let app = self.clone();
         let id = id.to_string();
         std::thread::spawn(move || app.run_session(&id));
@@ -928,6 +972,12 @@ impl App {
     }
 
     fn run_session(self: &Arc<Self>, id: &str) {
+        // Re-verify the claim this thread was spawned on: a queued
+        // session that was stopped (cancelled) between the spawn and
+        // this thread's start must not run after all.
+        if self.status_of(id).as_deref() != Some("working") {
+            return;
+        }
         let session = {
             let sessions = self.sessions.lock().unwrap();
             sessions.iter().find(|s| s.id == id).unwrap().clone()
@@ -1138,7 +1188,7 @@ impl App {
 
     /// One agent run inside a session's worktree, through the engine
     /// adapter, streamed and bounded (timeout and the operator's stop
-    /// flag both apply). Returns true when the agent exited cleanly.
+    /// flag both apply). Returns how the run ended (AgentRun).
     /// On any other ending the session has already been handed to
     /// needs-you with the reason recorded, the queue pumped, and the
     /// caller must stop.
@@ -1149,7 +1199,7 @@ impl App {
         wt: &Path,
         prompt: &str,
         continuation: bool,
-    ) -> bool {
+    ) -> AgentRun {
         let timeout = self.policy.timeout_secs;
         let app_lines = self.clone();
         let id_lines = id.to_string();
@@ -1168,13 +1218,14 @@ impl App {
         );
         let mut agent_cmd = Command::new(&prog);
         agent_cmd.args(&args).current_dir(wt);
-        // A stop flag belongs to the run it was set against: clear
-        // it as a new run starts, or a retried session would stop
-        // itself instantly on a stale flag. (The flag is deliberately
-        // NOT cleared before the check that follows this run — a stop
-        // pressed in the settle window still lands there.)
+        // The stop flag is NOT cleared at run start: a stop can be
+        // pressed in the windows where no run is polling it
+        // (worktree creation, between runs, during the settle), and
+        // clearing here would silently discard exactly those. The
+        // flag is cleared when a session is (re)queued — the one
+        // moment a new lifecycle begins — and re-checked at the
+        // settle before Done is set.
         let flag = self.stop_flag(id);
-        flag.store(false, std::sync::atomic::Ordering::Relaxed);
         let outcome = run_bounded(agent_cmd, timeout, Some(&flag), &mut on_line);
         self.sweep_detached(id, wt);
         match outcome.end {
@@ -1182,7 +1233,7 @@ impl App {
                 self.log(id, format!("agent failed to start: {e}"));
                 self.set_needs_you(id, &format!("agent failed to start: {}", session.agent));
                 self.pump_queue();
-                false
+                AgentRun::NotStarted
             }
             RunEnd::Stopped => {
                 self.log(
@@ -1191,7 +1242,7 @@ impl App {
                 );
                 self.set_needs_you(id, "stopped by you mid-run");
                 self.pump_queue();
-                false
+                AgentRun::Failed
             }
             RunEnd::TimedOut => {
                 self.log(
@@ -1200,7 +1251,7 @@ impl App {
                 );
                 self.set_needs_you(id, &format!("agent timed out after {timeout}s"));
                 self.pump_queue();
-                false
+                AgentRun::Failed
             }
             RunEnd::PipesHeld => {
                 self.log(
@@ -1212,15 +1263,15 @@ impl App {
                     "agent exited but a detached process kept its output open past the limit — the run cannot be trusted complete",
                 );
                 self.pump_queue();
-                false
+                AgentRun::Failed
             }
             RunEnd::Exited(false) => {
                 self.log(id, "agent exited non-zero — handing back to you".to_string());
                 self.set_needs_you(id, "agent exited non-zero");
                 self.pump_queue();
-                false
+                AgentRun::Failed
             }
-            RunEnd::Exited(true) => true,
+            RunEnd::Exited(true) => AgentRun::Clean,
         }
     }
 
@@ -1249,7 +1300,7 @@ impl App {
         let steer_first = resumed && self.steer_pending(id);
         if !steer_first {
             self.log(id, format!("agent started: {}", session.task));
-            if !self.run_one(id, session, wt, &session.task, false) {
+            if self.run_one(id, session, wt, &session.task, false) != AgentRun::Clean {
                 return;
             }
         }
@@ -1261,7 +1312,12 @@ impl App {
         // always describes a tree the operator has not since steered
         // away from.
         loop {
-            let msgs = self.take_steer(id);
+            // Peek, do not take: the batch leaves the persisted
+            // queue only after the run that carries it, so a server
+            // crash mid-delivery cannot lose the operator's words —
+            // after a restart the messages are still queued and the
+            // resumed pass delivers them.
+            let msgs = self.peek_steer(id);
             if msgs.is_empty() {
                 break;
             }
@@ -1272,8 +1328,16 @@ impl App {
                 id,
                 "steering: handing your message to the agent before the check runs".to_string(),
             );
-            if !self.run_one(id, session, wt, &msgs.join("\n\n"), true) {
-                return;
+            match self.run_one(id, session, wt, &msgs.join("\n\n"), true) {
+                // The process never started, so the batch was never
+                // delivered: it stays queued for the next pass.
+                AgentRun::NotStarted => return,
+                outcome => {
+                    self.drop_steer(id, msgs.len());
+                    if outcome != AgentRun::Clean {
+                        return;
+                    }
+                }
             }
         }
         self.log(
@@ -1580,8 +1644,20 @@ impl App {
                 "the check passed but this session produced no changes in its worktree — nothing to verify or merge (the check may be passing on pre-existing state)",
             );
         } else if passed {
-            self.log(id, "check passed — verified done".to_string());
-            self.set_status(id, Status::Done);
+            // A stop pressed while the check ran or the gates were
+            // computed was accepted but had nothing left to kill —
+            // it still lands here, before Done: the operator said
+            // stop, so the session needs them, not a merge button.
+            if self.stop_flag(id).load(std::sync::atomic::Ordering::Relaxed) {
+                self.log(
+                    id,
+                    "stopped by you — the stop landed before this session settled".to_string(),
+                );
+                self.set_needs_you(id, "stopped by you");
+            } else {
+                self.log(id, "check passed — verified done".to_string());
+                self.set_status(id, Status::Done);
+            }
         } else if check_pipes_held {
             self.log(
                 id,
@@ -1803,6 +1879,10 @@ impl App {
             }
         }
         self.persist();
+        // A new lifecycle starts here: a stop pressed against the
+        // previous run must not kill this one on sight.
+        self.stop_flag(id)
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.maybe_start(id);
     }
 
@@ -1823,7 +1903,11 @@ impl App {
             let Some(parent) = sessions.iter_mut().find(|s| s.id == id) else {
                 return;
             };
-            if parent.next_queue.is_empty() {
+            // Re-verify the precondition inside the lock: a steer
+            // that landed after the settle's own status read has
+            // already reopened this session — a chain must never
+            // fire for work that is being re-verified.
+            if parent.status != "done" || parent.next_queue.is_empty() {
                 return;
             }
             let task = parent.next_queue.remove(0);
@@ -1870,7 +1954,10 @@ impl App {
             &new_id,
             format!("handed out automatically: session {id} finished verified done"),
         );
-        self.maybe_start(&new_id);
+        // The successor joins the queue like any hand-out: pumping
+        // in hand-out order gives sessions queued earlier first
+        // claim on the freed slot — a chain never jumps the queue.
+        self.pump_queue();
     }
 
     /// Record an operator steering message for a session. What
@@ -2743,6 +2830,26 @@ fn main() {
             ),
         );
         app.set_needs_you(&id, &format!("server restarted while {was}"));
+    }
+    // A verified-done session whose successor never fired (the
+    // server died in the settle-to-fire window) must not stall in
+    // silence: fire its chain now — fire_successor re-verifies the
+    // done status under its lock before handing anything out.
+    let stalled_chains: Vec<String> = {
+        let sessions = app.sessions.lock().unwrap();
+        sessions
+            .iter()
+            .filter(|s| s.status == "done" && !s.next_queue.is_empty())
+            .map(|s| s.id.clone())
+            .collect()
+    };
+    for id in stalled_chains {
+        app.log(
+            &id,
+            "server restarted before this session's named successor was handed out — handing it out now"
+                .to_string(),
+        );
+        app.fire_successor(&id);
     }
     if !app.sessions.lock().unwrap().is_empty() {
         println!(
