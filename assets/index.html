@@ -50,8 +50,9 @@
 let selected = null;
 async function refresh() {
   const pol = await (await fetch('/api/policy')).json();
+  const agentBits = (pol.agents || []).map(a => `${a.name}: ${a.found ? 'found' : 'not found'}`).join(' · ');
   document.getElementById('policy').textContent =
-    `agent: ${pol.agent_cmd} · max parallel: ${pol.max_parallel} · policy: ${pol.source}`;
+    `agents — ${agentBits} · default: ${pol.default_agent ?? 'none'} · max parallel: ${pol.max_parallel} · policy: ${pol.source}`;
   const sessions = await (await fetch('/api/sessions')).json();
   const list = document.getElementById('sessions');
   list.innerHTML = '';
