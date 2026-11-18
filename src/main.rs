@@ -389,13 +389,37 @@ impl App {
         if let Some(parent) = wt.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["worktree", "add", "-b", &session.branch])
-            .arg(&wt)
-            .arg("HEAD")
-            .output();
+        // If the session's branch already exists (its worktree
+        // directory was deleted after an earlier run), restore the
+        // worktree from the branch — `add -b` would refuse, the branch
+        // exists, and the session's committed work would be stranded.
+        let out = if self.branch_exists(&session.repo, &session.branch) {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["worktree", "prune"])
+                .output();
+            self.log(
+                id,
+                "worktree directory was missing — restored from the session's branch; earlier committed work is intact"
+                    .to_string(),
+            );
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["worktree", "add"])
+                .arg(&wt)
+                .arg(&session.branch)
+                .output()
+        } else {
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["worktree", "add", "-b", &session.branch])
+                .arg(&wt)
+                .arg("HEAD")
+                .output()
+        };
         match out {
             Ok(o) if o.status.success() => {
                 self.log(id, format!("worktree ready on branch {}", session.branch));
@@ -572,6 +596,16 @@ impl App {
             self.set_needs_you(id, &format!("check failed: {}", session.check_cmd));
         }
         self.pump_queue();
+    }
+
+    fn branch_exists(&self, repo: &str, branch: &str) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 
     /// The ignored *files* (not directories) in a worktree. An agent's
