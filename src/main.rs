@@ -568,6 +568,31 @@ impl App {
                 session.status
             ));
         }
+        // Merge safety: the operator's own state in that repo is not
+        // ours to entangle. A merge already in progress, or uncommitted
+        // changes to tracked files, stops the merge before it starts.
+        let repo_path = Path::new(&session.repo);
+        if repo_path.join(".git").join("MERGE_HEAD").exists() {
+            return Err(
+                "repo already has a merge in progress — resolve or abort it before merging a session"
+                    .to_string(),
+            );
+        }
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&session.repo)
+            .args(["status", "--porcelain"])
+            .output()
+            .map_err(|e| e.to_string())?;
+        let dirty = String::from_utf8_lossy(&status.stdout)
+            .lines()
+            .any(|l| !l.starts_with("??"));
+        if dirty {
+            return Err(
+                "repo has uncommitted changes — commit or stash them before merging a session"
+                    .to_string(),
+            );
+        }
         let out = Command::new("git")
             .arg("-C")
             .arg(&session.repo)
@@ -576,9 +601,16 @@ impl App {
             .output()
             .map_err(|e| e.to_string())?;
         if !out.status.success() {
+            // Never leave the operator's repo mid-merge on our account.
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(&session.repo)
+                .args(["merge", "--abort"])
+                .output();
+            let detail = String::from_utf8_lossy(&out.stderr);
+            let first = detail.lines().next().unwrap_or("merge failed").trim();
             return Err(format!(
-                "merge failed: {}",
-                String::from_utf8_lossy(&out.stderr)
+                "merge conflict: {first} — the merge was aborted and nothing was merged"
             ));
         }
         self.set_status(id, Status::Merged);
