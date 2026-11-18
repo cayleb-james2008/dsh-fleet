@@ -108,7 +108,7 @@ impl Status {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 struct Session {
     id: String,
     task: String,
@@ -124,6 +124,11 @@ struct Session {
     #[serde(skip_serializing_if = "Option::is_none")]
     check_passed: Option<bool>,
     diff: String,
+    /// Why this session needs the operator, when it does. Set at every
+    /// needs-you transition so the inbox can aggregate reasons, not just
+    /// statuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
     transcript: Vec<String>,
 }
 
@@ -140,12 +145,46 @@ struct App {
 }
 
 impl App {
-    fn set_status(&self, id: &str, status: Status) {
-        let mut sessions = self.sessions.lock().unwrap();
-        if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
-            s.status = status.label().to_string();
-            s.bucket = status.bucket().to_string();
+    /// Snapshot all session state to disk (atomic rename), so a server
+    /// restart loses nothing. The per-session log files are the durable
+    /// transcript record; this file is the state snapshot.
+    fn persist(&self) {
+        let snapshot = {
+            let sessions = self.sessions.lock().unwrap();
+            let counter = self.counter.lock().unwrap();
+            serde_json::json!({ "counter": *counter, "sessions": *sessions })
+        };
+        let tmp = self.data_dir.join("sessions.json.tmp");
+        let dst = self.data_dir.join("sessions.json");
+        if std::fs::write(&tmp, snapshot.to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, &dst);
         }
+    }
+
+    fn set_status(&self, id: &str, status: Status) {
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
+                s.status = status.label().to_string();
+                s.bucket = status.bucket().to_string();
+            }
+        }
+        self.persist();
+    }
+
+    /// Mark a session needs-you with the reason recorded on the session
+    /// itself (the inbox aggregates these) and in its transcript.
+    fn set_needs_you(&self, id: &str, reason: &str) {
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
+                s.status = Status::NeedsYou.label().to_string();
+                s.bucket = Status::NeedsYou.bucket().to_string();
+                s.reason = Some(reason.to_string());
+            }
+        }
+        self.log(id, format!("needs you: {reason}"));
+        self.persist();
     }
     fn status_of(&self, id: &str) -> Option<String> {
         self.sessions
@@ -156,9 +195,29 @@ impl App {
             .map(|s| s.status.clone())
     }
     fn log(&self, id: &str, line: String) {
-        let mut sessions = self.sessions.lock().unwrap();
-        if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
-            s.transcript.push(line);
+        let count = {
+            let mut sessions = self.sessions.lock().unwrap();
+            match sessions.iter_mut().find(|s| s.id == id) {
+                Some(s) => {
+                    s.transcript.push(line.clone());
+                    s.transcript.len()
+                }
+                None => return,
+            }
+        };
+        // The per-session log file is written on every line: it is the
+        // transcript record that survives even a hard kill.
+        let logs_dir = self.data_dir.join("logs");
+        let _ = std::fs::create_dir_all(&logs_dir);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(logs_dir.join(format!("{id}.log")))
+        {
+            let _ = writeln!(f, "{line}");
+        }
+        if count % 25 == 0 {
+            self.persist();
         }
     }
     fn active_count(&self) -> i64 {
@@ -231,13 +290,13 @@ impl App {
                         String::from_utf8_lossy(&o.stderr)
                     ),
                 );
-                self.set_status(id, Status::NeedsYou);
+                self.set_needs_you(id, "worktree creation failed");
                 self.pump_queue();
                 return;
             }
             Err(e) => {
                 self.log(id, format!("could not run git: {e}"));
-                self.set_status(id, Status::NeedsYou);
+                self.set_needs_you(id, "could not run git");
                 self.pump_queue();
                 return;
             }
@@ -255,7 +314,7 @@ impl App {
             Ok(c) => c,
             Err(e) => {
                 self.log(id, format!("agent failed to start: {e}"));
-                self.set_status(id, Status::NeedsYou);
+                self.set_needs_you(id, &format!("agent failed to start: {}", self.agent_cmd));
                 self.pump_queue();
                 return;
             }
@@ -288,7 +347,7 @@ impl App {
         }
         if !agent_ok {
             self.log(id, "agent exited non-zero — handing back to you".to_string());
-            self.set_status(id, Status::NeedsYou);
+            self.set_needs_you(id, "agent exited non-zero");
             self.pump_queue();
             return;
         }
@@ -337,12 +396,13 @@ impl App {
                 s.diff = diff;
             }
         }
+        self.persist();
         if passed {
             self.log(id, "check passed — verified done".to_string());
             self.set_status(id, Status::Done);
         } else {
             self.log(id, "check FAILED — this needs you".to_string());
-            self.set_status(id, Status::NeedsYou);
+            self.set_needs_you(id, &format!("check failed: {}", session.check_cmd));
         }
         self.pump_queue();
     }
@@ -490,9 +550,11 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 check_output: None,
                 check_passed: None,
                 diff: String::new(),
+                reason: None,
                 transcript: Vec::new(),
             };
             app.sessions.lock().unwrap().push(session.clone());
+            app.persist();
             app.maybe_start(&id);
             json_response(201, &serde_json::to_string(&session).unwrap())
         }
@@ -513,6 +575,32 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
         }
         _ => json_response(404, "{\"error\":\"not found\"}"),
     }
+}
+
+/// Load the persisted snapshot from a previous run, if one exists.
+/// Transcripts are refreshed from the per-session log files, which are
+/// written on every line and so can be ahead of the last snapshot.
+fn load_persisted(data_dir: &Path) -> (Vec<Session>, u64) {
+    let path = data_dir.join("sessions.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return (Vec::new(), 0);
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return (Vec::new(), 0);
+    };
+    let counter = v["counter"].as_u64().unwrap_or(0);
+    let mut sessions: Vec<Session> =
+        serde_json::from_value(v["sessions"].clone()).unwrap_or_default();
+    for s in sessions.iter_mut() {
+        let log_path = data_dir.join("logs").join(format!("{}.log", s.id));
+        if let Ok(text) = std::fs::read_to_string(&log_path) {
+            let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+            if lines.len() > s.transcript.len() {
+                s.transcript = lines;
+            }
+        }
+    }
+    (sessions, counter)
 }
 
 fn main() {
@@ -545,19 +633,50 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./fleet-data"));
     let _ = std::fs::create_dir_all(data_dir.join("worktrees"));
+    let _ = std::fs::create_dir_all(data_dir.join("logs"));
 
     let run_tag = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
         .unwrap_or_else(|_| "run".to_string());
+    let (restored, restored_counter) = load_persisted(&data_dir);
     let app = Arc::new(App {
         policy,
         agent_cmd,
         data_dir,
         run_tag,
-        sessions: Mutex::new(Vec::new()),
-        counter: Mutex::new(0),
+        sessions: Mutex::new(restored),
+        counter: Mutex::new(restored_counter),
     });
+
+    // Recovery: a session that was mid-work when the server died cannot
+    // honestly still be "working" — nobody is running it. Mark it
+    // needs-you with the reason stated; queued sessions never started,
+    // so they simply resume through the queue.
+    let interrupted: Vec<(String, String)> = {
+        let sessions = app.sessions.lock().unwrap();
+        sessions
+            .iter()
+            .filter(|s| s.status == "working" || s.status == "checking")
+            .map(|s| (s.id.clone(), s.status.clone()))
+            .collect()
+    };
+    for (id, was) in interrupted {
+        app.log(
+            &id,
+            format!(
+                "server restarted while this session was {was} — the worktree is intact; retry it or inspect it"
+            ),
+        );
+        app.set_needs_you(&id, &format!("server restarted while {was}"));
+    }
+    if !app.sessions.lock().unwrap().is_empty() {
+        println!(
+            "fleet-rs: restored {} session(s) from disk",
+            app.sessions.lock().unwrap().len()
+        );
+    }
+    app.pump_queue();
 
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind failed");
     println!("fleet-rs listening on http://127.0.0.1:{port} (agent: {}, max_parallel: {})", app.agent_cmd, app.policy.max_parallel);
@@ -657,6 +776,7 @@ mod tests {
             check_output: None,
             check_passed: None,
             diff: String::new(),
+            reason: None,
             transcript: Vec::new(),
         };
         app.sessions.lock().unwrap().push(session);
