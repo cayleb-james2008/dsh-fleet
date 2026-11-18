@@ -73,6 +73,101 @@ impl Policy {
 }
 
 // ---------------------------------------------------------------------------
+// Agent detection — support is detected, never assumed
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Serialize)]
+struct AgentInfo {
+    name: String,
+    found: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+/// The CLI agents fleet-rs knows how to drive, probed against the real
+/// PATH at startup. A name is "found" only when `which` resolves it.
+fn detect_agents() -> Vec<AgentInfo> {
+    ["opencode", "claude", "codex"]
+        .iter()
+        .map(|name| {
+            let path = Command::new("which")
+                .arg(name)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty());
+            AgentInfo {
+                name: name.to_string(),
+                found: path.is_some(),
+                path,
+            }
+        })
+        .collect()
+}
+
+fn is_executable(p: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        p.exists()
+    }
+}
+
+/// Validate an agent reference: a bare name must be a detected, installed
+/// agent; a path must be an executable file. Anything else is refused
+/// with the problem named — before any session or worktree exists.
+fn validate_agent(app: &App, agent: &str) -> Result<String, String> {
+    if agent.contains('/') {
+        if is_executable(Path::new(agent)) {
+            Ok(agent.to_string())
+        } else {
+            Err(format!("agent '{agent}' is not an executable file"))
+        }
+    } else {
+        match app.agents.iter().find(|a| a.name == agent) {
+            Some(a) if a.found => Ok(agent.to_string()),
+            _ => {
+                let found: Vec<&str> = app
+                    .agents
+                    .iter()
+                    .filter(|a| a.found)
+                    .map(|a| a.name.as_str())
+                    .collect();
+                Err(format!(
+                    "agent '{agent}' is not available on this machine — detected agents: {}",
+                    if found.is_empty() {
+                        "none".to_string()
+                    } else {
+                        found.join(", ")
+                    }
+                ))
+            }
+        }
+    }
+}
+
+fn resolve_agent(app: &App, requested: Option<&str>) -> Result<String, String> {
+    match requested {
+        Some(a) if !a.is_empty() => validate_agent(app, a),
+        _ => match &app.default_agent {
+            Some(d) => validate_agent(app, d)
+                .map_err(|e| format!("the configured default agent is unusable: {e}")),
+            None => Err(
+                "no agent available: none of opencode, claude, codex is installed and FLEET_AGENT is not set"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------
 
@@ -118,6 +213,11 @@ struct Session {
     worktree: String,
     status: String,
     bucket: String,
+    /// The agent this session runs under (a detected name or an
+    /// executable path), recorded at hand-out so retries and the UI can
+    /// say exactly what ran.
+    #[serde(default)]
+    agent: String,
     check_cmd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     check_output: Option<String>,
@@ -134,7 +234,8 @@ struct Session {
 
 struct App {
     policy: Policy,
-    agent_cmd: String,
+    agents: Vec<AgentInfo>,
+    default_agent: Option<String>,
     data_dir: PathBuf,
     /// Tag unique to this server run, baked into session ids and branch
     /// names so a restarted server can never collide with worktrees or
@@ -304,7 +405,7 @@ impl App {
 
         // 2. Run the agent in the worktree, streaming its output.
         self.log(id, format!("agent started: {}", session.task));
-        let child = Command::new(&self.agent_cmd)
+        let child = Command::new(&session.agent)
             .arg(&session.task)
             .current_dir(&wt)
             .stdout(Stdio::piped())
@@ -314,7 +415,7 @@ impl App {
             Ok(c) => c,
             Err(e) => {
                 self.log(id, format!("agent failed to start: {e}"));
-                self.set_needs_you(id, &format!("agent failed to start: {}", self.agent_cmd));
+                self.set_needs_you(id, &format!("agent failed to start: {}", session.agent));
                 self.pump_queue();
                 return;
             }
@@ -496,7 +597,8 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
             200,
             &serde_json::json!({
                 "max_parallel": app.policy.max_parallel,
-                "agent_cmd": app.agent_cmd,
+                "agents": app.agents,
+                "default_agent": app.default_agent,
                 "source": "policies.rn (Rune)"
             })
             .to_string(),
@@ -516,6 +618,18 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
             if task.is_empty() || repo.is_empty() {
                 return json_response(400, "{\"error\":\"task and repo are required\"}");
             }
+            // The agent is resolved and validated before anything is
+            // created: an unavailable agent is a refusal, not a session
+            // that fails later in a worktree nobody asked for.
+            let agent = match resolve_agent(app, req["agent"].as_str()) {
+                Ok(a) => a,
+                Err(e) => {
+                    return json_response(
+                        400,
+                        &serde_json::json!({ "error": e }).to_string(),
+                    )
+                }
+            };
             if !Path::new(&repo).join(".git").exists() {
                 return json_response(400, "{\"error\":\"repo is not a git repository\"}");
             }
@@ -546,6 +660,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                     .to_string(),
                 status: Status::Queued.label().to_string(),
                 bucket: Status::Queued.bucket().to_string(),
+                agent,
                 check_cmd,
                 check_output: None,
                 check_passed: None,
@@ -609,19 +724,16 @@ fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8471);
-    let agent_cmd = std::env::var("FLEET_AGENT").unwrap_or_else(|_| {
-        for candidate in ["opencode", "claude", "codex"] {
-            if Command::new("which")
-                .arg(candidate)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-            {
-                return candidate.to_string();
-            }
-        }
-        "codex".to_string()
-    });
+    let agents = detect_agents();
+    let default_agent = std::env::var("FLEET_AGENT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            agents
+                .iter()
+                .find(|a| a.found)
+                .map(|a| a.name.clone())
+        });
     let policy_path = args
         .get(1)
         .cloned()
@@ -642,7 +754,8 @@ fn main() {
     let (restored, restored_counter) = load_persisted(&data_dir);
     let app = Arc::new(App {
         policy,
-        agent_cmd,
+        agents,
+        default_agent,
         data_dir,
         run_tag,
         sessions: Mutex::new(restored),
@@ -679,7 +792,17 @@ fn main() {
     app.pump_queue();
 
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind failed");
-    println!("fleet-rs listening on http://127.0.0.1:{port} (agent: {}, max_parallel: {})", app.agent_cmd, app.policy.max_parallel);
+    let detected: Vec<String> = app
+        .agents
+        .iter()
+        .map(|a| format!("{}:{}", a.name, if a.found { "found" } else { "not found" }))
+        .collect();
+    println!(
+        "fleet-rs listening on http://127.0.0.1:{port} (agents: {}; default: {}; max_parallel: {})",
+        detected.join(", "),
+        app.default_agent.as_deref().unwrap_or("none"),
+        app.policy.max_parallel
+    );
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
@@ -756,7 +879,8 @@ mod tests {
         }
         let app = Arc::new(App {
             policy: Policy::load(SCRIPT).unwrap(),
-            agent_cmd: agent.to_string_lossy().to_string(),
+            agents: Vec::new(),
+            default_agent: Some(agent.to_string_lossy().to_string()),
             data_dir: dir.join("data"),
             run_tag: "test".to_string(),
             sessions: Mutex::new(Vec::new()),
@@ -772,6 +896,7 @@ mod tests {
             worktree: dir.join("data/worktrees/s1").to_string_lossy().to_string(),
             status: Status::Queued.label().to_string(),
             bucket: Status::Queued.bucket().to_string(),
+            agent: agent.to_string_lossy().to_string(),
             check_cmd: "test -s output.txt".to_string(),
             check_output: None,
             check_passed: None,
