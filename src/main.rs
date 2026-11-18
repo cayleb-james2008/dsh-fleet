@@ -34,6 +34,30 @@ const TRANSCRIPT_CAP: usize = 2000;
 /// Stored check output / diff cap, in characters.
 const OUTPUT_CAP: usize = 256_000;
 
+/// Does a symlink stored at `path` (repo-relative) with the text
+/// target `target` resolve outside the repo? Absolute targets always
+/// do; relative ones do when their `..` components climb past the
+/// repo root.
+fn symlink_escapes(path: &str, target: &str) -> bool {
+    if target.starts_with('/') {
+        return true;
+    }
+    let mut depth = path.matches('/').count() as i64; // dirs above the file
+    for part in target.split('/') {
+        match part {
+            ".." => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            "." | "" => {}
+            _ => depth += 1,
+        }
+    }
+    false
+}
+
 /// Truncate stored text to OUTPUT_CAP chars with an honest note.
 fn truncate_output(text: String) -> String {
     if text.chars().count() > OUTPUT_CAP {
@@ -264,6 +288,12 @@ struct Session {
     /// statuses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    /// The exact commit the check verified, recorded when the session
+    /// is marked done. Merging consumes this commit, never the
+    /// branch's later tip: work added after verification is not
+    /// verified work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verified_commit: Option<String>,
     transcript: Vec<String>,
 }
 
@@ -345,6 +375,7 @@ impl App {
                 s.status = Status::NeedsYou.label().to_string();
                 s.bucket = Status::NeedsYou.bucket().to_string();
                 s.reason = Some(reason.to_string());
+                s.verified_commit = None;
             }
         }
         self.log(id, format!("needs you: {reason}"));
@@ -644,9 +675,55 @@ impl App {
             self.pump_queue();
             return;
         }
-        self.log(id, "agent claims completion — running the check".to_string());
+        self.log(
+            id,
+            "agent claims completion — committing its work, then running the check on the committed tree"
+                .to_string(),
+        );
+        self.set_status(id, Status::Checking);
 
-        // 3. Verified done: the app runs the task's check itself.
+        // 3. Commit FIRST, so the check's verdict describes the exact
+        // tree a merge would land. A pre-commit hook that rewrites
+        // files during the commit changes that tree — the check must
+        // judge the tree as committed, not the one the agent left.
+        let _ = Command::new("git").arg("-C").arg(wt).args(["add", "-A"]).output();
+        // Files the agent produced that this repo gitignores are not in
+        // the commit and can never be merged — surface them, by name.
+        let new_ignored: Vec<String> = Self::ignored_files(wt)
+            .into_iter()
+            .filter(|p| !ignored_baseline.contains(p))
+            .collect();
+        let commit = Command::new("git")
+            .arg("-C")
+            .arg(wt)
+            .args(["-c", "user.email=fleet@localhost", "-c", "user.name=fleet-rs"])
+            .args(["commit", "--allow-empty", "-m", &format!("fleet session {}: {}", id, session.task)])
+            .output();
+        let commit_error = match &commit {
+            Ok(o) if o.status.success() => None,
+            Ok(o) => Some(
+                String::from_utf8_lossy(&o.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("git commit failed")
+                    .trim()
+                    .to_string(),
+            ),
+            Err(e) => Some(format!("could not run git commit: {e}")),
+        };
+        // The commit the check is about to verify — the merge will
+        // consume exactly this commit, never the branch's later tip.
+        let tip = Command::new("git")
+            .arg("-C")
+            .arg(wt)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+        // 4. Verified done: the app runs the task's check itself, on
+        // the committed tree (the worktree now matches the commit).
         self.set_status(id, Status::Checking);
         let timeout = self.policy.timeout_secs;
         let check_child = Command::new("sh")
@@ -690,45 +767,11 @@ impl App {
             Err(e) => (false, format!("check could not run: {e}"), false),
         };
 
-        // 4. Capture the diff and commit the worktree so it can be merged.
-        let _ = Command::new("git").arg("-C").arg(wt).args(["add", "-A"]).output();
-        let diff = Command::new("git")
-            .arg("-C")
-            .arg(wt)
-            .args(["diff", "--cached"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default();
-        // Files the agent produced that this repo gitignores are not in
-        // the diff and can never be committed — surface them, by name.
-        let new_ignored: Vec<String> = Self::ignored_files(wt)
-            .into_iter()
-            .filter(|p| !ignored_baseline.contains(p))
-            .collect();
-        let commit = Command::new("git")
-            .arg("-C")
-            .arg(wt)
-            .args(["-c", "user.email=fleet@localhost", "-c", "user.name=fleet-rs"])
-            .args(["commit", "--allow-empty", "-m", &format!("fleet session {}: {}", id, session.task)])
-            .output();
-        let commit_error = match &commit {
-            Ok(o) if o.status.success() => None,
-            Ok(o) => Some(
-                String::from_utf8_lossy(&o.stderr)
-                    .lines()
-                    .next()
-                    .unwrap_or("git commit failed")
-                    .trim()
-                    .to_string(),
-            ),
-            Err(e) => Some(format!("could not run git commit: {e}")),
-        };
-
-        // The diff the operator reviews before merging must be
+        // 5. The diff the operator reviews before merging must be
         // everything the merge will land: the branch's whole history
-        // against the repo, not just this run's staged changes. A
-        // retried session commits across runs; showing only the last
-        // run's diff would misstate the merge.
+        // against the repo, not just this run's changes. A retried
+        // session commits across runs; showing only the last run's
+        // diff would misstate the merge.
         let diff = Command::new("git")
             .arg("-C")
             .arg(&session.repo)
@@ -736,7 +779,14 @@ impl App {
             .arg(format!("HEAD...{}", session.branch))
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or(diff);
+            .unwrap_or_default();
+        // Problems inside the committed tree itself: a nested repo
+        // (bare gitlink) or an escaping symlink would make "merged"
+        // a lie no matter what the check said.
+        let tree_problems = tip
+            .as_deref()
+            .map(|t| Self::tree_problems(wt, t))
+            .unwrap_or_default();
         // The full check output goes to the session's log file before
         // the stored copy is capped — the cap must never lose it.
         self.append_log_text(id, &format!("--- check output ---\n{output}"));
@@ -745,7 +795,9 @@ impl App {
             if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
                 s.check_output = Some(truncate_output(output));
                 s.check_passed = Some(passed);
-                s.diff = truncate_output(diff);
+                s.diff = truncate_output(diff.clone());
+                // Provisional: every needs-you path below clears it.
+                s.verified_commit = tip.clone();
             }
         }
         self.persist();
@@ -754,6 +806,13 @@ impl App {
             // the usual cause) — never let it be called done.
             self.log(id, format!("commit failed: {err}"));
             self.set_needs_you(id, &format!("could not commit the session's work: {err}"));
+        } else if !tree_problems.is_empty() {
+            let named = tree_problems.join("; ");
+            self.log(id, format!("the committed tree cannot be merged as work: {named}"));
+            self.set_needs_you(
+                id,
+                &format!("the committed tree cannot be merged as work: {named}"),
+            );
         } else if passed && !new_ignored.is_empty() {
             self.log(
                 id,
@@ -768,6 +827,18 @@ impl App {
                     "agent produced files this repo gitignores — they cannot be committed or merged: {}",
                     new_ignored.join(", ")
                 ),
+            );
+        } else if passed && diff.trim().is_empty() {
+            // The check passed on state the session did not change —
+            // there is no work to verify or merge, and calling it
+            // "verified done" would invent both.
+            self.log(
+                id,
+                "check passed but the session produced no changes — nothing to verify or merge".to_string(),
+            );
+            self.set_needs_you(
+                id,
+                "the check passed but this session produced no changes in its worktree — nothing to verify or merge (the check may be passing on pre-existing state)",
             );
         } else if passed {
             self.log(id, "check passed — verified done".to_string());
@@ -798,38 +869,72 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// The ignored *files* (not directories) in a worktree. An agent's
-    /// work product that the repo gitignores can never be committed or
-    /// merged — the app must notice, or "done" would be invented.
+    /// The ignored files in a worktree, enumerated by CONTENT:
+    /// ls-files lists the files inside ignored directories, where
+    /// `git status --ignored` collapses a whole directory to a single
+    /// `!! build/` line. An agent's work product that the repo
+    /// gitignores can never be committed or merged — the app must
+    /// notice, or "done" would be invented.
     fn ignored_files(wt: &Path) -> Vec<String> {
         let out = Command::new("git")
             .arg("-C")
             .arg(wt)
-            .args(["status", "--porcelain", "--ignored=matching"])
+            .args(["ls-files", "--others", "--ignored", "--exclude-standard"])
             .output();
         match out {
             Ok(o) => String::from_utf8_lossy(&o.stdout)
                 .lines()
-                .filter_map(|l| l.strip_prefix("!! "))
                 .map(|p| p.trim().to_string())
-                .filter(|p| !p.ends_with('/'))
+                .filter(|p| !p.is_empty())
                 .collect(),
             Err(_) => Vec::new(),
         }
     }
 
-    /// The ignored-files baseline for a session: snapshotted before the
-    /// agent first runs and kept on disk, so a retry compares against
-    /// the same baseline and only flags files the agent produced.
-    fn ignored_baseline(&self, id: &str, wt: &Path) -> std::collections::HashSet<String> {
-        let meta = self.data_dir.join("meta").join(format!("{id}.ignored"));
-        if let Ok(text) = std::fs::read_to_string(&meta) {
-            return text.lines().map(|l| l.to_string()).collect();
+    /// The ignored-files baseline for one run: the ignored files
+    /// already in the worktree when the agent starts. Only files a run
+    /// ADDS to that set are the run's own — an earlier run's ignored
+    /// leftovers must not block this run forever.
+    fn ignored_baseline(&self, _id: &str, wt: &Path) -> std::collections::HashSet<String> {
+        Self::ignored_files(wt).into_iter().collect()
+    }
+
+    /// Problems in the committed tree that would make "merged" a lie:
+    /// a nested git repository commits as a bare gitlink (its content
+    /// never enters this repo), and a symlink whose target is absolute
+    /// or escapes the repo lands as a pointer to somewhere else.
+    fn tree_problems(wt: &Path, commit: &str) -> Vec<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(wt)
+            .args(["ls-tree", "-r", commit])
+            .output();
+        let mut problems = Vec::new();
+        let Ok(o) = out else { return problems };
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            // "<mode> <type> <hash>\t<path>"
+            let Some((meta, path)) = line.split_once('\t') else { continue };
+            let mode = meta.split_whitespace().next().unwrap_or("");
+            if mode == "160000" {
+                problems.push(format!(
+                    "{path} is a nested git repository — it commits as a bare pointer and its content never enters this repo"
+                ));
+            } else if mode == "120000" {
+                let target = Command::new("git")
+                    .arg("-C")
+                    .arg(wt)
+                    .args(["cat-file", "-p", &format!("{commit}:{path}")])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                if symlink_escapes(path, &target) {
+                    problems.push(format!(
+                        "{path} is a symlink to '{target}', outside this repo — merging it would land a pointer, not the work"
+                    ));
+                }
+            }
         }
-        let files = Self::ignored_files(wt);
-        let _ = std::fs::create_dir_all(self.data_dir.join("meta"));
-        let _ = std::fs::write(&meta, files.join("\n"));
-        files.into_iter().collect()
+        problems
     }
 
     /// Hand a needs-you session back to its agent: the check state is
@@ -861,7 +966,7 @@ impl App {
         Ok(())
     }
 
-    fn merge(&self, id: &str) -> Result<(), String> {
+    fn merge(&self, id: &str) -> Result<String, String> {
         let session = {
             let sessions = self.sessions.lock().unwrap();
             sessions
@@ -875,6 +980,28 @@ impl App {
                 "session is '{}' — only a verified-done session can be merged",
                 session.status
             ));
+        }
+        // The merge consumes the exact commit the check verified —
+        // never the branch's later tip, which may carry work nobody
+        // checked.
+        let Some(pin) = session.verified_commit.clone() else {
+            return Err(
+                "this session has no verified commit recorded — retry it so its work is verified before merging"
+                    .to_string(),
+            );
+        };
+        if !self.branch_exists(&session.repo, &session.branch) {
+            // The verified work itself is gone; "done" no longer
+            // describes anything real. Move the session back to
+            // Needs you so it can be retried, and say what happened.
+            self.set_needs_you(
+                id,
+                "the session's branch no longer exists — the verified work is gone; retry to run it again",
+            );
+            return Err(
+                "the session's branch no longer exists — the session was moved to Needs you; retry it to re-run the work"
+                    .to_string(),
+            );
         }
         // Merge safety: the operator's own state in that repo is not
         // ours to entangle. A merge already in progress, or uncommitted
@@ -901,11 +1028,26 @@ impl App {
                     .to_string(),
             );
         }
+        // A detached HEAD advances no branch: the merge would
+        // "succeed" into limbo and be orphaned at the next checkout.
+        let on_branch = Command::new("git")
+            .arg("-C")
+            .arg(&session.repo)
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !on_branch {
+            return Err(
+                "repo is on a detached HEAD — check out a branch before merging a session, or the work lands on no branch"
+                    .to_string(),
+            );
+        }
         let out = Command::new("git")
             .arg("-C")
             .arg(&session.repo)
             .args(["merge", "--no-ff", "-m", &format!("merge fleet session {id}")])
-            .arg(&session.branch)
+            .arg(&pin)
             .output()
             .map_err(|e| e.to_string())?;
         if !out.status.success() {
@@ -952,7 +1094,7 @@ impl App {
         let landed = Command::new("git")
             .arg("-C")
             .arg(&session.repo)
-            .args(["merge-base", "--is-ancestor", &session.branch, "HEAD"])
+            .args(["merge-base", "--is-ancestor", &pin, "HEAD"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -963,7 +1105,7 @@ impl App {
             );
         }
         self.set_status(id, Status::Merged);
-        Ok(())
+        Ok(pin)
     }
 }
 
@@ -1133,6 +1275,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 check_passed: None,
                 diff: String::new(),
                 reason: None,
+                verified_commit: None,
                 transcript: Vec::new(),
             };
             app.sessions.lock().unwrap().push(session.clone());
@@ -1165,7 +1308,10 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
         ("POST", route) if route.starts_with("/api/sessions/") && route.ends_with("/merge") => {
             let id = &route["/api/sessions/".len()..route.len() - "/merge".len()];
             match app.merge(id) {
-                Ok(()) => json_response(200, "{\"merged\":true}"),
+                Ok(commit) => json_response(
+                    200,
+                    &format!("{{\"merged\":true,\"commit\":\"{commit}\"}}"),
+                ),
                 Err(e) => error_response(409, &e),
             }
         }
@@ -1415,6 +1561,7 @@ mod tests {
             check_passed: None,
             diff: String::new(),
             reason: None,
+            verified_commit: None,
             transcript: Vec::new(),
         };
         app.sessions.lock().unwrap().push(session);
