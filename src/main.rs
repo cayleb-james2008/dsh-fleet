@@ -107,6 +107,11 @@ fn detect_agents() -> Vec<AgentInfo> {
 }
 
 fn is_executable(p: &Path) -> bool {
+    // A directory passes a mode-bits check on unix (its x bits mean
+    // "searchable") — an agent must be a regular file first.
+    if !p.is_file() {
+        return false;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -116,7 +121,7 @@ fn is_executable(p: &Path) -> bool {
     }
     #[cfg(not(unix))]
     {
-        p.exists()
+        true
     }
 }
 
@@ -234,6 +239,9 @@ struct Session {
 
 struct App {
     policy: Policy,
+    /// The policy file actually loaded (argv), reported by /api/policy
+    /// as the source — never a hardcoded display string.
+    policy_source: String,
     agents: Vec<AgentInfo>,
     default_agent: Option<String>,
     data_dir: PathBuf,
@@ -775,6 +783,13 @@ fn sessions_json(sessions: &[Session]) -> serde_json::Value {
     serde_json::Value::Array(arr)
 }
 
+fn error_response(status: u16, message: &str) -> String {
+    json_response(
+        status,
+        &serde_json::json!({ "error": message }).to_string(),
+    )
+}
+
 fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
     let (route, query) = match path.split_once('?') {
         Some((r, q)) => (r, q),
@@ -789,7 +804,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 "max_parallel": app.policy.max_parallel,
                 "agents": app.agents,
                 "default_agent": app.default_agent,
-                "source": "policies.rn (Rune)"
+                "source": app.policy_source
             })
             .to_string(),
         ),
@@ -800,13 +815,13 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
         ("POST", "/api/sessions") => {
             let req: serde_json::Value = match serde_json::from_str(body) {
                 Ok(v) => v,
-                Err(e) => return json_response(400, &format!("{{\"error\":\"bad json: {e}\"}}")),
+                Err(e) => return error_response(400, &format!("bad json: {e}")),
             };
             let task = req["task"].as_str().unwrap_or("").to_string();
             let repo = req["repo"].as_str().unwrap_or("").to_string();
             let project = req["project"].as_str().unwrap_or("default").to_string();
             if task.is_empty() || repo.is_empty() {
-                return json_response(400, "{\"error\":\"task and repo are required\"}");
+                return error_response(400, "task and repo are required");
             }
             // The agent is resolved and validated before anything is
             // created: an unavailable agent is a refusal, not a session
@@ -821,13 +836,13 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 }
             };
             if !Path::new(&repo).join(".git").exists() {
-                return json_response(400, "{\"error\":\"repo is not a git repository\"}");
+                return error_response(400, "repo is not a git repository");
             }
             let check_cmd = match req["check"].as_str() {
                 Some(c) if !c.is_empty() => c.to_string(),
                 _ => match app.policy.default_check(&project) {
                     Ok(c) => c,
-                    Err(e) => return json_response(500, &format!("{{\"error\":\"{e}\"}}")),
+                    Err(e) => return error_response(500, &e),
                 },
             };
             let n = {
@@ -882,21 +897,21 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 .and_then(|a| a.iter().find(|v| v["id"].as_str() == Some(id)).cloned())
             {
                 Some(v) => json_response(200, &v.to_string()),
-                None => json_response(404, "{\"error\":\"no such session\"}"),
+                None => error_response(404, "no such session"),
             }
         }
         ("POST", route) if route.starts_with("/api/sessions/") && route.ends_with("/merge") => {
             let id = &route["/api/sessions/".len()..route.len() - "/merge".len()];
             match app.merge(id) {
                 Ok(()) => json_response(200, "{\"merged\":true}"),
-                Err(e) => json_response(409, &format!("{{\"error\":\"{e}\"}}")),
+                Err(e) => error_response(409, &e),
             }
         }
         ("POST", route) if route.starts_with("/api/sessions/") && route.ends_with("/retry") => {
             let id = &route["/api/sessions/".len()..route.len() - "/retry".len()];
             match app.retry(id) {
                 Ok(()) => json_response(200, "{\"retried\":true}"),
-                Err(e) => json_response(409, &format!("{{\"error\":\"{e}\"}}")),
+                Err(e) => error_response(409, &e),
             }
         }
         ("GET", "/api/inbox") => {
@@ -911,7 +926,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 .collect();
             json_response(200, &serde_json::Value::Array(inbox).to_string())
         }
-        _ => json_response(404, "{\"error\":\"not found\"}"),
+        _ => error_response(404, "not found"),
     }
 }
 
@@ -977,6 +992,7 @@ fn main() {
     let (restored, restored_counter) = load_persisted(&data_dir);
     let app = Arc::new(App {
         policy,
+        policy_source: policy_path.clone(),
         agents,
         default_agent,
         data_dir,
@@ -1102,6 +1118,7 @@ mod tests {
         }
         let app = Arc::new(App {
             policy: Policy::load(SCRIPT).unwrap(),
+            policy_source: "policies.rn".to_string(),
             agents: Vec::new(),
             default_agent: Some(agent.to_string_lossy().to_string()),
             data_dir: dir.join("data"),
