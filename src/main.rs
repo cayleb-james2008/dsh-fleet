@@ -31,6 +31,8 @@ const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
 /// In-memory transcript cap per session (the on-disk log is uncapped).
 const TRANSCRIPT_CAP: usize = 2000;
+/// Stored-transcript byte budget per session (see log()).
+const TRANSCRIPT_BYTES: usize = 512 * 1024;
 /// Stored check output / diff cap, in characters.
 const OUTPUT_CAP: usize = 256_000;
 
@@ -310,6 +312,9 @@ struct App {
     /// branches a previous run left in the target repo.
     run_tag: String,
     sessions: Mutex<Vec<Session>>,
+    /// Transcript lines logged since the last snapshot — the persist
+    /// cadence counter (see log()).
+    lines_since_persist: std::sync::atomic::AtomicU64,
     counter: Mutex<u64>,
 }
 
@@ -508,7 +513,11 @@ impl App {
             let counter = self.counter.lock().unwrap();
             serde_json::json!({ "counter": *counter, "sessions": *sessions })
         };
-        let tmp = self.data_dir.join("sessions.json.tmp");
+        static PERSIST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = PERSIST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = self
+            .data_dir
+            .join(format!("sessions.json.tmp.{}-{}", std::process::id(), seq));
         let dst = self.data_dir.join("sessions.json");
         if std::fs::write(&tmp, snapshot.to_string()).is_ok() {
             let _ = std::fs::rename(&tmp, &dst);
@@ -588,6 +597,25 @@ impl App {
                                 .to_string(),
                         );
                     }
+                    // The byte budget binds even when the line count
+                    // does not: a few enormous lines must not bloat
+                    // memory, the snapshot, or every API response.
+                    let bytes: usize = s.transcript.iter().map(|l| l.len() + 1).sum();
+                    if bytes > TRANSCRIPT_BYTES {
+                        let mut over = bytes - TRANSCRIPT_BYTES;
+                        // Keep the marker (index 0 when present) and
+                        // the newest lines; drop oldest real lines.
+                        let start = if s.transcript.first().is_some_and(|l| l.starts_with('…')) {
+                            1
+                        } else {
+                            0
+                        };
+                        let mut idx = start;
+                        while over > 0 && s.transcript.len() > idx + 1 {
+                            over = over.saturating_sub(s.transcript[idx].len() + 1);
+                            s.transcript.remove(idx);
+                        }
+                    }
                     s.transcript.len()
                 }
                 None => return,
@@ -604,7 +632,14 @@ impl App {
         {
             let _ = writeln!(f, "{line}");
         }
-        if count % 25 == 0 {
+        let _ = count;
+        let since = self
+            .lines_since_persist
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if since >= 25 {
+            self.lines_since_persist
+                .store(0, std::sync::atomic::Ordering::Relaxed);
             self.persist();
         }
     }
@@ -888,7 +923,7 @@ impl App {
             .unwrap_or_default();
         // The full check output goes to the session's log file before
         // the stored copy is capped — the cap must never lose it.
-        self.append_log_text(id, &format!("--- check output ---\n{output}"));
+        self.append_log_text(id, &format!("--- check output ---\n{output}\n--- end check output ---"));
         {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
@@ -1452,27 +1487,138 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
 /// Load the persisted snapshot from a previous run, if one exists.
 /// Transcripts are refreshed from the per-session log files, which are
 /// written on every line and so can be ahead of the last snapshot.
-fn load_persisted(data_dir: &Path) -> (Vec<Session>, u64) {
-    let path = data_dir.join("sessions.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return (Vec::new(), 0);
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return (Vec::new(), 0);
-    };
-    let counter = v["counter"].as_u64().unwrap_or(0);
-    let mut sessions: Vec<Session> =
-        serde_json::from_value(v["sessions"].clone()).unwrap_or_default();
-    for s in sessions.iter_mut() {
-        let log_path = data_dir.join("logs").join(format!("{}.log", s.id));
-        if let Ok(text) = std::fs::read_to_string(&log_path) {
-            let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
-            if lines.len() > s.transcript.len() {
-                s.transcript = lines;
-            }
+/// The transcript lines a session's log file actually holds: the
+/// check-output blocks the runner appends to the same file are not
+/// transcript (they sit between the markers; older logs have no end
+/// marker, so their block runs to the end of the file).
+fn transcript_lines_from_log(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_check_block = false;
+    for line in text.lines() {
+        if line == "--- check output ---" {
+            in_check_block = true;
+            continue;
+        }
+        if line == "--- end check output ---" {
+            in_check_block = false;
+            continue;
+        }
+        if !in_check_block {
+            out.push(line.to_string());
         }
     }
-    (sessions, counter)
+    out
+}
+
+/// Cap a restored transcript exactly as log() caps a live one: the
+/// restart must not resurrect lines the cap had already dropped.
+fn cap_transcript(lines: Vec<String>) -> Vec<String> {
+    if lines.len() <= TRANSCRIPT_CAP {
+        return lines;
+    }
+    let mut kept: Vec<String> = vec![
+        "… earlier lines are in this session's log file on disk — this view keeps the most recent lines"
+            .to_string(),
+    ];
+    kept.extend(lines.into_iter().rev().take(TRANSCRIPT_CAP - 1).rev());
+    kept
+}
+
+/// Rebuild sessions from their log files when the store itself is
+/// gone or unreadable. The logs, worktrees and branches survive a
+/// lost sessions.json; the sessions must not silently vanish with
+/// it. A recovered session says what happened and lands in Needs
+/// you — its repo and check settings lived only in the store.
+fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
+    let logs_dir = data_dir.join("logs");
+    let mut sessions = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&logs_dir) else {
+        return sessions;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let Some(id) = path.file_stem().map(|s| s.to_string_lossy().to_string()) else {
+            continue;
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines = transcript_lines_from_log(&text);
+        let task = lines
+            .iter()
+            .find_map(|l| l.strip_prefix("agent started: ").map(|t| t.to_string()))
+            .unwrap_or_else(|| "(recovered session)".to_string());
+        sessions.push(Session {
+            id: id.clone(),
+            task,
+            project: String::new(),
+            repo: String::new(),
+            branch: format!("fleet/{id}"),
+            worktree: data_dir
+                .join("worktrees")
+                .join(&id)
+                .to_string_lossy()
+                .to_string(),
+            status: Status::NeedsYou.label().to_string(),
+            bucket: Status::NeedsYou.bucket().to_string(),
+            agent: String::new(),
+            check_cmd: String::new(),
+            check_output: None,
+            check_passed: None,
+            diff: String::new(),
+            reason: Some(
+                "recovered after the session store (sessions.json) was lost or unreadable — the transcript was restored from this session's log file; the repo and check settings lived only in the store, so check them before retrying"
+                    .to_string(),
+            ),
+            verified_commit: None,
+            transcript: cap_transcript(lines),
+        });
+    }
+    sessions
+}
+
+fn load_persisted(data_dir: &Path) -> (Vec<Session>, u64) {
+    let path = data_dir.join("sessions.json");
+    let parsed = std::fs::read_to_string(&path).ok().and_then(|text| {
+        let v = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+        let counter = v["counter"].as_u64().unwrap_or(0);
+        let sessions: Vec<Session> =
+            serde_json::from_value(v["sessions"].clone()).unwrap_or_default();
+        Some((sessions, counter))
+    });
+    if let Some((mut sessions, counter)) = parsed {
+        if sessions.is_empty() && !recover_from_logs(data_dir).is_empty() {
+            // A readable store that names no sessions while session
+            // logs exist is a loss, not a fresh start.
+            return (recover_from_logs(data_dir), counter);
+        }
+        for s in sessions.iter_mut() {
+            let log_path = data_dir.join("logs").join(format!("{}.log", s.id));
+            if let Ok(text) = std::fs::read_to_string(&log_path) {
+                let lines = transcript_lines_from_log(&text);
+                if lines.len() > s.transcript.len() {
+                    s.transcript = cap_transcript(lines);
+                }
+            }
+        }
+        return (sessions, counter);
+    }
+    // The store is missing or unreadable. Keep an unreadable one
+    // aside as evidence rather than overwriting it, then recover
+    // what the logs still know.
+    if path.exists() {
+        let aside = data_dir.join(format!(
+            "sessions.json.corrupt-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::rename(&path, &aside);
+    }
+    (recover_from_logs(data_dir), 0)
 }
 
 fn main() {
@@ -1517,6 +1663,7 @@ fn main() {
         data_dir,
         run_tag,
         sessions: Mutex::new(restored),
+        lines_since_persist: std::sync::atomic::AtomicU64::new(0),
         counter: Mutex::new(restored_counter),
     });
 
@@ -1654,6 +1801,7 @@ mod tests {
             data_dir: dir.join("data"),
             run_tag: "test".to_string(),
             sessions: Mutex::new(Vec::new()),
+            lines_since_persist: std::sync::atomic::AtomicU64::new(0),
             counter: Mutex::new(0),
         });
         // Drive the same path the HTTP layer drives.
