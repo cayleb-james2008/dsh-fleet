@@ -1,105 +1,313 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Fleet — your agents, one screen</title>
 <style>
+  :root, [data-theme="dark"] {
+    --bg: #0e1218; --panel: #141a22; --panel-2: #1a222d; --border: #232c38;
+    --text: #e8edf3; --dim: #94a3b5; --accent: #6ea8e1; --accent-ink: #0b1522;
+    --verified: #4cc38a; --warn: #d99a4e; --danger: #e06c60;
+    --chip-working: #22354d; --chip-needs: #453214; --chip-done: #173d2a;
+    --pre-bg: #10151c;
+  }
+  [data-theme="light"] {
+    --bg: #f4f6f9; --panel: #ffffff; --panel-2: #eef2f7; --border: #d8dfe8;
+    --text: #17222e; --dim: #50637a; --accent: #1f66c2; --accent-ink: #ffffff;
+    --verified: #177a4c; --warn: #96600f; --danger: #b3382e;
+    --chip-working: #dcebfb; --chip-needs: #f7e3c2; --chip-done: #d3efdf;
+    --pre-bg: #f0f3f7;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; background: #0f1115; color: #e6e6e6; display: flex; height: 100vh; }
-  #sidebar { width: 300px; border-right: 1px solid #262a33; display: flex; flex-direction: column; background: #15181f; }
-  #sidebar h1 { font-size: 15px; margin: 14px 16px 4px; font-weight: 600; }
-  #policy { font-size: 11px; color: #8a8f98; margin: 0 16px 10px; }
-  #sessions { flex: 1; overflow-y: auto; }
-  .session { padding: 10px 16px; border-bottom: 1px solid #1d2027; cursor: pointer; }
-  .session:hover { background: #1a1e26; }
-  .session.selected { background: #1f2733; }
+  html, body { height: 100%; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); display: flex; font-size: 14px; }
+  ::selection { background: var(--accent); color: var(--accent-ink); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button { font: inherit; }
+  svg.ic { width: 14px; height: 14px; flex: none; vertical-align: -2px; }
+
+  #sidebar { width: 320px; border-right: 1px solid var(--border); display: flex; flex-direction: column; background: var(--panel); min-height: 0; }
+  #sidebar header { display: flex; align-items: center; justify-content: space-between; padding: 16px 16px 4px; }
+  #sidebar h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  #inboxBtn { display: inline-flex; align-items: center; gap: 6px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; cursor: pointer; min-height: 32px; }
+  #inboxBtn:hover { border-color: var(--accent); }
+  #inboxBtn .count { font-variant-numeric: tabular-nums; font-weight: 600; }
+  #inboxBtn.attn { border-color: var(--warn); color: var(--warn); }
+  #policy { font-size: 12px; color: var(--dim); margin: 4px 16px 12px; line-height: 1.5; }
+  #inboxPanel { border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 8px 16px 12px; background: var(--panel-2); }
+  #inboxPanel h2 { font-size: 13px; margin: 6px 0 8px; font-weight: 600; }
+  .inboxItem { padding: 8px 0; border-top: 1px solid var(--border); }
+  .inboxItem:first-of-type { border-top: 0; }
+  .inboxItem .t { font-size: 13px; }
+  .inboxItem .r { font-size: 12px; color: var(--warn); margin: 2px 0 6px; }
+  .inboxItem button { background: none; border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 4px 10px; cursor: pointer; min-height: 28px; margin-right: 6px; }
+  .inboxItem button:hover { border-color: var(--accent); }
+
+  #sessions { flex: 1; overflow-y: auto; padding-bottom: 8px; scrollbar-color: var(--border) transparent; }
+  .group { font-size: 12px; color: var(--dim); margin: 14px 16px 4px; font-weight: 600; }
+  .session { padding: 10px 16px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  .session:hover { background: var(--panel-2); }
+  .session.selected { background: var(--panel-2); box-shadow: inset 2px 0 0 var(--accent); }
   .session .task { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .chip { display: inline-block; font-size: 10px; padding: 1px 7px; border-radius: 8px; margin-top: 4px; text-transform: uppercase; letter-spacing: .04em; }
-  .chip.working { background: #2b3a55; color: #9db8e8; }
-  .chip.needs-you { background: #553a2b; color: #e8b89d; }
-  .chip.done { background: #2b553a; color: #9de8b8; }
-  #composer { border-top: 1px solid #262a33; padding: 12px 16px; }
-  #composer input, #composer textarea { width: 100%; background: #0f1115; border: 1px solid #2c313c; border-radius: 6px; color: #e6e6e6; padding: 7px 9px; margin-bottom: 8px; font-size: 13px; }
-  #composer button, .mergebtn { background: #2563eb; color: #fff; border: 0; border-radius: 6px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
-  .mergebtn { background: #1d7a43; margin-top: 10px; }
-  #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-  #detail { padding: 18px 22px; overflow-y: auto; flex: 1; }
-  #detail h2 { font-size: 16px; margin: 0 0 4px; }
-  .meta { color: #8a8f98; font-size: 12px; margin-bottom: 14px; }
-  pre { background: #15181f; border: 1px solid #262a33; border-radius: 6px; padding: 12px; font-size: 12px; overflow-x: auto; white-space: pre-wrap; }
-  .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #8a8f98; margin: 16px 0 6px; }
-  .empty { color: #8a8f98; margin: auto; font-size: 14px; }
-  .pass { color: #9de8b8; } .fail { color: #e89d9d; }
+  .statusrow { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 12px; color: var(--dim); }
+  .chip { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 999px; }
+  .chip.working { background: var(--chip-working); color: var(--accent); }
+  .chip.needs-you { background: var(--chip-needs); color: var(--warn); }
+  .chip.done { background: var(--chip-done); color: var(--verified); }
+  .checkline { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 12px; color: var(--verified); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .checkline.failed { color: var(--danger); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
+  .dot.live { background: var(--accent); animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) { .dot.live { animation: none; } }
+
+  #composer { border-top: 1px solid var(--border); padding: 12px 16px; }
+  #composer label { display: block; font-size: 12px; color: var(--dim); margin: 8px 0 4px; }
+  #composer label:first-child { margin-top: 0; }
+  #composer input, #composer textarea, #composer select { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 8px; font: inherit; font-size: 13px; }
+  #composer button[type="submit"] { background: var(--accent); color: var(--accent-ink); border: 0; border-radius: 6px; padding: 8px 14px; cursor: pointer; margin-top: 12px; min-height: 36px; font-weight: 600; }
+  .err { color: var(--danger); font-size: 12px; margin: 8px 0 0; }
+
+  #settings { border-top: 1px solid var(--border); padding: 10px 16px; display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: var(--dim); }
+  #themeBtn { display: inline-flex; align-items: center; gap: 6px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer; min-height: 30px; }
+
+  #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+  #detail { padding: 20px 24px; overflow-y: auto; flex: 1; scrollbar-color: var(--border) transparent; }
+  #detail h2 { font-size: 17px; margin: 0 0 4px; font-weight: 600; }
+  .meta { color: var(--dim); font-size: 12px; margin-bottom: 16px; }
+  .checkbanner { display: flex; gap: 8px; align-items: baseline; border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin-bottom: 8px; background: var(--panel); }
+  .checkbanner .v { font-weight: 600; }
+  .checkbanner.pass .v { color: var(--verified); }
+  .checkbanner.fail .v { color: var(--danger); }
+  .checkbanner code { color: var(--dim); font-size: 12px; }
+  pre { background: var(--pre-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-size: 12px; overflow-x: auto; white-space: pre-wrap; margin: 0; }
+  .label { font-size: 12px; color: var(--dim); margin: 20px 0 6px; font-weight: 600; }
+  .empty { color: var(--dim); margin: auto; font-size: 14px; padding: 24px; }
+  .actions { margin-top: 16px; display: flex; gap: 8px; }
+  .actions button { border: 0; border-radius: 6px; padding: 8px 14px; cursor: pointer; min-height: 36px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
+  .mergebtn { background: var(--verified); color: #08130d; }
+  [data-theme="light"] .mergebtn { color: #ffffff; }
+  .retrybtn { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
+  @media (max-width: 700px) { #sidebar { width: 240px; } #detail { padding: 16px; } }
 </style>
 </head>
 <body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></symbol>
+    <symbol id="i-tray" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.7 4H7.3a2 2 0 0 0-1.8 1.1Z"/></symbol>
+    <symbol id="i-retry" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 2.6-6.4L3 8"/><path d="M3 3v5h5"/></symbol>
+    <symbol id="i-merge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
+  </svg>
+
   <div id="sidebar">
-    <h1>Fleet</h1>
-    <p id="policy">loading policy…</p>
-    <div id="sessions"></div>
+    <header>
+      <h1>Fleet</h1>
+      <button id="inboxBtn" aria-label="Open the needs-you inbox">
+        <svg class="ic"><use href="#i-tray"/></svg> Needs you <span class="count" id="inboxCount">0</span>
+      </button>
+    </header>
+    <p id="policy">Loading policy…</p>
+    <div id="inboxPanel" hidden>
+      <h2>Needs you</h2>
+      <div id="inboxItems"></div>
+    </div>
+    <div id="sessions" role="list"></div>
     <form id="composer">
-      <input id="repo" placeholder="git repo path" required>
-      <input id="project" placeholder="project (policy picks the check)" value="fixture">
+      <label for="repo">Git repo path</label>
+      <input id="repo" required autocomplete="off">
+      <label for="project">Project (the policy picks its check)</label>
+      <input id="project" value="fixture" autocomplete="off">
+      <label for="agent">Agent</label>
+      <select id="agent"><option value="">Default agent</option></select>
+      <label for="task">Task</label>
       <textarea id="task" rows="2" placeholder="Hand out work…" required></textarea>
-      <input id="check" placeholder="check command (optional)">
+      <label for="check">Check command (optional)</label>
+      <input id="check" autocomplete="off">
       <button type="submit">Hand it out</button>
+      <p class="err" id="formErr" hidden></p>
     </form>
+    <div id="settings">
+      <span>Settings</span>
+      <button id="themeBtn" aria-label="Switch colour theme"></button>
+    </div>
   </div>
   <div id="main"><div id="detail"><p class="empty">Pick a session, or hand out work below.</p></div></div>
+
 <script>
+const rootEl = document.documentElement;
+function applyTheme(t) {
+  rootEl.dataset.theme = t;
+  const btn = document.getElementById('themeBtn');
+  btn.innerHTML = t === 'dark'
+    ? '<svg class="ic"><use href="#i-sun"/></svg> Light'
+    : '<svg class="ic"><use href="#i-moon"/></svg> Dark';
+}
+applyTheme(localStorage.getItem('fleet-theme') || 'dark');
+document.getElementById('themeBtn').addEventListener('click', () => {
+  const next = rootEl.dataset.theme === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('fleet-theme', next);
+  applyTheme(next);
+});
+
 let selected = null;
+let inboxOpen = false;
+const esc = (s) => { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; };
+
 async function refresh() {
-  const pol = await (await fetch('/api/policy')).json();
-  const agentBits = (pol.agents || []).map(a => `${a.name}: ${a.found ? 'found' : 'not found'}`).join(' · ');
+  let pol, sessions, inbox;
+  try {
+    pol = await (await fetch('/api/policy')).json();
+    sessions = await (await fetch('/api/sessions')).json();
+    inbox = await (await fetch('/api/inbox')).json();
+  } catch (e) { return; }
+  const agentBits = (pol.agents || []).map(a => `${a.name} ${a.found ? 'found' : 'not found'}`).join(' · ');
   document.getElementById('policy').textContent =
-    `agents — ${agentBits} · default: ${pol.default_agent ?? 'none'} · max parallel: ${pol.max_parallel} · policy: ${pol.source}`;
-  const sessions = await (await fetch('/api/sessions')).json();
-  const list = document.getElementById('sessions');
-  list.innerHTML = '';
-  for (const s of sessions) {
-    const div = document.createElement('div');
-    div.className = 'session' + (s.id === selected ? ' selected' : '');
-    div.innerHTML = `<div class="task"></div><span class="chip ${s.bucket}">${s.status}</span>`;
-    div.querySelector('.task').textContent = s.task;
-    div.onclick = () => { selected = s.id; refresh(); };
-    list.appendChild(div);
+    `Agents: ${agentBits}. Default: ${pol.default_agent ?? 'none'}. Up to ${pol.max_parallel} sessions run at once; checks come from ${pol.source}.`;
+  const sel = document.getElementById('agent');
+  if (sel.options.length <= 1) {
+    for (const a of (pol.agents || []).filter(a => a.found)) {
+      const o = document.createElement('option'); o.value = a.name; o.textContent = a.name; sel.appendChild(o);
+    }
   }
+  const btn = document.getElementById('inboxBtn');
+  document.getElementById('inboxCount').textContent = inbox.length;
+  btn.classList.toggle('attn', inbox.length > 0);
+  renderInbox(inbox);
+  renderSessions(sessions);
   if (selected) {
     const s = sessions.find(x => x.id === selected);
     if (s) renderDetail(s);
   }
 }
+
+function renderInbox(inbox) {
+  const panel = document.getElementById('inboxPanel');
+  panel.hidden = !inboxOpen;
+  const box = document.getElementById('inboxItems');
+  box.innerHTML = '';
+  if (!inbox.length) {
+    box.innerHTML = '<p style="color:var(--dim);font-size:13px;margin:4px 0">Nothing needs you right now.</p>';
+    return;
+  }
+  for (const s of inbox) {
+    const div = document.createElement('div');
+    div.className = 'inboxItem';
+    div.innerHTML = `<div class="t"></div><div class="r"></div>
+      <button data-act="view">View</button><button data-act="retry">Retry</button>`;
+    div.querySelector('.t').textContent = s.task;
+    div.querySelector('.r').textContent = s.reason || 'needs you';
+    div.querySelector('[data-act="view"]').onclick = () => { selected = s.id; inboxOpen = false; refresh(); };
+    div.querySelector('[data-act="retry"]').onclick = async () => { await post(`/api/sessions/${s.id}/retry`); refresh(); };
+    box.appendChild(div);
+  }
+}
+document.getElementById('inboxBtn').addEventListener('click', () => { inboxOpen = !inboxOpen; refresh(); });
+
+function statusChip(s) {
+  if (s.bucket === 'working' && s.status === 'queued')
+    return `<span class="chip working">queued · #${s.queue_position ?? '?'}</span>`;
+  return `<span class="chip ${s.bucket}">${s.status.replace('-', ' ')}</span>`;
+}
+function renderSessions(sessions) {
+  const list = document.getElementById('sessions');
+  list.innerHTML = '';
+  if (!sessions.length) {
+    list.innerHTML = '<p class="empty">No sessions yet. Hand out work below and it will run here.</p>';
+    return;
+  }
+  const groups = [['needs-you', 'Needs you'], ['working', 'Working'], ['done', 'Done']];
+  for (const [bucket, label] of groups) {
+    const inGroup = sessions.filter(s => s.bucket === bucket);
+    if (!inGroup.length) continue;
+    const h = document.createElement('div');
+    h.className = 'group';
+    h.textContent = `${label} · ${inGroup.length}`;
+    list.appendChild(h);
+    for (const s of inGroup) {
+      const div = document.createElement('div');
+      div.className = 'session' + (s.id === selected ? ' selected' : '');
+      div.setAttribute('role', 'listitem');
+      let inner = `<div class="task"></div><div class="statusrow">`;
+      inner += (s.bucket === 'working' && s.status !== 'queued') ? '<span class="dot live"></span>' : '<span class="dot"></span>';
+      inner += statusChip(s) + `<span>${esc(s.agent || '')}</span></div>`;
+      if (s.check_passed === true) inner += `<div class="checkline"><svg class="ic"><use href="#i-check"/></svg><span></span></div>`;
+      if (s.check_passed === false) inner += `<div class="checkline failed"><svg class="ic"><use href="#i-x"/></svg><span></span></div>`;
+      div.innerHTML = inner;
+      div.querySelector('.task').textContent = s.task;
+      const cl = div.querySelector('.checkline span');
+      if (cl) cl.textContent = s.check_cmd;
+      div.onclick = () => { selected = s.id; refresh(); };
+      list.appendChild(div);
+    }
+  }
+}
+
 function renderDetail(s) {
   const d = document.getElementById('detail');
-  let html = `<h2></h2><div class="meta">branch ${s.branch} · status ${s.status} · check: <code></code></div>`;
-  html += `<div class="label">Transcript</div><pre id="tr"></pre>`;
+  let html = `<h2></h2><div class="meta">branch ${esc(s.branch)} · agent ${esc(s.agent || 'unknown')} · status ${esc(s.status)}${s.queue_position ? ` · queue #${s.queue_position}` : ''}</div>`;
   if (s.check_passed !== undefined && s.check_passed !== null) {
-    html += `<div class="label">Check — <span class="${s.check_passed ? 'pass' : 'fail'}">${s.check_passed ? 'PASSED' : 'FAILED'}</span></div><pre id="co"></pre>`;
+    html += `<div class="checkbanner ${s.check_passed ? 'pass' : 'fail'}">
+      <svg class="ic"><use href="#${s.check_passed ? 'i-check' : 'i-x'}"/></svg>
+      <span class="v">${s.check_passed ? 'Check passed — verified done' : 'Check failed'}</span>
+      <code></code></div>`;
   }
+  if (s.status === 'needs-you' && s.reason) html += `<div class="checkbanner fail reasonbanner"><svg class="ic"><use href="#i-alert"/></svg><span class="v"></span></div>`;
+  html += `<div class="label">Transcript</div><pre id="tr"></pre>`;
+  if (s.check_output) html += `<div class="label">Check output</div><pre id="co"></pre>`;
   if (s.diff) html += `<div class="label">Diff</div><pre id="df"></pre>`;
-  if (s.status === 'done') html += `<button class="mergebtn" onclick="merge('${s.id}')">Merge this work</button>`;
+  html += `<div class="actions">`;
+  if (s.status === 'done') html += `<button class="mergebtn" id="mergeBtn"><svg class="ic"><use href="#i-merge"/></svg> Merge this work</button>`;
+  if (s.status === 'needs-you') html += `<button class="retrybtn" id="retryBtn"><svg class="ic"><use href="#i-retry"/></svg> Retry this session</button>`;
+  html += `</div><p class="err" id="actErr" hidden></p>`;
   d.innerHTML = html;
   d.querySelector('h2').textContent = s.task;
-  d.querySelector('.meta code').textContent = s.check_cmd;
+  const code = d.querySelector('.checkbanner code');
+  if (code) code.textContent = s.check_cmd;
+  const reasonEl = d.querySelector('.reasonbanner .v');
+  if (reasonEl && s.status === 'needs-you') reasonEl.textContent = s.reason;
   d.querySelector('#tr').textContent = s.transcript.join('\n');
   if (d.querySelector('#co')) d.querySelector('#co').textContent = s.check_output || '';
   if (d.querySelector('#df')) d.querySelector('#df').textContent = s.diff;
+  const mb = d.querySelector('#mergeBtn');
+  if (mb) mb.onclick = async () => {
+    const r = await post(`/api/sessions/${s.id}/merge`);
+    if (r) showErr('#actErr', r);
+    refresh();
+  };
+  const rb = d.querySelector('#retryBtn');
+  if (rb) rb.onclick = async () => {
+    const r = await post(`/api/sessions/${s.id}/retry`);
+    if (r) showErr('#actErr', r);
+    refresh();
+  };
 }
-async function merge(id) {
-  const r = await fetch(`/api/sessions/${id}/merge`, { method: 'POST' });
-  if (!r.ok) alert((await r.json()).error);
-  refresh();
+function showErr(sel, msg) {
+  const el = document.querySelector(sel);
+  if (el) { el.textContent = msg; el.hidden = !msg; }
+}
+async function post(url) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  if (!r.ok) { try { return (await r.json()).error || 'request failed'; } catch { return 'request failed'; } }
+  return null;
 }
 document.getElementById('composer').addEventListener('submit', async (e) => {
   e.preventDefault();
+  showErr('#formErr', '');
   const body = {
     repo: document.getElementById('repo').value,
     project: document.getElementById('project').value,
     task: document.getElementById('task').value,
     check: document.getElementById('check').value,
   };
+  const agent = document.getElementById('agent').value;
+  if (agent) body.agent = agent;
   const r = await fetch('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  if (!r.ok) { alert((await r.json()).error); return; }
+  if (!r.ok) { showErr('#formErr', (await r.json()).error || 'could not hand out the task'); return; }
   const s = await r.json();
   selected = s.id;
   document.getElementById('task').value = '';
