@@ -115,6 +115,7 @@
     <div id="inboxPanel" hidden>
       <h2>Needs you</h2>
       <div id="inboxItems"></div>
+      <p id="inboxError" class="err" hidden></p>
     </div>
     <div id="sessions" role="list"></div>
     <form id="composer">
@@ -189,10 +190,20 @@ let lastListKey = '';
 let lastDetailKey = '';
 let detailError = '';
 
+let lastInboxKey = '';
+let inboxError = '';
 function renderInbox(inbox) {
   const panel = document.getElementById('inboxPanel');
   panel.hidden = !inboxOpen;
+  if (!inboxOpen) { lastInboxKey = ''; return; }
+  // Same discipline as the list and detail views: rebuilding on every
+  // poll would destroy keyboard focus on the View/Retry buttons.
+  const key = JSON.stringify([inbox.map(s => [s.id, s.reason]), inboxError]);
+  if (key === lastInboxKey) return;
+  lastInboxKey = key;
   const box = document.getElementById('inboxItems');
+  const errEl = document.getElementById('inboxError');
+  if (errEl) { errEl.textContent = inboxError; errEl.hidden = !inboxError; }
   box.innerHTML = '';
   if (!inbox.length) {
     box.innerHTML = '<p style="color:var(--dim);font-size:13px;margin:4px 0">Nothing needs you right now.</p>';
@@ -206,7 +217,13 @@ function renderInbox(inbox) {
     div.querySelector('.t').textContent = s.task;
     div.querySelector('.r').textContent = s.reason || 'needs you';
     div.querySelector('[data-act="view"]').onclick = () => { selected = s.id; detailError = ''; lastDetailKey = ''; inboxOpen = false; refresh(); };
-    div.querySelector('[data-act="retry"]').onclick = async () => { await post(`/api/sessions/${s.id}/retry`); refresh(); };
+    div.querySelector('[data-act="retry"]').onclick = async () => {
+      // A refused retry (409 — the session already moved on) must be
+      // SEEN, not swallowed: post() reports the server's own words.
+      inboxError = await post(`/api/sessions/${s.id}/retry`);
+      lastInboxKey = '';
+      refresh();
+    };
     box.appendChild(div);
   }
 }
@@ -270,7 +287,9 @@ function renderDetail(s) {
   // Render only when the session's visible state actually changed;
   // when a render does happen, put scroll and focus back.
   const key = JSON.stringify([s.id, s.status, s.check_passed, s.reason, s.queue_position,
-    s.transcript.length, (s.check_output || '').length, (s.diff || '').length, detailError]);
+    s.transcript.length, s.transcript[s.transcript.length - 1] || '',
+    (s.check_output || '').length, (s.check_output || '').slice(-80),
+    (s.diff || '').length, (s.diff || '').slice(-80), detailError]);
   if (key === lastDetailKey) return;
   const prevScroll = d.scrollTop;
   const prevTr = d.querySelector('#tr');

@@ -93,6 +93,11 @@ impl Policy {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
         };
         policy.max_parallel = policy.call_i64("max_parallel", ())?;
+        if policy.max_parallel < 1 {
+            // A cap of zero would queue every session forever with
+            // nothing anywhere saying why. The floor is 1.
+            policy.max_parallel = 1;
+        }
         // timeout_secs is optional in the policy file; absent or
         // unusable means the default, never "no timeout".
         if let Ok(secs) = policy.call_i64("timeout_secs", ()) {
@@ -761,6 +766,43 @@ impl App {
         self.run_agent_and_check(id, &session, &wt);
     }
 
+    /// Clear a stale index.lock in a worktree's git dir, if one is
+    /// there. A lock older than a minute is the residue of a git
+    /// process killed mid-operation (a server kill -9 leaves one),
+    /// not a live process — and without clearing it, every git
+    /// operation on the worktree fails identically forever. Returns
+    /// true when a lock was cleared.
+    fn clear_stale_index_lock(&self, id: &str, wt: &Path) -> bool {
+        let git_dir = Command::new("git")
+            .arg("-C")
+            .arg(wt)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                let p = PathBuf::from(&raw);
+                if p.is_absolute() { p } else { wt.join(p) }
+            });
+        let Some(lock) = git_dir.map(|d| d.join("index.lock")) else {
+            return false;
+        };
+        let stale = std::fs::metadata(&lock)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age.as_secs() > 60);
+        if stale && std::fs::remove_file(&lock).is_ok() {
+            self.log(
+                id,
+                "cleared a stale index.lock (residue of a killed git process)".to_string(),
+            );
+            return true;
+        }
+        false
+    }
+
     /// Steps 2–4 of a session: run the agent in its worktree, run the
     /// task's check, record the outcome. Entered with the worktree ready
     /// (freshly created, or reused on a retry).
@@ -831,6 +873,7 @@ impl App {
         // tree a merge would land. A pre-commit hook that rewrites
         // files during the commit changes that tree — the check must
         // judge the tree as committed, not the one the agent left.
+        self.clear_stale_index_lock(id, wt);
         let _ = Command::new("git").arg("-C").arg(wt).args(["add", "-A"]).output();
         // Files the agent produced that this repo gitignores are not in
         // the commit and can never be merged — surface them, by name.
@@ -844,7 +887,7 @@ impl App {
             .args(["-c", "user.email=fleet@localhost", "-c", "user.name=fleet-rs"])
             .args(["commit", "--allow-empty", "-m", &format!("fleet session {}: {}", id, session.task)])
             .output();
-        let commit_error = match &commit {
+        let mut commit_error = match &commit {
             Ok(o) if o.status.success() => None,
             Ok(o) => Some(
                 String::from_utf8_lossy(&o.stderr)
@@ -856,6 +899,35 @@ impl App {
             ),
             Err(e) => Some(format!("could not run git commit: {e}")),
         };
+        // If the commit still hit a lock (one that appeared during
+        // the run), clear it if stale and retry the commit once —
+        // re-running the add first, since the add may have been the
+        // lock's first casualty.
+        if commit_error
+            .as_deref()
+            .is_some_and(|e| e.contains("index.lock"))
+            && self.clear_stale_index_lock(id, wt)
+        {
+            let _ = Command::new("git").arg("-C").arg(wt).args(["add", "-A"]).output();
+            let retry = Command::new("git")
+                .arg("-C")
+                .arg(wt)
+                .args(["-c", "user.email=fleet@localhost", "-c", "user.name=fleet-rs"])
+                .args(["commit", "--allow-empty", "-m", &format!("fleet session {}: {}", id, session.task)])
+                .output();
+            commit_error = match &retry {
+                Ok(o) if o.status.success() => None,
+                Ok(o) => Some(
+                    String::from_utf8_lossy(&o.stderr)
+                        .lines()
+                        .next()
+                        .unwrap_or("git commit failed")
+                        .trim()
+                        .to_string(),
+                ),
+                Err(e) => Some(format!("could not run git commit: {e}")),
+            };
+        }
         // The commit the check is about to verify — the merge will
         // consume exactly this commit, never the branch's later tip.
         let tip = Command::new("git")
@@ -1273,36 +1345,108 @@ fn html_response(body: &str) -> String {
     )
 }
 
-fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, String)> {
+/// The whole request — headers and body together — gets one
+/// deadline. A per-read timeout alone is defeated by a client that
+/// dribbles a byte at a time under it, parking its handler thread
+/// forever.
+const READ_DEADLINE_SECS: u64 = 30;
+
+fn read_request(
+    stream: &mut std::net::TcpStream,
+) -> Option<(String, String, String, String, String)> {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(READ_DEADLINE_SECS);
     let mut reader = BufReader::new(stream.try_clone().ok()?);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line).ok()?;
+    // Arm the socket timeout for the next read: never more than the
+    // per-read timeout, never past the request's deadline.
+    let arm = |stream: &std::net::TcpStream| -> Option<()> {
+        let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+        let t = remaining.min(std::time::Duration::from_secs(READ_TIMEOUT_SECS));
+        stream.set_read_timeout(Some(t)).ok()?;
+        Some(())
+    };
+    // Lines are read byte by byte so the deadline is re-armed for
+    // EVERY byte: arming once per read_line would let a drip feed
+    // one byte per per-read timeout and outlive the deadline inside
+    // a single line.
+    let read_line_by_byte =
+        |reader: &mut BufReader<std::net::TcpStream>,
+         stream: &std::net::TcpStream|
+         -> Option<String> {
+            let mut line = String::new();
+            loop {
+                arm(stream)?;
+                let mut b = [0u8; 1];
+                let n = reader.read(&mut b).ok()?;
+                if n == 0 {
+                    return if line.is_empty() { None } else { Some(line) };
+                }
+                line.push(b[0] as char);
+                if b[0] == b'\n' || line.len() > 16384 {
+                    return Some(line);
+                }
+            }
+        };
+    let request_line = read_line_by_byte(&mut reader, stream)?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
     let mut content_length = 0usize;
+    let mut content_type = String::new();
+    let mut origin = String::new();
     loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).ok()?;
+        let line = read_line_by_byte(&mut reader, stream)?;
         if line == "\r\n" || line.is_empty() {
             break;
         }
         let lower = line.to_lowercase();
         if let Some(v) = lower.strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = lower.strip_prefix("content-type:") {
+            content_type = v.trim().to_string();
+        } else if let Some(v) = lower.strip_prefix("origin:") {
+            origin = v.trim().to_string();
         }
     }
     // A declared body over the cap is refused without being read —
     // otherwise one connection can pin its handler thread (and a huge
     // allocation) by declaring a giant body and sending nothing.
     if content_length > MAX_BODY_BYTES {
-        return Some(("__too_large__".to_string(), String::new(), String::new()));
+        return Some((
+            "__too_large__".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ));
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
+        arm(stream)?;
         reader.read_exact(&mut body).ok()?;
     }
-    Some((method, path, String::from_utf8_lossy(&body).to_string()))
+    Some((
+        method,
+        path,
+        String::from_utf8_lossy(&body).to_string(),
+        content_type,
+        origin,
+    ))
+}
+
+/// An Origin is acceptable only when it names this machine: the
+/// board's own page (127.0.0.1 / localhost / ::1). Any other web
+/// origin is a drive-by — a page the operator happens to have open
+/// must not be able to hand out work to a command-executing server.
+fn origin_is_local(origin: &str) -> bool {
+    let host = origin
+        .split("://")
+        .nth(1)
+        .unwrap_or("")
+        .split([':', '/'])
+        .next()
+        .unwrap_or("");
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
 }
 
 /// Largest request body the API accepts (hand-outs are small JSON).
@@ -1716,9 +1860,24 @@ fn main() {
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(
                         READ_TIMEOUT_SECS,
                     )));
-                    if let Some((method, path, body)) = read_request(&mut stream) {
+                    if let Some((method, path, body, content_type, origin)) =
+                        read_request(&mut stream)
+                    {
                         let response = if method == "__too_large__" {
                             error_response(413, "request body too large")
+                        } else if method == "POST"
+                            && !content_type.starts_with("application/json")
+                        {
+                            // A browser "simple request" (text/plain,
+                            // no preflight) must never reach a handler:
+                            // requiring JSON is what makes a drive-by
+                            // POST from another site impossible.
+                            error_response(415, "POST requires Content-Type: application/json")
+                        } else if method == "POST"
+                            && !origin.is_empty()
+                            && !origin_is_local(&origin)
+                        {
+                            error_response(403, "cross-origin requests are refused")
                         } else {
                             handle(&app, &method, &path, &body)
                         };

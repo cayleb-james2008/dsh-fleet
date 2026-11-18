@@ -8,6 +8,7 @@ export PATH="$HOME/.rust/bin:$PATH"
 LABEL="${1:-run}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/.loop/runs/$LABEL"
+rm -rf "$OUT"
 mkdir -p "$OUT"
 cd "$ROOT"
 

@@ -26,5 +26,8 @@ echo "$page" | grep -q 'detailError' || { echo "FAIL: action errors are not kept
 echo "$page" | grep -q 'tabindex' || { echo "FAIL: session rows are not focusable"; exit 1; }
 echo "$page" | grep -q 'onkeydown' || { echo "FAIL: session rows have no keyboard activation"; exit 1; }
 echo "$page" | grep -q 'lastListKey' || { echo "FAIL: session list rebuilds unconditionally, dropping row focus"; exit 1; }
+echo "$page" | grep -q 'lastInboxKey' || { echo "FAIL: the inbox rebuilds unconditionally, dropping button focus (the B12 discipline never reached it)"; exit 1; }
+echo "$page" | grep -q 'inboxError' || { echo "FAIL: inbox retry failures are swallowed instead of shown"; exit 1; }
+echo "$page" | grep -q 'slice(-80)' || { echo "FAIL: the detail signature keys on lengths only — a capped live transcript would never re-render"; exit 1; }
 
-echo "UI OK: detail renders on change only with scroll/focus restored, errors persist across renders, rows are keyboard-operable"
+echo "UI OK: detail renders on change only with scroll/focus restored, errors persist across renders, rows are keyboard-operable, the inbox is gated and surfaces its errors"
