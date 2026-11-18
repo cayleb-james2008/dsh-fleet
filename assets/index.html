@@ -3,206 +3,368 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Fleet — your agents, one screen</title>
+<title>Fleet: your agents, one screen</title>
+<meta name="description" content="Fleet hands coding tasks to agents that work in parallel. A task is done only when its check command passes; anything else waits in Needs you with the reason.">
 <script>try { document.documentElement.dataset.theme = localStorage.getItem('fleet-theme') || 'dark'; } catch (e) {}</script>
 <style>
-/* hallmark-rune · app: fleet · vernacular: ops board · nav: session rail (the list is the work) · signature: session board · tokens: hr-template v1 (Fleet anchor row) · critique: weakest State coverage — this pass adds the board's loading and connection-error states */
+/* Hallmark: app screen, fleet, modern-minimal, quiet control board: hairlines, colour only as state, one primary action */
+/* Hallmark · reworded "sidebar" to "board" · the rail is gone, Close uses i-x */
+/* Fleet board. Geist and Geist Mono with system fallbacks; one near-white primary action in dark. */
   :root, [data-theme="dark"] {
     color-scheme: dark;
-    --bg: #0e1218; --panel: #141a22; --panel-2: #1a222d; --field: #10151c;
-    --ink: #e8edf3; --muted: #94a3b5; --faint: #7e8a9c; --rule: #232c38;
-    --accent: #6ea8e1; --accent-hover: #5b97d4; --accent-ink: #0b1522; --accent-bg: #22354d;
-    --ok: #4cc38a; --ok-bg: #173d2a; --ok-ink: #08130d;
-    --warn: #d99a4e; --warn-bg: #453214;
-    --err: #e06c60; --err-bg: #3a1d1a;
-    --font-body: "Barlow", "Inter", "Segoe UI", -apple-system, Roboto, "Helvetica Neue", sans-serif;
-    --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    --text-meta: 11px; --text-label: 12px; --text-small: 13px; --text-dense: 14px;
-    --text-body: 15px; --text-title: 18px; --text-screen: 20px; --text-display: 24px;
-    --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px; --sp-7: 48px;
-    --r-control: 6px; --r-card: 8px; --r-panel: 12px; --r-chip: 999px;
-    --dur-micro: 120ms; --dur-short: 200ms; --dur-panel: 280ms;
-    --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+    --canvas: #0c0e12; --surface: #13161b; --raised: #1a1e25; --track: #1d2129; --hairline: #262b34;
+    --ink: #eceef2; --ink-2: #a2a9b7; --ink-3: #8a92a2; --ink-inv: #0c0e12;
+    --primary: #eceef2; --primary-hover: #ffffff; --primary-ink: #0c0e12;
+    --ok: #4cc38a; --ok-text: #5fd39b; --ok-tint: rgba(76, 195, 138, 0.14); --ok-ink: #0c0e12;
+    --warn: #e5a54b; --warn-text: #efb566; --warn-tint: rgba(229, 165, 75, 0.14);
+    --bad: #ef6f62; --bad-text: #f3857a; --bad-tint: rgba(239, 111, 98, 0.14);
+    --focus: #8fb4ff; --scrim: rgba(0, 0, 0, 0.5); --float: 0 16px 40px rgba(0, 0, 0, 0.45);
   }
   [data-theme="light"] {
     color-scheme: light;
-    --bg: #f4f6f9; --panel: #ffffff; --panel-2: #eef2f7; --field: #f0f3f7;
-    --ink: #17222e; --muted: #50637a; --faint: #57687d; --rule: #d8dfe8;
-    --accent: #1f66c2; --accent-hover: #1a57a6; --accent-ink: #ffffff; --accent-bg: #dcebfb;
-    --ok: #146c43; --ok-bg: #dcf0e4; --ok-ink: #ffffff;
-    --warn: #8a580c; --warn-bg: #f7e3c2;
-    --err: #b3382e; --err-bg: #f9e3e0;
+    --canvas: #f1f2f4; --surface: #ffffff; --raised: #f7f8fa; --track: #eceef2; --hairline: #dfe3e9;
+    --ink: #15181e; --ink-2: #545c6b; --ink-3: #626a79; --ink-inv: #ffffff;
+    --primary: #15181e; --primary-hover: #2a2f39; --primary-ink: #ffffff;
+    --ok: #17794a; --ok-text: #14703f; --ok-tint: #e2f4ea; --ok-ink: #ffffff;
+    --warn: #c98214; --warn-text: #7c4f00; --warn-tint: #fbefd6;
+    --bad: #c9432f; --bad-text: #a8311f; --bad-tint: #fbe4df;
+    --focus: #2c63d8; --scrim: rgba(21, 24, 30, 0.35); --float: 0 16px 40px rgba(21, 24, 30, 0.16);
   }
-  * { box-sizing: border-box; }
+  :root {
+    --font-ui: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --dur-micro: 120ms; --dur-short: 200ms; --dur-panel: 260ms; --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+    --r-control: 6px; --r-card: 8px; --r-panel: 10px; --r-dialog: 14px;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html, body { height: 100%; overflow-x: clip; }
-  body { margin: 0; font-family: var(--font-body); background: var(--bg); color: var(--ink); display: flex; font-size: var(--text-dense); line-height: 1.5; }
-  ::selection { background: var(--accent); color: var(--accent-ink); }
-  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  html { scrollbar-color: var(--rule) transparent; caret-color: var(--accent); }
-  button { font: inherit; }
-  svg.ic { width: 14px; height: 14px; flex: none; vertical-align: -2px; }
-  code { font-family: var(--font-mono); }
+  body { margin: 0; background: var(--canvas); color: var(--ink); font: 400 14px/1.5 var(--font-ui); }
+  h1, h2, h3, p { margin: 0; }
+  h1, h2, h3 { font-weight: 500; text-wrap: balance; }
+  button { font: inherit; color: inherit; }
+  input, textarea, select { font: inherit; }
+  code, .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  svg.ic { width: 16px; height: 16px; flex: none; }
+  ::selection { background: var(--focus); color: var(--ink-inv); }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  html { scrollbar-color: var(--hairline) transparent; caret-color: var(--focus); }
 
-  #sidebar { width: 320px; border-right: 1px solid var(--rule); display: flex; flex-direction: column; background: var(--panel); min-height: 0; flex: none; }
-  #sidebar header { display: flex; align-items: center; justify-content: space-between; padding: var(--sp-4) var(--sp-4) var(--sp-1); }
-  #sidebar h1 { font-size: var(--text-screen); margin: 0; font-weight: 600; }
-  #inboxBtn { display: inline-flex; align-items: center; gap: var(--sp-2); background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: var(--r-control); padding: var(--sp-2) var(--sp-3); cursor: pointer; min-height: 32px; font-size: var(--text-small); }
-  #inboxBtn:hover { border-color: var(--accent); }
-  #inboxBtn .count { font-variant-numeric: tabular-nums; font-weight: 600; }
-  #inboxBtn.attn { border-color: var(--warn); color: var(--warn); }
-  #policy { font-size: var(--text-label); color: var(--muted); margin: var(--sp-1) var(--sp-4) var(--sp-3); line-height: 1.5; font-variant-numeric: tabular-nums; }
-  .connnote { font-size: var(--text-label); color: var(--err); margin: 0 var(--sp-4) var(--sp-3); line-height: 1.5; }
-  #inboxPanel { border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); padding: var(--sp-2) var(--sp-4) var(--sp-3); background: var(--panel-2); }
-  #inboxPanel h2 { font-size: var(--text-small); margin: var(--sp-2) 0 var(--sp-2); font-weight: 600; }
-  .inboxItem { padding: var(--sp-2) 0; border-top: 1px solid var(--rule); }
+  /* Top bar: wordmark, the inbox count, the one primary action, engines. */
+  .app { min-height: 100vh; display: flex; flex-direction: column; }
+  .top { position: sticky; top: 0; z-index: 20; height: 56px; display: flex; align-items: center; gap: 12px; padding: 0 24px; background: var(--surface); border-bottom: 1px solid var(--hairline); }
+  .brand { display: flex; align-items: center; gap: 8px; margin: 0 auto 0 0; font-size: 16px; font-weight: 500; }
+  .brand svg { width: 20px; height: 20px; }
+  .top-actions { display: flex; align-items: center; gap: 8px; }
+
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; padding: 0 16px; border: 1px solid var(--hairline); border-radius: var(--r-control); background: transparent; color: var(--ink); font-size: 14px; font-weight: 500; text-decoration: none; cursor: pointer; white-space: nowrap; transition: background-color var(--dur-micro) var(--ease-out), border-color var(--dur-micro) var(--ease-out), color var(--dur-micro) var(--ease-out), transform var(--dur-micro) var(--ease-out); }
+  .btn:hover { border-color: var(--ink-3); }
+  .btn:active { transform: scale(0.98); }
+  .btn:disabled { color: var(--ink-3); cursor: not-allowed; border-color: var(--hairline); opacity: 0.6; transform: none; }
+  .btn.primary { background: var(--primary); color: var(--primary-ink); border-color: var(--primary); }
+  .btn.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
+  .btn.quiet { background: transparent; border-color: transparent; color: var(--ink-2); }
+  .btn.quiet:hover { color: var(--ink); border-color: var(--hairline); }
+  .btn.merge { background: var(--ok); color: var(--ok-ink); border-color: var(--ok); }
+  .btn.merge:hover { filter: brightness(1.06); }
+  .btn.stop { color: var(--bad-text); border-color: var(--bad); background: transparent; }
+  .btn.stop:hover { background: var(--bad-tint); }
+  .btn.icon { padding: 0 12px; }
+  .btn.attn { color: var(--bad-text); border-color: var(--bad); background: var(--bad-tint); }
+  .btn .count { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--track); color: var(--ink-2); }
+  .btn.attn .count { background: var(--bad); color: var(--ink-inv); }
+  .btn.bump .count { animation: bump var(--dur-short) var(--ease-out); }
+  @keyframes bump { from { transform: scale(1.25); } to { transform: none; } }
+
+  .switch { display: inline-flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 44px; padding: 0 12px; border: 1px solid var(--hairline); border-radius: var(--r-control); background: var(--raised); color: var(--ink); cursor: pointer; transition: border-color var(--dur-micro) var(--ease-out); }
+  .switch:hover { border-color: var(--ink-3); }
+  .switch .track { position: relative; width: 36px; height: 20px; border-radius: 999px; background: var(--track); border: 1px solid var(--hairline); flex: none; }
+  .switch .knob { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--ink); transition: transform var(--dur-short) var(--ease-out); }
+  .switch[aria-checked="false"] .knob { transform: translateX(16px); }
+  .switch[aria-checked="true"] .knob { transform: translateX(0); }
+
+  /* Popovers: inbox and engines. Fixed under the top bar, closed by Escape or a click outside. */
+  .pop { position: fixed; top: 64px; right: 20px; z-index: 35; width: min(400px, calc(100% - 40px)); max-height: calc(100vh - 88px); overflow-y: auto; padding: 16px; background: var(--surface); border: 0; border-radius: var(--r-panel); box-shadow: var(--float); animation: rise var(--dur-short) var(--ease-out); border-color: transparent; }
+  @keyframes rise { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+  .pop h2 { font-size: 15px; margin-bottom: 4px; }
+  .pop .lead { color: var(--ink-2); font-size: 13px; line-height: 1.5; margin-bottom: 12px; }
+  .inboxItem { padding: 12px 0; border-top: 1px solid var(--hairline); }
   .inboxItem:first-of-type { border-top: 0; }
-  .inboxItem .t { font-size: var(--text-small); }
-  .inboxItem .r { font-size: var(--text-label); color: var(--warn); margin: var(--sp-1) 0 var(--sp-2); }
-  .inboxItem button { background: none; border: 1px solid var(--rule); color: var(--ink); border-radius: var(--r-control); padding: var(--sp-1) var(--sp-3); cursor: pointer; min-height: 32px; margin-right: var(--sp-2); font-size: var(--text-small); }
-  .inboxItem button:hover { border-color: var(--accent); }
-  .inboxEmpty { color: var(--muted); font-size: var(--text-small); margin: var(--sp-1) 0; }
+  .inboxItem .t { font-weight: 500; overflow-wrap: anywhere; }
+  .inboxItem .r { color: var(--bad-text); font-size: 13px; margin: 4px 0 12px; line-height: 1.45; }
+  .inboxItem .acts { display: flex; gap: 8px; flex-wrap: wrap; }
+    .inboxEmpty { color: var(--ink-2); font-size: 13px; padding: 8px 0; }
+  #settings .sect { margin-top: 16px; }
+  #settings .sect h3 { font-size: 13px; color: var(--ink-2); font-weight: 500; margin-bottom: 8px; }
+  #policy { color: var(--ink-2); font-size: 13px; line-height: 1.5; font-variant-numeric: tabular-nums; }
+  #agentList { list-style: none; margin: 0; padding: 0; border: 1px solid var(--hairline); border-radius: var(--r-control); }
+  #agentList li { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 40px; padding: 8px 12px; border-top: 1px solid var(--hairline); font-size: 13px; }
+  #agentList li:first-child { border-top: 0; }
+  #agentList .name { font-family: var(--font-mono); font-size: 13px; overflow-wrap: anywhere; }
+  .avail { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-3); white-space: nowrap; }
+  .avail.ok { color: var(--ok-text); }
+  .connnote { margin: 0 0 16px; padding: 12px 16px; border-radius: var(--r-card); background: var(--bad-tint); color: var(--bad-text); font-size: 13px; line-height: 1.45; display: flex; gap: 8px; align-items: flex-start; }
 
-  #sessions { flex: 1; overflow-y: auto; padding-bottom: var(--sp-2); scrollbar-color: var(--rule) transparent; }
-  .group { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--text-label); color: var(--muted); margin: var(--sp-4) var(--sp-4) var(--sp-1); font-weight: 600; }
-  .gcount { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-weight: 500; background: var(--panel-2); border-radius: var(--r-chip); padding: 0 var(--sp-2); }
-  .session { padding: var(--sp-3) var(--sp-4); border-bottom: 1px solid var(--rule); cursor: pointer; }
-  .session:hover { background: var(--panel-2); }
-  .session.selected { background: var(--panel-2); box-shadow: inset 2px 0 0 var(--accent); }
-  .session .task { font-size: var(--text-small); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .statusrow { display: flex; align-items: center; gap: var(--sp-2); margin-top: var(--sp-1); font-size: var(--text-label); color: var(--muted); }
-  .chip { display: inline-block; font-size: var(--text-label); padding: var(--sp-1) var(--sp-2); border-radius: var(--r-chip); line-height: 1.25; }
-  .chip.working { background: var(--accent-bg); color: var(--accent); }
-  .chip.needs-you { background: var(--warn-bg); color: var(--warn); }
-  .chip.done { background: var(--ok-bg); color: var(--ok); }
-  .tmode { border: 1px solid var(--rule); border-radius: var(--r-chip); padding: 0 var(--sp-2); line-height: 1.4; }
-  .checkline { display: flex; align-items: center; gap: var(--sp-2); margin-top: var(--sp-1); font-size: var(--text-label); color: var(--ok); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .checkline .cmd { font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; }
-  .checkline.failed { color: var(--err); }
-  .checkline.noted { color: var(--warn); }
-  .checkbanner.noted { border-color: var(--warn); color: var(--warn); }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
-  .dot.live { background: var(--accent); animation: pulse 1.6s ease-in-out infinite; }
-  @keyframes pulse { 50% { opacity: .35; } }
+  /* The board: three groups as columns, stacked on narrow screens. */
+  .work { display: flex; flex: 1; min-height: 0; align-items: stretch; }
+  .board { flex: 1; min-width: 0; padding: 24px; }
+  #sessions { display: grid; grid-template-columns: minmax(0, 1fr); gap: 24px; align-items: start; }
+  .col { min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+  .colhead { display: flex; align-items: center; gap: 8px; padding: 0 2px; min-height: 28px; font-weight: 500; color: var(--ink-2); }
+  .colhead .gcount { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--track); color: var(--ink-2); }
+  .col.needs .colhead { color: var(--ink); }
+  .col.needs .colhead .gcount { background: var(--bad-tint); color: var(--bad-text); }
+  .colbody { display: flex; flex-direction: column; gap: 8px; }
+  .colempty { padding: 16px; border: 1px dashed var(--hairline); border-radius: var(--r-card); color: var(--ink-3); font-size: 13px; line-height: 1.5; }
+  .skel { height: 84px; border-radius: var(--r-card); background: var(--track); animation: breathe 1.4s ease-in-out infinite; }
+  @keyframes breathe { 50% { opacity: 0.5; } }
+  .emptyboard { grid-column: 1 / -1; display: flex; flex-direction: column; align-items: flex-start; gap: 12px; max-width: 520px; margin: 48px auto 0; padding: 24px; border: 1px solid var(--hairline); border-radius: var(--r-panel); background: var(--surface); }
+  .emptyboard p { color: var(--ink-2); line-height: 1.55; }
 
-  #composer { border-top: 1px solid var(--rule); padding: var(--sp-3) var(--sp-4); }
-  #composer label { display: block; font-size: var(--text-label); color: var(--muted); margin: var(--sp-2) 0 var(--sp-1); }
-  #composer label:first-child { margin-top: 0; }
-  #composer input, #composer textarea, #composer select { width: 100%; background: var(--field); border: 1px solid var(--rule); border-radius: var(--r-control); color: var(--ink); padding: var(--sp-2); font: inherit; font-size: var(--text-small); }
-  #composer button[type="submit"] { background: var(--accent); color: var(--accent-ink); border: 0; border-radius: var(--r-control); padding: var(--sp-2) var(--sp-4); cursor: pointer; margin-top: var(--sp-3); min-height: 36px; font-weight: 600; }
-  #composer button[type="submit"]:hover { background: var(--accent-hover); }
-  .err { color: var(--err); font-size: var(--text-label); margin: var(--sp-2) 0 0; }
+  .card { display: flex; flex-direction: column; gap: 8px; width: 100%; min-width: 0; padding: 12px 16px; background: var(--surface); border: 1px solid var(--hairline); border-radius: var(--r-card); color: inherit; text-align: left; cursor: pointer; transition: background-color var(--dur-micro) var(--ease-out), border-color var(--dur-micro) var(--ease-out), transform var(--dur-micro) var(--ease-out); }
+  .card:hover { border-color: var(--ink-3); background: var(--raised); }
+  .card:active { transform: scale(0.99); }
+  .card[aria-current="true"] { border-color: var(--ink-2); background: var(--raised); }
+  .card.needs { box-shadow: inset 3px 0 0 var(--bad); }
+  .cardtop { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
+  .pill { display: inline-flex; align-items: center; gap: 8px; min-height: 22px; padding: 0 8px; border-radius: 999px; font-size: 12px; line-height: 1; white-space: nowrap; background: var(--track); color: var(--ink-2); }
+  .pill.project { font-family: var(--font-mono); max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
+  .pill.s-working { background: var(--warn-tint); color: var(--warn-text); }
+  .pill.s-needs { background: var(--bad-tint); color: var(--bad-text); }
+  .pill.s-done { background: var(--ok-tint); color: var(--ok-text); }
+  .live { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.25; } }
+  .elapsed { margin-left: auto; font-family: var(--font-mono); font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .task { font-weight: 500; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+  .reason { font-size: 13px; line-height: 1.45; color: var(--bad-text); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+  .note { font-size: 13px; color: var(--warn-text); line-height: 1.4; }
+  .receipt { display: flex; align-items: baseline; gap: 12px; min-width: 0; font-family: var(--font-mono); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .receipt .line { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ok-text); }
+  .receipt .stat { margin-left: auto; color: var(--ink-2); white-space: nowrap; }
+  .cardfoot { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 12px; color: var(--ink-3); }
+  .chip { display: inline-flex; align-items: center; min-height: 22px; padding: 0 8px; border-radius: var(--r-control); background: var(--track); color: var(--ink-2); font-size: 12px; white-space: nowrap; flex: none; }
+  .chip.testmode { background: var(--warn-tint); color: var(--warn-text); }
+  .cardfoot .branch { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--ink-3); }
 
-  #settings { border-top: 1px solid var(--rule); padding: var(--sp-3) var(--sp-4); display: flex; align-items: center; justify-content: space-between; font-size: var(--text-label); color: var(--muted); }
-  #themeBtn { display: inline-flex; align-items: center; gap: var(--sp-2); background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: var(--r-control); padding: var(--sp-2) var(--sp-3); cursor: pointer; min-height: 32px; font-size: var(--text-small); }
-  #themeBtn:hover { border-color: var(--accent); }
+  /* Detail panel: right column on wide screens, overlay on tablets, bottom sheet on phones. */
+  #main { display: none; flex-direction: column; min-width: 0; background: var(--surface); }
+  .app.has-detail #main { display: flex; animation: slideIn var(--dur-panel) var(--ease-out); }
+  @keyframes slideIn { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: none; } }
+  #detail { flex: 1; min-height: 0; overflow-y: auto; padding: 24px; scrollbar-color: var(--hairline) transparent; }
+  .dhead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .dhead .btn.quiet { margin-left: auto; }
+  #detail h2 { font-size: 18px; line-height: 1.3; margin: 12px 0 8px; overflow-wrap: anywhere; }
+  .facts { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--ink-2); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .facts .k { color: var(--ink-3); margin-right: 8px; }
+  .facts code { color: var(--ink); font-size: 12px; overflow-wrap: anywhere; }
+  .chain { display: flex; flex-direction: column; gap: 4px; margin-top: 12px; color: var(--ink-2); font-size: 13px; }
+  .receiptcard { margin-top: 16px; padding: 16px; border: 1px solid var(--hairline); border-radius: var(--r-card); background: var(--canvas); display: flex; flex-direction: column; gap: 8px; }
+  .receiptcard .verdict { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+  .receiptcard.pass .verdict { color: var(--ok-text); }
+  .receiptcard.noted .verdict { color: var(--warn-text); }
+  .receiptcard.fail .verdict { color: var(--bad-text); }
+  .receiptcard .check { font-family: var(--font-mono); font-size: 13px; overflow-wrap: anywhere; }
+  .receiptcard .cmd { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); overflow-wrap: anywhere; }
+  .reasonbox { margin-top: 12px; padding: 12px 16px; border-radius: var(--r-card); background: var(--bad-tint); color: var(--bad-text); display: flex; gap: 8px; align-items: flex-start; line-height: 1.45; }
+  .reasonbox .v { color: var(--ink); overflow-wrap: anywhere; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+  .confirm { margin-top: 16px; padding: 12px 16px; border: 1px solid var(--hairline); border-radius: var(--r-card); background: var(--raised); }
+  .confirm p { font-size: 13px; color: var(--ink-2); margin-bottom: 12px; line-height: 1.45; }
+  .confirm .actions { margin-top: 0; }
+  .tabs { display: flex; gap: 4px; margin-top: 24px; border-bottom: 1px solid var(--hairline); }
+  .tab { position: relative; min-height: 44px; padding: 0 12px; border: 0; background: none; color: var(--ink-2); cursor: pointer; transition: color var(--dur-micro) var(--ease-out); }
+  .tab:hover { color: var(--ink); }
+  .tab[aria-selected="true"] { color: var(--ink); }
+  .tab[aria-selected="true"]::after { content: ""; position: absolute; left: 8px; right: 8px; bottom: -1px; height: 2px; border-radius: 2px; background: var(--ink); }
+  .panel { padding-top: 16px; }
+  .dstat { font-size: 13px; color: var(--ink-2); margin-bottom: 12px; font-variant-numeric: tabular-nums; }
+  .dstat .add { color: var(--ok-text); }
+  .dstat .del { color: var(--bad-text); }
+  pre { margin: 0; padding: 12px; max-height: 52vh; overflow: auto; background: var(--canvas); border: 1px solid var(--hairline); border-radius: var(--r-card); font-family: var(--font-mono); font-size: 12px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+  .hint { color: var(--ink-3); font-size: 12px; line-height: 1.5; margin-top: 8px; }
+  .hint code { font-size: 12px; overflow-wrap: anywhere; }
+  .steer { margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--hairline); }
+  .steer h3 { font-size: 14px; margin-bottom: 8px; }
+  .steer textarea { width: 100%; min-height: 72px; padding: 12px 12px; background: var(--canvas); border: 1px solid var(--hairline); border-radius: var(--r-control); color: var(--ink); resize: vertical; }
+  .steer textarea:hover { border-color: var(--ink-3); }
+  .steer .actions { margin-top: 12px; }
+  .err { color: var(--bad-text); font-size: 13px; line-height: 1.45; margin-top: 12px; }
+  #scrim { display: none; }
 
-  #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
-  #detail { padding: var(--sp-5) var(--sp-5); overflow-y: auto; flex: 1; scrollbar-color: var(--rule) transparent; }
-  #detail h2 { font-size: var(--text-title); margin: 0 0 var(--sp-1); font-weight: 600; line-height: 1.25; }
-  .meta { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-5); color: var(--muted); font-size: var(--text-label); font-variant-numeric: tabular-nums; }
-  .meta .k { color: var(--faint); margin-right: var(--sp-1); }
-  .chain { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-4); color: var(--muted); font-size: var(--text-label); margin-top: var(--sp-1); }
-  .checkbanner { display: flex; gap: var(--sp-2); align-items: baseline; border: 1px solid var(--rule); border-radius: var(--r-card); padding: var(--sp-3) var(--sp-4); margin: var(--sp-4) 0 var(--sp-2); background: var(--field); }
-  .checkbanner .v { font-weight: 600; }
-  .checkbanner.pass .v { color: var(--ok); }
-  .checkbanner.fail .v { color: var(--err); }
-  .checkbanner code { color: var(--muted); font-size: var(--text-label); }
-  pre { background: var(--field); border: 1px solid var(--rule); border-radius: var(--r-card); padding: var(--sp-3); font-family: var(--font-mono); font-size: var(--text-label); line-height: 1.5; overflow-x: auto; white-space: pre-wrap; margin: 0; }
-  .label { font-size: var(--text-label); color: var(--muted); margin: var(--sp-5) 0 var(--sp-2); font-weight: 600; }
-  .empty { color: var(--muted); margin: auto; font-size: var(--text-dense); padding: var(--sp-5); }
-  .actions { margin-top: var(--sp-4); display: flex; gap: var(--sp-2); flex-wrap: wrap; }
-  .actions button { border: 0; border-radius: var(--r-control); padding: var(--sp-2) var(--sp-4); cursor: pointer; min-height: 36px; font-weight: 600; display: inline-flex; align-items: center; gap: var(--sp-2); }
-  .mergebtn { background: var(--ok); color: var(--ok-ink); }
-  .retrybtn { background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); }
-  .retrybtn:hover { border-color: var(--accent); }
-  .stopbtn { background: none; color: var(--err); border: 1px solid var(--err); }
-  #detail textarea { width: 100%; background: var(--field); border: 1px solid var(--rule); border-radius: var(--r-control); color: var(--ink); padding: var(--sp-2); font: inherit; font-size: var(--text-small); }
-  .hint { color: var(--muted); font-size: var(--text-label); margin: var(--sp-2) 0 0; line-height: 1.5; }
-  .backbtn { display: none; }
+  /* Dialog: New session. */
+  dialog#newDlg { width: min(540px, calc(100% - 32px)); max-height: calc(100vh - 48px); overflow-y: auto; padding: 0; border: 0; border-radius: var(--r-dialog); background: var(--surface); color: var(--ink); box-shadow: var(--float); }
+  dialog#newDlg::backdrop { background: var(--scrim); }
+  dialog#newDlg[open] { animation: rise var(--dur-short) var(--ease-out); }
+  .dlg { padding: 24px; }
+  .dlg h2 { font-size: 18px; margin-bottom: 8px; }
+  .dlg .lead { color: var(--ink-2); font-size: 13px; line-height: 1.5; }
+  .field { margin-top: 16px; }
+  .field label { display: block; font-size: 13px; font-weight: 500; color: var(--ink); margin-bottom: 8px; }
+  .field input, .field textarea, .field select { display: block; width: 100%; min-height: 44px; padding: 8px 12px; background: var(--canvas); border: 1px solid var(--hairline); border-radius: var(--r-control); color: var(--ink); transition: border-color var(--dur-micro) var(--ease-out); }
+  .field textarea { resize: vertical; min-height: 64px; }
+  .field input:hover, .field textarea:hover, .field select:hover { border-color: var(--ink-3); }
+  .field input:focus-visible, .field textarea:focus-visible, .field select:focus-visible { outline: 2px solid var(--focus); outline-offset: 0; border-color: var(--focus); }
+  .field input[aria-invalid="true"], .field textarea[aria-invalid="true"] { border-color: var(--bad); }
+  .field .hint { margin-top: 8px; }
+  .dlg .actions { justify-content: flex-end; margin-top: 24px; }
+  .dlg .err { margin-top: 16px; }
 
-  @media (prefers-reduced-motion: reduce) {
-    *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
-    .dot.live { animation: none; }
+  @media (min-width: 1100px) {
+    #sessions { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    #main { width: 460px; flex: none; position: sticky; top: 56px; height: calc(100vh - 56px); border-left: 1px solid var(--hairline); }
   }
-  @media (max-width: 768px) {
-    html, body { height: auto; }
-    body { flex-direction: column; min-height: 100vh; }
-    #sidebar { width: 100%; border-right: 0; border-bottom: 1px solid var(--rule); }
-    #sessions { max-height: 38vh; }
-    #main { flex: none; height: 100vh; }
-    #detail { padding: var(--sp-4); }
-    .backbtn { display: inline-flex; align-items: center; gap: var(--sp-2); background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: var(--r-control); padding: var(--sp-2) var(--sp-3); min-height: 44px; cursor: pointer; font-weight: 600; margin-bottom: var(--sp-3); }
-    #inboxBtn, #themeBtn, .inboxItem button, .actions button, #composer button[type="submit"] { min-height: 44px; }
-    #composer input, #composer select, #detail textarea { min-height: 44px; }
+  @media (max-width: 1099px) {
+    #main { position: fixed; top: 0; right: 0; bottom: 0; z-index: 40; width: min(480px, 100%); border-left: 1px solid var(--hairline); box-shadow: var(--float); }
+    .app.has-detail ~ #scrim { display: block; position: fixed; inset: 0; z-index: 30; background: var(--scrim); }
+  }
+  @media (max-width: 767px) {
+    .top { height: auto; flex-wrap: wrap; row-gap: 8px; padding: 12px 16px; }
+    .brand { width: 100%; }
+    .top-actions { width: 100%; }
+    .top-actions .btn { flex: 1; }
+    .top-actions .btn.icon { flex: none; width: 44px; padding: 0; }
+    .top-actions .btn.icon .lbl { display: none; }
+    .board { padding: 16px; }
+    .pop { top: 124px; left: 12px; right: 12px; width: auto; }
+    #main { top: auto; left: 0; right: 0; width: auto; height: auto; max-height: 88vh; border-left: 0; border-top: 1px solid var(--hairline); border-radius: 14px 14px 0 0; animation: sheetUp var(--dur-panel) var(--ease-out); }
+    @keyframes sheetUp { from { transform: translateY(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+    #detail { padding: 16px 16px 24px; }
+    .card { padding: 16px; }
+    .steer textarea { min-height: 88px; }
+    .field input, .field textarea, .field select { min-height: 44px; }
+    dialog#newDlg { width: calc(100% - 24px); }
+    .dlg { padding: 16px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+    .live, .skel { animation: none; }
   }
 </style>
 </head>
 <body>
   <svg width="0" height="0" style="position:absolute" aria-hidden="true">
-    <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></symbol>
-    <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></symbol>
-    <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></symbol>
-    <symbol id="i-tray" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.7 4H7.3a2 2 0 0 0-1.8 1.1Z"/></symbol>
-    <symbol id="i-retry" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 2.6-6.4L3 8"/><path d="M3 3v5h5"/></symbol>
-    <symbol id="i-stop" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><rect x="9" y="9" width="6" height="6" fill="currentColor" stroke="none"/></symbol>
-    <symbol id="i-send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></symbol>
-    <symbol id="i-merge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></symbol>
-    <symbol id="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
-    <symbol id="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
-    <symbol id="i-back" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="m12 19-7-7 7-7"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="m12 19-7-7 7-7"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></symbol>
+    <symbol id="i-minus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M5 12h14"/></symbol>
+    <symbol id="i-tray" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.7 4H7.3a2 2 0 0 0-1.8 1.1Z"/></symbol>
+    <symbol id="i-retry" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 2.6-6.4L3 8"/><path d="M3 3v5h5"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><rect x="9" y="9" width="6" height="6" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></symbol>
+    <symbol id="i-merge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-cpu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="0.5"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></symbol>
+    <symbol id="i-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 6h18M3 12h12M3 18h7"/><circle cx="19" cy="18" r="2" fill="currentColor" stroke="none"/></symbol>
   </svg>
 
-  <div id="sidebar">
-    <header>
-      <h1>Fleet</h1>
-      <button id="inboxBtn" aria-label="Open the needs-you inbox">
-        <svg class="ic"><use href="#i-tray"/></svg> Needs you <span class="count" id="inboxCount"></span>
-      </button>
+  <div class="app" id="app">
+    <header class="top">
+      <h1 class="brand"><svg class="ic" aria-hidden="true"><use href="#i-mark"/></svg>Fleet</h1>
+      <div class="top-actions">
+        <button class="btn" id="inboxBtn" aria-haspopup="true" aria-expanded="false" aria-label="Needs you inbox">
+          <svg class="ic" aria-hidden="true"><use href="#i-tray"/></svg><span>Needs you</span><span class="count" id="inboxCount">0</span>
+        </button>
+        <button class="btn primary" id="newBtn"><svg class="ic" aria-hidden="true"><use href="#i-plus"/></svg>New session</button>
+        <button class="btn icon" id="engBtn" aria-haspopup="true" aria-expanded="false" aria-label="Engines and settings" title="Engines and settings"><svg class="ic" aria-hidden="true"><use href="#i-cpu"/></svg><span class="lbl">Engines</span></button>
+      </div>
     </header>
-    <p id="policy">Loading policy…</p>
-    <p id="connNote" class="connnote" hidden>Cannot reach the server — retrying on its own.</p>
-    <div id="inboxPanel" hidden>
-      <h2>Needs you</h2>
-      <div id="inboxItems"></div>
-      <p id="inboxError" class="err" hidden></p>
-    </div>
-    <div id="sessions" role="list"><p class="empty">Loading the board…</p></div>
-    <form id="composer">
-      <label for="repo">Git repo path</label>
-      <input id="repo" required autocomplete="off">
-      <label for="project">Project (the policy picks its check)</label>
-      <input id="project" value="fixture" autocomplete="off">
-      <label for="agent">Agent</label>
-      <select id="agent"><option value="">Default agent</option></select>
-      <label for="task">Task</label>
-      <textarea id="task" rows="2" placeholder="Hand out work…" required></textarea>
-      <label for="check">Check command (optional)</label>
-      <input id="check" autocomplete="off">
-      <label for="next">Then (optional) — starts on its own when this one is verified done</label>
-      <input id="next" autocomplete="off" placeholder="The next job in the chain">
-      <button type="submit">Hand it out</button>
-      <p class="err" id="formErr" hidden></p>
-    </form>
-    <div id="settings">
-      <span>Settings</span>
-      <button id="themeBtn" aria-label="Switch colour theme"></button>
+
+    <div class="work">
+      <div class="board">
+        <p class="connnote" id="connNote" hidden><svg class="ic" aria-hidden="true"><use href="#i-alert"/></svg><span>Cannot reach the server. The board keeps retrying on its own.</span></p>
+        <div id="sessions" aria-busy="true" aria-live="polite">
+          <div class="col"><div class="skel"></div><div class="skel"></div></div>
+          <div class="col"><div class="skel"></div></div>
+          <div class="col"><div class="skel"></div><div class="skel"></div></div>
+        </div>
+      </div>
+      <aside id="main" aria-label="Session details"><div id="detail"></div></aside>
     </div>
   </div>
-  <div id="main"><div id="detail"><p class="empty">Pick a session, or hand out work below.</p></div></div>
+  <div id="scrim" aria-hidden="true"></div>
+
+  <section id="inboxPanel" class="pop" hidden aria-label="Needs you">
+    <h2>Needs you</h2>
+    <p class="lead">Sessions that need a person: a failed check, a refused merge, a stopped or timed-out run.</p>
+    <div id="inboxItems"></div>
+    <p id="inboxError" class="err" hidden></p>
+  </section>
+
+  <section id="settings" class="pop" hidden aria-label="Engines and settings">
+    <h2>Engines</h2>
+    <p class="lead" id="policy">Loading policy</p>
+    <div class="sect">
+      <h3>What this machine can run</h3>
+      <ul id="agentList"></ul>
+    </div>
+    <div class="sect">
+      <h3>Theme</h3>
+      <button class="switch" id="themeBtn" role="switch" aria-checked="true"><span>Dark</span><span class="track" aria-hidden="true"><span class="knob"></span></span></button>
+    </div>
+  </section>
+
+  <dialog id="newDlg" aria-labelledby="newTitle">
+    <form id="composer" class="dlg" novalidate>
+      <h2 id="newTitle">New session</h2>
+      <p class="lead">Fleet runs the agent in its own git worktree of this repo. When the agent stops, Fleet runs your check. The session is done only when that check passes.</p>
+
+      <div class="field">
+        <label for="repo">Repo path</label>
+        <input id="repo" autocomplete="off" aria-describedby="repoHint">
+        <p class="hint" id="repoHint">The folder of a git repository, for example /home/you/projects/app.</p>
+      </div>
+      <div class="field">
+        <label for="project">Project</label>
+        <input id="project" value="fixture" autocomplete="off" aria-describedby="projectHint">
+        <p class="hint" id="projectHint">The policy file names this project and its check. Leave it as it is unless your policy names another.</p>
+      </div>
+      <div class="field">
+        <label for="agent">Agent</label>
+        <select id="agent" aria-describedby="agentHint"><option value="">Default agent</option></select>
+        <p class="hint" id="agentHint">Only agents found on this machine are listed. Engines shows what is installed.</p>
+      </div>
+      <div class="field">
+        <label for="task">Task</label>
+        <textarea id="task" rows="3" aria-describedby="taskHint"></textarea>
+        <p class="hint" id="taskHint">Say what the agent should change, in one or two sentences.</p>
+      </div>
+      <div class="field">
+        <label for="check">Check command (optional)</label>
+        <input id="check" autocomplete="off" aria-describedby="checkHint">
+        <p class="hint" id="checkHint">Leave it empty to use the project’s check from the policy file. Its output becomes the receipt.</p>
+      </div>
+      <div class="field">
+        <label for="next">Then (optional)</label>
+        <input id="next" autocomplete="off" placeholder="The next task in the chain" aria-describedby="nextHint">
+        <p class="hint" id="nextHint">Starts on its own only when this session is verified done.</p>
+      </div>
+
+      <p class="err" id="formErr" hidden></p>
+      <div class="actions">
+        <button type="button" class="btn quiet" id="cancelNew">Cancel</button>
+        <button type="submit" class="btn primary">Hand it out</button>
+      </div>
+    </form>
+  </dialog>
 
 <script>
 const rootEl = document.documentElement;
+const esc = (s) => { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; };
+const sym = (id) => `<svg class="ic" aria-hidden="true"><use href="#${id}"/></svg>`;
+
 function applyTheme(t) {
   rootEl.dataset.theme = t;
   const btn = document.getElementById('themeBtn');
-  btn.innerHTML = t === 'dark'
-    ? '<svg class="ic"><use href="#i-sun"/></svg> Light'
-    : '<svg class="ic"><use href="#i-moon"/></svg> Dark';
+  btn.setAttribute('aria-checked', t === 'dark' ? 'true' : 'false');
+  btn.querySelector('span').textContent = t === 'dark' ? 'Dark' : 'Light';
 }
 applyTheme(localStorage.getItem('fleet-theme') || 'dark');
 document.getElementById('themeBtn').addEventListener('click', () => {
   const next = rootEl.dataset.theme === 'dark' ? 'light' : 'dark';
-  localStorage.setItem('fleet-theme', next);
+  try { localStorage.setItem('fleet-theme', next); } catch (e) {}
   applyTheme(next);
 });
 
@@ -210,14 +372,22 @@ let selected = null;
 let inboxOpen = false;
 let boardLoaded = false;
 let boardErrShown = false;
-const esc = (s) => { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; };
-// On the phone layout the detail sits below the whole sidebar;
-// selecting a session must bring it into view or the tap looks dead.
-function revealDetail() {
-  if (window.matchMedia('(max-width: 768px)').matches) {
-    document.getElementById('main').scrollIntoView();
-  }
+let curSession = null;
+let activeTab = 'tr';
+let pendingAct = null;
+const workSince = {};
+const steerDrafts = {};
+let lastListKey = '';
+let lastDetailKey = '';
+let detailError = '';
+let lastInboxKey = '';
+let inboxError = '';
+
+function setPopover(id, btnId, open) {
+  document.getElementById(id).hidden = !open;
+  document.getElementById(btnId).setAttribute('aria-expanded', open ? 'true' : 'false');
 }
+function closeSelection() { selected = null; curSession = null; pendingAct = null; detailError = ''; lastDetailKey = ''; refresh(); }
 
 async function refresh() {
   let pol, sessions, inbox;
@@ -226,30 +396,32 @@ async function refresh() {
     sessions = await (await fetch('/api/sessions')).json();
     inbox = await (await fetch('/api/inbox')).json();
   } catch (e) {
-    // The board's error state: say what broke and what happens next,
-    // and (before the first successful load) replace the loading
-    // placeholder with it. A later poll failure keeps the last good
-    // board on screen and only lights the note.
+    // The board's error state: say what broke and what happens next.
+    // Before the first good load the skeleton gives way to the message;
+    // after it, the last good board stays and the note appears.
     document.getElementById('connNote').hidden = false;
     if (!boardLoaded && !boardErrShown) {
       boardErrShown = true;
       lastListKey = '__connerr';
-      document.getElementById('policy').textContent = 'Policy unavailable — the server is not answering.';
+      document.getElementById('policy').textContent = 'Policy unavailable: the server is not answering.';
+      document.getElementById('sessions').setAttribute('aria-busy', 'false');
       document.getElementById('sessions').innerHTML =
-        '<p class="empty">The board cannot reach the server. Check that Fleet is running — it reconnects on its own.</p>';
+        '<div class="emptyboard"><h2>The board cannot reach the server</h2><p>Check that Fleet is running. This page reconnects on its own every few seconds.</p></div>';
     }
     return;
   }
   document.getElementById('connNote').hidden = true;
   boardLoaded = true;
   boardErrShown = false;
+  document.getElementById('sessions').setAttribute('aria-busy', 'false');
   const agentBits = (pol.agents || []).map(a => `${a.name} ${a.found ? 'found' : 'not found'}`).join(', ');
   const modelBit = pol.model ? ` Model for opencode sessions: ${pol.model}.` : '';
   const defaultBit = pol.default_agent
-    ? `Default: ${pol.default_agent}${pol.default_agent_engine === 'custom' ? ' (custom command — test mode)' : ''}.`
-    : 'Default: none.';
+    ? `Default agent: ${pol.default_agent_engine === 'custom' ? 'a custom command (test mode)' : pol.default_agent}.`
+    : 'No default agent is set.';
   document.getElementById('policy').textContent =
-    `Agents: ${agentBits}. ${defaultBit}${modelBit} Up to ${pol.max_parallel} sessions run at once; an agent or check past ${pol.timeout_secs}s is handed back as needs-you; checks come from ${pol.source}.`;
+    `Up to ${pol.max_parallel} sessions run at once. An agent or check that runs past ${pol.timeout_secs} seconds is handed back to Needs you. Checks come from ${pol.source}. ${defaultBit}${modelBit}`;
+  renderEngines(pol.agents || []);
   const sel = document.getElementById('agent');
   if (sel.options.length <= 1) {
     for (const a of (pol.agents || []).filter(a => a.found)) {
@@ -257,29 +429,45 @@ async function refresh() {
     }
   }
   const btn = document.getElementById('inboxBtn');
-  document.getElementById('inboxCount').textContent = inbox.length;
+  const cnt = document.getElementById('inboxCount');
+  if (cnt.textContent !== String(inbox.length)) {
+    cnt.textContent = inbox.length;
+    btn.classList.remove('bump'); void btn.offsetWidth; btn.classList.add('bump');
+  }
   btn.classList.toggle('attn', inbox.length > 0);
+  btn.setAttribute('aria-label', `Needs you inbox, ${inbox.length} waiting`);
   renderInbox(inbox);
   renderSessions(sessions);
-  if (selected) {
-    const s = sessions.find(x => x.id === selected);
-    if (s) renderDetail(s);
+  curSession = null;
+  if (selected) curSession = sessions.find(x => x.id === selected) || null;
+  if (selected && !curSession) selected = null;
+  const app = document.getElementById('app');
+  app.classList.toggle('has-detail', !!curSession);
+  if (curSession) renderDetail(curSession);
+}
+
+function renderEngines(agents) {
+  const list = document.getElementById('agentList');
+  list.innerHTML = '';
+  if (!agents.length) {
+    list.innerHTML = '<li><span>No agents are configured. Test mode runs a custom command from the policy file.</span></li>';
+    return;
+  }
+  for (const a of agents) {
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="name"></span><span class="avail ${a.found ? 'ok' : ''}">${sym(a.found ? 'i-check' : 'i-minus')}${a.found ? 'found on this machine' : 'not installed'}</span>`;
+    li.querySelector('.name').textContent = a.name;
+    list.appendChild(li);
   }
 }
 
-let lastListKey = '';
-let lastDetailKey = '';
-let detailError = '';
-
-let lastInboxKey = '';
-let inboxError = '';
-const steerDrafts = {};
 function renderInbox(inbox) {
   const panel = document.getElementById('inboxPanel');
   panel.hidden = !inboxOpen;
+  document.getElementById('inboxBtn').setAttribute('aria-expanded', inboxOpen ? 'true' : 'false');
   if (!inboxOpen) { lastInboxKey = ''; return; }
   // Same discipline as the list and detail views: rebuilding on every
-  // poll would destroy keyboard focus on the View/Retry buttons.
+  // poll would destroy keyboard focus on the View and Retry buttons.
   const key = JSON.stringify([inbox.map(s => [s.id, s.reason]), inboxError]);
   if (key === lastInboxKey) return;
   lastInboxKey = key;
@@ -288,19 +476,19 @@ function renderInbox(inbox) {
   if (errEl) { errEl.textContent = inboxError; errEl.hidden = !inboxError; }
   box.innerHTML = '';
   if (!inbox.length) {
-    box.innerHTML = '<p class="inboxEmpty">Nothing needs you right now.</p>';
+    box.innerHTML = '<p class="inboxEmpty">Nothing needs you right now. Failed checks and stopped runs appear here with the reason.</p>';
     return;
   }
   for (const s of inbox) {
     const div = document.createElement('div');
     div.className = 'inboxItem';
     div.innerHTML = `<div class="t"></div><div class="r"></div>
-      <button data-act="view">View</button><button data-act="retry">Retry</button>`;
+      <div class="acts"><button class="btn" data-act="view">View session</button><button class="btn" data-act="retry">Retry</button></div>`;
     div.querySelector('.t').textContent = s.task;
     div.querySelector('.r').textContent = s.reason || 'needs you';
-    div.querySelector('[data-act="view"]').onclick = () => { selected = s.id; detailError = ''; lastDetailKey = ''; inboxOpen = false; refresh(); revealDetail(); };
+    div.querySelector('[data-act="view"]').onclick = () => { selected = s.id; detailError = ''; pendingAct = null; lastDetailKey = ''; inboxOpen = false; refresh(); };
     div.querySelector('[data-act="retry"]').onclick = async () => {
-      // A refused retry (409 — the session already moved on) must be
+      // A refused retry (409, the session already moved on) must be
       // SEEN, not swallowed: post() reports the server's own words.
       inboxError = await post(`/api/sessions/${s.id}/retry`);
       lastInboxKey = '';
@@ -309,61 +497,135 @@ function renderInbox(inbox) {
     box.appendChild(div);
   }
 }
-document.getElementById('inboxBtn').addEventListener('click', () => { inboxOpen = !inboxOpen; refresh(); });
+document.getElementById('inboxBtn').addEventListener('click', () => {
+  inboxOpen = !inboxOpen;
+  if (inboxOpen) setPopover('settings', 'engBtn', false);
+  refresh();
+});
+document.getElementById('engBtn').addEventListener('click', () => {
+  const open = document.getElementById('settings').hidden;
+  inboxOpen = false;
+  setPopover('settings', 'engBtn', open);
+  refresh();
+});
 
-function statusChip(s) {
-  if (s.bucket === 'working' && s.status === 'queued')
-    return `<span class="chip working">queued #${s.queue_position ?? '?'}</span>`;
-  return `<span class="chip ${s.bucket}">${s.status.replace('-', ' ')}</span>`;
+function statusText(s) {
+  if (s.bucket === 'working' && s.status === 'queued') return `queued #${s.queue_position ?? '?'}`;
+  return s.status.replace('-', ' ');
 }
+function statusCls(s) {
+  if (s.bucket === 'needs-you') return 'needs';
+  if (s.bucket === 'done') return 'done';
+  return 'working';
+}
+// The receipt line is the check's own last printed line, the way a
+// check's runner ends its output ("3 passed in 4.12s").
+function receiptLine(s) {
+  const lines = (s.check_output || '').split('\n').map(x => x.trim()).filter(Boolean);
+  return lines.length ? lines[lines.length - 1] : (s.check_cmd || '');
+}
+function diffStat(d) {
+  let files = 0, add = 0, del = 0;
+  for (const l of (d || '').split('\n')) {
+    if (l.startsWith('diff --git')) files++;
+    else if (l.startsWith('+') && !l.startsWith('+++')) add++;
+    else if (l.startsWith('-') && !l.startsWith('---')) del++;
+  }
+  return { files, add, del };
+}
+function fmtElapsed(ms) {
+  const t = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), sec = t % 60;
+  const p = (n) => String(n).padStart(2, '0');
+  return h ? `${h}:${p(m)}:${p(sec)}` : `${m}:${p(sec)}`;
+}
+function tickElapsed() {
+  const now = Date.now();
+  document.querySelectorAll('.elapsed[data-since]').forEach(el => {
+    el.textContent = fmtElapsed(now - Number(el.dataset.since));
+  });
+}
+setInterval(tickElapsed, 1000);
+
 function renderSessions(sessions) {
   // Skip the rebuild when nothing visible changed: rebuilding the
-  // list every poll would drop keyboard focus from a row the operator
-  // is tabbing through.
-  const key = JSON.stringify(sessions.map(s => [s.id, s.status, s.bucket, s.check_passed, s.queue_position, s.test_mode, s.successor, (s.steer || []).length, s.id === selected]));
+  // columns every poll would drop keyboard focus from a card the
+  // operator is tabbing through.
+  const key = JSON.stringify(sessions.map(s => [s.id, s.status, s.bucket, s.check_passed, s.queue_position, s.test_mode, s.successor, (s.steer || []).length, s.id === selected, s.reason || '', receiptLine(s), s.diff ? s.diff.length : 0]));
   if (key === lastListKey) return;
   lastListKey = key;
   const list = document.getElementById('sessions');
   list.innerHTML = '';
   if (!sessions.length) {
-    list.innerHTML = '<p class="empty">No sessions yet. Hand out work below and it will run here.</p>';
+    list.innerHTML = `<div class="emptyboard"><h2>No sessions yet</h2>
+      <p>Hand out a task and Fleet runs an agent on it in its own git worktree. The task is done only when your check passes, and its output is the receipt.</p>
+      <button class="btn primary" id="emptyNew"><svg class="ic" aria-hidden="true"><use href="#i-plus"/></svg>New session</button></div>`;
+    document.getElementById('emptyNew').onclick = openNew;
     return;
   }
-  const groups = [['needs-you', 'Needs you'], ['working', 'Working'], ['done', 'Done']];
-  for (const [bucket, label] of groups) {
-    const inGroup = sessions.filter(s => s.bucket === bucket);
-    if (!inGroup.length) continue;
-    const h = document.createElement('div');
-    h.className = 'group';
-    h.innerHTML = `<span></span><span class="gcount">${inGroup.length}</span>`;
-    h.querySelector('span').textContent = label;
-    list.appendChild(h);
-    for (const s of inGroup) {
-      const div = document.createElement('div');
-      div.className = 'session' + (s.id === selected ? ' selected' : '');
-      // Keyboard-operable: a session row is an action, not furniture.
-      div.setAttribute('role', 'button');
-      div.setAttribute('tabindex', '0');
-      div.setAttribute('aria-label', `Open session: ${s.task}`);
-      let inner = `<div class="task"></div><div class="statusrow">`;
-      inner += (s.bucket === 'working' && s.status !== 'queued') ? '<span class="dot live"></span>' : '<span class="dot"></span>';
-      inner += statusChip(s) + `<span>${esc(s.agent || '')}</span>${s.test_mode ? '<span class="tmode">test mode</span>' : ''}</div>`;
-      if ((s.steer || []).length) inner += `<div class="checkline noted"><svg class="ic"><use href="#i-alert"/></svg><span>${s.steer.length} steering message${s.steer.length > 1 ? 's' : ''} waiting</span></div>`;
-      if (s.check_passed === true) inner += (s.status === 'done' || s.status === 'merged')
-        ? `<div class="checkline"><svg class="ic"><use href="#i-check"/></svg><span class="cmd"></span></div>`
-        : `<div class="checkline noted"><svg class="ic"><use href="#i-alert"/></svg><span class="cmd"></span></div>`;
-      if (s.check_passed === false) inner += `<div class="checkline failed"><svg class="ic"><use href="#i-x"/></svg><span class="cmd"></span></div>`;
-      div.innerHTML = inner;
-      div.querySelector('.task').textContent = s.task;
-      const cl = div.querySelector('.checkline .cmd');
-      if (cl) cl.textContent = s.check_cmd;
-      div.onclick = () => { selected = s.id; detailError = ''; lastDetailKey = ''; refresh(); revealDetail(); };
-      div.onkeydown = (e) => {
-        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); div.onclick(); }
-      };
-      list.appendChild(div);
-    }
+  const groups = [
+    ['needs-you', 'Needs you', 'Nothing needs you. Failed checks and stopped runs land here with the reason.'],
+    ['working', 'Working', 'No agent is running right now.'],
+    ['done', 'Done', 'Work appears here once its check passes, with the check line as its receipt.'],
+  ];
+  const now = Date.now();
+  for (const s of sessions) {
+    if (s.bucket === 'working' && s.status !== 'queued') { if (!workSince[s.id]) workSince[s.id] = now; }
+    else delete workSince[s.id];
   }
+  for (const [bucket, label, empty] of groups) {
+    const inGroup = sessions.filter(s => s.bucket === bucket);
+    const col = document.createElement('section');
+    col.className = `col ${bucket === 'needs-you' ? 'needs' : bucket}`;
+    col.setAttribute('aria-label', label);
+    col.innerHTML = `<div class="colhead"><span class="cname"></span><span class="gcount">${inGroup.length}</span></div><div class="colbody"></div>`;
+    col.querySelector('.cname').textContent = label;
+    const body = col.querySelector('.colbody');
+    if (!inGroup.length) {
+      body.innerHTML = `<p class="colempty"></p>`;
+      body.querySelector('p').textContent = empty;
+    }
+    for (const s of inGroup) body.appendChild(sessionCard(s));
+    list.appendChild(col);
+  }
+}
+
+function sessionCard(s) {
+  const div = document.createElement('div');
+  const cls = statusCls(s);
+  div.className = 'card' + (s.bucket === 'needs-you' ? ' needs' : '');
+  div.setAttribute('role', 'button');
+  div.setAttribute('tabindex', '0');
+  div.setAttribute('aria-label', `Open session: ${s.task}`);
+  div.setAttribute('aria-current', s.id === selected ? 'true' : 'false');
+  const live = (s.bucket === 'working' && s.status !== 'queued') ? '<span class="live" aria-hidden="true"></span>' : '';
+  const since = workSince[s.id];
+  const elapsed = since ? `<span class="elapsed" data-since="${since}" title="Measured from when this board first saw the session running">${fmtElapsed(Date.now() - since)}</span>` : '';
+  const agent = s.test_mode ? '<span class="chip testmode">test mode</span>' : `<span class="chip">${esc(s.engine || s.agent || 'agent')}</span>`;
+  let inner = `<div class="cardtop"><span class="pill project"></span><span class="pill s-${cls}">${live}<span class="st"></span></span>${elapsed}</div>
+    <div class="task"></div>`;
+  if (s.bucket === 'needs-you') inner += `<p class="reason"></p>`;
+  else if (s.status === 'checking') inner += `<p class="note">The agent finished. Running your check.</p>`;
+  if (s.bucket === 'done') {
+    const ds = diffStat(s.diff);
+    inner += `<div class="receipt"><span class="line"></span><span class="stat">${ds.files} file${ds.files === 1 ? '' : 's'} <span class="add">+${ds.add}</span> <span class="del">−${ds.del}</span></span></div>`;
+  }
+  if ((s.steer || []).length) inner += `<p class="note">${s.steer.length} steering message${s.steer.length > 1 ? 's' : ''} waiting</p>`;
+  inner += `<div class="cardfoot">${agent}<code class="branch"></code></div>`;
+  div.innerHTML = inner;
+  div.querySelector('.pill.project').textContent = s.project;
+  div.querySelector('.st').textContent = statusText(s);
+  div.querySelector('.task').textContent = s.task;
+  const rs = div.querySelector('.reason');
+  if (rs) rs.textContent = s.reason || 'needs you';
+  const rl = div.querySelector('.receipt .line');
+  if (rl) rl.textContent = receiptLine(s);
+  div.querySelector('.branch').textContent = s.branch || '';
+  div.onclick = () => { selected = s.id; detailError = ''; pendingAct = null; lastDetailKey = ''; refresh(); };
+  div.onkeydown = (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); div.onclick(); }
+  };
+  return div;
 }
 
 function renderDetail(s) {
@@ -376,7 +638,7 @@ function renderDetail(s) {
     s.transcript.length, s.transcript[s.transcript.length - 1] || '',
     (s.check_output || '').length, (s.check_output || '').slice(-80),
     (s.diff || '').length, (s.diff || '').slice(-80), detailError,
-    (s.steer || []).length, s.successor, s.spawned_from, (s.next_queue || []).join('|'), s.test_mode]);
+    (s.steer || []).length, s.successor, s.spawned_from, (s.next_queue || []).join('|'), s.test_mode, JSON.stringify(pendingAct)]);
   if (key === lastDetailKey) return;
   const prevScroll = d.scrollTop;
   const prevTr = d.querySelector('#tr');
@@ -384,83 +646,126 @@ function renderDetail(s) {
   const prevTrAtBottom = prevTr ? (prevTr.scrollHeight - prevTr.scrollTop - prevTr.clientHeight < 24) : true;
   const activeId = (document.activeElement && d.contains(document.activeElement)) ? document.activeElement.id : '';
   lastDetailKey = key;
-  const facts = [];
-  facts.push(`<span class="fact"><span class="k">Branch</span><code>${esc(s.branch)}</code></span>`);
-  facts.push(`<span class="fact"><span class="k">Agent</span>${esc(s.agent || 'unknown')}${s.test_mode ? ' (custom command — test mode)' : ''}</span>`);
-  facts.push(`<span class="fact"><span class="k">Status</span>${esc(s.status)}</span>`);
-  if (s.queue_position) facts.push(`<span class="fact"><span class="k">Queue</span>#${s.queue_position}</span>`);
+  const cls = statusCls(s);
+  const agentLabel = s.test_mode ? 'test mode (custom command)' : (s.engine || s.agent || 'unknown');
   const chainBits = [];
-  if (s.spawned_from) chainBits.push(`handed out automatically when ${s.spawned_from} finished`);
-  if (s.successor) chainBits.push(`its finish handed out ${s.successor}`);
-  if ((s.next_queue || []).length) chainBits.push(`then: ${s.next_queue.join(', ')}`);
-  let html = `<button class="backbtn" id="backBtn"><svg class="ic"><use href="#i-back"/></svg> Back to the board</button><h2></h2><div class="meta">${facts.join('')}</div>`;
+  if (s.spawned_from) chainBits.push(`Handed out automatically when ${s.spawned_from} finished.`);
+  if (s.successor) chainBits.push(`Its finish handed out ${s.successor}.`);
+  if ((s.next_queue || []).length) chainBits.push(`Then: ${s.next_queue.join(', ')}.`);
+  const verified = s.check_passed === true && (s.status === 'done' || s.status === 'merged');
+  const noted = s.check_passed === true && !verified;
+  const hasCheck = s.check_passed === true || s.check_passed === false;
+  const rc = receiptLine(s);
+  const ds = diffStat(s.diff);
+
+  let html = `<div class="dhead"><span class="pill s-${cls}"><span class="st"></span></span>
+      <button class="btn quiet" id="backBtn" aria-label="Close this session">${sym('i-x')}Close</button></div>
+    <h2></h2>
+    <div class="facts">
+      <span><span class="k">Project</span><span class="pj"></span></span>
+      <span><span class="k">Agent</span><span class="ag"></span></span>
+      <span><span class="k">Branch</span><code class="br"></code></span>
+      ${s.queue_position ? `<span><span class="k">Queue</span>#${s.queue_position}</span>` : ''}
+    </div>`;
   if (chainBits.length) html += `<div class="chain">${chainBits.map(b => `<span>${esc(b)}</span>`).join('')}</div>`;
-  if (s.check_passed !== undefined && s.check_passed !== null) {
-    // "Verified done" is a claim about the SESSION, not just the
-    // check: a session the gates refused (status needs-you) whose
-    // check happened to pass must not wear it.
-    const verified = s.check_passed && (s.status === 'done' || s.status === 'merged');
-    const noted = s.check_passed && !verified;
-    html += `<div class="checkbanner ${verified ? 'pass' : noted ? 'noted' : 'fail'}">
-      <svg class="ic"><use href="#${verified ? 'i-check' : noted ? 'i-alert' : 'i-x'}"/></svg>
-      <span class="v">${verified ? 'Check passed — verified done' : noted ? 'Check passed — but this session needs you' : 'Check failed'}</span>
-      <code></code></div>`;
+  if (hasCheck) {
+    html += `<div class="receiptcard ${verified ? 'pass' : noted ? 'noted' : 'fail'}">
+      <div class="verdict">${sym(verified ? 'i-check' : noted ? 'i-alert' : 'i-x')}<span class="vt"></span></div>
+      <div class="check"></div>
+      <div class="cmd"></div></div>`;
   }
-  if (s.status === 'needs-you' && s.reason) html += `<div class="checkbanner fail reasonbanner"><svg class="ic"><use href="#i-alert"/></svg><span class="v"></span></div>`;
-  html += `<div class="label">Transcript</div><pre id="tr"></pre>`;
-  if (s.check_output) html += `<div class="label">Check output</div><pre id="co"></pre>`;
-  if (s.diff) html += `<div class="label">Diff</div><pre id="df"></pre>`;
-  html += `<div class="actions">`;
-  if (s.status === 'done') html += `<button class="mergebtn" id="mergeBtn"><svg class="ic"><use href="#i-merge"/></svg> Merge this work</button>`;
-  if (s.status === 'needs-you') html += `<button class="retrybtn" id="retryBtn"><svg class="ic"><use href="#i-retry"/></svg> Retry this session</button>`;
-  if (s.status === 'queued' || s.status === 'working' || s.status === 'checking')
-    html += `<button class="stopbtn" id="stopBtn"><svg class="ic"><use href="#i-stop"/></svg> Stop this session</button>`;
-  html += `</div>`;
+  if (s.status === 'needs-you' && s.reason) html += `<div class="reasonbox">${sym('i-alert')}<span class="v"></span></div>`;
+
+  if (pendingAct && pendingAct.id === s.id) {
+    const isMerge = pendingAct.act === 'merge';
+    html += `<div class="confirm" role="group" aria-label="Confirm">
+      <p>${isMerge ? 'Merge this verified work into its target branch? Fleet refuses if the target is dirty or in the middle of a merge.' : 'Stop this run now? It lands in Needs you as stopped by you.'}</p>
+      <div class="actions">
+        <button class="btn ${isMerge ? 'merge' : 'stop'}" id="${isMerge ? 'mergeConfirm' : 'stopConfirm'}">${sym(isMerge ? 'i-merge' : 'i-stop')}${isMerge ? 'Merge now' : 'Stop now'}</button>
+        <button class="btn" id="cancelAct">Keep it</button>
+      </div></div>`;
+  } else {
+    html += `<div class="actions">`;
+    if (s.status === 'done') html += `<button class="btn merge" id="mergeBtn">${sym('i-merge')}Merge this work</button>`;
+    if (s.status === 'needs-you') html += `<button class="btn" id="retryBtn">${sym('i-retry')}Retry this session</button>`;
+    if (s.status === 'queued' || s.status === 'working' || s.status === 'checking')
+      html += `<button class="btn stop" id="stopBtn">${sym('i-stop')}Stop this session</button>`;
+    if (s.status !== 'merged') html += `<button class="btn" id="steerJump">${sym('i-send')}Steer</button>`;
+    html += `</div>`;
+  }
+
+  html += `<div class="tabs" role="tablist" aria-label="Session views">
+      <button class="tab" role="tab" id="tab-tr" data-tab="tr" aria-controls="panel-tr">Transcript</button>
+      <button class="tab" role="tab" id="tab-df" data-tab="df" aria-controls="panel-df">Diff</button>
+      <button class="tab" role="tab" id="tab-rc" data-tab="rc" aria-controls="panel-rc">Receipt</button>
+    </div>
+    <div class="panel" role="tabpanel" id="panel-tr" aria-labelledby="tab-tr">
+      <p class="dstat"></p>
+      <pre id="tr"></pre>
+      <p class="hint" id="trNote" hidden></p>
+    </div>
+    <div class="panel" role="tabpanel" id="panel-df" aria-labelledby="tab-df" hidden>
+      <p class="dstat">${ds.files} file${ds.files === 1 ? '' : 's'} changed, <span class="add">+${ds.add}</span> <span class="del">−${ds.del}</span> lines, against the branch this session started from.</p>
+      <pre id="df"></pre>
+    </div>
+    <div class="panel" role="tabpanel" id="panel-rc" aria-labelledby="tab-rc" hidden>
+      <p class="dstat">The receipt is the check's own output. A session is done only when this check passed.</p>
+      <pre id="co"></pre>
+    </div>`;
   if (s.status !== 'merged') {
     const hint = s.status === 'needs-you'
-      ? 'Sending also retries the session — your message goes to the agent first, before anything is re-checked.'
+      ? 'Sending also retries the session: your message goes to the agent first, before anything is re-checked.'
       : s.status === 'done'
         ? 'Sending reopens this session: the agent gets your message and the work is re-checked before it can be merged.'
-        : 'Delivered when the current run ends — before anything is committed or checked.';
-    html += `<div class="label">Steer this session</div>
-      <textarea id="steerText" rows="2" placeholder="Tell the agent what to change…"></textarea>
-      <div class="actions"><button class="retrybtn" id="steerBtn"><svg class="ic"><use href="#i-send"/></svg> Send to the agent</button></div>
-      <p class="hint">${hint}</p>`;
+        : 'Delivered when the current run ends, before anything is committed or checked.';
+    html += `<div class="steer"><h3>Steer this session</h3>
+      <textarea id="steerText" rows="2" placeholder="Tell the agent what to change" aria-describedby="steerHint"></textarea>
+      <div class="actions"><button class="btn" id="steerBtn">${sym('i-send')}Send to the agent</button></div>
+      <p class="hint" id="steerHint">${esc(hint)}</p></div>`;
   }
   html += `<p class="err" id="actErr" hidden></p>`;
   d.innerHTML = html;
   d.querySelector('h2').textContent = s.task;
+  d.querySelector('.st').textContent = statusText(s);
+  d.querySelector('.pj').textContent = s.project;
+  d.querySelector('.ag').textContent = agentLabel;
+  d.querySelector('.br').textContent = s.branch || '';
   const bb = d.querySelector('#backBtn');
-  if (bb) bb.onclick = () => { document.getElementById('sidebar').scrollIntoView(); };
-  const code = d.querySelector('.checkbanner code');
-  if (code) code.textContent = s.check_cmd;
-  const reasonEl = d.querySelector('.reasonbanner .v');
-  if (reasonEl && s.status === 'needs-you') reasonEl.textContent = s.reason;
-  d.querySelector('#tr').textContent = s.transcript.join('\n');
-  if (d.querySelector('#co')) d.querySelector('#co').textContent = s.check_output || '';
-  if (d.querySelector('#df')) d.querySelector('#df').textContent = s.diff;
+  if (bb) bb.onclick = () => closeSelection();
+  if (hasCheck) {
+    d.querySelector('.vt').textContent = verified ? 'Check passed: verified done'
+      : noted ? 'Check passed, but this session needs you' : 'Check failed';
+    d.querySelector('.receiptcard .check').textContent = rc;
+    d.querySelector('.receiptcard .cmd').textContent = `Check: ${s.check_cmd || ''}`;
+  }
+  const reasonEl = d.querySelector('.reasonbox .v');
+  if (reasonEl) reasonEl.textContent = s.reason;
+  const tr = d.querySelector('#tr');
+  tr.textContent = s.transcript.length ? s.transcript.join('\n') : 'No output yet.';
+  const trNote = d.querySelector('#trNote');
+  if (s.transcript.length >= 2000) {
+    trNote.hidden = false;
+    trNote.textContent = `Showing the most recent lines. The full log is kept on disk as logs/${s.id}.log in the Fleet data folder.`;
+  }
+  d.querySelector('.dstat').textContent = `${s.transcript.length} line${s.transcript.length === 1 ? '' : 's'} so far.`;
+  d.querySelector('#co').textContent = s.check_output || 'No check has run yet.';
+  d.querySelector('#df').textContent = s.diff || 'No changes on this branch yet.';
   // The action error lives in detailError, outside the DOM, so a
   // re-render can never erase it before it is read.
   const errEl = d.querySelector('#actErr');
   if (errEl && detailError) { errEl.textContent = detailError; errEl.hidden = false; }
   const mb = d.querySelector('#mergeBtn');
-  if (mb) mb.onclick = async () => {
-    const r = await post(`/api/sessions/${s.id}/merge`);
-    detailError = r || '';
-    refresh();
-  };
+  if (mb) mb.onclick = () => { pendingAct = { id: s.id, act: 'merge' }; detailError = ''; lastDetailKey = ''; renderDetail(s); };
+  const mc = d.querySelector('#mergeConfirm');
+  if (mc) mc.onclick = async () => { pendingAct = null; detailError = (await post(`/api/sessions/${s.id}/merge`)) || ''; refresh(); };
   const rb = d.querySelector('#retryBtn');
-  if (rb) rb.onclick = async () => {
-    const r = await post(`/api/sessions/${s.id}/retry`);
-    detailError = r || '';
-    refresh();
-  };
+  if (rb) rb.onclick = async () => { detailError = (await post(`/api/sessions/${s.id}/retry`)) || ''; refresh(); };
   const tb = d.querySelector('#stopBtn');
-  if (tb) tb.onclick = async () => {
-    const r = await post(`/api/sessions/${s.id}/stop`);
-    detailError = r || '';
-    refresh();
-  };
+  if (tb) tb.onclick = () => { pendingAct = { id: s.id, act: 'stop' }; detailError = ''; lastDetailKey = ''; renderDetail(s); };
+  const sc = d.querySelector('#stopConfirm');
+  if (sc) sc.onclick = async () => { pendingAct = null; detailError = (await post(`/api/sessions/${s.id}/stop`)) || ''; refresh(); };
+  const cancel = d.querySelector('#cancelAct');
+  if (cancel) cancel.onclick = () => { pendingAct = null; lastDetailKey = ''; renderDetail(s); };
   // The steer draft lives outside the DOM (like detailError): a
   // re-render on the 2s poll must never eat a half-typed message.
   const st = d.querySelector('#steerText');
@@ -468,6 +773,8 @@ function renderDetail(s) {
     st.value = steerDrafts[s.id] || '';
     st.addEventListener('input', () => { steerDrafts[s.id] = st.value; });
   }
+  const sj = d.querySelector('#steerJump');
+  if (sj) sj.onclick = () => { const t = document.getElementById('steerText'); if (t) { t.scrollIntoView({ block: 'nearest' }); t.focus(); } };
   const sb = d.querySelector('#steerBtn');
   if (sb) sb.onclick = async () => {
     const msg = (steerDrafts[s.id] || '').trim();
@@ -477,19 +784,29 @@ function renderDetail(s) {
     detailError = r || '';
     refresh();
   };
+  // Tabs: the panels stay in the DOM and only their visibility changes,
+  // so the poll never rebuilds the transcript the operator is reading.
+  d.querySelectorAll('.tab').forEach(t => t.onclick = () => setTab(t.dataset.tab));
+  setTab(activeTab);
   // Restore what the rebuild disturbed.
   d.scrollTop = prevScroll;
-  const tr = d.querySelector('#tr');
-  if (tr) tr.scrollTop = prevTrAtBottom ? tr.scrollHeight : prevTrScroll;
+  const tr2 = d.querySelector('#tr');
+  if (tr2) tr2.scrollTop = prevTrAtBottom ? tr2.scrollHeight : prevTrScroll;
   if (activeId) {
     const again = d.querySelector('#' + CSS.escape(activeId));
     if (again) again.focus();
   }
 }
-function showErr(sel, msg) {
-  const el = document.querySelector(sel);
-  if (el) { el.textContent = msg; el.hidden = !msg; }
+function setTab(name) {
+  activeTab = name;
+  document.querySelectorAll('#detail .tab').forEach(t => {
+    const on = t.dataset.tab === name;
+    t.setAttribute('aria-selected', on ? 'true' : 'false');
+    t.tabIndex = on ? 0 : -1;
+  });
+  document.querySelectorAll('#detail .panel').forEach(p => { p.hidden = p.id !== 'panel-' + name; });
 }
+
 async function post(url) {
   const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   if (!r.ok) { try { return (await r.json()).error || 'request failed'; } catch { return 'request failed'; } }
@@ -500,34 +817,78 @@ async function postBody(url, obj) {
   if (!r.ok) { try { return (await r.json()).error || 'request failed'; } catch { return 'request failed'; } }
   return null;
 }
+
+const dlg = document.getElementById('newDlg');
+function openNew() { setPopover('settings', 'engBtn', false); inboxOpen = false; dlg.showModal(); document.getElementById('repo').focus(); }
+document.getElementById('newBtn').addEventListener('click', openNew);
+document.getElementById('cancelNew').addEventListener('click', () => dlg.close());
+document.getElementById('scrim').addEventListener('click', () => { if (selected) closeSelection(); });
+document.addEventListener('click', (e) => {
+  // A click outside an open popover closes it; its own button toggles it.
+  const s = document.getElementById('settings'), ib = document.getElementById('inboxPanel');
+  if (!s.hidden && !s.contains(e.target) && !document.getElementById('engBtn').contains(e.target)) { setPopover('settings', 'engBtn', false); }
+  if (!ib.hidden && !ib.contains(e.target) && !document.getElementById('inboxBtn').contains(e.target)) { inboxOpen = false; refresh(); }
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || dlg.open) return;
+  if (inboxOpen) { inboxOpen = false; refresh(); return; }
+  if (!document.getElementById('settings').hidden) { setPopover('settings', 'engBtn', false); return; }
+  if (selected) closeSelection();
+});
+
 document.getElementById('composer').addEventListener('submit', async (e) => {
   e.preventDefault();
-  showErr('#formErr', '');
+  const err = document.getElementById('formErr');
+  const repoEl = document.getElementById('repo'), taskEl = document.getElementById('task');
+  const problems = [];
+  repoEl.setAttribute('aria-invalid', repoEl.value.trim() ? 'false' : 'true');
+  taskEl.setAttribute('aria-invalid', taskEl.value.trim() ? 'false' : 'true');
+  if (!repoEl.value.trim()) problems.push('Give the repo path: the folder of the git repository the agent works in.');
+  if (!taskEl.value.trim()) problems.push('Write the task: say what the agent should do.');
+  if (problems.length) {
+    err.textContent = problems.join(' ');
+    err.hidden = false;
+    (repoEl.value.trim() ? taskEl : repoEl).focus();
+    return;
+  }
+  err.hidden = true;
   const body = {
-    repo: document.getElementById('repo').value,
+    repo: repoEl.value.trim(),
     project: document.getElementById('project').value,
-    task: document.getElementById('task').value,
+    task: taskEl.value.trim(),
     check: document.getElementById('check').value,
   };
   const next = document.getElementById('next').value.trim();
   if (next) body.next = next;
   const agent = document.getElementById('agent').value;
   if (agent) body.agent = agent;
-  const r = await fetch('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  if (!r.ok) { showErr('#formErr', (await r.json()).error || 'could not hand out the task'); return; }
+  let r;
+  try {
+    r = await fetch('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  } catch (x) {
+    err.textContent = 'Could not reach the server. Your text is still here; try again when Fleet is running.';
+    err.hidden = false;
+    return;
+  }
+  if (!r.ok) {
+    let msg = 'Could not hand out the task.';
+    try { msg = (await r.json()).error || msg; } catch (x) {}
+    err.textContent = msg;
+    err.hidden = false;
+    return;
+  }
   const s = await r.json();
   selected = s.id;
-  document.getElementById('task').value = '';
+  pendingAct = null;
+  lastDetailKey = '';
+  taskEl.value = '';
   document.getElementById('next').value = '';
+  document.getElementById('check').value = '';
+  dlg.close();
   refresh();
-  revealDetail();
 });
 refresh();
 setInterval(refresh, 2000);
 </script>
-<!-- hallmark-rune override log — Fleet elevation (18 Nov 2026)
-override · R9 · guard: the session list is the primary work surface — every session is a destination in it, and the inbox, composer and settings live with it · reason: in Fleet the rail is the board, not chrome
-override · R1 · guard: transcript, check output, diff, branch name and check command are data returned by the API · reason: mono carries the data surfaces only; every label, heading and control stays in the body face
--->
 </body>
 </html>
