@@ -57,6 +57,8 @@
   .chip.done { background: var(--chip-done); color: var(--verified); }
   .checkline { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 12px; color: var(--verified); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .checkline.failed { color: var(--danger); }
+  .checkline.noted { color: var(--warn); }
+  .checkbanner.noted { border-color: var(--warn); color: var(--warn); }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
   .dot.live { background: var(--accent); animation: pulse 1.6s ease-in-out infinite; }
   @keyframes pulse { 50% { opacity: .35; } }
@@ -265,7 +267,9 @@ function renderSessions(sessions) {
       let inner = `<div class="task"></div><div class="statusrow">`;
       inner += (s.bucket === 'working' && s.status !== 'queued') ? '<span class="dot live"></span>' : '<span class="dot"></span>';
       inner += statusChip(s) + `<span>${esc(s.agent || '')}</span></div>`;
-      if (s.check_passed === true) inner += `<div class="checkline"><svg class="ic"><use href="#i-check"/></svg><span></span></div>`;
+      if (s.check_passed === true) inner += (s.status === 'done' || s.status === 'merged')
+        ? `<div class="checkline"><svg class="ic"><use href="#i-check"/></svg><span></span></div>`
+        : `<div class="checkline noted"><svg class="ic"><use href="#i-alert"/></svg><span></span></div>`;
       if (s.check_passed === false) inner += `<div class="checkline failed"><svg class="ic"><use href="#i-x"/></svg><span></span></div>`;
       div.innerHTML = inner;
       div.querySelector('.task').textContent = s.task;
@@ -299,9 +303,14 @@ function renderDetail(s) {
   lastDetailKey = key;
   let html = `<h2></h2><div class="meta">branch ${esc(s.branch)} · agent ${esc(s.agent || 'unknown')} · status ${esc(s.status)}${s.queue_position ? ` · queue #${s.queue_position}` : ''}</div>`;
   if (s.check_passed !== undefined && s.check_passed !== null) {
-    html += `<div class="checkbanner ${s.check_passed ? 'pass' : 'fail'}">
-      <svg class="ic"><use href="#${s.check_passed ? 'i-check' : 'i-x'}"/></svg>
-      <span class="v">${s.check_passed ? 'Check passed — verified done' : 'Check failed'}</span>
+    // "Verified done" is a claim about the SESSION, not just the
+    // check: a session the gates refused (status needs-you) whose
+    // check happened to pass must not wear it.
+    const verified = s.check_passed && (s.status === 'done' || s.status === 'merged');
+    const noted = s.check_passed && !verified;
+    html += `<div class="checkbanner ${verified ? 'pass' : noted ? 'noted' : 'fail'}">
+      <svg class="ic"><use href="#${verified ? 'i-check' : noted ? 'i-alert' : 'i-x'}"/></svg>
+      <span class="v">${verified ? 'Check passed — verified done' : noted ? 'Check passed — but this session needs you' : 'Check failed'}</span>
       <code></code></div>`;
   }
   if (s.status === 'needs-you' && s.reason) html += `<div class="checkbanner fail reasonbanner"><svg class="ic"><use href="#i-alert"/></svg><span class="v"></span></div>`;
