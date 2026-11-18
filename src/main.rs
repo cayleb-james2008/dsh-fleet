@@ -1004,12 +1004,24 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, Str
             content_length = v.trim().parse().unwrap_or(0);
         }
     }
+    // A declared body over the cap is refused without being read —
+    // otherwise one connection can pin its handler thread (and a huge
+    // allocation) by declaring a giant body and sending nothing.
+    if content_length > MAX_BODY_BYTES {
+        return Some(("__too_large__".to_string(), String::new(), String::new()));
+    }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body).ok()?;
     }
     Some((method, path, String::from_utf8_lossy(&body).to_string()))
 }
+
+/// Largest request body the API accepts (hand-outs are small JSON).
+const MAX_BODY_BYTES: usize = 1_048_576;
+/// How long a connection may take to deliver its request before the
+/// handler drops it — a stalled request must not hold a thread forever.
+const READ_TIMEOUT_SECS: u64 = 10;
 
 /// Serialize sessions for the API with queue positions computed in:
 /// a queued session's position is its place among the queued, in
@@ -1297,8 +1309,15 @@ fn main() {
             Ok(mut stream) => {
                 let app = app.clone();
                 std::thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(
+                        READ_TIMEOUT_SECS,
+                    )));
                     if let Some((method, path, body)) = read_request(&mut stream) {
-                        let response = handle(&app, &method, &path, &body);
+                        let response = if method == "__too_large__" {
+                            error_response(413, "request body too large")
+                        } else {
+                            handle(&app, &method, &path, &body)
+                        };
                         let _ = stream.write_all(response.as_bytes());
                     }
                 });
