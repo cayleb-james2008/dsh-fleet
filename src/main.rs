@@ -462,6 +462,10 @@ struct Session {
     /// it has fired.
     #[serde(default)]
     successor: Option<String>,
+    /// The prompt a retried session's next run receives: the original
+    /// task plus what failed last time. Set by retry(), read by the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_prompt: Option<String>,
     transcript: Vec<String>,
 }
 
@@ -1322,7 +1326,18 @@ impl App {
         let steer_first = resumed && self.steer_pending(id);
         if !steer_first {
             self.log(id, format!("agent started: {}", session.task));
-            if self.run_one(id, session, wt, &session.task, false) != AgentRun::Clean {
+            let prompt = session
+                .retry_prompt
+                .clone()
+                .unwrap_or_else(|| session.task.clone());
+            if session.retry_prompt.is_some() {
+                // The retry note is delivered once; a later pass starts
+                // from the task again.
+                if let Some(s) = self.sessions.lock().unwrap().iter_mut().find(|s| s.id == id) {
+                    s.retry_prompt = None;
+                }
+            }
+            if self.run_one(id, session, wt, &prompt, false) != AgentRun::Clean {
                 return;
             }
         }
@@ -1866,7 +1881,31 @@ impl App {
         problems
     }
 
-    /// Hand a needs-you session back to its agent: the check state is
+    /// The prompt a retried session's agent receives: the original task,
+/// then a delimited note with what failed last time — the check's
+/// command and the tail of its output, or the previous reason when the
+/// check printed nothing.
+fn retry_prompt_text(
+    task: &str,
+    check_cmd: &str,
+    check_output: Option<&str>,
+    reason: Option<&str>,
+) -> String {
+    let note = match check_output.filter(|o| !o.trim().is_empty()) {
+        Some(out) => {
+            let n = out.chars().count();
+            let tail: String = out.chars().skip(n.saturating_sub(4000)).collect();
+            format!("Check command: {check_cmd}\nLast output of the check (up to 4000 characters):\n{tail}")
+        }
+        None => format!(
+            "Previous reason: {}",
+            reason.unwrap_or("the previous attempt did not finish")
+        ),
+    };
+    format!("{task}\n\n--- retry: the previous attempt did not pass ---\n{note}\n--- end of retry note ---")
+}
+
+/// Hand a needs-you session back to its agent: the check state is
     /// cleared and the session re-queues; its worktree (with the agent's
     /// earlier work in it) is reused by run_session.
     fn retry(self: &Arc<Self>, id: &str) -> Result<(), String> {
@@ -1888,6 +1927,12 @@ impl App {
                         .to_string(),
                 );
             }
+            s.retry_prompt = Some(Self::retry_prompt_text(
+                &s.task,
+                &s.check_cmd,
+                s.check_output.as_deref(),
+                s.reason.as_deref(),
+            ));
         }
         self.log(id, "retry: handed back to the agent".to_string());
         self.requeue(id);
@@ -1983,6 +2028,7 @@ impl App {
                 next_queue: rest,
                 spawned_from: Some(id.to_string()),
                 successor: None,
+                retry_prompt: None,
                 transcript: Vec::new(),
             };
             sessions.push(child);
@@ -2560,6 +2606,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 next_queue,
                 spawned_from: None,
                 successor: None,
+                retry_prompt: None,
                 transcript: Vec::new(),
             };
             app.sessions.lock().unwrap().push(session.clone());
@@ -2786,6 +2833,7 @@ fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
             next_queue: Vec::new(),
             spawned_from: None,
             successor: None,
+            retry_prompt: None,
             transcript: cap_transcript(lines),
         });
     }
@@ -3151,6 +3199,7 @@ mod tests {
             next_queue: Vec::new(),
             spawned_from: None,
             successor: None,
+            retry_prompt: None,
             transcript: Vec::new(),
         };
         app.sessions.lock().unwrap().push(session);
@@ -3198,6 +3247,7 @@ mod tests {
             next_queue: Vec::new(),
             spawned_from: None,
             successor: None,
+            retry_prompt: None,
             transcript: Vec::new(),
         }
     }
@@ -3303,6 +3353,49 @@ mod tests {
         let sessions = app.sessions.lock().unwrap();
         let reason = sessions[0].reason.clone().unwrap_or_default();
         assert!(reason.contains("No such file or directory"), "reason was: {reason}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retry_hands_the_agent_the_failure_it_must_fix() {
+        let dir = std::env::temp_dir().join(format!("fleet-f3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir);
+        // A recording agent: it keeps the prompt it was given.
+        let received = dir.join("received.txt");
+        let agent = dir.join("recorder.sh");
+        std::fs::write(
+            &agent,
+            format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n", received.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut s = test_session("s1", Status::NeedsYou, &dir);
+        s.task = "write output".to_string();
+        s.repo = repo.to_string_lossy().to_string();
+        s.agent = agent.to_string_lossy().to_string();
+        s.check_cmd = "echo boom-output; false".to_string();
+        s.check_output = Some("boom-output".to_string());
+        s.check_passed = Some(false);
+        s.verified_commit = None;
+        s.reason = Some("check failed: echo boom-output; false".to_string());
+        let app = test_app(dir.join("data"), vec![s]);
+        app.retry("s1").unwrap();
+        for _ in 0..400 {
+            if app.status_of("s1").as_deref() == Some("needs-you") && received.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let prompt = std::fs::read_to_string(&received).unwrap_or_default();
+        assert!(prompt.starts_with("write output"), "prompt was: {prompt}");
+        assert!(prompt.contains("echo boom-output; false"), "prompt was: {prompt}");
+        assert!(prompt.contains("boom-output"), "prompt was: {prompt}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
