@@ -30,6 +30,16 @@ branch it diverged from, and merge it into the target branch — or retry a
 failed session, which re-runs the agent in the same worktree with the failure
 attached.
 
+While a session works, you can **steer** it — your message runs as a
+continuation of the same session before Fleet runs the check — and **stop**
+it, which kills the run within seconds and lands it in Needs you with
+"stopped by you" as the reason. Steering is durable: a message leaves the
+queue only after the run that carries it, so a server crash mid-delivery
+loses nothing and the retry delivers it. A hand-out can also name what runs
+**next**: when the session reaches verified done, the follow-up work is
+handed out on its own branch, in hand-out order — a session that lands in
+Needs you fires nothing.
+
 ## What "verified" means here
 
 - **The check is the product's own command**, named per project in a policies
@@ -67,6 +77,29 @@ up front, before any worktree is created, and the board says which agents
 this machine really has. When a session names no agent, it runs the
 project's policy default.
 
+## Engines, driven properly
+
+A bare name gets the engine's real headless form, with the model pinned:
+
+- **opencode** — `opencode run --model <model> "<task>"`; a continuation
+  resumes the session the first run reported (`--session <id>`).
+- **claude** — `claude -p "<task>" --model <model>`; continuations resume
+  with `--resume <id>`.
+- **codex** — `codex exec "<task>" -m <model>`; continuations use
+  `codex exec resume <id>`.
+
+The model comes from one config point: the policies file's `agent_model()`
+— set to `opencode-go/deepseek-v4.1-flash` — and the board's `/api/policy`
+shows the model in force. Any other executable named as the agent (a script,
+a fixture, a full path) runs in **test mode**, labelled as such on the
+board, driven with the bare `<agent> "<task>"` form.
+
+The honest limit: on the machine this was built on, no engine CLI is
+installed or signed in, so the adapter is proven by its exact invocation
+shape (a recording stand-in receives precisely the commands above) and, for
+the one CLI present, up to its sign-in wall. A live model run needs a host
+where the engine is signed in.
+
 ## Running it
 
 ```sh
@@ -81,6 +114,9 @@ on its own branch of the session's repo.
 
 `bash .loop/verify` builds the binary, runs the Rust tests, and runs the
 check kit: persistence across a `kill -9`, agent detection and refusal,
+the engine adapter's invocation shapes, steering and stop, successor
+chains, the settle races (a successor never jumps the queue, steering
+survives a mid-delivery crash, a stalled chain is recovered at startup),
 merge safety against dirty and mid-merge targets, gitignored-output
 detection, retry after a deleted worktree, the timeout path, the inbox,
 the HTTP body's size and read limits, and both themes. The kit is the bar:

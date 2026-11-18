@@ -103,7 +103,7 @@ must keep every proven flow working: checker rounds grade BOTH
 directions — the new look at 8 widths in both themes, and the full
 verify kit still green.
 
-### G6 — PUBLIC SURFACES — IN PROGRESS 18 Nov (README + repo push + site page; captures/video flagged stale, not re-recorded)
+### G6 — PUBLIC SURFACES — DONE 18 Nov: README updated to the completion facts, loop/work landed to main on github.com/cayleb-james2008/dsh-fleet per Cayleb's 07:48 rule change, site page updated to checker-proven facts only; captures/video flagged stale for re-shoot, not re-recorded. Thermonuclear fix wave (C17) landed with it — ledger C5-wave.
 README + the public repo (github.com/cayleb-james2008/dsh-fleet) and
 the site page (landing-work/site, projects/dsh-fleet.html) are updated
 to checker-proven facts only — including the honest engine limit:
