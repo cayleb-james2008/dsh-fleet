@@ -100,8 +100,12 @@ done
 [ "$st2" = "needs-you" ] || { echo "FAIL: session whose work product is gitignored reached '$st2' — it can never land, so 'done' would be invented"; exit 1; }
 api /api/sessions | jq -e '.[1].reason | test("gitignore"; "i")' >/dev/null \
   || { echo "FAIL: gitignored-output session's reason does not name the gitignore problem: $(api /api/sessions | jq -c '.[1].reason')"; exit 1; }
-api /api/sessions | jq -e '.[1].check_passed == true' >/dev/null \
-  || { echo "FAIL: the check did pass in the worktree and should be recorded as passed"; exit 1; }
+# The check judges the committed tree (B16/B20): the work product
+# is not in that tree, so the check did NOT pass there, and the
+# record must say so — recording a pass from the mutable worktree
+# was the pre-B16 shape round 3 broke.
+api /api/sessions | jq -e '.[1].check_passed == false' >/dev/null \
+  || { echo "FAIL: the check should be recorded as failed on the committed tree (the work product is not in it)"; exit 1; }
 
 # 6. An untracked-file collision is a refusal, not a conflict — and
 # the error must name the file it is about. The operator's untracked
