@@ -722,10 +722,21 @@ impl App {
     /// restart loses nothing. The per-session log files are the durable
     /// transcript record; this file is the state snapshot.
     fn persist(&self) {
-        let snapshot = {
+        let (snapshot, records) = {
             let sessions = self.sessions.lock().unwrap();
             let counter = self.counter.lock().unwrap();
-            serde_json::json!({ "counter": *counter, "sessions": *sessions })
+            let snapshot = serde_json::json!({ "counter": *counter, "sessions": *sessions });
+            // Each session's record: its settings and settled outcome,
+            // next to its log. The transcript is already in the log.
+            let records: Vec<Session> = sessions
+                .iter()
+                .map(|s| {
+                    let mut r = s.clone();
+                    r.transcript.clear();
+                    r
+                })
+                .collect();
+            (snapshot, records)
         };
         static PERSIST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = PERSIST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -735,6 +746,17 @@ impl App {
         let dst = self.data_dir.join("sessions.json");
         if std::fs::write(&tmp, snapshot.to_string()).is_ok() {
             let _ = std::fs::rename(&tmp, &dst);
+        }
+        let logs_dir = self.data_dir.join("logs");
+        let _ = std::fs::create_dir_all(&logs_dir);
+        for r in records {
+            let Ok(text) = serde_json::to_string(&r) else {
+                continue;
+            };
+            let tmp = logs_dir.join(format!("{}.record.json.tmp.{}-{}", r.id, std::process::id(), seq));
+            if std::fs::write(&tmp, text).is_ok() {
+                let _ = std::fs::rename(&tmp, logs_dir.join(format!("{}.record.json", r.id)));
+            }
         }
     }
 
@@ -2696,17 +2718,32 @@ fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
     let Ok(entries) = std::fs::read_dir(&logs_dir) else {
         return sessions;
     };
-    let mut paths: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+    let mut ids: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.strip_suffix(".record.json")
+                .or_else(|| name.strip_suffix(".log"))
+                .map(|id| id.to_string())
+        })
         .collect();
-    paths.sort();
-    for path in paths {
-        let Some(id) = path.file_stem().map(|s| s.to_string_lossy().to_string()) else {
-            continue;
-        };
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
+    ids.sort();
+    ids.dedup();
+    for id in ids {
+        let text = std::fs::read_to_string(logs_dir.join(format!("{id}.log"))).unwrap_or_default();
         let lines = transcript_lines_from_log(&text);
+        // A session with a record comes back as it was: its repo,
+        // check, agent and settled outcome are in the record, so a
+        // done session stays done and a merged one stays merged.
+        let record = std::fs::read_to_string(logs_dir.join(format!("{id}.record.json")))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Session>(&t).ok())
+            .filter(|r| r.id == id);
+        if let Some(mut s) = record {
+            s.transcript = cap_transcript(lines);
+            sessions.push(s);
+            continue;
+        }
         let task = lines
             .iter()
             .find_map(|l| l.strip_prefix("agent started: ").map(|t| t.to_string()))
@@ -3111,6 +3148,85 @@ mod tests {
         assert_eq!(app.status_of("s1").as_deref(), Some("needs-you"));
         let sessions = app.sessions.lock().unwrap();
         assert_eq!(sessions[0].check_passed, Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_app(data_dir: PathBuf, sessions: Vec<Session>) -> Arc<App> {
+        Arc::new(App {
+            policy: Policy::load(SCRIPT).unwrap(),
+            policy_source: "policies.rn".to_string(),
+            agents: Vec::new(),
+            default_agent: None,
+            data_dir,
+            run_tag: "test".to_string(),
+            sessions: Mutex::new(sessions),
+            lines_since_persist: std::sync::atomic::AtomicU64::new(0),
+            counter: Mutex::new(0),
+            stops: Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    fn test_session(id: &str, status: Status, dir: &Path) -> Session {
+        Session {
+            id: id.to_string(),
+            task: format!("task for {id}"),
+            project: "fixture".to_string(),
+            repo: dir.join("repo").to_string_lossy().to_string(),
+            branch: format!("fleet/{id}"),
+            worktree: dir.join("data/worktrees").join(id).to_string_lossy().to_string(),
+            status: status.label().to_string(),
+            bucket: status.bucket().to_string(),
+            agent: "/bin/true".to_string(),
+            check_cmd: "test -s output.txt".to_string(),
+            check_output: Some("1 passed".to_string()),
+            check_passed: Some(true),
+            diff: String::new(),
+            reason: None,
+            verified_commit: Some("abc123".to_string()),
+            steer: Vec::new(),
+            next_queue: Vec::new(),
+            spawned_from: None,
+            successor: None,
+            transcript: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn done_and_merged_survive_a_lost_session_store() {
+        let dir = std::env::temp_dir().join(format!("fleet-f1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let app = test_app(
+            data.clone(),
+            vec![
+                test_session("s1", Status::Done, &dir),
+                test_session("s2", Status::Merged, &dir),
+            ],
+        );
+        app.log("s1", "check passed — verified done".to_string());
+        app.log("s2", "merged into main".to_string());
+        app.persist();
+        std::fs::remove_file(data.join("sessions.json")).unwrap();
+        let (restored, _) = load_persisted(&data);
+        let repo = dir.join("repo").to_string_lossy().to_string();
+        let s1 = restored.iter().find(|s| s.id == "s1").unwrap();
+        assert_eq!((s1.status.as_str(), s1.bucket.as_str()), ("done", "done"));
+        assert_eq!(s1.verified_commit.as_deref(), Some("abc123"));
+        assert_eq!(s1.check_passed, Some(true));
+        assert_eq!(s1.check_output.as_deref(), Some("1 passed"));
+        assert_eq!(s1.repo, repo);
+        assert_eq!(s1.check_cmd, "test -s output.txt");
+        assert_eq!(s1.branch, "fleet/s1");
+        let s2 = restored.iter().find(|s| s.id == "s2").unwrap();
+        assert_eq!((s2.status.as_str(), s2.bucket.as_str()), ("merged", "done"));
+        assert_eq!(s2.repo, repo);
+        // A session with no record keeps the honest needs-you recovery.
+        std::fs::write(data.join("logs/s9.log"), "agent started: old task\n").unwrap();
+        let (restored, _) = load_persisted(&data);
+        let s9 = restored.iter().find(|s| s.id == "s9").unwrap();
+        assert_eq!(s9.bucket, "needs-you");
+        assert!(s9.reason.as_deref().unwrap_or("").contains("recovered"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
