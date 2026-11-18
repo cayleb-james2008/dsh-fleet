@@ -385,6 +385,7 @@ enum Status {
     Done,
     NeedsYou,
     Merged,
+    Archived,
 }
 
 impl Status {
@@ -396,6 +397,7 @@ impl Status {
             Status::Done => "done",
             Status::NeedsYou => "needs-you",
             Status::Merged => "merged",
+            Status::Archived => "archived",
         }
     }
     /// The three buckets the sidebar shows: working / needs you / done.
@@ -404,6 +406,7 @@ impl Status {
             Status::Queued | Status::Working | Status::Checking => "working",
             Status::NeedsYou => "needs-you",
             Status::Done | Status::Merged => "done",
+            Status::Archived => "archived",
         }
     }
 }
@@ -2069,6 +2072,12 @@ fn retry_prompt_text(
                 .iter_mut()
                 .find(|s| s.id == id)
                 .ok_or("no such session")?;
+            if s.status == "archived" {
+                return Err(
+                    "this session was dismissed — hand out new work instead of steering it"
+                        .to_string(),
+                );
+            }
             if s.status == "merged" {
                 return Err(
                     "this session's work is already merged — hand out new work instead of steering it"
@@ -2106,6 +2115,30 @@ fn retry_prompt_text(
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    /// Clear a needs-you session the operator has decided not to
+    /// pursue. It leaves the board and the inbox; its record and log
+    /// stay on disk. Only a needs-you session can be dismissed.
+    fn dismiss(&self, id: &str) -> Result<(), String> {
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            let s = sessions
+                .iter_mut()
+                .find(|s| s.id == id)
+                .ok_or("no such session")?;
+            if s.status != "needs-you" {
+                return Err(format!(
+                    "session is '{}' — only a needs-you session can be dismissed",
+                    s.status
+                ));
+            }
+            s.status = Status::Archived.label().to_string();
+            s.bucket = Status::Archived.bucket().to_string();
+        }
+        self.log(id, "dismissed by you — it left the board and the inbox; this log stays on disk".to_string());
+        self.persist();
         Ok(())
     }
 
@@ -2711,6 +2744,14 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
             }
             match app.steer(id, &message) {
                 Ok(()) => json_response(200, "{\"steered\":true}"),
+                Err(e) if e == "no such session" => error_response(404, &e),
+                Err(e) => error_response(409, &e),
+            }
+        }
+        ("POST", route) if route.starts_with("/api/sessions/") && route.ends_with("/dismiss") => {
+            let id = &route["/api/sessions/".len()..route.len() - "/dismiss".len()];
+            match app.dismiss(id) {
+                Ok(()) => json_response(200, "{\"dismissed\":true}"),
                 Err(e) if e == "no such session" => error_response(404, &e),
                 Err(e) => error_response(409, &e),
             }
@@ -3513,5 +3554,35 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 404"), "{}", resp.lines().next().unwrap_or(""));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn dismiss_clears_a_needs_you_session_and_keeps_its_log() {
+        let dir = std::env::temp_dir().join(format!("fleet-f5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        let mut stuck = test_session("s1", Status::NeedsYou, &dir);
+        stuck.reason = Some("check failed: false".to_string());
+        let app = test_app(data.clone(), vec![stuck, test_session("s2", Status::Done, &dir)]);
+        app.log("s1", "check FAILED — this needs you".to_string());
+
+        let resp = handle(&app, "POST", "/api/sessions/s1/dismiss", "{}");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{}", resp.lines().next().unwrap_or(""));
+        let inbox = response_body(&handle(&app, "GET", "/api/inbox", ""));
+        assert!(inbox.as_array().unwrap().is_empty(), "{inbox}");
+        let all = response_body(&handle(&app, "GET", "/api/sessions", ""));
+        let s1 = all.as_array().unwrap().iter().find(|v| v["id"] == "s1").unwrap();
+        assert_eq!((s1["status"].as_str(), s1["bucket"].as_str()), (Some("archived"), Some("archived")));
+        assert!(data.join("logs/s1.log").exists());
+        // Only a needs-you session can be dismissed.
+        let resp = handle(&app, "POST", "/api/sessions/s2/dismiss", "{}");
+        assert!(resp.starts_with("HTTP/1.1 409"), "{}", resp.lines().next().unwrap_or(""));
+        assert!(response_body(&resp)["error"].as_str().unwrap_or("").contains("only a needs-you"));
+        // A dismissed session takes no steering.
+        let resp = handle(&app, "POST", "/api/sessions/s1/steer", "{\"message\":\"hello\"}");
+        assert!(resp.starts_with("HTTP/1.1 409"), "{}", resp.lines().next().unwrap_or(""));
+        let resp = handle(&app, "POST", "/api/sessions/nope/dismiss", "{}");
+        assert!(resp.starts_with("HTTP/1.1 404"), "{}", resp.lines().next().unwrap_or(""));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

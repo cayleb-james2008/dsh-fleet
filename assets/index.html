@@ -659,16 +659,18 @@ function renderDetail(s) {
 
   if (pendingAct && pendingAct.id === s.id) {
     const isMerge = pendingAct.act === 'merge';
+    const isDismiss = pendingAct.act === 'dismiss';
     html += `<div class="confirm" role="group" aria-label="Confirm">
-      <p>${isMerge ? 'Merge this verified work into its target branch? Fleet refuses if the target is dirty or in the middle of a merge.' : 'Stop this run now? It lands in Needs you as stopped by you.'}</p>
+      <p>${isMerge ? 'Merge this verified work into its target branch? Fleet refuses if the target is dirty or in the middle of a merge.' : isDismiss ? 'Dismiss this session? It leaves the board and the inbox. Its log stays on disk.' : 'Stop this run now? It lands in Needs you as stopped by you.'}</p>
       <div class="actions">
-        <button class="btn ${isMerge ? 'merge' : 'stop'}" id="${isMerge ? 'mergeConfirm' : 'stopConfirm'}">${sym(isMerge ? 'i-merge' : 'i-stop')}${isMerge ? 'Merge now' : 'Stop now'}</button>
+        <button class="btn ${isMerge ? 'merge' : 'stop'}" id="${isMerge ? 'mergeConfirm' : isDismiss ? 'dismissConfirm' : 'stopConfirm'}">${sym(isMerge ? 'i-merge' : isDismiss ? 'i-x' : 'i-stop')}${isMerge ? 'Merge now' : isDismiss ? 'Dismiss now' : 'Stop now'}</button>
         <button class="btn" id="cancelAct">Keep it</button>
       </div></div>`;
   } else {
     html += `<div class="actions">`;
     if (s.status === 'done') html += `<button class="btn merge" id="mergeBtn">${sym('i-merge')}Merge this work</button>`;
     if (s.status === 'needs-you') html += `<button class="btn" id="retryBtn">${sym('i-retry')}Retry this session</button>`;
+    if (s.status === 'needs-you') html += `<button class="btn quiet" id="dismissBtn">${sym('i-x')}Dismiss</button>`;
     if (s.status === 'queued' || s.status === 'working' || s.status === 'checking')
       html += `<button class="btn stop" id="stopBtn">${sym('i-stop')}Stop this session</button>`;
     if (s.status !== 'merged') html += `<button class="btn" id="steerJump">${sym('i-send')}Steer</button>`;
@@ -745,6 +747,14 @@ function renderDetail(s) {
   if (tb) tb.onclick = () => { pendingAct = { id: s.id, act: 'stop' }; detailError = ''; lastDetailKey = ''; renderDetail(s); };
   const sc = d.querySelector('#stopConfirm');
   if (sc) sc.onclick = async () => { pendingAct = null; detailError = (await post(`/api/sessions/${s.id}/stop`)) || ''; refresh(); };
+  const dbtn = d.querySelector('#dismissBtn');
+  if (dbtn) dbtn.onclick = () => { pendingAct = { id: s.id, act: 'dismiss' }; detailError = ''; lastDetailKey = ''; renderDetail(s); };
+  const dc = d.querySelector('#dismissConfirm');
+  if (dc) dc.onclick = async () => {
+    pendingAct = null;
+    detailError = (await post(`/api/sessions/${s.id}/dismiss`)) || '';
+    if (detailError) refresh(); else closeSelection();
+  };
   const cancel = d.querySelector('#cancelAct');
   if (cancel) cancel.onclick = () => { pendingAct = null; lastDetailKey = ''; renderDetail(s); };
   // The steer draft lives outside the DOM (like detailError): a
