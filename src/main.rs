@@ -313,29 +313,189 @@ struct App {
     counter: Mutex<u64>,
 }
 
-/// Collect a child process stream into a shared buffer on its own
-/// thread (an unread pipe would wedge the child). Works for both
-/// stdout and stderr handles.
-fn collect_stream<R: std::io::Read + Send + 'static>(
-    stream: Option<R>,
-) -> (Arc<Mutex<String>>, Option<std::thread::JoinHandle<()>>) {
-    let buf = Arc::new(Mutex::new(String::new()));
-    let thread = stream.map(|s| {
-        let buf = buf.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(s).lines() {
-                match line {
-                    Ok(l) => {
-                        let mut b = buf.lock().unwrap();
-                        b.push_str(&l);
-                        b.push('\n');
+/// How a bounded run ended.
+enum RunEnd {
+    /// The process exited; the bool is its success.
+    Exited(bool),
+    /// The deadline passed with the process still running; its whole
+    /// process group was killed.
+    TimedOut,
+    /// The process exited but a detached descendant kept its output
+    /// pipes open past the drain grace — the run's output cannot be
+    /// trusted complete. The process group was killed.
+    PipesHeld,
+    /// The process could not be spawned at all.
+    SpawnFailed(String),
+}
+
+struct RunOutcome {
+    end: RunEnd,
+    /// Every output line (both streams, arrival order), each line
+    /// already truncated to LINE_CAP.
+    lines: Vec<String>,
+}
+
+/// One stored line's cap, in characters. A single unbounded line must
+/// not defeat every other cap in the system.
+const LINE_CAP: usize = 8192;
+
+fn truncate_line(l: String) -> String {
+    if l.chars().count() > LINE_CAP {
+        let mut t: String = l.chars().take(LINE_CAP).collect();
+        t.push_str(" …[line truncated]");
+        t
+    } else {
+        l
+    }
+}
+
+/// Kill a whole process group (killpg, via the syscall — this
+/// system's `kill` binary silently ignores negative pids, which is
+/// exactly the failure this function exists to avoid). The group is
+/// the unit a runaway run is stopped by: killing only the direct
+/// child leaves its children holding pipes and writing into
+/// worktrees the operator believes are settled.
+fn kill_group(pid: u32) {
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+/// Run a command in its OWN process group, streaming lines to
+/// `on_line` as they arrive. The timeout bounds everything: the
+/// process itself, and — after it exits — a short grace for its pipes
+/// to close. A descendant that inherited the pipes (or detached into
+/// the worktree) can therefore hold a session for at most the timeout
+/// plus the grace, and is then killed with the group.
+fn run_bounded(
+    mut cmd: Command,
+    timeout_secs: u64,
+    on_line: &mut dyn FnMut(bool, &str),
+) -> RunOutcome {
+    use std::os::unix::process::CommandExt;
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return RunOutcome {
+                end: RunEnd::SpawnFailed(e.to_string()),
+                lines: Vec::new(),
+            }
+        }
+    };
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    for (stream, is_err) in [
+        (child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>), false),
+        (child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>), true),
+    ] {
+        if let Some(s) = stream {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(s).lines() {
+                    match line {
+                        Ok(l) => {
+                            if tx.send((is_err, truncate_line(l))).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
+                }
+            });
+        }
+    }
+    drop(tx);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut lines: Vec<String> = Vec::new();
+    let mut child_status: Option<bool> = None;
+    // After the child exits, the pipes get a grace — but measured as
+    // INACTIVITY, not wall time: a fast producer's backlog is still
+    // being forwarded line by line, and draining it is progress, not
+    // a stuck pipe. The pipes count as held only when the child is
+    // gone, the pipes are still open, and nothing has flowed for the
+    // grace (or the drain exceeds a hard cap, for a descendant that
+    // prints forever).
+    let mut exited_at: Option<std::time::Instant> = None;
+    let mut last_line_at = std::time::Instant::now();
+    let end = loop {
+        if child_status.is_none() {
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    child_status = Some(st.success());
+                    exited_at = Some(std::time::Instant::now());
+                }
+                Ok(None) => {}
+                Err(_) => child_status = Some(false),
+            }
+        }
+        let now = std::time::Instant::now();
+        if child_status.is_none() && now >= deadline {
+            kill_group(pid);
+            let _ = child.kill();
+            break RunEnd::TimedOut;
+        }
+        if let Some(x) = exited_at {
+            let idle = now.duration_since(last_line_at);
+            let draining = now.duration_since(x);
+            if idle >= std::time::Duration::from_secs(3)
+                || draining >= std::time::Duration::from_secs(30)
+            {
+                kill_group(pid);
+                break RunEnd::PipesHeld;
+            }
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok((is_err, line)) => {
+                last_line_at = std::time::Instant::now();
+                on_line(is_err, &line);
+                lines.push(line);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Both pipes are closed. The process may still be
+                // finishing; give it until the main deadline.
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(st)) => {
+                            child_status = Some(st.success());
+                            break;
+                        }
+                        Ok(None) => {
+                            if std::time::Instant::now() >= deadline {
+                                kill_group(pid);
+                                let _ = child.kill();
+                                child_status = None;
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        Err(_) => {
+                            child_status = Some(false);
+                            break;
+                        }
+                    }
+                }
+                match child_status {
+                    Some(ok) => break RunEnd::Exited(ok),
+                    None => break RunEnd::TimedOut,
                 }
             }
-        })
-    });
-    (buf, thread)
+        }
+    };
+    // Reap with a short bound; after a group kill the child is
+    // already dead or dying, and this thread must not become the
+    // thing that hangs.
+    for _ in 0..40 {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    RunOutcome { end, lines }
 }
 
 impl App {
@@ -566,32 +726,6 @@ impl App {
         self.run_agent_and_check(id, &session, &wt);
     }
 
-    /// Wait for a child with a deadline. Some(true/false) is the exit
-    /// status's success; None means the deadline passed and the child
-    /// was killed — a hung agent or check must never hold its session
-    /// (and its parallel slot) forever.
-    fn wait_with_timeout(
-        child: &mut std::process::Child,
-        timeout_secs: u64,
-    ) -> Option<bool> {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return Some(status.success()),
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return None;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                Err(_) => return Some(false),
-            }
-        }
-    }
-
     /// Steps 2–4 of a session: run the agent in its worktree, run the
     /// task's check, record the outcome. Entered with the worktree ready
     /// (freshly created, or reused on a retry).
@@ -602,78 +736,54 @@ impl App {
         let ignored_baseline = self.ignored_baseline(id, wt);
         // 2. Run the agent in the worktree, streaming its output.
         self.log(id, format!("agent started: {}", session.task));
-        let child = Command::new(&session.agent)
-            .arg(&session.task)
-            .current_dir(wt)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
-        let mut child = match child {
-            Ok(c) => c,
-            Err(e) => {
+        let timeout = self.policy.timeout_secs;
+        let app_lines = self.clone();
+        let id_lines = id.to_string();
+        let mut on_line = move |is_err: bool, line: &str| {
+            if is_err {
+                app_lines.log(&id_lines, format!("stderr: {line}"));
+            } else {
+                app_lines.log(&id_lines, line.to_string());
+            }
+        };
+        let mut agent_cmd = Command::new(&session.agent);
+        agent_cmd.arg(&session.task).current_dir(wt);
+        let outcome = run_bounded(agent_cmd, timeout, &mut on_line);
+        match outcome.end {
+            RunEnd::SpawnFailed(e) => {
                 self.log(id, format!("agent failed to start: {e}"));
                 self.set_needs_you(id, &format!("agent failed to start: {}", session.agent));
                 self.pump_queue();
                 return;
             }
-        };
-        // Drain both pipes on their own threads into the transcript: a
-        // piped but unread stream would fill its buffer and wedge the
-        // agent. The main thread only watches the clock and the exit.
-        let drain = |stream: Option<std::process::ChildStdout>| {
-            stream.map(|s| {
-                let app = self.clone();
-                let id = id.to_string();
-                std::thread::spawn(move || {
-                    for line in BufReader::new(s).lines() {
-                        match line {
-                            Ok(l) => app.log(&id, l),
-                            Err(_) => break,
-                        }
-                    }
-                })
-            })
-        };
-        let stdout_thread = drain(child.stdout.take());
-        let stderr_thread = child.stderr.take().map(|stderr| {
-            let app = self.clone();
-            let id = id.to_string();
-            std::thread::spawn(move || {
-                for line in BufReader::new(stderr).lines() {
-                    match line {
-                        Ok(l) => app.log(&id, format!("stderr: {l}")),
-                        Err(_) => break,
-                    }
-                }
-            })
-        });
-        let timeout = self.policy.timeout_secs;
-        let agent_result = Self::wait_with_timeout(&mut child, timeout);
-        if agent_result.is_none() {
-            // Do not join the drain threads here: whatever the agent
-            // spawned may still hold the pipes, and joining would hang
-            // the session the timeout just freed. The threads end when
-            // the pipes close.
-            self.log(
-                id,
-                format!("agent timed out after {timeout}s — killed; handing back to you"),
-            );
-            self.set_needs_you(id, &format!("agent timed out after {timeout}s"));
-            self.pump_queue();
-            return;
-        }
-        if let Some(t) = stdout_thread {
-            let _ = t.join();
-        }
-        if let Some(t) = stderr_thread {
-            let _ = t.join();
-        }
-        let agent_ok = agent_result.unwrap_or(false);
-        if !agent_ok {
-            self.log(id, "agent exited non-zero — handing back to you".to_string());
-            self.set_needs_you(id, "agent exited non-zero");
-            self.pump_queue();
-            return;
+            RunEnd::TimedOut => {
+                self.log(
+                    id,
+                    format!("agent timed out after {timeout}s — killed its whole process group; handing back to you"),
+                );
+                self.set_needs_you(id, &format!("agent timed out after {timeout}s"));
+                self.pump_queue();
+                return;
+            }
+            RunEnd::PipesHeld => {
+                self.log(
+                    id,
+                    "agent exited but a detached process kept its output open — killed the process group".to_string(),
+                );
+                self.set_needs_you(
+                    id,
+                    "agent exited but a detached process kept its output open past the limit — the run cannot be trusted complete",
+                );
+                self.pump_queue();
+                return;
+            }
+            RunEnd::Exited(false) => {
+                self.log(id, "agent exited non-zero — handing back to you".to_string());
+                self.set_needs_you(id, "agent exited non-zero");
+                self.pump_queue();
+                return;
+            }
+            RunEnd::Exited(true) => {}
         }
         self.log(
             id,
@@ -726,45 +836,34 @@ impl App {
         // the committed tree (the worktree now matches the commit).
         self.set_status(id, Status::Checking);
         let timeout = self.policy.timeout_secs;
-        let check_child = Command::new("sh")
+        let mut sink = |_: bool, _: &str| {};
+        let mut check_cmd_proc = Command::new("sh");
+        check_cmd_proc
             .arg("-c")
             .arg(&session.check_cmd)
-            .current_dir(wt)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
-        let (passed, output, check_timed_out) = match check_child {
-            Ok(mut child) => {
-                // Collect both streams on threads (an unread pipe would
-                // wedge the check); the main thread watches the clock.
-                let (out_buf, out_t) = collect_stream(child.stdout.take());
-                let (err_buf, err_t) = collect_stream(child.stderr.take());
-                match Self::wait_with_timeout(&mut child, timeout) {
-                    Some(ok) => {
-                        if let Some(t) = out_t {
-                            let _ = t.join();
-                        }
-                        if let Some(t) = err_t {
-                            let _ = t.join();
-                        }
-                        let text = format!(
-                            "{}{}",
-                            out_buf.lock().unwrap(),
-                            err_buf.lock().unwrap()
-                        );
-                        (ok, text, false)
-                    }
-                    None => {
-                        let text = format!(
-                            "{}{}\n(check timed out after {timeout}s and was killed)",
-                            out_buf.lock().unwrap(),
-                            err_buf.lock().unwrap()
-                        );
-                        (false, text, true)
-                    }
-                }
-            }
-            Err(e) => (false, format!("check could not run: {e}"), false),
+            .current_dir(wt);
+        let outcome = run_bounded(check_cmd_proc, timeout, &mut sink);
+        let (passed, output, check_timed_out, check_pipes_held) = match outcome.end {
+            RunEnd::SpawnFailed(e) => (false, format!("check could not run: {e}"), false, false),
+            RunEnd::Exited(ok) => (ok, outcome.lines.join("\n"), false, false),
+            RunEnd::TimedOut => (
+                false,
+                format!(
+                    "{}\n(check timed out after {timeout}s and was killed)",
+                    outcome.lines.join("\n")
+                ),
+                true,
+                false,
+            ),
+            RunEnd::PipesHeld => (
+                false,
+                format!(
+                    "{}\n(check's output stayed open past the limit — a detached process held it; the process group was killed)",
+                    outcome.lines.join("\n")
+                ),
+                false,
+                true,
+            ),
         };
 
         // 5. The diff the operator reviews before merging must be
@@ -843,6 +942,18 @@ impl App {
         } else if passed {
             self.log(id, "check passed — verified done".to_string());
             self.set_status(id, Status::Done);
+        } else if check_pipes_held {
+            self.log(
+                id,
+                "check's output stayed open past the limit — this needs you".to_string(),
+            );
+            self.set_needs_you(
+                id,
+                &format!(
+                    "check did not finish cleanly — a detached process kept its output open past the limit: {}",
+                    session.check_cmd
+                ),
+            );
         } else if check_timed_out {
             self.log(
                 id,
