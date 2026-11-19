@@ -339,6 +339,12 @@ impl Updater {
         })
     }
 
+    /// Test-only: pretend `version` is staged on disk and waiting for a restart.
+    #[cfg(test)]
+    pub fn stage_for_test(&self, version: &str) {
+        self.state.lock().unwrap().applied = Some(version.to_string());
+    }
+
     fn is_dev_build(&self) -> bool {
         !self.cfg.allow_dev && self.cfg.exe.components().any(|c| c.as_os_str() == "target")
     }
