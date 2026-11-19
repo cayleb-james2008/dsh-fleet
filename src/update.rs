@@ -571,13 +571,25 @@ fn file_name(p: &Path) -> String {
 /// Runs the downloaded file with `--version` and requires the expected version
 /// in its output, so a wrong or damaged build is never swapped in.
 fn prove_version(staged: &Path, version: &str) -> Result<(), String> {
-    let mut child = std::process::Command::new(staged)
-        .arg("--version")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .stdin(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("the downloaded file does not run on this machine: {e}"))?;
+    // "Text file busy" is transient: a fork elsewhere in the process can still
+    // hold the freshly written file open for a moment. Retry that one error.
+    let mut attempts = 0;
+    let mut child = loop {
+        match std::process::Command::new(staged)
+            .arg("--version")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => break c,
+            Err(e) if e.raw_os_error() == Some(26) && attempts < 20 => {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => return Err(format!("the downloaded file does not run on this machine: {e}")),
+        }
+    };
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
