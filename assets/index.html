@@ -10,6 +10,7 @@
 /* Hallmark: app screen, fleet, modern-minimal, quiet control board: hairlines, colour only as state, one primary action */
 /* Hallmark · reworded "sidebar" to "board" · the rail is gone, Close uses i-x */
 /* Fleet board. Geist and Geist Mono with system fallbacks; one near-white primary action in dark. */
+/* Hallmark · waive 39b · session rows are role=button list rows, not controls · each row is a keyboard-operable session row with a receipt inside, reached by tabindex and Enter */
   :root, [data-theme="dark"] {
     color-scheme: dark;
     --canvas: #0c0e12; --surface: #13161b; --raised: #1a1e25; --track: #1d2129; --hairline: #262b34;
@@ -197,9 +198,9 @@
   dialog#newDlg::backdrop { background: var(--scrim); }
   dialog#newDlg[open] { display: flex; flex-direction: column; animation: rise var(--dur-short) var(--ease-out); }
   #composer { display: flex; flex-direction: column; min-height: 0; flex: 1; }
-  .dlgbody { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 22px; }
-  .dlgfoot { flex: none; padding: 14px 22px; border-top: 1px solid var(--hairline); background: var(--surface); }
-  .dlgfoot .err { margin: 0 0 10px; }
+  .dlgbody { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 24px; }
+  .dlgfoot { flex: none; padding: 16px 24px; border-top: 1px solid var(--hairline); background: var(--surface); }
+  .dlgfoot .err { margin: 0 0 12px; }
   .dlgfoot .actions { justify-content: flex-end; margin-top: 0; }
   .dlgbody h2 { font-size: 18px; margin-bottom: 8px; }
   .dlgbody .lead { color: var(--ink-2); font-size: 13px; line-height: 1.5; }
