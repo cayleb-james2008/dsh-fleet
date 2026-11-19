@@ -166,6 +166,8 @@
   .receiptcard .check { font-family: var(--font-mono); font-size: 13px; overflow-wrap: anywhere; }
   .receiptcard .cmd { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); overflow-wrap: anywhere; }
   .nextline { margin-top: 12px; }
+  #repoErr { margin: 8px 0 0; }
+  #repoErr .fix { display: block; color: var(--ink-3); font-size: 12px; }
   .mergeerr { margin-top: 12px; padding: 12px 16px; border-radius: var(--r-card); background: var(--bad-tint); color: var(--bad-text); line-height: 1.45; }
   .mergeerr .mergemsg { color: var(--ink); overflow-wrap: anywhere; }
   .mergeerr details { margin-top: 8px; }
@@ -335,6 +337,7 @@
         <label for="repo">Repo path</label>
         <input id="repo" autocomplete="off" aria-describedby="repoHint">
         <p class="hint" id="repoHint">The folder of a git repository, for example /home/you/projects/app.</p>
+        <p class="err" id="repoErr" hidden><span class="msg"></span><span class="fix">Use the folder you run git in.</span></p>
       </div>
       <div class="field">
         <label for="project">Project</label>
@@ -349,7 +352,7 @@
       <div class="field">
         <label for="task">Task</label>
         <textarea id="task" rows="3" aria-describedby="taskHint"></textarea>
-        <p class="hint" id="taskHint">Say what the agent should change, in one or two sentences.</p>
+        <p class="hint" id="taskHint">Say what the agent should change, in one or two sentences. Ctrl+Enter or Cmd+Enter hands it out.</p>
       </div>
       <div class="field">
         <label for="check">Check command (optional)</label>
@@ -492,6 +495,12 @@ async function refresh() {
     policyEl.textContent =
       `Up to ${pol.max_parallel} sessions run at once. An agent or check that runs past ${pol.timeout_secs} seconds is handed back to Needs you. Checks come from ${pol.source}. ${defaultBit}${modelBit}`;
     renderEngines(pol.agents);
+    const testDefault = pol.default_agent_engine === 'custom';
+    document.querySelector('#agent option[value=""]').textContent =
+      testDefault ? 'Default agent: a test script (no real model)' : 'Default agent';
+    document.getElementById('agentHint').textContent = testDefault
+      ? 'Default agent: a test script (no real model). Engines lists what is installed.'
+      : 'Only agents found on this machine are listed. Engines shows what is installed.';
   }
   const sel = document.getElementById('agent');
   if (sel.options.length <= 1) {
@@ -955,6 +964,9 @@ document.addEventListener('keydown', (e) => {
   if (selected) closeSelection();
 });
 
+document.getElementById('task').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); document.getElementById('composer').requestSubmit(); }
+});
 let submitting = false;
 document.getElementById('composer').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -965,6 +977,15 @@ document.getElementById('composer').addEventListener('submit', async (e) => {
   if (sub) sub.disabled = true;
   try { await handOut(); } finally { submitting = false; if (sub) sub.disabled = false; }
 });
+// A refused repo path is named under the Repo field and that field gets focus.
+function showRepoErr(msg) {
+  const repoEl = document.getElementById('repo'), box = document.getElementById('repoErr');
+  box.querySelector('.msg').textContent = msg;
+  box.hidden = false;
+  repoEl.setAttribute('aria-invalid', 'true');
+  repoEl.setAttribute('aria-describedby', 'repoHint repoErr');
+  repoEl.focus();
+}
 async function handOut() {
   const err = document.getElementById('formErr');
   const repoEl = document.getElementById('repo'), taskEl = document.getElementById('task');
@@ -973,6 +994,8 @@ async function handOut() {
   taskEl.setAttribute('aria-invalid', taskEl.value.trim() ? 'false' : 'true');
   repoEl.setAttribute('aria-describedby', repoEl.value.trim() ? 'repoHint' : 'repoHint formErr');
   taskEl.setAttribute('aria-describedby', taskEl.value.trim() ? 'taskHint' : 'taskHint formErr');
+  document.getElementById('repoErr').hidden = true;
+  repoEl.setAttribute('aria-describedby', 'repoHint');
   if (!repoEl.value.trim()) problems.push('Give the repo path: the folder of the git repository the agent works in.');
   if (!taskEl.value.trim()) problems.push('Write the task: say what the agent should do.');
   if (problems.length) {
@@ -1003,8 +1026,8 @@ async function handOut() {
   if (!r.ok) {
     let msg = 'Could not hand out the task.';
     try { msg = (await r.json()).error || msg; } catch (x) {}
-    err.textContent = msg;
-    err.hidden = false;
+    if (/repo/i.test(msg)) showRepoErr(msg);
+    else { err.textContent = msg; err.hidden = false; }
     return;
   }
   const s = await r.json();
