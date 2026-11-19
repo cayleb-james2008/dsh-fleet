@@ -277,8 +277,27 @@
         <button class="btn" id="inboxBtn" aria-haspopup="true" aria-expanded="false" aria-label="Needs you inbox">
           <svg class="ic" aria-hidden="true"><use href="#i-tray"/></svg><span class="lbl">Needs you</span><span class="count" id="inboxCount">0</span>
         </button>
+  <section id="inboxPanel" class="pop" hidden aria-label="Needs you">
+    <h2>Needs you</h2>
+    <p class="lead">Sessions that need a person: a failed check, a refused merge, a stopped or timed-out run.</p>
+    <div id="inboxItems"></div>
+    <p id="inboxError" class="err" hidden></p>
+  </section>
         <button class="btn primary" id="newBtn" aria-label="New session"><svg class="ic" aria-hidden="true"><use href="#i-plus"/></svg><span class="lbl">New session</span></button>
         <button class="btn icon" id="engBtn" aria-haspopup="true" aria-expanded="false" aria-label="Engines and settings" title="Engines and settings"><svg class="ic" aria-hidden="true"><use href="#i-cpu"/></svg><span class="lbl">Engines</span></button>
+  <section id="settings" class="pop" hidden aria-label="Engines and settings">
+    <h2>Engines</h2>
+    <p class="lead" id="policy">Loading policy</p>
+    <div class="sect">
+      <h3>What this machine can run</h3>
+      <ul id="agentList"></ul>
+    </div>
+    <p class="lead testnote">Test mode: a script stands in for a coding agent, so nothing here used a real model.</p>
+    <div class="sect">
+      <h3>Theme</h3>
+      <button class="switch" id="themeBtn" role="switch" aria-checked="true"><span>Dark</span><span class="track" aria-hidden="true"><span class="knob"></span></span></button>
+    </div>
+  </section>
       </div>
     </header>
 
@@ -296,26 +315,7 @@
   </div>
   <div id="scrim" aria-hidden="true"></div>
 
-  <section id="inboxPanel" class="pop" hidden aria-label="Needs you">
-    <h2>Needs you</h2>
-    <p class="lead">Sessions that need a person: a failed check, a refused merge, a stopped or timed-out run.</p>
-    <div id="inboxItems"></div>
-    <p id="inboxError" class="err" hidden></p>
-  </section>
 
-  <section id="settings" class="pop" hidden aria-label="Engines and settings">
-    <h2>Engines</h2>
-    <p class="lead" id="policy">Loading policy</p>
-    <div class="sect">
-      <h3>What this machine can run</h3>
-      <ul id="agentList"></ul>
-    </div>
-    <p class="lead testnote">Test mode: a script stands in for a coding agent, so nothing here used a real model.</p>
-    <div class="sect">
-      <h3>Theme</h3>
-      <button class="switch" id="themeBtn" role="switch" aria-checked="true"><span>Dark</span><span class="track" aria-hidden="true"><span class="knob"></span></span></button>
-    </div>
-  </section>
 
   <dialog id="newDlg" aria-labelledby="newTitle">
     <form id="composer" novalidate>
@@ -545,16 +545,22 @@ function renderInbox(inbox) {
     box.appendChild(div);
   }
 }
+// A popover takes focus when it opens; its heading is the first stop.
+function focusPanel(id) {
+  const h = document.querySelector('#' + id + ' h2');
+  if (h) { h.tabIndex = -1; h.focus(); }
+}
 document.getElementById('inboxBtn').addEventListener('click', () => {
   inboxOpen = !inboxOpen;
   if (inboxOpen) setPopover('settings', 'engBtn', false);
-  refresh();
+  refresh().then(() => { if (inboxOpen) focusPanel('inboxPanel'); });
 });
 document.getElementById('engBtn').addEventListener('click', () => {
   const open = document.getElementById('settings').hidden;
   inboxOpen = false;
   setPopover('settings', 'engBtn', open);
   refresh();
+  if (open) focusPanel('settings');
 });
 
 function statusText(s) {
@@ -911,8 +917,8 @@ document.addEventListener('click', (e) => {
 });
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape' || dlg.open) return;
-  if (inboxOpen) { inboxOpen = false; refresh(); return; }
-  if (!document.getElementById('settings').hidden) { setPopover('settings', 'engBtn', false); return; }
+  if (inboxOpen) { inboxOpen = false; refresh(); document.getElementById('inboxBtn').focus(); return; }
+  if (!document.getElementById('settings').hidden) { setPopover('settings', 'engBtn', false); document.getElementById('engBtn').focus(); return; }
   if (selected) closeSelection();
 });
 
