@@ -475,7 +475,19 @@ struct Session {
     check_ran: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     check_exit: Option<i32>,
+    /// The last refusal of a merge of this session (null when none): set
+    /// by a refused merge, cleared by a merge that lands or by a retry.
+    #[serde(default)]
+    merge_error: Option<MergeRefusal>,
     transcript: Vec<String>,
+}
+
+/// A refused merge, kept on its session.
+#[derive(Clone, Serialize, serde::Deserialize)]
+struct MergeRefusal {
+    message: String,
+    detail: Option<String>,
+    ts: u64,
 }
 
 struct App {
@@ -2006,6 +2018,7 @@ fn retry_prompt_text(
                         .to_string(),
                 );
             }
+            s.merge_error = None;
             s.retry_prompt = Some(Self::retry_prompt_text(
                 &s.task,
                 &s.check_cmd,
@@ -2112,6 +2125,7 @@ fn retry_prompt_text(
                 retry_prompt: None,
                 check_ran: false,
                 check_exit: None,
+                merge_error: None,
                 transcript: Vec::new(),
             };
             sessions.push(child);
@@ -2251,11 +2265,38 @@ fn retry_prompt_text(
 
     fn merge(&self, id: &str) -> Result<(String, String), MergeError> {
         let mut detail = String::new();
-        self.merge_landing(id, &mut detail).map_err(|message| MergeError {
+        let result = self.merge_landing(id, &mut detail).map_err(|message| MergeError {
             status: if message == "no such session" { 404 } else { 409 },
             message,
             detail: (!detail.is_empty()).then_some(detail),
-        })
+        });
+        // The last refusal stays on the session until a merge lands.
+        let refusal = result.as_ref().err().map(|e| MergeRefusal {
+            message: e.message.clone(),
+            detail: e.detail.clone(),
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        });
+        self.set_merge_error(id, refusal);
+        result
+    }
+
+    fn set_merge_error(&self, id: &str, refusal: Option<MergeRefusal>) {
+        let found = {
+            let mut sessions = self.sessions.lock().unwrap();
+            match sessions.iter_mut().find(|s| s.id == id) {
+                Some(s) => {
+                    s.merge_error = refusal;
+                    true
+                }
+                None => false,
+            }
+        };
+        if found {
+            self.persist();
+        }
     }
 
     /// The merge itself. A refusal carries a plain sentence; git's own
@@ -2797,6 +2838,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 retry_prompt: None,
                 check_ran: false,
                 check_exit: None,
+                merge_error: None,
                 transcript: Vec::new(),
             };
             app.sessions.lock().unwrap().push(session.clone());
@@ -3040,6 +3082,7 @@ fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
             retry_prompt: None,
             check_ran: false,
             check_exit: None,
+            merge_error: None,
             transcript: cap_transcript(lines),
         });
     }
@@ -3438,6 +3481,7 @@ mod tests {
             retry_prompt: None,
             check_ran: false,
             check_exit: None,
+            merge_error: None,
             transcript: Vec::new(),
         };
         app.sessions.lock().unwrap().push(session);
@@ -3488,6 +3532,7 @@ mod tests {
             retry_prompt: None,
             check_ran: false,
             check_exit: None,
+            merge_error: None,
             transcript: Vec::new(),
         }
     }
@@ -3940,6 +3985,64 @@ mod tests {
         settle(&app, "s1");
         let reason = app.sessions.lock().unwrap()[0].reason.clone().unwrap_or_default();
         assert!(reason.starts_with("Check failed"), "after losing the link: {reason}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_merge_refusal_is_kept_on_the_session() {
+        let dir = std::env::temp_dir().join(format!("fleet-fr2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir);
+        git_run(&repo, &["checkout", "-b", "fleet/s1"]);
+        std::fs::write(repo.join("README.md"), "branch change\n").unwrap();
+        git_run(&repo, &["commit", "-am", "branch"]);
+        let pin = git_run(&repo, &["rev-parse", "HEAD"]);
+        git_run(&repo, &["checkout", "main"]);
+        std::fs::write(repo.join("README.md"), "main change\n").unwrap();
+        git_run(&repo, &["commit", "-am", "main"]);
+        let data = dir.join("data");
+        let mut s = test_session("s1", Status::Done, &dir);
+        s.repo = repo.to_string_lossy().to_string();
+        s.branch = "fleet/s1".to_string();
+        s.verified_commit = Some(pin);
+        let app = test_app(data.clone(), vec![s]);
+
+        let resp = handle(&app, "POST", "/api/sessions/s1/merge", "{}");
+        assert!(resp.starts_with("HTTP/1.1 409"), "{}", resp.lines().next().unwrap_or(""));
+        let got = response_body(&handle(&app, "GET", "/api/sessions/s1", ""));
+        assert_eq!(got["merge_error"]["message"], "Merge conflict in README.md. Nothing was merged.", "{got}");
+        assert!(got["merge_error"]["detail"].as_str().unwrap_or("").contains("CONFLICT"), "{got}");
+        assert!(got["merge_error"]["ts"].as_u64().unwrap_or(0) > 0, "{got}");
+        drop(app);
+
+        // It survives a restart from the same data dir.
+        let (restored, _) = load_persisted(&data);
+        let app = test_app(data.clone(), restored);
+        let got = response_body(&handle(&app, "GET", "/api/sessions/s1", ""));
+        assert_eq!(got["merge_error"]["message"], "Merge conflict in README.md. Nothing was merged.", "{got}");
+
+        // A merge that lands clears it.
+        let head = git_run(&repo, &["rev-parse", "HEAD"]);
+        app.sessions.lock().unwrap()[0].verified_commit = Some(head);
+        let resp = handle(&app, "POST", "/api/sessions/s1/merge", "{}");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{}", resp.lines().next().unwrap_or(""));
+        let got = response_body(&handle(&app, "GET", "/api/sessions/s1", ""));
+        assert!(got["merge_error"].is_null(), "{got}");
+
+        // A retry clears it too.
+        let mut stuck = test_session("s2", Status::NeedsYou, &dir);
+        stuck.repo = repo.to_string_lossy().to_string();
+        stuck.merge_error = Some(MergeRefusal {
+            message: "old refusal".to_string(),
+            detail: None,
+            ts: 1,
+        });
+        app.sessions.lock().unwrap().push(stuck);
+        let resp = handle(&app, "POST", "/api/sessions/s2/retry", "{}");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{}", resp.lines().next().unwrap_or(""));
+        let got = response_body(&handle(&app, "GET", "/api/sessions/s2", ""));
+        assert!(got["merge_error"].is_null(), "{got}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
