@@ -242,8 +242,11 @@
   }
   @media (max-width: 399px) {
     .top-actions .btn { flex: none; min-width: 44px; padding: 0 12px; }
-    .top-actions .btn .lbl { display: none; }
-    .top-actions #newBtn { width: 44px; padding: 0; }
+    #inboxBtn .lbl, #engBtn .lbl { display: none; }
+  }
+  @media (max-width: 359px) {
+    #newBtn .lbl { display: none; }
+    #newBtn { width: 44px; padding: 0; }
   }
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
@@ -390,7 +393,23 @@ let boardErrShown = false;
 let curSession = null;
 let activeTab = 'tr';
 let pendingAct = null;
+// A steer draft is kept per session in sessionStorage, so a reload does
+// not lose a message half written to a running agent.
 const steerDrafts = {};
+function draftGet(id) {
+  if (steerDrafts[id] !== undefined) return steerDrafts[id];
+  let v = '';
+  try { v = sessionStorage.getItem('fleet-steer:' + id) || ''; } catch (e) {}
+  steerDrafts[id] = v;
+  return v;
+}
+function draftSet(id, v) {
+  steerDrafts[id] = v;
+  try {
+    if (v) sessionStorage.setItem('fleet-steer:' + id, v);
+    else sessionStorage.removeItem('fleet-steer:' + id);
+  } catch (e) {}
+}
 let lastListKey = '';
 let lastDetailKey = '';
 let detailError = '';
@@ -839,17 +858,17 @@ function renderDetail(s) {
   // re-render on the 2s poll must never eat a half-typed message.
   const st = d.querySelector('#steerText');
   if (st) {
-    st.value = steerDrafts[s.id] || '';
-    st.addEventListener('input', () => { steerDrafts[s.id] = st.value; });
+    st.value = draftGet(s.id);
+    st.addEventListener('input', () => draftSet(s.id, st.value));
   }
   const sj = d.querySelector('#steerJump');
   if (sj) sj.onclick = () => { const t = document.getElementById('steerText'); if (t) { t.scrollIntoView({ block: 'nearest' }); t.focus(); } };
   const sb = d.querySelector('#steerBtn');
   if (sb) sb.onclick = async () => {
-    const msg = (steerDrafts[s.id] || '').trim();
+    const msg = draftGet(s.id).trim();
     if (!msg) { detailError = 'Write the message first.'; lastDetailKey = ''; renderDetail(s); return; }
     const r = await postBody(`/api/sessions/${s.id}/steer`, { message: msg });
-    if (!r) steerDrafts[s.id] = '';
+    if (!r) draftSet(s.id, '');
     detailError = r || '';
     refresh();
   };
