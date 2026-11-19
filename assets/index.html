@@ -284,7 +284,7 @@
 
     <div class="work">
       <div class="board">
-        <p class="connnote" id="connNote" hidden><svg class="ic" aria-hidden="true"><use href="#i-alert"/></svg><span>Cannot reach the server. The board keeps retrying on its own.</span></p>
+        <div role="status" aria-live="polite" id="connWrap"><p class="connnote" id="connNote" hidden><svg class="ic" aria-hidden="true"><use href="#i-alert"/></svg><span>Cannot reach the server. The board keeps retrying on its own.</span></p></div>
         <div id="sessions" aria-busy="true" aria-live="polite">
           <div class="col"><div class="skel"></div><div class="skel"></div></div>
           <div class="col"><div class="skel"></div></div>
@@ -621,6 +621,15 @@ function renderSessions(sessions) {
   }
 }
 
+// The accessible name reads the task, the status and the one line that
+// explains it (the reason when it needs you, the receipt when done).
+function cardName(s) {
+  const short = (t) => (t || '').length > 100 ? t.slice(0, 99) + '…' : (t || '');
+  const parts = [short(s.task), statusText(s)];
+  if (s.bucket === 'needs-you' && s.reason) parts.push(short(s.reason));
+  else if (s.bucket === 'done') parts.push(short(receiptLine(s)));
+  return parts.join(', ');
+}
 function sessionCard(s) {
   const div = document.createElement('div');
   const cls = statusCls(s);
@@ -628,7 +637,7 @@ function sessionCard(s) {
   div.setAttribute('role', 'button');
   div.setAttribute('tabindex', '0');
   div.setAttribute('data-sid', s.id);
-  div.setAttribute('aria-label', `Open session: ${s.task}`);
+  div.setAttribute('aria-label', cardName(s));
   div.setAttribute('aria-current', s.id === selected ? 'true' : 'false');
   const live = (s.bucket === 'working' && s.status !== 'queued') ? '<span class="live" aria-hidden="true"></span>' : '';
   const agent = s.test_mode ? '<span class="chip testmode" title="Test mode: a script stands in for a coding agent, so nothing here used a real model.">test mode</span>' : `<span class="chip">${esc(s.engine || s.agent || 'agent')}</span>`;
@@ -841,6 +850,21 @@ function renderDetail(s) {
   // Tabs: the panels stay in the DOM and only their visibility changes,
   // so the poll never rebuilds the transcript the operator is reading.
   d.querySelectorAll('.tab').forEach(t => t.onclick = () => setTab(t.dataset.tab));
+  // Keyboard: the selected tab is the one Tab stop (roving tabindex);
+  // Left and Right move between tabs, Home and End go to the ends.
+  const order = ['tr', 'df', 'rc'];
+  d.querySelector('.tabs').onkeydown = (e) => {
+    const i = order.indexOf(activeTab);
+    let j = null;
+    if (e.key === 'ArrowRight') j = (i + 1) % order.length;
+    else if (e.key === 'ArrowLeft') j = (i + order.length - 1) % order.length;
+    else if (e.key === 'Home') j = 0;
+    else if (e.key === 'End') j = order.length - 1;
+    if (j === null) return;
+    e.preventDefault();
+    setTab(order[j]);
+    d.querySelector('#tab-' + order[j]).focus();
+  };
   setTab(activeTab);
   // Restore what the rebuild disturbed.
   d.scrollTop = prevScroll;
