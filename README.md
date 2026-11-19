@@ -17,56 +17,121 @@ receipt, and it travels with the session everywhere it is listed.
 
 Sessions live in three groups:
 
-- **Needs you** — the check failed, the agent errored, a merge was refused,
-  the run timed out. Each one says why, in the session's own words and the
-  check's own output. This group is also an inbox: one list of everything
-  waiting on a human, across every session.
+- **Needs you** — the check failed, the agent exited non-zero, a merge was
+  refused, the run timed out or was stopped. Each one says why. This group is
+  also an inbox: one list of everything waiting on a human, across every
+  session. A needs-you session you have decided not to pursue can be
+  **dismissed**: it leaves the board and the inbox, and its log stays on disk.
 - **Working** — the agent is running, or Fleet is running the check.
-- **Done** — the check passed. The session's row carries the check line
-  itself ("3 passed in 4.12s", "PROOF DONE"), not just a green badge.
+- **Done** — the check passed. The row carries the check's last printed line
+  ("3 passed in 4.12s"), or "Check passed (no output)" when it printed nothing.
 
-From a finished session you can read the full diff Fleet computed against the
-branch it diverged from, and merge it into the target branch — or retry a
-failed session, which re-runs the agent in the same worktree with the failure
-attached.
+A session's detail panel has three tabs: **Transcript**, **Diff** and
+**Receipt**. The diff is the whole branch against the branch it diverged from.
+From a finished session you can merge into the target branch. From a failed
+session you can **retry**: the agent runs again in the same worktree, and its
+prompt is the original task plus a note with the failing check's command and
+the last 4000 characters of its output (or the previous reason, when the check
+printed nothing).
 
 While a session works, you can **steer** it — your message runs as a
 continuation of the same session before Fleet runs the check — and **stop**
-it, which kills the run within seconds and lands it in Needs you with
-"stopped by you" as the reason. Steering is durable: a message leaves the
-queue only after the run that carries it, so a server crash mid-delivery
-loses nothing and the retry delivers it. A hand-out can also name what runs
-**next**: when the session reaches verified done, the follow-up work is
-handed out on its own branch, in hand-out order — a session that lands in
-Needs you fires nothing.
+it, which kills the run and lands it in Needs you with "stopped by you" as the
+reason. A steering message still waiting on a needs-you session is named in
+its reason. Steering is durable: a message leaves the queue only after the run
+that carries it, so a server crash mid-delivery loses nothing. A hand-out can
+also name what runs **next**: when the session reaches verified done, the
+follow-up work is handed out on its own branch, in hand-out order. A session
+that lands in Needs you fires nothing.
 
 ## What "verified" means here
 
 - **The check is the product's own command**, named per project in a policies
-  file (`policies.rn`, Rune) — the same command a developer would run.
-  Whoever grades the work, it is never the agent.
+  file (`policies.rn`, Rune) — the same command a developer would run. A
+  check given with a hand-out replaces the default; a blank one counts as no
+  check given. Whoever grades the work, it is never the agent.
+- **A failed check says what it printed.** Its reason reads
+  `Check failed (exit N): <command>. Output: <first 200 characters>`, or
+  `Check failed (exit N): <command>. The check printed nothing.` A check that
+  never started reads `the check did not run: <command>`.
 - **Merging is defensive.** Fleet refuses to merge into a dirty or
   mid-merge target, aborts its own failed merge cleanly, and leaves the
-  session in Done with the refusal attached when it cannot land. A merge is
-  only reported once the session's branch is verifiably an ancestor of the
-  target.
+  session in Done when it cannot land. A refusal is a plain sentence:
+  a content conflict names its files ("Merge conflict in <files>. Nothing was
+  merged."), a missing git identity names `git config user.name` and
+  `git config user.email`. Git's own text is kept in the response's `detail`.
+  The refusal is also kept on the session as `merge_error`, until a merge
+  lands or the session is retried. A merge is only reported once the
+  session's branch is verifiably an ancestor of the target.
 - **Nothing is silently dropped.** If an agent writes files your repo's
   gitignore excludes, they can never be committed — so the session goes to
   Needs you, naming the files, instead of reporting a "done" whose work is
-  not in the diff. The diff a session shows is the whole branch, across
-  every attempt, so what you review is what a merge would land.
+  not in the diff.
 - **Runs are bounded.** Agent and check runs take their timeout from the
   policies file; a run that exceeds it is killed and the session says so.
-  Transcripts are capped on the board; the full log is kept on disk, per
-  session, and the cap marker names the file.
+  Transcripts are capped on the board (2000 lines, 512 KB); the full log is
+  kept on disk, per session, and the cap marker names the file.
+
+## Hand-outs
+
+A hand-out is a JSON `POST /api/sessions` with `task` and `repo`, and
+optionally `project`, `check`, `agent` and `next`.
+
+- `task` and `repo` are trimmed. Either empty is a 400. A task containing a
+  NUL byte, or longer than 100000 bytes, is a 400.
+- A `repo` that is not a folder is a 400 `There is no folder at <path>.`; a
+  folder that is not a git repository is a 400 that names the `.git` folder
+  to point at.
+- An agent that is not installed is refused before any worktree is created.
 
 ## Persistence
 
 Sessions survive restarts. State is written atomically (a temp file renamed
-over the old one) after every change; each session's full transcript is its
-own log file. A session that was mid-run when the server stopped comes back
-in **Needs you**, with "the server restarted while this session was …"
-attached — never silently resumed, never lost.
+over the old one) after every change. Each session has two files in
+`logs/`: its transcript (`<id>.log`) and its record (`<id>.record.json`),
+which holds its repo, branch, check, agent, status, check result, merge
+refusal and queued steering. If `sessions.json` is lost, sessions are rebuilt
+from their records, so a done session stays done and a merged one stays
+merged; a session with no record comes back in Needs you.
+
+A session that was mid-run when the server stopped comes back in **Needs
+you**, with "the server restarted while this session was …" attached.
+
+If a session's worktree has lost its link to the repo (its `.git` file is gone
+or the repo no longer knows the worktree), a retry moves the directory aside
+(`<id>.detached-<seconds>`, files kept, path logged) and re-attaches the work
+from the session's branch. Two retries at once run the session once; the second
+is refused with "already running".
+
+## Session JSON
+
+`GET /api/sessions` and `GET /api/sessions/<id>` return the sessions. Besides
+the task, status, bucket and transcript, each carries:
+
+- `check_cmd`, `check_output` (empty string when none), `check_passed` (null
+  until a check ran), `check_ran` (true once the check command started) and
+  `check_exit` (its exit code when it exited).
+- `merge_target` — the repo's checked-out branch, where Merge lands; null when
+  the repo is unknown or its HEAD is detached.
+- `merge_error` — `{message, detail, ts}` of the last refused merge, or null.
+- `engine`, `test_mode` (true for a custom command), `queue_position`,
+  `reason`, `successor` and `spawned_from`.
+
+## HTTP
+
+- `POST /api/sessions` — hand out (201). Other session routes are
+  `/api/sessions/<id>/merge`, `/retry`, `/steer` (`{"message": ...}`),
+  `/stop`, and `/dismiss` (only for a needs-you session; it becomes
+  `archived`). Actions on a session in the wrong state answer 409 with a plain
+  sentence; an unknown session answers 404.
+- `GET /api/inbox` lists the needs-you sessions. `GET /api/policy` shows the
+  parallel cap, detected agents, default agent and model.
+- Only loopback Host names are answered: `localhost`, `127.0.0.1` and `[::1]`,
+  plus any names in `FLEET_ALLOWED_HOSTS` (comma-separated). Any other Host is
+  a 403. A request with more than 100 header lines, or more than 32 KiB of
+  headers, is a 431. A request body over 1 MiB is a 413.
+- A POST must be `Content-Type: application/json` (415 otherwise), and a POST
+  with an `Origin` that is not this machine is refused (403).
 
 ## Agents, honestly
 
@@ -77,28 +142,29 @@ up front, before any worktree is created, and the board says which agents
 this machine really has. When a session names no agent, it runs the
 project's policy default.
 
-## Engines, driven properly
+## Engines, driven as headless CLIs
 
-A bare name gets the engine's real headless form, with the model pinned:
+A bare name gets the engine's non-interactive form:
 
-- **opencode** — `opencode run --model <model> "<task>"`; a continuation
-  resumes the session the first run reported (`--session <id>`).
-- **claude** — `claude -p "<task>" --model <model>`; continuations resume
-  with `--resume <id>`.
-- **codex** — `codex exec "<task>" -m <model>`; continuations use
-  `codex exec resume <id>`.
+- **opencode** — `opencode run --model <model> <task>`; a continuation adds
+  `--continue`.
+- **claude** — `claude -p <task>`; a continuation adds `--continue`. The
+  OpenCode Go model is not passed to claude.
+- **codex** — `codex exec --sandbox workspace-write --color never <task>`; a
+  continuation is `codex exec resume --last <task>`, which keeps the first
+  run's sandbox.
 
-The model comes from one config point: the policies file's `agent_model()`
-— set to `opencode-go/deepseek-v4.1-flash` — and the board's `/api/policy`
-shows the model in force. Any other executable named as the agent (a script,
-a fixture, a full path) runs in **test mode**, labelled as such on the
-board, driven with the bare `<agent> "<task>"` form.
+The model comes from one config point: the policies file's `agent_model()` —
+set to `opencode-go/deepseek-v4.1-flash` — and `/api/policy` shows the model in
+force. Any other executable named as the agent (a script, a fixture, a full
+path) runs in **test mode**, labelled as such on the board, and receives the
+prompt as its single argument.
 
-The honest limit: on the machine this was built on, no engine CLI is
-installed or signed in, so the adapter is proven by its exact invocation
-shape (a recording stand-in receives precisely the commands above) and, for
-the one CLI present, up to its sign-in wall. A live model run needs a host
-where the engine is signed in.
+The honest limit: on the machine this was built on, no engine CLI is installed
+or signed in, so the adapter is proven by its exact invocation shape (a
+recording stand-in receives precisely the commands above) and, for the one CLI
+present, up to its sign-in wall. A live model run needs a host where the engine
+is signed in.
 
 ## Running it
 
@@ -106,28 +172,35 @@ where the engine is signed in.
 cargo run -- policies.rn               # serves the board on $PORT (default 8471)
 ```
 
+Environment: `PORT` (default 8471), `FLEET_DATA` (default `./fleet-data`),
+`FLEET_AGENT` (the default agent, otherwise the first detected one),
+`FLEET_ALLOWED_HOSTS` (extra Host names, see HTTP).
+
 State lands in `./fleet-data/` (override with `FLEET_DATA`): the session
-store, one log file per session, and the worktrees — one per session, each
-on its own branch of the session's repo.
+store, `logs/`, and the worktrees — one per session, each on its own branch of
+the session's repo.
 
-## Checks
+## Tests and checks
 
-`bash .loop/verify` builds the binary, runs the Rust tests, and runs the
-check kit: persistence across a `kill -9`, agent detection and refusal,
-the engine adapter's invocation shapes, steering and stop, successor
-chains, the settle races (a successor never jumps the queue, steering
-survives a mid-delivery crash, a stalled chain is recovered at startup),
-merge safety against dirty and mid-merge targets, gitignored-output
-detection, retry after a deleted worktree, the timeout path, the inbox,
-the HTTP body's size and read limits, and both themes. The kit is the bar:
-it passes end to end, and it is re-run after every change.
+`cargo test` runs the Rust tests: 22 at this commit, all passing. They cover
+the session store and recovery, the runner's settle path, check reasons, the
+engine invocation shapes, merge refusals, retry after a lost worktree, the
+concurrent retry, task and repo validation, the Host and header limits, and the
+steering and dismiss routes.
+
+`bash .loop/verify` builds the binary, runs the Rust tests, and runs the shell
+checks in `.loop/checks/`. The shell checks run the real binary over HTTP.
+One is known to be out of date: `.loop/checks/inbox.sh` matches the old reason
+text `check failed`, which the current reason (`Check failed (exit N): …`)
+does not contain. Until that check is updated, `bash .loop/verify` reports it
+as a failure.
 
 ## Layout
 
 - `src/main.rs` — the whole server: sessions, the runner, the checker, the
-  merger, persistence, and the HTTP API.
+  merger, persistence, the HTTP API, and the tests.
 - `assets/index.html` — the board: the three groups, the session detail with
-  its transcript, diff and check receipt, the Needs-you inbox, and Settings.
+  its Transcript, Diff and Receipt tabs, the Needs-you inbox, and Settings.
   Light and dark themes, dark by default, the switch in the settings footer;
   icons are drawn symbols, never letters.
 - `policies.rn` — the Rune policies file: per-project check command, default

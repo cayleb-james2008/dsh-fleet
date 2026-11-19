@@ -385,6 +385,7 @@ enum Status {
     Done,
     NeedsYou,
     Merged,
+    Archived,
 }
 
 impl Status {
@@ -396,6 +397,7 @@ impl Status {
             Status::Done => "done",
             Status::NeedsYou => "needs-you",
             Status::Merged => "merged",
+            Status::Archived => "archived",
         }
     }
     /// The three buckets the sidebar shows: working / needs you / done.
@@ -404,6 +406,7 @@ impl Status {
             Status::Queued | Status::Working | Status::Checking => "working",
             Status::NeedsYou => "needs-you",
             Status::Done | Status::Merged => "done",
+            Status::Archived => "archived",
         }
     }
 }
@@ -462,7 +465,45 @@ struct Session {
     /// it has fired.
     #[serde(default)]
     successor: Option<String>,
+    /// The prompt a retried session's next run receives: the original
+    /// task plus what failed last time. Set by retry(), read by the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_prompt: Option<String>,
+    /// Whether the check command actually started, and the exit code
+    /// it ended with when it exited normally.
+    #[serde(default)]
+    check_ran: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    check_exit: Option<i32>,
+    /// The last refusal of a merge of this session (null when none): set
+    /// by a refused merge, cleared by a merge that lands or by a retry.
+    #[serde(default)]
+    merge_error: Option<MergeRefusal>,
     transcript: Vec<String>,
+}
+
+/// The branch a merge into this repo lands on: its checked-out branch.
+fn merge_target(repo: &str) -> Option<String> {
+    if repo.is_empty() {
+        return None;
+    }
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|b| !b.is_empty())
+}
+
+/// A refused merge, kept on its session.
+#[derive(Clone, Serialize, serde::Deserialize)]
+struct MergeRefusal {
+    message: String,
+    detail: Option<String>,
+    ts: u64,
 }
 
 struct App {
@@ -520,6 +561,8 @@ enum RunEnd {
 
 struct RunOutcome {
     end: RunEnd,
+    /// The exit code, when the process exited with one.
+    code: Option<i32>,
     /// Every output line (both streams, arrival order), each line
     /// already truncated to LINE_CAP.
     lines: Vec<String>,
@@ -577,6 +620,7 @@ fn run_bounded(
         Err(e) => {
             return RunOutcome {
                 end: RunEnd::SpawnFailed(e.to_string()),
+                code: None,
                 lines: Vec::new(),
             }
         }
@@ -612,6 +656,7 @@ fn run_bounded(
         });
     let mut lines: Vec<String> = Vec::new();
     let mut child_status: Option<bool> = None;
+    let mut child_code: Option<i32> = None;
     // After the child exits, the pipes get a grace — but measured as
     // INACTIVITY, not wall time: a fast producer's backlog is still
     // being forwarded line by line, and draining it is progress, not
@@ -634,6 +679,7 @@ fn run_bounded(
             match child.try_wait() {
                 Ok(Some(st)) => {
                     child_status = Some(st.success());
+                    child_code = st.code();
                     exited_at = Some(std::time::Instant::now());
                 }
                 Ok(None) => {}
@@ -677,6 +723,7 @@ fn run_bounded(
                     match child.try_wait() {
                         Ok(Some(st)) => {
                             child_status = Some(st.success());
+                            child_code = st.code();
                             break;
                         }
                         Ok(None) => {
@@ -714,7 +761,7 @@ fn run_bounded(
             Err(_) => break,
         }
     }
-    RunOutcome { end, lines }
+    RunOutcome { end, code: child_code, lines }
 }
 
 impl App {
@@ -722,10 +769,21 @@ impl App {
     /// restart loses nothing. The per-session log files are the durable
     /// transcript record; this file is the state snapshot.
     fn persist(&self) {
-        let snapshot = {
+        let (snapshot, records) = {
             let sessions = self.sessions.lock().unwrap();
             let counter = self.counter.lock().unwrap();
-            serde_json::json!({ "counter": *counter, "sessions": *sessions })
+            let snapshot = serde_json::json!({ "counter": *counter, "sessions": *sessions });
+            // Each session's record: its settings and settled outcome,
+            // next to its log. The transcript is already in the log.
+            let records: Vec<Session> = sessions
+                .iter()
+                .map(|s| {
+                    let mut r = s.clone();
+                    r.transcript.clear();
+                    r
+                })
+                .collect();
+            (snapshot, records)
         };
         static PERSIST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = PERSIST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -735,6 +793,17 @@ impl App {
         let dst = self.data_dir.join("sessions.json");
         if std::fs::write(&tmp, snapshot.to_string()).is_ok() {
             let _ = std::fs::rename(&tmp, &dst);
+        }
+        let logs_dir = self.data_dir.join("logs");
+        let _ = std::fs::create_dir_all(&logs_dir);
+        for r in records {
+            let Ok(text) = serde_json::to_string(&r) else {
+                continue;
+            };
+            let tmp = logs_dir.join(format!("{}.record.json.tmp.{}-{}", r.id, std::process::id(), seq));
+            if std::fs::write(&tmp, text).is_ok() {
+                let _ = std::fs::rename(&tmp, logs_dir.join(format!("{}.record.json", r.id)));
+            }
         }
     }
 
@@ -771,6 +840,36 @@ impl App {
             .iter()
             .find(|s| s.id == id)
             .map(|s| s.status.clone())
+    }
+
+    /// The session JSON for the API. Each distinct repo's merge target
+    /// is resolved with git outside the sessions lock, once per request;
+    /// the JSON is then built under the lock with no git calls in it. A
+    /// session that appears while the targets are being resolved is
+    /// picked up on the next pass.
+    fn sessions_view(&self) -> serde_json::Value {
+        let mut targets: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
+        loop {
+            let missing: Vec<String> = {
+                let sessions = self.sessions.lock().unwrap();
+                let mut repos: Vec<String> = sessions
+                    .iter()
+                    .filter(|s| !s.repo.is_empty() && !targets.contains_key(&s.repo))
+                    .map(|s| s.repo.clone())
+                    .collect();
+                repos.sort();
+                repos.dedup();
+                if repos.is_empty() {
+                    return sessions_json(&sessions, &targets);
+                }
+                repos
+            };
+            for repo in missing {
+                let target = merge_target(&repo);
+                targets.insert(repo, target);
+            }
+        }
     }
 
     /// The session's stop flag, created on first use. The worker
@@ -988,6 +1087,34 @@ impl App {
         // 1. Isolated worktree on its own branch. On a retry the
         // worktree already exists with the agent's earlier work in it —
         // reuse it, so the agent continues from what it already did.
+        // A worktree whose link to the repo is gone (the repo's admin
+        // record for it was lost) cannot be reused: its files move
+        // aside, and the work is re-attached from the session's branch.
+        if wt.exists() && !Self::worktree_attached(&wt) {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let aside = wt.with_file_name(format!("{}.detached-{secs}", session.id));
+            match std::fs::rename(&wt, &aside) {
+                Ok(()) => self.log(
+                    id,
+                    format!(
+                        "the worktree had lost its link to the repo — its files were moved to {}",
+                        aside.display()
+                    ),
+                ),
+                Err(e) => {
+                    self.log(id, format!("could not move the detached worktree aside: {e}"));
+                    self.set_needs_you(
+                        id,
+                        "the worktree lost its link to the repo and could not be moved aside",
+                    );
+                    self.pump_queue();
+                    return;
+                }
+            }
+        }
         if wt.join(".git").exists() {
             self.log(
                 id,
@@ -1002,12 +1129,14 @@ impl App {
         // directory was deleted after an earlier run), restore the
         // worktree from the branch — `add -b` would refuse, the branch
         // exists, and the session's committed work would be stranded.
+        // Admin records of worktrees whose directories are gone must go
+        // first, or git refuses to add the path again.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "prune"])
+            .output();
         let out = if self.branch_exists(&session.repo, &session.branch) {
-            let _ = Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(["worktree", "prune"])
-                .output();
             self.log(
                 id,
                 "worktree directory was missing — restored from the session's branch; earlier committed work is intact"
@@ -1231,7 +1360,7 @@ impl App {
         match outcome.end {
             RunEnd::SpawnFailed(e) => {
                 self.log(id, format!("agent failed to start: {e}"));
-                self.set_needs_you(id, &format!("agent failed to start: {}", session.agent));
+                self.set_needs_you(id, &format!("agent failed to start: {}: {e}", session.agent));
                 self.pump_queue();
                 AgentRun::NotStarted
             }
@@ -1300,7 +1429,18 @@ impl App {
         let steer_first = resumed && self.steer_pending(id);
         if !steer_first {
             self.log(id, format!("agent started: {}", session.task));
-            if self.run_one(id, session, wt, &session.task, false) != AgentRun::Clean {
+            let prompt = session
+                .retry_prompt
+                .clone()
+                .unwrap_or_else(|| session.task.clone());
+            if session.retry_prompt.is_some() {
+                // The retry note is delivered once; a later pass starts
+                // from the task again.
+                if let Some(s) = self.sessions.lock().unwrap().iter_mut().find(|s| s.id == id) {
+                    s.retry_prompt = None;
+                }
+            }
+            if self.run_one(id, session, wt, &prompt, false) != AgentRun::Clean {
                 return;
             }
         }
@@ -1492,6 +1632,8 @@ impl App {
                 .args(["worktree", "prune"])
                 .output();
         }
+        let check_ran = !pristine_failed && !matches!(outcome.end, RunEnd::SpawnFailed(_));
+        let check_exit = outcome.code;
         let (passed, output, check_timed_out, check_pipes_held, check_stopped) = if pristine_failed {
             (
                 false,
@@ -1561,11 +1703,14 @@ impl App {
         // The full check output goes to the session's log file before
         // the stored copy is capped — the cap must never lose it.
         self.append_log_text(id, &format!("--- check output ---\n{output}\n--- end check output ---"));
+        let failed_reason = Self::check_failure_reason(&session.check_cmd, check_exit, &output);
         {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
                 s.check_output = Some(truncate_output(output));
                 s.check_passed = Some(passed);
+                s.check_ran = check_ran;
+                s.check_exit = check_exit;
                 s.diff = truncate_output(diff.clone());
                 // Provisional: every needs-you path below clears it.
                 s.verified_commit = tip.clone();
@@ -1697,7 +1842,12 @@ impl App {
             self.set_needs_you(id, "stopped by you while the check was running");
         } else {
             self.log(id, "check FAILED — this needs you".to_string());
-            self.set_needs_you(id, &format!("check failed: {}", session.check_cmd));
+            let reason = if check_ran {
+                failed_reason
+            } else {
+                format!("the check did not run: {}", session.check_cmd)
+            };
+            self.set_needs_you(id, &reason);
         }
         // Steering that arrived while the check ran must not be
         // stranded on a settled session. If the session finished
@@ -1721,6 +1871,20 @@ impl App {
             }
         }
         self.pump_queue();
+    }
+
+    /// Is this worktree still linked to a repository git can read?
+    fn worktree_attached(wt: &Path) -> bool {
+        // The worktree's own link file must exist; without it git would
+        // walk up to an enclosing repository and wrongly report success.
+        wt.join(".git").exists()
+            && Command::new("git")
+                .arg("-C")
+                .arg(wt)
+                .args(["rev-parse", "--git-dir"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
     }
 
     fn branch_exists(&self, repo: &str, branch: &str) -> bool {
@@ -1844,7 +2008,46 @@ impl App {
         problems
     }
 
-    /// Hand a needs-you session back to its agent: the check state is
+    /// The prompt a retried session's agent receives: the original task,
+/// then a delimited note with what failed last time — the check's
+/// command and the tail of its output, or the previous reason when the
+/// check printed nothing.
+fn retry_prompt_text(
+    task: &str,
+    check_cmd: &str,
+    check_output: Option<&str>,
+    reason: Option<&str>,
+) -> String {
+    let note = match check_output.filter(|o| !o.trim().is_empty()) {
+        Some(out) => {
+            let n = out.chars().count();
+            let tail: String = out.chars().skip(n.saturating_sub(4000)).collect();
+            format!("Check command: {check_cmd}\nLast output of the check (up to 4000 characters):\n{tail}")
+        }
+        None => format!(
+            "Previous reason: {}",
+            reason.unwrap_or("the previous attempt did not finish")
+        ),
+    };
+    format!("{task}\n\n--- retry: the previous attempt did not pass ---\n{note}\n--- end of retry note ---")
+}
+
+    /// The reason a failed check gives: its command, its exit code and
+    /// the head of its output, or that it printed nothing.
+    fn check_failure_reason(cmd: &str, exit: Option<i32>, output: &str) -> String {
+        let code = match exit {
+            Some(c) => format!("exit {c}"),
+            None => "no exit code".to_string(),
+        };
+        let head: String = output.trim().chars().take(200).collect();
+        if head.is_empty() {
+            format!("Check failed ({code}): {cmd}. The check printed nothing.")
+        } else {
+            format!("Check failed ({code}): {cmd}. Output: {head}")
+        }
+    }
+
+/// Hand a needs-you session back to its agent: the check state is
     /// cleared and the session re-queues; its worktree (with the agent's
     /// earlier work in it) is reused by run_session.
     fn retry(self: &Arc<Self>, id: &str) -> Result<(), String> {
@@ -1854,6 +2057,12 @@ impl App {
                 .iter_mut()
                 .find(|s| s.id == id)
                 .ok_or("no such session")?;
+            if matches!(s.status.as_str(), "queued" | "working" | "checking") {
+                return Err(format!(
+                    "this session is already running ({}) — there is nothing to retry",
+                    s.status
+                ));
+            }
             if s.status != "needs-you" {
                 return Err(format!(
                     "session is '{}' — only a needs-you session can be retried",
@@ -1866,9 +2075,32 @@ impl App {
                         .to_string(),
                 );
             }
+            s.merge_error = None;
+            s.retry_prompt = Some(Self::retry_prompt_text(
+                &s.task,
+                &s.check_cmd,
+                s.check_output.as_deref(),
+                s.reason.as_deref(),
+            ));
+            // Claim the session in the same step as the status check, so
+            // a second Retry finds it queued and is refused. The stop
+            // flag is cleared before the queued status is visible, as
+            // requeue does.
+            self.stop_flag(id)
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            s.check_output = None;
+            s.check_passed = None;
+            s.check_ran = false;
+            s.check_exit = None;
+            s.reason = None;
+            s.diff = String::new();
+            s.verified_commit = None;
+            s.status = Status::Queued.label().to_string();
+            s.bucket = Status::Queued.bucket().to_string();
         }
         self.log(id, "retry: handed back to the agent".to_string());
-        self.requeue(id);
+        self.persist();
+        self.maybe_start(id);
         Ok(())
     }
 
@@ -1892,6 +2124,8 @@ impl App {
             if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
                 s.check_output = None;
                 s.check_passed = None;
+                s.check_ran = false;
+                s.check_exit = None;
                 s.reason = None;
                 s.diff = String::new();
                 s.verified_commit = None;
@@ -1961,6 +2195,10 @@ impl App {
                 next_queue: rest,
                 spawned_from: Some(id.to_string()),
                 successor: None,
+                retry_prompt: None,
+                check_ran: false,
+                check_exit: None,
+                merge_error: None,
                 transcript: Vec::new(),
             };
             sessions.push(child);
@@ -2001,6 +2239,12 @@ impl App {
                 .iter_mut()
                 .find(|s| s.id == id)
                 .ok_or("no such session")?;
+            if s.status == "archived" {
+                return Err(
+                    "this session was dismissed — hand out new work instead of steering it"
+                        .to_string(),
+                );
+            }
             if s.status == "merged" {
                 return Err(
                     "this session's work is already merged — hand out new work instead of steering it"
@@ -2041,6 +2285,30 @@ impl App {
         Ok(())
     }
 
+    /// Clear a needs-you session the operator has decided not to
+    /// pursue. It leaves the board and the inbox; its record and log
+    /// stay on disk. Only a needs-you session can be dismissed.
+    fn dismiss(&self, id: &str) -> Result<(), String> {
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            let s = sessions
+                .iter_mut()
+                .find(|s| s.id == id)
+                .ok_or("no such session")?;
+            if s.status != "needs-you" {
+                return Err(format!(
+                    "session is '{}' — only a needs-you session can be dismissed",
+                    s.status
+                ));
+            }
+            s.status = Status::Archived.label().to_string();
+            s.bucket = Status::Archived.bucket().to_string();
+        }
+        self.log(id, "dismissed by you — it left the board and the inbox; this log stays on disk".to_string());
+        self.persist();
+        Ok(())
+    }
+
     /// Stop a session at the operator's word. A live run (agent or
     /// check) is killed through its stop flag — the bounded runner
     /// kills the whole process group and lands the session in
@@ -2068,7 +2336,45 @@ impl App {
         }
     }
 
-    fn merge(&self, id: &str) -> Result<(String, String), String> {
+    fn merge(&self, id: &str) -> Result<(String, String), MergeError> {
+        let mut detail = String::new();
+        let result = self.merge_landing(id, &mut detail).map_err(|message| MergeError {
+            status: if message == "no such session" { 404 } else { 409 },
+            message,
+            detail: (!detail.is_empty()).then_some(detail),
+        });
+        // The last refusal stays on the session until a merge lands.
+        let refusal = result.as_ref().err().map(|e| MergeRefusal {
+            message: e.message.clone(),
+            detail: e.detail.clone(),
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        });
+        self.set_merge_error(id, refusal);
+        result
+    }
+
+    fn set_merge_error(&self, id: &str, refusal: Option<MergeRefusal>) {
+        let found = {
+            let mut sessions = self.sessions.lock().unwrap();
+            match sessions.iter_mut().find(|s| s.id == id) {
+                Some(s) => {
+                    s.merge_error = refusal;
+                    true
+                }
+                None => false,
+            }
+        };
+        if found {
+            self.persist();
+        }
+    }
+
+    /// The merge itself. A refusal carries a plain sentence; git's own
+    /// text for a refusal git made is left in `detail`.
+    fn merge_landing(&self, id: &str, detail: &mut String) -> Result<(String, String), String> {
         let session = {
             let sessions = self.sessions.lock().unwrap();
             sessions
@@ -2174,12 +2480,16 @@ impl App {
             // refusal, and the filename lives past the first line.
             // Git writes conflict markers to stdout and refusals to
             // stderr — read both.
-            let detail = format!(
+            let raw = format!(
                 "{}{}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
-            let lines: Vec<&str> = detail
+            *detail = raw.trim().to_string();
+            if let Some(plain) = plain_merge_refusal(&raw) {
+                return Err(plain);
+            }
+            let lines: Vec<&str> = raw
                 .lines()
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty())
@@ -2190,11 +2500,6 @@ impl App {
             } else {
                 lines.join(" — ")
             };
-            if detail.contains("CONFLICT") {
-                return Err(format!(
-                    "merge conflict: {summary} — the merge was aborted and nothing was merged"
-                ));
-            }
             return Err(format!(
                 "merge refused: {summary} — nothing was merged"
             ));
@@ -2228,6 +2533,14 @@ impl App {
 // HTTP layer (std-only, one request per connection)
 // ---------------------------------------------------------------------------
 
+/// A refused merge: the HTTP status, the plain message for the
+/// operator, and git's own text when git made the refusal.
+struct MergeError {
+    status: u16,
+    message: String,
+    detail: Option<String>,
+}
+
 fn json_response(status: u16, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -2250,7 +2563,7 @@ const READ_DEADLINE_SECS: u64 = 30;
 
 fn read_request(
     stream: &mut std::net::TcpStream,
-) -> Option<(String, String, String, String, String)> {
+) -> Option<(String, String, String, String, String, String)> {
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(READ_DEADLINE_SECS);
     let mut reader = BufReader::new(stream.try_clone().ok()?);
@@ -2291,10 +2604,25 @@ fn read_request(
     let mut content_length = 0usize;
     let mut content_type = String::new();
     let mut origin = String::new();
+    let mut host = String::new();
+    let mut header_count = 0usize;
+    let mut header_bytes = 0usize;
     loop {
         let line = read_line_by_byte(&mut reader, stream)?;
         if line == "\r\n" || line.is_empty() {
             break;
+        }
+        header_count += 1;
+        header_bytes += line.len();
+        if header_count > MAX_HEADERS || header_bytes > MAX_HEADER_BYTES {
+            return Some((
+                "__headers_too_large__".to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ));
         }
         let lower = line.to_lowercase();
         if let Some(v) = lower.strip_prefix("content-length:") {
@@ -2303,6 +2631,8 @@ fn read_request(
             content_type = v.trim().to_string();
         } else if let Some(v) = lower.strip_prefix("origin:") {
             origin = v.trim().to_string();
+        } else if let Some(v) = lower.strip_prefix("host:") {
+            host = v.trim().to_string();
         }
     }
     // A declared body over the cap is refused without being read —
@@ -2315,6 +2645,7 @@ fn read_request(
             String::new(),
             String::new(),
             String::new(),
+            host,
         ));
     }
     let mut body: Vec<u8> = Vec::with_capacity(content_length);
@@ -2336,6 +2667,7 @@ fn read_request(
         String::from_utf8_lossy(&body).to_string(),
         content_type,
         origin,
+        host,
     ))
 }
 
@@ -2354,8 +2686,32 @@ fn origin_is_local(origin: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
 }
 
+/// Is a Host header one this server answers to? Its hostname (port
+/// ignored, case ignored) must be a loopback name, or listed in the
+/// comma-separated FLEET_ALLOWED_HOSTS. Anything else is a name a
+/// browser was pointed at by someone other than the operator.
+fn host_allowed(host: &str, extra: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(rest) => format!("[{}]", rest.split(']').next().unwrap_or("")),
+        None => host.split(':').next().unwrap_or("").to_string(),
+    }
+    .to_lowercase();
+    matches!(name.as_str(), "localhost" | "127.0.0.1" | "[::1]")
+        || extra
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .any(|h| !h.is_empty() && h == name)
+}
+
+/// Header limits: more header lines, or more header bytes, than these
+/// is refused with 431 before any header is acted on.
+const MAX_HEADERS: usize = 100;
+const MAX_HEADER_BYTES: usize = 32 * 1024;
+
 /// Largest request body the API accepts (hand-outs are small JSON).
 const MAX_BODY_BYTES: usize = 1_048_576;
+/// Largest task text a hand-out may carry, in bytes.
+const MAX_TASK_BYTES: usize = 100_000;
 /// How long a connection may take to deliver its request before the
 /// handler drops it — a stalled request must not hold a thread forever.
 const READ_TIMEOUT_SECS: u64 = 10;
@@ -2363,7 +2719,10 @@ const READ_TIMEOUT_SECS: u64 = 10;
 /// Serialize sessions for the API with queue positions computed in:
 /// a queued session's position is its place among the queued, in
 /// hand-out order. Non-queued sessions carry null.
-fn sessions_json(sessions: &[Session]) -> serde_json::Value {
+fn sessions_json(
+    sessions: &[Session],
+    targets: &std::collections::HashMap<String, Option<String>>,
+) -> serde_json::Value {
     let mut pos = 0usize;
     let arr: Vec<serde_json::Value> = sessions
         .iter()
@@ -2376,6 +2735,29 @@ fn sessions_json(sessions: &[Session]) -> serde_json::Value {
             let kind = engine_kind(&s.agent);
             v["engine"] = serde_json::json!(kind.label());
             v["test_mode"] = serde_json::json!(kind == EngineKind::Custom);
+            // The receipt facts are always present: null until a check ran.
+            v["check_output"] = serde_json::json!(s.check_output.clone().unwrap_or_default());
+            v["check_passed"] = serde_json::json!(s.check_passed);
+            v["check_ran"] = serde_json::json!(s.check_ran);
+            v["check_exit"] = serde_json::json!(s.check_exit);
+            // Where Merge will land: the repo's checked-out branch, null
+            // when the repo is unknown or its HEAD is detached.
+            let target = if s.repo.is_empty() {
+                None
+            } else {
+                targets.get(&s.repo).cloned().flatten()
+            };
+            v["merge_target"] = serde_json::json!(target);
+            // A needs-you session whose steering is still waiting says
+            // so in its reason: the message is not silently pending.
+            if s.status == "needs-you" && !s.steer.is_empty() {
+                let msg = &s.steer[0];
+                let shown: String = msg.chars().take(120).collect();
+                let cut = if msg.chars().count() > 120 { "…" } else { "" };
+                let note = format!("Your message is still waiting: \"{shown}{cut}\".");
+                let base = s.reason.clone().unwrap_or_default();
+                v["reason"] = serde_json::json!(format!("{base} {note}").trim_start());
+            }
             if s.status == "queued" {
                 pos += 1;
                 v["queue_position"] = serde_json::json!(pos);
@@ -2421,19 +2803,27 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
             .to_string(),
         ),
         ("GET", "/api/sessions") => {
-            let sessions = app.sessions.lock().unwrap();
-            json_response(200, &sessions_json(&sessions).to_string())
+            json_response(200, &app.sessions_view().to_string())
         }
         ("POST", "/api/sessions") => {
             let req: serde_json::Value = match serde_json::from_str(body) {
                 Ok(v) => v,
                 Err(e) => return error_response(400, &format!("bad json: {e}")),
             };
-            let task = req["task"].as_str().unwrap_or("").to_string();
-            let repo = req["repo"].as_str().unwrap_or("").to_string();
+            let task = req["task"].as_str().unwrap_or("").trim().to_string();
+            let repo = req["repo"].as_str().unwrap_or("").trim().to_string();
             let project = req["project"].as_str().unwrap_or("default").to_string();
             if task.is_empty() || repo.is_empty() {
                 return error_response(400, "task and repo are required");
+            }
+            if task.contains('\0') {
+                return error_response(400, "the task contains a NUL byte, which an agent cannot receive — remove it");
+            }
+            if task.len() > MAX_TASK_BYTES {
+                return error_response(
+                    400,
+                    &format!("the task is over {MAX_TASK_BYTES} bytes — split it into smaller tasks"),
+                );
             }
             // The agent is resolved and validated before anything is
             // created: an unavailable agent is a refusal, not a session
@@ -2455,10 +2845,19 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                     .output()
                     .map(|o| o.status.success())
                     .unwrap_or(false);
-            if !repo_ok {
-                return error_response(400, "repo is not a git repository");
+            if !Path::new(&repo).is_dir() {
+                return error_response(400, &format!("There is no folder at {repo}."));
             }
-            let check_cmd = match req["check"].as_str() {
+            if !repo_ok {
+                return error_response(
+                    400,
+                    &format!(
+                        "That folder is not a git repository: {repo}. Give the path of a folder that contains a .git folder, for example the one you run git in."
+                    ),
+                );
+            }
+            // A blank explicit check is no check: the policy default applies.
+            let check_cmd = match req["check"].as_str().map(str::trim) {
                 Some(c) if !c.is_empty() => c.to_string(),
                 _ => match app.policy.default_check(&project) {
                     Ok(c) => c,
@@ -2527,13 +2926,16 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 next_queue,
                 spawned_from: None,
                 successor: None,
+                retry_prompt: None,
+                check_ran: false,
+                check_exit: None,
+                merge_error: None,
                 transcript: Vec::new(),
             };
             app.sessions.lock().unwrap().push(session.clone());
             app.persist();
             app.maybe_start(&id);
-            let sessions = app.sessions.lock().unwrap();
-            let all = sessions_json(&sessions);
+            let all = app.sessions_view();
             let mine = all
                 .as_array()
                 .and_then(|a| {
@@ -2546,8 +2948,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
         }
         ("GET", route) if route.starts_with("/api/sessions/") => {
             let id = &route["/api/sessions/".len()..];
-            let sessions = app.sessions.lock().unwrap();
-            let all = sessions_json(&sessions);
+            let all = app.sessions_view();
             match all
                 .as_array()
                 .and_then(|a| a.iter().find(|v| v["id"].as_str() == Some(id)).cloned())
@@ -2568,7 +2969,13 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                     })
                     .to_string(),
                 ),
-                Err(e) => error_response(409, &e),
+                Err(e) => {
+                    let mut body = serde_json::json!({ "error": e.message });
+                    if let Some(d) = e.detail {
+                        body["detail"] = serde_json::json!(d);
+                    }
+                    json_response(e.status, &body.to_string())
+                }
             }
         }
         ("POST", route) if route.starts_with("/api/sessions/") && route.ends_with("/retry") => {
@@ -2597,6 +3004,14 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 Err(e) => error_response(409, &e),
             }
         }
+        ("POST", route) if route.starts_with("/api/sessions/") && route.ends_with("/dismiss") => {
+            let id = &route["/api/sessions/".len()..route.len() - "/dismiss".len()];
+            match app.dismiss(id) {
+                Ok(()) => json_response(200, "{\"dismissed\":true}"),
+                Err(e) if e == "no such session" => error_response(404, &e),
+                Err(e) => error_response(409, &e),
+            }
+        }
         ("POST", route) if route.starts_with("/api/sessions/") && route.ends_with("/stop") => {
             let id = &route["/api/sessions/".len()..route.len() - "/stop".len()];
             match app.stop(id) {
@@ -2606,8 +3021,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
             }
         }
         ("GET", "/api/inbox") => {
-            let sessions = app.sessions.lock().unwrap();
-            let all = sessions_json(&sessions);
+            let all = app.sessions_view();
             let inbox: Vec<serde_json::Value> = all
                 .as_array()
                 .cloned()
@@ -2690,23 +3104,52 @@ fn cap_transcript(lines: Vec<String>) -> Vec<String> {
 /// lost sessions.json; the sessions must not silently vanish with
 /// it. A recovered session says what happened and lands in Needs
 /// you — its repo and check settings lived only in the store.
+/// Added to a session's transcript when it is rebuilt from its record
+/// after the session store was lost.
+const RESTORED_LINE: &str = "restored from its record after the session store was lost";
+/// Appended to the reason of a needs-you session rebuilt that way.
+const RESTORED_REASON: &str = "(recovered from its record after the session store was lost)";
+
 fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
     let logs_dir = data_dir.join("logs");
     let mut sessions = Vec::new();
     let Ok(entries) = std::fs::read_dir(&logs_dir) else {
         return sessions;
     };
-    let mut paths: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+    let mut ids: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.strip_suffix(".record.json")
+                .or_else(|| name.strip_suffix(".log"))
+                .map(|id| id.to_string())
+        })
         .collect();
-    paths.sort();
-    for path in paths {
-        let Some(id) = path.file_stem().map(|s| s.to_string_lossy().to_string()) else {
-            continue;
-        };
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
+    ids.sort();
+    ids.dedup();
+    for id in ids {
+        let text = std::fs::read_to_string(logs_dir.join(format!("{id}.log"))).unwrap_or_default();
         let lines = transcript_lines_from_log(&text);
+        // A session with a record comes back as it was: its repo,
+        // check, agent and settled outcome are in the record, so a
+        // done session stays done and a merged one stays merged.
+        let record = std::fs::read_to_string(logs_dir.join(format!("{id}.record.json")))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Session>(&t).ok())
+            .filter(|r| r.id == id);
+        if let Some(mut s) = record {
+            // Say so, once, in the transcript; a session that needs the
+            // operator says it in its reason too. Status is unchanged.
+            let mut lines = lines;
+            lines.push(RESTORED_LINE.to_string());
+            s.transcript = cap_transcript(lines);
+            if s.status == "needs-you" && !s.reason.as_deref().unwrap_or("").contains(RESTORED_REASON) {
+                let base = s.reason.clone().unwrap_or_else(|| "needs you".to_string());
+                s.reason = Some(format!("{base} {RESTORED_REASON}"));
+            }
+            sessions.push(s);
+            continue;
+        }
         let task = lines
             .iter()
             .find_map(|l| l.strip_prefix("agent started: ").map(|t| t.to_string()))
@@ -2738,6 +3181,10 @@ fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
             next_queue: Vec::new(),
             spawned_from: None,
             successor: None,
+            retry_prompt: None,
+            check_ran: false,
+            check_exit: None,
+            merge_error: None,
             transcript: cap_transcript(lines),
         });
     }
@@ -2904,6 +3351,7 @@ fn main() {
     app.pump_queue();
 
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind failed");
+    let allowed_hosts = std::env::var("FLEET_ALLOWED_HOSTS").unwrap_or_default();
     let detected: Vec<String> = app
         .agents
         .iter()
@@ -2919,14 +3367,19 @@ fn main() {
         match stream {
             Ok(mut stream) => {
                 let app = app.clone();
+                let allowed_hosts = allowed_hosts.clone();
                 std::thread::spawn(move || {
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(
                         READ_TIMEOUT_SECS,
                     )));
-                    if let Some((method, path, body, content_type, origin)) =
+                    if let Some((method, path, body, content_type, origin, host)) =
                         read_request(&mut stream)
                     {
-                        let response = if method == "__too_large__" {
+                        let response = if method == "__headers_too_large__" {
+                            error_response(431, "request headers are too large")
+                        } else if !host_allowed(&host, &allowed_hosts) {
+                            error_response(403, "this board answers only to its own host name")
+                        } else if method == "__too_large__" {
                             error_response(413, "request body too large")
                         } else if method == "POST"
                             && !content_type.starts_with("application/json")
@@ -2956,6 +3409,30 @@ fn main() {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Git's refusal text for a merge, in plain words, for the two cases
+/// the operator can act on: a missing committer identity and a content
+/// conflict. Anything else is described by the caller from git's own lines.
+fn plain_merge_refusal(raw: &str) -> Option<String> {
+    if raw.contains("identity unknown")
+        || raw.contains("Please tell me who you are")
+        || raw.contains("auto-detection is disabled")
+    {
+        return Some("Git has no name and email for the merge commit. Set them with git config user.name and git config user.email in this repo, then merge again. Nothing was merged.".to_string());
+    }
+    if raw.contains("CONFLICT") {
+        let files: Vec<&str> = raw
+            .lines()
+            .filter_map(|l| l.split_once("Merge conflict in ").map(|(_, f)| f.trim()))
+            .collect();
+        return Some(if files.is_empty() {
+            "Merge conflict. Nothing was merged.".to_string()
+        } else {
+            format!("Merge conflict in {}. Nothing was merged.", files.join(", "))
+        });
+    }
+    None
+}
 
 #[cfg(test)]
 mod tests {
@@ -3103,6 +3580,10 @@ mod tests {
             next_queue: Vec::new(),
             spawned_from: None,
             successor: None,
+            retry_prompt: None,
+            check_ran: false,
+            check_exit: None,
+            merge_error: None,
             transcript: Vec::new(),
         };
         app.sessions.lock().unwrap().push(session);
@@ -3111,6 +3592,728 @@ mod tests {
         assert_eq!(app.status_of("s1").as_deref(), Some("needs-you"));
         let sessions = app.sessions.lock().unwrap();
         assert_eq!(sessions[0].check_passed, Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_app(data_dir: PathBuf, sessions: Vec<Session>) -> Arc<App> {
+        Arc::new(App {
+            policy: Policy::load(SCRIPT).unwrap(),
+            policy_source: "policies.rn".to_string(),
+            agents: Vec::new(),
+            default_agent: None,
+            data_dir,
+            run_tag: "test".to_string(),
+            sessions: Mutex::new(sessions),
+            lines_since_persist: std::sync::atomic::AtomicU64::new(0),
+            counter: Mutex::new(0),
+            stops: Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    fn test_session(id: &str, status: Status, dir: &Path) -> Session {
+        Session {
+            id: id.to_string(),
+            task: format!("task for {id}"),
+            project: "fixture".to_string(),
+            repo: dir.join("repo").to_string_lossy().to_string(),
+            branch: format!("fleet/{id}"),
+            worktree: dir.join("data/worktrees").join(id).to_string_lossy().to_string(),
+            status: status.label().to_string(),
+            bucket: status.bucket().to_string(),
+            agent: "/bin/true".to_string(),
+            check_cmd: "test -s output.txt".to_string(),
+            check_output: Some("1 passed".to_string()),
+            check_passed: Some(true),
+            diff: String::new(),
+            reason: None,
+            verified_commit: Some("abc123".to_string()),
+            steer: Vec::new(),
+            next_queue: Vec::new(),
+            spawned_from: None,
+            successor: None,
+            retry_prompt: None,
+            check_ran: false,
+            check_exit: None,
+            merge_error: None,
+            transcript: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn done_and_merged_survive_a_lost_session_store() {
+        let dir = std::env::temp_dir().join(format!("fleet-f1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let mut stuck = test_session("s3", Status::NeedsYou, &dir);
+        stuck.reason = Some("check failed: false".to_string());
+        let app = test_app(
+            data.clone(),
+            vec![
+                test_session("s1", Status::Done, &dir),
+                test_session("s2", Status::Merged, &dir),
+                stuck,
+            ],
+        );
+        app.log("s1", "check passed — verified done".to_string());
+        app.log("s2", "merged into main".to_string());
+        app.log("s3", "needs you: check failed: false".to_string());
+        app.persist();
+        std::fs::remove_file(data.join("sessions.json")).unwrap();
+        let (restored, _) = load_persisted(&data);
+        let repo = dir.join("repo").to_string_lossy().to_string();
+        let s1 = restored.iter().find(|s| s.id == "s1").unwrap();
+        assert_eq!((s1.status.as_str(), s1.bucket.as_str()), ("done", "done"));
+        assert_eq!(s1.verified_commit.as_deref(), Some("abc123"));
+        assert_eq!(s1.check_passed, Some(true));
+        assert_eq!(s1.check_output.as_deref(), Some("1 passed"));
+        assert_eq!(s1.repo, repo);
+        assert_eq!(s1.check_cmd, "test -s output.txt");
+        assert_eq!(s1.branch, "fleet/s1");
+        let s2 = restored.iter().find(|s| s.id == "s2").unwrap();
+        assert_eq!((s2.status.as_str(), s2.bucket.as_str()), ("merged", "done"));
+        assert_eq!(s2.repo, repo);
+        // Every session rebuilt from its record says so in its transcript;
+        // only a needs-you one also says so in its reason.
+        let restored_line = "restored from its record after the session store was lost";
+        for id in ["s1", "s2", "s3"] {
+            let r = restored.iter().find(|s| s.id == id).unwrap();
+            assert!(r.transcript.iter().any(|l| l == restored_line), "{id}: {:?}", r.transcript);
+        }
+        assert_eq!(s1.reason, None);
+        let s3 = restored.iter().find(|s| s.id == "s3").unwrap();
+        assert_eq!((s3.status.as_str(), s3.bucket.as_str()), ("needs-you", "needs-you"));
+        assert_eq!(
+            s3.reason.as_deref(),
+            Some("check failed: false (recovered from its record after the session store was lost)")
+        );
+        // A session with no record keeps the honest needs-you recovery.
+        std::fs::write(data.join("logs/s9.log"), "agent started: old task\n").unwrap();
+        let (restored, _) = load_persisted(&data);
+        let s9 = restored.iter().find(|s| s.id == "s9").unwrap();
+        assert_eq!(s9.bucket, "needs-you");
+        assert!(!s9.transcript.iter().any(|l| l.starts_with("restored from its record")));
+        assert!(s9.reason.as_deref().unwrap_or("").contains("recovered"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn git_repo(dir: &Path) -> PathBuf {
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success())
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "x").unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"]);
+        repo
+    }
+
+    #[test]
+    fn task_input_is_validated_at_the_api() {
+        let dir = std::env::temp_dir().join(format!("fleet-f2-{}", std::process::id()));
+        let app = test_app(dir.join("data"), Vec::new());
+        let post = |task: String| {
+            handle(
+                &app,
+                "POST",
+                "/api/sessions",
+                &serde_json::json!({ "task": task, "repo": "/nonexistent" }).to_string(),
+            )
+        };
+        for (task, message) in [
+            ("   \n\t".to_string(), "task and repo are required"),
+            ("fix\0it".to_string(), "NUL byte"),
+            ("x".repeat(100_001), "100000 bytes"),
+        ] {
+            let resp = post(task);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{}", resp.lines().next().unwrap_or(""));
+            assert!(resp.contains(message), "expected '{message}' in {resp}");
+        }
+        assert!(app.sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn spawn_failure_reason_carries_the_os_error() {
+        let dir = std::env::temp_dir().join(format!("fleet-f2b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir);
+        let gone = dir.join("gone-agent.sh");
+        std::fs::write(&gone, "#!/bin/sh\n").unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        let mut s = test_session("s1", Status::Queued, &dir);
+        s.repo = repo.to_string_lossy().to_string();
+        s.agent = gone.to_string_lossy().to_string();
+        let app = test_app(dir.join("data"), vec![s]);
+        app.set_status("s1", Status::Working);
+        app.run_session("s1");
+        assert_eq!(app.status_of("s1").as_deref(), Some("needs-you"));
+        let sessions = app.sessions.lock().unwrap();
+        let reason = sessions[0].reason.clone().unwrap_or_default();
+        assert!(reason.contains("No such file or directory"), "reason was: {reason}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retry_hands_the_agent_the_failure_it_must_fix() {
+        let dir = std::env::temp_dir().join(format!("fleet-f3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir);
+        // A recording agent: it keeps the prompt it was given.
+        let received = dir.join("received.txt");
+        let agent = dir.join("recorder.sh");
+        std::fs::write(
+            &agent,
+            format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n", received.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut s = test_session("s1", Status::NeedsYou, &dir);
+        s.task = "write output".to_string();
+        s.repo = repo.to_string_lossy().to_string();
+        s.agent = agent.to_string_lossy().to_string();
+        s.check_cmd = "echo boom-output; false".to_string();
+        s.check_output = Some("boom-output".to_string());
+        s.check_passed = Some(false);
+        s.verified_commit = None;
+        s.reason = Some("check failed: echo boom-output; false".to_string());
+        let app = test_app(dir.join("data"), vec![s]);
+        app.retry("s1").unwrap();
+        for _ in 0..400 {
+            if app.status_of("s1").as_deref() == Some("needs-you") && received.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let prompt = std::fs::read_to_string(&received).unwrap_or_default();
+        assert!(prompt.starts_with("write output"), "prompt was: {prompt}");
+        assert!(prompt.contains("echo boom-output; false"), "prompt was: {prompt}");
+        assert!(prompt.contains("boom-output"), "prompt was: {prompt}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn git_run(cwd: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn response_body(resp: &str) -> serde_json::Value {
+        serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap_or_default()
+    }
+
+    #[test]
+    fn merge_refusals_are_plain_and_keep_git_text() {
+        let dir = std::env::temp_dir().join(format!("fleet-f4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A real content conflict on README.md.
+        let repo = git_repo(&dir);
+        git_run(&repo, &["checkout", "-b", "fleet/s1"]);
+        std::fs::write(repo.join("README.md"), "branch change\n").unwrap();
+        git_run(&repo, &["commit", "-am", "branch"]);
+        let pin = git_run(&repo, &["rev-parse", "HEAD"]);
+        git_run(&repo, &["checkout", "main"]);
+        std::fs::write(repo.join("README.md"), "main change\n").unwrap();
+        git_run(&repo, &["commit", "-am", "main"]);
+        let mut s = test_session("s1", Status::Done, &dir);
+        s.repo = repo.to_string_lossy().to_string();
+        s.branch = "fleet/s1".to_string();
+        s.verified_commit = Some(pin);
+        let app = test_app(dir.join("data"), vec![s]);
+        let resp = handle(&app, "POST", "/api/sessions/s1/merge", "{}");
+        assert!(resp.starts_with("HTTP/1.1 409"), "{}", resp.lines().next().unwrap_or(""));
+        let body = response_body(&resp);
+        assert_eq!(body["error"], "Merge conflict in README.md. Nothing was merged.", "{body}");
+        assert!(body["detail"].as_str().unwrap_or("").contains("CONFLICT"), "{body}");
+
+        // A merge commit with no identity configured: git's own words map to a
+        // plain sentence naming the two settings (pure mapping: no process-wide
+        // environment is touched, so tests that run git elsewhere cannot race).
+        let identity_raw = "Committer identity unknown\n\n*** Please tell me who you are.\n\nRun\n\n  git config --global user.email \"you@example.com\"\n  git config --global user.name \"Your Name\"\n";
+        let msg = plain_merge_refusal(identity_raw).unwrap_or_default();
+        assert!(msg.contains("git config user.name") && msg.contains("git config user.email"), "{msg}");
+        assert!(plain_merge_refusal("Auto-merging a.txt\nCONFLICT (content): Merge conflict in a.txt\n").unwrap().contains("Merge conflict in a.txt"));
+        assert!(plain_merge_refusal("fatal: something else").is_none());
+        let app2 = test_app(dir.join("data2"), vec![test_session("s2", Status::Done, &dir)]);
+
+        // An unknown session is a 404, as GET answers.
+        let resp = handle(&app2, "POST", "/api/sessions/nope/merge", "{}");
+        assert!(resp.starts_with("HTTP/1.1 404"), "{}", resp.lines().next().unwrap_or(""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dismiss_clears_a_needs_you_session_and_keeps_its_log() {
+        let dir = std::env::temp_dir().join(format!("fleet-f5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        let mut stuck = test_session("s1", Status::NeedsYou, &dir);
+        stuck.reason = Some("check failed: false".to_string());
+        let app = test_app(data.clone(), vec![stuck, test_session("s2", Status::Done, &dir)]);
+        app.log("s1", "check FAILED — this needs you".to_string());
+
+        let resp = handle(&app, "POST", "/api/sessions/s1/dismiss", "{}");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{}", resp.lines().next().unwrap_or(""));
+        let inbox = response_body(&handle(&app, "GET", "/api/inbox", ""));
+        assert!(inbox.as_array().unwrap().is_empty(), "{inbox}");
+        let all = response_body(&handle(&app, "GET", "/api/sessions", ""));
+        let s1 = all.as_array().unwrap().iter().find(|v| v["id"] == "s1").unwrap();
+        assert_eq!((s1["status"].as_str(), s1["bucket"].as_str()), (Some("archived"), Some("archived")));
+        assert!(data.join("logs/s1.log").exists());
+        // Only a needs-you session can be dismissed.
+        let resp = handle(&app, "POST", "/api/sessions/s2/dismiss", "{}");
+        assert!(resp.starts_with("HTTP/1.1 409"), "{}", resp.lines().next().unwrap_or(""));
+        assert!(response_body(&resp)["error"].as_str().unwrap_or("").contains("only a needs-you"));
+        // A dismissed session takes no steering.
+        let resp = handle(&app, "POST", "/api/sessions/s1/steer", "{\"message\":\"hello\"}");
+        assert!(resp.starts_with("HTTP/1.1 409"), "{}", resp.lines().next().unwrap_or(""));
+        let resp = handle(&app, "POST", "/api/sessions/nope/dismiss", "{}");
+        assert!(resp.starts_with("HTTP/1.1 404"), "{}", resp.lines().next().unwrap_or(""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Send raw request bytes over a real socket and parse them with
+    /// the server's own request reader.
+    fn read_raw(request: Vec<u8>) -> Option<(String, String, String, String, String, String)> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            let _ = c.write_all(&request);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let parsed = read_request(&mut stream);
+        client.join().unwrap();
+        parsed
+    }
+
+    #[test]
+    fn request_headers_are_bounded() {
+        let mut many = String::from("GET / HTTP/1.1\r\nHost: 127.0.0.1:9840\r\n");
+        for i in 0..101 {
+            many.push_str(&format!("X-Pad-{i}: a\r\n"));
+        }
+        many.push_str("\r\n");
+        let parsed = read_raw(many.into_bytes()).unwrap();
+        assert_eq!(parsed.0, "__headers_too_large__");
+        let big = format!(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1:9840\r\nX-A: {0}\r\nX-B: {0}\r\nX-C: {0}\r\n\r\n",
+            "a".repeat(12_000)
+        );
+        let parsed = read_raw(big.into_bytes()).unwrap();
+        assert_eq!(parsed.0, "__headers_too_large__");
+        let small = "GET / HTTP/1.1\r\nHost: 127.0.0.1:9840\r\n\r\n".to_string();
+        assert_eq!(read_raw(small.into_bytes()).unwrap().0, "GET");
+    }
+
+    #[test]
+    fn host_header_must_name_this_machine() {
+        assert!(host_allowed("127.0.0.1:9840", ""));
+        assert!(host_allowed("localhost:9840", ""));
+        assert!(host_allowed("[::1]:9840", ""));
+        assert!(!host_allowed("evil.example:9840", ""));
+        assert!(!host_allowed("127.0.0.1.evil.example:9840", ""));
+        assert!(!host_allowed("", ""));
+        assert!(host_allowed("fleet.lan:9840", "fleet.lan, other.lan"));
+        assert!(!host_allowed("fleet.lan:9840", ""));
+        let raw = "GET / HTTP/1.1\r\nHost: Evil.Example:9840\r\n\r\n".to_string();
+        assert_eq!(read_raw(raw.into_bytes()).unwrap().5, "evil.example:9840");
+    }
+
+    #[test]
+    fn waiting_steering_is_named_on_a_needs_you_reason() {
+        let mut s = test_session("s1", Status::NeedsYou, Path::new("."));
+        s.reason = Some("check failed: false".to_string());
+        s.steer = vec!["also fix the tests".to_string()];
+        let v = sessions_json(&[s], &std::collections::HashMap::new());
+        let reason = v[0]["reason"].as_str().unwrap_or("");
+        assert!(reason.starts_with("check failed: false"), "{reason}");
+        assert!(
+            reason.contains("Your message is still waiting: \"also fix the tests\""),
+            "{reason}"
+        );
+    }
+
+    fn script_agent(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let agent = dir.join(name);
+        std::fs::write(&agent, format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        agent
+    }
+
+    #[test]
+    fn whitespace_check_falls_back_to_the_policy_default() {
+        let dir = std::env::temp_dir().join(format!("fleet-fb6-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir);
+        let agent = script_agent(&dir, "noop.sh", "");
+        let app = test_app(dir.join("data"), Vec::new());
+        let body = serde_json::json!({
+            "task": "do nothing",
+            "repo": repo.to_string_lossy(),
+            "project": "fixture",
+            "check": "   ",
+            "agent": agent.to_string_lossy(),
+        });
+        let resp = handle(&app, "POST", "/api/sessions", &body.to_string());
+        assert!(resp.starts_with("HTTP/1.1 201"), "{}", resp.lines().next().unwrap_or(""));
+        let created = response_body(&resp);
+        assert_eq!(created["check_cmd"], "test -s output.txt", "{created}");
+        let id = created["id"].as_str().unwrap_or("").to_string();
+        // The run settles on its own; the policy check fails on an empty tree.
+        for _ in 0..400 {
+            let st = app.status_of(&id).unwrap_or_default();
+            if !matches!(st.as_str(), "queued" | "working" | "checking") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(app.status_of(&id).as_deref(), Some("needs-you"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_json_carries_the_receipt_facts() {
+        let dir = std::env::temp_dir().join(format!("fleet-fb8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir).to_string_lossy().to_string();
+        let agent = script_agent(&dir, "writer.sh", "echo done > out.txt").to_string_lossy().to_string();
+        let cases = [("ok", "true"), ("bad", "echo x; exit 3"), ("quiet", "false")];
+        let mut sessions = Vec::new();
+        for (id, check) in cases {
+            let mut s = test_session(id, Status::Working, &dir);
+            s.repo = repo.clone();
+            s.agent = agent.clone();
+            s.check_cmd = check.to_string();
+            s.check_output = None;
+            s.check_passed = None;
+            s.verified_commit = None;
+            sessions.push(s);
+        }
+        // Never run: no check has run, so the receipt says so.
+        let mut idle = test_session("idle", Status::NeedsYou, &dir);
+        idle.check_output = None;
+        idle.check_passed = None;
+        idle.verified_commit = None;
+        sessions.push(idle);
+        let app = test_app(dir.join("data"), sessions);
+        for (id, _) in cases {
+            app.run_session(id);
+        }
+        let get = |id: &str| response_body(&handle(&app, "GET", &format!("/api/sessions/{id}"), ""));
+
+        let ok = get("ok");
+        assert_eq!(ok["status"], "done", "{ok}");
+        assert_eq!(ok["check_cmd"], "true");
+        assert_eq!(ok["check_output"], "");
+        assert_eq!(ok["check_passed"], true);
+        assert_eq!(ok["check_ran"], true);
+        assert_eq!(ok["check_exit"], 0);
+
+        let bad = get("bad");
+        assert_eq!(bad["check_output"], "x", "{bad}");
+        assert_eq!(bad["check_passed"], false);
+        assert_eq!(bad["check_ran"], true);
+        assert_eq!(bad["check_exit"], 3);
+        assert_eq!(bad["reason"], "Check failed (exit 3): echo x; exit 3. Output: x", "{bad}");
+
+        let quiet = get("quiet");
+        assert_eq!(quiet["check_exit"], 1, "{quiet}");
+        assert_eq!(quiet["reason"], "Check failed (exit 1): false. The check printed nothing.", "{quiet}");
+
+        let idle = get("idle");
+        assert_eq!(idle["check_cmd"], "test -s output.txt");
+        assert_eq!(idle["check_output"], "");
+        assert!(idle["check_passed"].is_null(), "{idle}");
+        assert_eq!(idle["check_ran"], false);
+        assert!(idle["check_exit"].is_null(), "{idle}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn settle(app: &Arc<App>, id: &str) {
+        for _ in 0..600 {
+            let st = app.status_of(id).unwrap_or_default();
+            if !matches!(st.as_str(), "queued" | "working" | "checking") {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn retry_after_restart_reattaches_the_worktree() {
+        let dir = std::env::temp_dir().join(format!("fleet-fr1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir);
+        let agent = script_agent(&dir, "writer.sh", "echo done > out.txt").to_string_lossy().to_string();
+        let data = dir.join("data");
+        let mut s = test_session("s1", Status::Queued, &dir);
+        s.repo = repo.to_string_lossy().to_string();
+        s.agent = agent;
+        s.check_cmd = "false".to_string();
+        s.check_output = None;
+        s.check_passed = None;
+        s.verified_commit = None;
+        let app = test_app(data.clone(), vec![s]);
+        app.set_status("s1", Status::Working);
+        app.run_session("s1");
+        assert_eq!(app.status_of("s1").as_deref(), Some("needs-you"));
+        drop(app);
+
+        // Restart from the same data dir: a retry reuses the worktree.
+        let (restored, _) = load_persisted(&data);
+        let app = test_app(data.clone(), restored);
+        app.retry("s1").unwrap();
+        settle(&app, "s1");
+        let reason = app.sessions.lock().unwrap()[0].reason.clone().unwrap_or_default();
+        assert!(reason.starts_with("Check failed"), "after restart: {reason}");
+        drop(app);
+
+        // The repo lost this worktree's link (its admin record is gone).
+        // A retry after another restart must re-attach the work, not fail
+        // at the commit step.
+        std::fs::remove_dir_all(repo.join(".git/worktrees/s1")).unwrap();
+        let (restored, _) = load_persisted(&data);
+        let app = test_app(data.clone(), restored);
+        app.retry("s1").unwrap();
+        settle(&app, "s1");
+        let reason = app.sessions.lock().unwrap()[0].reason.clone().unwrap_or_default();
+        assert!(reason.starts_with("Check failed"), "after losing the link: {reason}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_merge_refusal_is_kept_on_the_session() {
+        let dir = std::env::temp_dir().join(format!("fleet-fr2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir);
+        git_run(&repo, &["checkout", "-b", "fleet/s1"]);
+        std::fs::write(repo.join("README.md"), "branch change\n").unwrap();
+        git_run(&repo, &["commit", "-am", "branch"]);
+        let pin = git_run(&repo, &["rev-parse", "HEAD"]);
+        git_run(&repo, &["checkout", "main"]);
+        std::fs::write(repo.join("README.md"), "main change\n").unwrap();
+        git_run(&repo, &["commit", "-am", "main"]);
+        let data = dir.join("data");
+        let mut s = test_session("s1", Status::Done, &dir);
+        s.repo = repo.to_string_lossy().to_string();
+        s.branch = "fleet/s1".to_string();
+        s.verified_commit = Some(pin);
+        let app = test_app(data.clone(), vec![s]);
+
+        let resp = handle(&app, "POST", "/api/sessions/s1/merge", "{}");
+        assert!(resp.starts_with("HTTP/1.1 409"), "{}", resp.lines().next().unwrap_or(""));
+        let got = response_body(&handle(&app, "GET", "/api/sessions/s1", ""));
+        assert_eq!(got["merge_error"]["message"], "Merge conflict in README.md. Nothing was merged.", "{got}");
+        assert!(got["merge_error"]["detail"].as_str().unwrap_or("").contains("CONFLICT"), "{got}");
+        assert!(got["merge_error"]["ts"].as_u64().unwrap_or(0) > 0, "{got}");
+        drop(app);
+
+        // It survives a restart from the same data dir.
+        let (restored, _) = load_persisted(&data);
+        let app = test_app(data.clone(), restored);
+        let got = response_body(&handle(&app, "GET", "/api/sessions/s1", ""));
+        assert_eq!(got["merge_error"]["message"], "Merge conflict in README.md. Nothing was merged.", "{got}");
+
+        // A merge that lands clears it.
+        let head = git_run(&repo, &["rev-parse", "HEAD"]);
+        app.sessions.lock().unwrap()[0].verified_commit = Some(head);
+        let resp = handle(&app, "POST", "/api/sessions/s1/merge", "{}");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{}", resp.lines().next().unwrap_or(""));
+        let got = response_body(&handle(&app, "GET", "/api/sessions/s1", ""));
+        assert!(got["merge_error"].is_null(), "{got}");
+
+        // A retry clears it too.
+        let mut stuck = test_session("s2", Status::NeedsYou, &dir);
+        stuck.repo = repo.to_string_lossy().to_string();
+        stuck.merge_error = Some(MergeRefusal {
+            message: "old refusal".to_string(),
+            detail: None,
+            ts: 1,
+        });
+        app.sessions.lock().unwrap().push(stuck);
+        let resp = handle(&app, "POST", "/api/sessions/s2/retry", "{}");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{}", resp.lines().next().unwrap_or(""));
+        let got = response_body(&handle(&app, "GET", "/api/sessions/s2", ""));
+        assert!(got["merge_error"].is_null(), "{got}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Set up a session that has run once and landed in needs-you with
+    /// its worktree attached. Returns the repo and the agent it used.
+    fn needs_you_session(dir: &Path, data: &Path, counter: Option<&Path>) -> (PathBuf, String) {
+        let repo = git_repo(dir);
+        let body = match counter {
+            Some(c) => format!("echo run >> '{}'", c.display()),
+            None => "echo done > out.txt".to_string(),
+        };
+        let agent = script_agent(dir, "agent.sh", &body).to_string_lossy().to_string();
+        let mut s = test_session("s1", Status::Queued, dir);
+        s.repo = repo.to_string_lossy().to_string();
+        s.agent = agent.clone();
+        s.check_cmd = "false".to_string();
+        s.check_output = None;
+        s.check_passed = None;
+        s.verified_commit = None;
+        let app = test_app(data.to_path_buf(), vec![s]);
+        app.set_status("s1", Status::Working);
+        app.run_session("s1");
+        assert_eq!(app.status_of("s1").as_deref(), Some("needs-you"));
+        (repo, agent)
+    }
+
+    /// A new App from the same data dir, as after a restart.
+    fn restart(data: &Path) -> Arc<App> {
+        let (restored, _) = load_persisted(data);
+        test_app(data.to_path_buf(), restored)
+    }
+
+    #[test]
+    fn retry_recovers_a_worktree_whose_git_file_is_gone() {
+        let dir = std::env::temp_dir().join(format!("fleet-fr1b-a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("data");
+        needs_you_session(&dir, &data, None);
+        // Only the worktree's own link file is lost; the directory stays.
+        std::fs::remove_file(data.join("worktrees/s1/.git")).unwrap();
+        let app = restart(&data);
+        app.retry("s1").unwrap();
+        settle(&app, "s1");
+        let reason = app.sessions.lock().unwrap()[0].reason.clone().unwrap_or_default();
+        assert!(reason.starts_with("Check failed"), "after losing the .git file: {reason}");
+        let aside = std::fs::read_dir(data.join("worktrees")).unwrap().flatten().any(|e| {
+            e.file_name().to_string_lossy().starts_with("s1.detached-")
+        });
+        assert!(aside, "the detached directory was not kept aside");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retry_recovers_a_session_whose_worktree_and_record_are_gone() {
+        let dir = std::env::temp_dir().join(format!("fleet-fr1b-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("data");
+        let (repo, _) = needs_you_session(&dir, &data, None);
+        std::fs::remove_dir_all(data.join("worktrees/s1")).unwrap();
+        std::fs::remove_dir_all(repo.join(".git/worktrees/s1")).unwrap();
+        let app = restart(&data);
+        app.retry("s1").unwrap();
+        settle(&app, "s1");
+        let reason = app.sessions.lock().unwrap()[0].reason.clone().unwrap_or_default();
+        assert!(reason.starts_with("Check failed"), "after losing worktree and record: {reason}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_double_retry_leaves_exactly_one_run() {
+        let dir = std::env::temp_dir().join(format!("fleet-fr1b-c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("data");
+        let runs = dir.join("runs.txt");
+        needs_you_session(&dir, &data, Some(&runs));
+        let app = restart(&data);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let app = app.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    app.retry("s1")
+                })
+            })
+            .collect();
+        let results: Vec<Result<(), String>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1, "{results:?}");
+        let refused = results.iter().find_map(|r| r.as_ref().err()).cloned().unwrap_or_default();
+        assert!(refused.contains("already running"), "refusal was: {refused}");
+        settle(&app, "s1");
+        let count = std::fs::read_to_string(&runs).unwrap_or_default().lines().count();
+        assert_eq!(count, 2, "runs: {count}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bad_repo_paths_get_plain_next_steps_and_merge_target_is_named() {
+        let dir = std::env::temp_dir().join(format!("fleet-fb10-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let missing = dir.join("missing");
+        let agent = script_agent(&dir, "noop.sh", "").to_string_lossy().to_string();
+        let app = test_app(dir.join("data"), Vec::new());
+        let post = |repo: &Path| {
+            handle(
+                &app,
+                "POST",
+                "/api/sessions",
+                &serde_json::json!({ "task": "t", "repo": repo.to_string_lossy(), "agent": agent }).to_string(),
+            )
+        };
+
+        let resp = post(&plain);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{}", resp.lines().next().unwrap_or(""));
+        let p = plain.to_string_lossy();
+        assert_eq!(
+            response_body(&resp)["error"],
+            format!("That folder is not a git repository: {p}. Give the path of a folder that contains a .git folder, for example the one you run git in."),
+            "{resp}"
+        );
+        let resp = post(&missing);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{}", resp.lines().next().unwrap_or(""));
+        assert_eq!(
+            response_body(&resp)["error"],
+            format!("There is no folder at {}.", missing.to_string_lossy()),
+            "{resp}"
+        );
+
+        // merge_target: the repo's checked-out branch; null when unknown.
+        let on_main = git_repo(&dir.join("main"));
+        let detached = git_repo(&dir.join("detached"));
+        git_run(&detached, &["checkout", "--detach"]);
+        let mut sessions = Vec::new();
+        for (id, repo) in [("on-main", on_main), ("detached", detached), ("plain", plain.clone())] {
+            let mut s = test_session(id, Status::Done, &dir);
+            s.repo = repo.to_string_lossy().to_string();
+            sessions.push(s);
+        }
+        app.sessions.lock().unwrap().extend(sessions);
+        let get = |id: &str| response_body(&handle(&app, "GET", &format!("/api/sessions/{id}"), ""));
+        assert_eq!(get("on-main")["merge_target"], "main");
+        assert!(get("detached")["merge_target"].is_null(), "{}", get("detached"));
+        assert!(get("plain")["merge_target"].is_null(), "{}", get("plain"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
