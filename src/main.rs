@@ -6,6 +6,8 @@
 //! Session policies (parallel cap, default checks) live in policies.rn and
 //! are executed through Rune — they drive behaviour, they are not metadata.
 
+mod update;
+
 use serde::Serialize;
 use std::os::unix::ffi::OsStrExt as _;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -3235,6 +3237,11 @@ fn load_persisted(data_dir: &Path) -> (Vec<Session>, u64) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Answered before anything else, so `--version` never reads the policies path.
+    if args.get(1).is_some_and(|a| a == "--version" || a == "-V") {
+        println!("fleet-rs {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
