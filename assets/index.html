@@ -166,6 +166,11 @@
   .receiptcard .check { font-family: var(--font-mono); font-size: 13px; overflow-wrap: anywhere; }
   .receiptcard .cmd { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); overflow-wrap: anywhere; }
   .nextline { margin-top: 12px; }
+  .honestcard { font-size: 13px; line-height: 1.4; color: var(--warn-text); }
+  .honestcard .hv { font-weight: 500; }
+  .honest { display: flex; gap: 12px; align-items: flex-start; margin: 12px 0 0; padding: 12px 16px; border-radius: var(--r-card); background: var(--warn-tint); color: var(--warn-text); line-height: 1.45; }
+  .honest .hv { font-weight: 500; color: var(--warn-text); }
+  .honest .hr { color: var(--ink); margin-top: 4px; overflow-wrap: anywhere; }
   .okline { margin: 12px 0 0; color: var(--ok-text); font-size: 13px; line-height: 1.45; }
   #repoErr { margin: 8px 0 0; }
   #repoErr .fix { display: block; color: var(--ink-3); font-size: 12px; }
@@ -398,6 +403,8 @@ document.getElementById('themeBtn').addEventListener('click', () => {
   applyTheme(next);
 });
 
+// The honest banner: a check passed, but the session is not verified.
+const HONEST = 'Check passed — but this session needs you';
 let selected = null;
 let inboxOpen = false;
 let boardLoaded = false;
@@ -677,6 +684,7 @@ function renderSessions(sessions) {
 function cardName(s) {
   const short = (t) => (t || '').length > 100 ? t.slice(0, 99) + '…' : (t || '');
   const parts = [short(s.task), statusText(s)];
+  if (s.bucket === 'needs-you' && s.check_passed === true && s.status === 'needs-you') parts.push(HONEST);
   if (s.bucket === 'needs-you' && s.reason) parts.push(short(s.reason));
   else if (s.bucket === 'done') parts.push(short(receiptLine(s)));
   return parts.join(', ');
@@ -694,6 +702,8 @@ function sessionCard(s) {
   const agent = s.test_mode ? '<span class="chip testmode" title="Test mode: a script stands in for a coding agent, so nothing here used a real model.">test mode</span>' : `<span class="chip">${esc(s.engine || s.agent || 'agent')}</span>`;
   let inner = `<div class="cardtop"><span class="pill project"></span><span class="pill s-${cls}">${live}<span class="st"></span></span></div>
     <div class="task"></div>`;
+  const honestCard = s.check_passed === true && s.status === 'needs-you';
+  if (honestCard) inner += `<p class="honestcard"><span class="hv">${HONEST}</span></p>`;
   if (s.bucket === 'needs-you') inner += `<p class="reason"></p>`;
   else if (s.status === 'checking') inner += `<p class="note">The agent finished. Running your check.</p>`;
   if (s.bucket === 'done') {
@@ -707,7 +717,8 @@ function sessionCard(s) {
   div.querySelector('.st').textContent = statusText(s);
   div.querySelector('.task').textContent = s.task;
   const rs = div.querySelector('.reason');
-  if (rs) rs.textContent = s.reason || 'needs you';
+  // The card keeps the reason to two short lines; the detail shows all of it.
+  if (rs) rs.textContent = (s.reason || 'needs you').length > 110 ? s.reason.slice(0, 109) + '…' : (s.reason || 'needs you');
   const rl = div.querySelector('.receipt .line');
   if (rl) rl.textContent = receiptLine(s);
   div.querySelector('.branch').textContent = s.branch || '';
@@ -743,13 +754,15 @@ function renderDetail(s) {
   if (s.successor) chainBits.push(`Its finish handed out ${s.successor}.`);
   if ((s.next_queue || []).length) chainBits.push(`Then: ${s.next_queue.join(', ')}.`);
   const verified = s.check_passed === true && (s.status === 'done' || s.status === 'merged');
-  const noted = s.check_passed === true && !verified;
+  const honest = s.check_passed === true && s.status === 'needs-you';
+  const noted = honest;
   const hasCheck = s.check_passed === true || s.check_passed === false;
   const rc = receiptLine(s);
   const ds = diffStat(s.diff);
 
   let html = `<div class="dhead"><span class="pill s-${cls}"><span class="st"></span></span>
       <button class="btn quiet" id="backBtn" aria-label="Close this session">${sym('i-x')}Close</button></div>
+    ${honest ? `<div class="honest" role="status">${sym('i-alert')}<div class="hbody"><p class="hv">${HONEST}</p><p class="hr"></p></div></div>` : ''}
     <h2></h2>
     <div class="facts">
       <span><span class="k">Project</span><span class="pj"></span></span>
@@ -758,7 +771,7 @@ function renderDetail(s) {
       ${s.queue_position ? `<span><span class="k">Queue</span>#${s.queue_position}</span>` : ''}
     </div>`;
   if (chainBits.length) html += `<div class="chain">${chainBits.map(b => `<span>${esc(b)}</span>`).join('')}</div>`;
-  const showReceipt = s.check_passed === true;
+  const showReceipt = verified;
   // The check state, derived until the server sends check_ran.
   const ranCheck = s.check_ran !== undefined ? !!s.check_ran : hasCheck;
   if (showReceipt) {
@@ -767,7 +780,7 @@ function renderDetail(s) {
       <div class="check"></div>
       <div class="cmd"></div></div>`;
   }
-  if (s.status === 'needs-you' && s.reason) html += `<div class="reasonbox">${sym('i-alert')}<span class="v"></span></div>`;
+  if (s.status === 'needs-you' && s.reason && !honest) html += `<div class="reasonbox">${sym('i-alert')}<span class="v"></span></div>`;
 
   if (pendingAct && pendingAct.id === s.id) {
     const isMerge = pendingAct.act === 'merge';
@@ -840,6 +853,8 @@ function renderDetail(s) {
     d.querySelector('.receiptcard .check').textContent = rc;
     d.querySelector('.receiptcard .cmd').textContent = `Check: ${s.check_cmd || ''}`;
   }
+  const hr = d.querySelector('.honest .hr');
+  if (hr) hr.textContent = s.reason || '';
   const reasonEl = d.querySelector('.reasonbox .v');
   if (reasonEl) reasonEl.textContent = s.reason;
   const tr = d.querySelector('#tr');
