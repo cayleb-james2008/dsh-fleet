@@ -251,8 +251,11 @@
     .top-actions .btn { flex: none; min-width: 44px; padding: 0 12px; }
     #inboxBtn .lbl { display: none; }
   }
+  @media (max-width: 360px) {
+    #engBtn .lbl { display: none; }
+  }
   @media (max-width: 359px) {
-    #newBtn .lbl, #engBtn .lbl { display: none; }
+    #newBtn .lbl { display: none; }
     #newBtn { width: 44px; padding: 0; }
   }
   @media (prefers-reduced-motion: reduce) {
