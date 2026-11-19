@@ -166,6 +166,32 @@
   .receiptcard .check { font-family: var(--font-mono); font-size: 13px; overflow-wrap: anywhere; }
   .receiptcard .cmd { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); overflow-wrap: anywhere; }
   .nextline { margin-top: 12px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+  /* Version and updates: one slim line over the board, plain words. */
+  .topver { display: none; align-items: center; min-height: 44px; margin-right: 8px; font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); text-decoration: none; white-space: nowrap; }
+  .topver:hover { color: var(--ink-2); }
+  @media (min-width: 1100px) { .topver { display: inline-flex; } }
+  .updbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 8px 20px; background: var(--surface); border-bottom: 1px solid var(--hairline); font-size: 13px; }
+  .upd-title { font-weight: 500; white-space: nowrap; }
+  .upd-notes { flex: 1 1 200px; min-width: 0; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .upd-hint { color: var(--ink-2); }
+  .upd-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+  .upd-actions .btn { min-height: 44px; padding: 0 12px; font-size: 13px; }
+  /* Progress and success are read out, not shown twice; errors stay on screen. */
+  .upd-live { margin: 0; color: var(--bad-text); }
+  .upd-live:not(.bad) { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+  @media (max-width: 767px) { .upd-live { flex-basis: 100%; } }
+  .upd-live:empty { display: none; }
+  .verrow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--hairline); font-size: 13px; color: var(--ink-2); }
+  .verrow #version-link { display: inline-flex; align-items: center; min-height: 44px; color: var(--ink); text-decoration: none; font-family: var(--font-mono); }
+  .verrow #version-link:hover { text-decoration: underline; }
+  .verrow .btn { min-height: 44px; }
+  .check-result { flex-basis: 100%; margin: 0; font-size: 12px; color: var(--ink-3); }
+  @media (max-width: 767px) {
+    .updbar { padding: 12px 16px; }
+    .upd-actions { margin-left: 0; width: 100%; }
+    .upd-actions .btn { flex: 1 1 auto; }
+  }
   .honestcard { font-size: 13px; line-height: 1.4; color: var(--warn-text); }
   .honestcard .hv { font-weight: 500; }
   .honest { display: flex; gap: 12px; align-items: flex-start; margin: 12px 0 0; padding: 12px 16px; border-radius: var(--r-card); background: var(--warn-tint); color: var(--warn-text); line-height: 1.45; }
@@ -292,6 +318,7 @@
   <div class="app" id="app">
     <header class="top">
       <h1 class="brand"><svg class="ic" aria-hidden="true"><use href="#i-mark"/></svg>Fleet</h1>
+      <a class="topver" id="topVersion" target="_blank" rel="noopener" hidden></a>
       <div class="top-actions">
         <button class="btn" id="inboxBtn" aria-haspopup="true" aria-expanded="false" aria-label="Needs you inbox">
           <svg class="ic" aria-hidden="true"><use href="#i-tray"/></svg><span class="lbl">Needs you</span><span class="count" id="inboxCount">0</span>
@@ -316,10 +343,22 @@
       <h3>Theme</h3>
       <button class="switch" id="themeBtn" role="switch" aria-checked="true"><span>Dark</span><span class="track" aria-hidden="true"><span class="knob"></span></span></button>
     </div>
+    <div class="verrow" id="version-row" hidden>
+      <a id="version-link" href="https://github.com/cayleb-james2008/dsh-fleet/releases" target="_blank" rel="noopener">Fleet</a>
+      <button class="btn quiet" type="button" id="check-updates">Check for updates</button>
+      <p class="check-result" id="check-result" role="status"></p>
+    </div>
   </section>
       </div>
     </header>
 
+    <section class="updbar" id="updBanner" role="region" aria-label="Fleet update" hidden>
+      <p class="upd-title" id="updTitle"></p>
+      <p class="upd-notes" id="updNotes" hidden></p>
+      <p class="upd-hint" id="updHint" hidden></p>
+      <div class="upd-actions" id="updActions"></div>
+      <p class="upd-live" id="updLive" role="status" aria-live="polite"></p>
+    </section>
     <div class="work">
       <div class="board">
         <div role="status" aria-live="polite" id="connWrap"><p class="connnote" id="connNote" hidden><svg class="ic" aria-hidden="true"><use href="#i-alert"/></svg><span>Cannot reach the server. The board keeps retrying on its own.</span></p></div>
@@ -1087,6 +1126,200 @@ async function handOut() {
 }
 refresh();
 setInterval(refresh, 2000);
+
+/* ---------------- version and updates ---------------------------- */
+// The server checks GitHub in the background; this page only asks it what it knows.
+const VERSION_URL = 'https://github.com/cayleb-james2008/dsh-fleet/releases/tag/v';
+const UPD_DISMISS_KEY = 'fleet-update-dismissed';
+const UPD_CHECK_MS = 30 * 60 * 1000;
+const updBanner = document.getElementById('updBanner');
+const updTitle = document.getElementById('updTitle');
+const updNotes = document.getElementById('updNotes');
+const updHint = document.getElementById('updHint');
+const updActions = document.getElementById('updActions');
+const updLive = document.getElementById('updLive');
+const checkBtn = document.getElementById('check-updates');
+const checkResult = document.getElementById('check-result');
+let updSnap = null;
+let updDone = '';
+let updKey = '';
+function updDismissed() { try { return localStorage.getItem(UPD_DISMISS_KEY) || ''; } catch (e) { return ''; } }
+function updRemember(v) { try { localStorage.setItem(UPD_DISMISS_KEY, v); } catch (e) {} }
+function plainErr(e) {
+  if (e && e.name === 'TypeError') return 'Could not reach Fleet. Is it running?';
+  return (e && e.message) || 'Something went wrong. Try again.';
+}
+function firstLine(t) { return String(t || '').split('\n').map(l => l.trim()).find(l => l) || ''; }
+function checkedWords(secs) {
+  if (!secs) return 'not yet';
+  const mins = Math.round((Date.now() - secs * 1000) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return mins + ' min ago';
+  return Math.round(mins / 60) + ' h ago';
+}
+// The live line: a neutral progress or result sentence, or red when it is an error.
+function say(text, bad) { updLive.className = 'upd-live' + (bad ? ' bad' : ''); updLive.textContent = text; }
+function updButton(label, cls, onClick) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'btn' + (cls ? ' ' + cls : '');
+  b.textContent = label;
+  b.addEventListener('click', () => onClick(b));
+  return b;
+}
+function updLink(label, href) {
+  const a = document.createElement('a');
+  a.className = 'btn quiet';
+  a.href = href; a.target = '_blank'; a.rel = 'noopener';
+  a.textContent = label;
+  const sr = document.createElement('span');
+  sr.className = 'sr-only';
+  sr.textContent = ' (opens in a new tab)';
+  a.appendChild(sr);
+  return a;
+}
+function resultLine(s) {
+  if (s.mode === 'off') return 'Updates are off on this Fleet.';
+  if (s.error) return s.error;
+  if (s.staged) return 'Version ' + s.staged + ' is installed. Restart to use it.';
+  if (s.available) return 'Version ' + s.latest + ' is available.';
+  if (!s.checked_at) return 'Not checked yet.';
+  return 'You are on the newest version (checked ' + checkedWords(s.checked_at) + ').';
+}
+// The banner is rebuilt only when what it says changes, so a poll never
+// drops focus from one of its buttons.
+function renderUpdate() {
+  const s = updSnap || {};
+  const dismissed = updDismissed();
+  const key = JSON.stringify([s.staged, s.available, s.latest, s.can_apply, s.dev_build, s.release_url, s.notes, updDone, dismissed]);
+  if (key === updKey) return;
+  updKey = key;
+  updActions.innerHTML = '';
+  updNotes.hidden = true; updNotes.textContent = '';
+  updHint.hidden = true; updHint.textContent = '';
+  let show = false;
+  if (s.staged) {
+    show = true;
+    updTitle.textContent = 'Version ' + s.staged + ' is installed. Restart to use it.';
+    updActions.appendChild(updButton('Restart now', 'primary', restartNow));
+  } else if (s.available && s.latest && dismissed !== s.latest) {
+    show = true;
+    updTitle.textContent = 'Version ' + s.latest + ' is available';
+    if (s.notes) { updNotes.textContent = firstLine(s.notes); updNotes.hidden = false; }
+    if (s.can_apply) {
+      updActions.appendChild(updButton('Update now', 'primary', applyNow));
+    } else {
+      updHint.textContent = s.dev_build ? 'Update Fleet from the terminal.' : 'Update from the machine Fleet runs on.';
+      updHint.hidden = false;
+    }
+    updActions.appendChild(updLink("What's new", s.release_url || (VERSION_URL + s.latest)));
+    updActions.appendChild(updButton('Dismiss', 'quiet', () => { updRemember(s.latest); renderUpdate(); }));
+  }
+  updBanner.hidden = !show;
+}
+function renderState(s) {
+  updSnap = s;
+  if (!s.staged) updDone = '';
+  renderUpdate();
+  checkBtn.hidden = s.mode === 'off';
+  checkResult.textContent = resultLine(s);
+}
+async function loadVersion() {
+  try {
+    const r = await fetch('/api/version', { cache: 'no-store' });
+    if (!r.ok) return;
+    const v = await r.json();
+    const label = 'Fleet ' + v.version;
+    const top = document.getElementById('topVersion');
+    top.textContent = label; top.href = VERSION_URL + v.version; top.hidden = false;
+    const link = document.getElementById('version-link');
+    link.textContent = label; link.href = VERSION_URL + v.version;
+    document.getElementById('version-row').hidden = false;
+  } catch (e) { /* no version line when the server does not answer */ }
+}
+async function loadUpdate() {
+  try {
+    const r = await fetch('/api/update', { cache: 'no-store' });
+    if (!r.ok) return;
+    renderState(await r.json());
+  } catch (e) { /* best effort: the page says nothing it cannot verify */ }
+}
+async function checkNow() {
+  checkBtn.disabled = true;
+  checkResult.textContent = 'Checking…';
+  try {
+    const r = await fetch('/api/update/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const s = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(s.error || 'The check did not finish. Try again later.');
+    renderState(s);
+  } catch (e) {
+    checkResult.textContent = plainErr(e);
+  }
+  checkBtn.disabled = false;
+}
+checkBtn.addEventListener('click', checkNow);
+async function applyNow(btn) {
+  const latest = updSnap ? updSnap.latest : '';
+  btn.disabled = true;
+  btn.textContent = 'Downloading and checking...';
+  say('Downloading and checking...');
+  try {
+    const r = await fetch('/api/update/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || 'The update did not install. Try again later.');
+    renderState(Object.assign({}, data, { staged: data.staged || data.applied || latest }));
+    say('Installed ' + latest + '. Restart when no session is running.');
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = 'Update now';
+    say(plainErr(e), true);
+  }
+}
+async function restartNow(btn) {
+  let r;
+  try {
+    r = await fetch('/api/update/restart', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  } catch (e) {
+    // The connection dropped as the server went down: the restart is under way.
+    waitForReturn();
+    return;
+  }
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    // Refused while sessions run: the button stays, and the reason is plain.
+    const m = /(\d+) session/.exec(data.error || '');
+    if (m) {
+      const one = m[1] === '1';
+      say(`${m[1]} session${one ? ' is' : 's are'} still running. Wait for ${one ? 'it' : 'them'} to finish or stop ${one ? 'it' : 'them'}, then restart.`, true);
+    } else {
+      say(data.error || 'Fleet could not restart. Try again later.', true);
+    }
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = 'Restarting…';
+  waitForReturn();
+}
+// Poll the version every second for up to a minute, then reload on the new process.
+function waitForReturn() {
+  const started = Date.now();
+  say('Restarting…');
+  const tick = async () => {
+    if (Date.now() - started > 60000) {
+      say('Fleet did not come back within a minute. Start Fleet again: run fleet, or restart its service. Then reload this page.', true);
+      return;
+    }
+    try {
+      const r = await fetch('/api/version', { cache: 'no-store' });
+      if (r.ok) { location.reload(); return; }
+    } catch (e) { /* still restarting */ }
+    setTimeout(tick, 1000);
+  };
+  setTimeout(tick, 1000);
+}
+loadVersion();
+loadUpdate();
+setInterval(loadUpdate, UPD_CHECK_MS);
 </script>
 </body>
 </html>
