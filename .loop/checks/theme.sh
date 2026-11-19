@@ -3,7 +3,7 @@
 # icons are lucide components now, so the "drawn icons" pin asserts the icon package instead. The tracked-caps pin
 # keeps its intent (no uppercase or positively tracked LABELS) and drops the one thing it never meant to forbid:
 # the Vantage display heads use NEGATIVE tracking (-0.035em), which is allowed.
-# Checks the shipped page: dark default, a light theme and a toggle, the choice stored under fleet-theme,
+# Checks the shipped page: light default (owner colour and theme alignment, 2026-11-19), a dark theme and a toggle, the choice stored under fleet-theme,
 # reduced motion honoured, no emoji, no uppercase or positive tracking on labels.
 set -u
 cd "$(dirname "$0")/../.."
@@ -25,7 +25,7 @@ html = open(sys.argv[1], encoding="utf-8").read()
 fails = []
 def need(cond, msg):
     if not cond: fails.append(msg)
-need(re.search(r'<html[^>]*data-theme="dark"', html) is not None, "dark is not the default theme on the root element")
+need(re.search(r'<html[^>]*data-theme="light"', html) is not None, "light is not the default theme on the root element")
 need('[data-theme=light]' in html or '[data-theme="light"]' in html, "no light theme variable set")
 need('[data-theme=dark]' in html or '[data-theme="dark"]' in html, "no dark theme variable set")
 need('fleet-theme' in html, "theme choice is not stored under fleet-theme")
@@ -40,5 +40,5 @@ pos = [m for m in re.findall(r'letter-spacing:\s*([^;}]+)', html) if re.match(r'
 need(not pos, f"positive letter-spacing present: {pos[:3]}")  # var() tokens resolve to the display tokens, which are negative
 if fails:
     print("FAIL: " + "; ".join(fails)); sys.exit(1)
-print("THEME OK: dark default + light theme, toggle, choice stored, reduced motion, no emoji, no uppercase or positive tracking")
+print("THEME OK: light default + dark theme, toggle, choice stored, reduced motion, no emoji, no uppercase or positive tracking")
 PY
