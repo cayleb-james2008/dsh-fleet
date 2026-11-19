@@ -391,42 +391,62 @@ function setPopover(id, btnId, open) {
 function closePopovers() { setPopover('settings', 'engBtn', false); inboxOpen = false; }
 function closeSelection() { selected = null; curSession = null; pendingAct = null; detailError = ''; lastDetailKey = ''; refresh(); }
 
-async function refresh() {
-  let pol, sessions, inbox;
+// Every poll is guarded: a non-ok or malformed reply never throws. The
+// last good list stays on screen with a note that says when it was read.
+let lastGood = null;
+async function getJson(url) {
   try {
-    pol = await (await fetch('/api/policy')).json();
-    sessions = await (await fetch('/api/sessions')).json();
-    inbox = await (await fetch('/api/inbox')).json();
-  } catch (e) {
-    // The board's error state: say what broke and what happens next.
-    // Before the first good load the skeleton gives way to the message;
-    // after it, the last good board stays and the note appears.
-    document.getElementById('connNote').hidden = false;
-    if (!boardLoaded && !boardErrShown) {
-      boardErrShown = true;
-      lastListKey = '__connerr';
-      document.getElementById('policy').textContent = 'Policy unavailable: the server is not answering.';
-      document.getElementById('sessions').setAttribute('aria-busy', 'false');
-      document.getElementById('sessions').innerHTML =
-        '<div class="emptyboard"><h2>The board cannot reach the server</h2><p>Check that Fleet is running. This page reconnects on its own every few seconds.</p></div>';
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) { return null; }
+}
+function showConn(text) {
+  const n = document.getElementById('connNote');
+  n.querySelector('span').textContent = text;
+  n.hidden = false;
+}
+async function refresh() {
+  const [pol, sessions, inbox] = await Promise.all([getJson('/api/policy'), getJson('/api/sessions'), getJson('/api/inbox')]);
+  const polOk = !!pol && typeof pol === 'object' && Array.isArray(pol.agents) && typeof pol.max_parallel === 'number'
+    && typeof pol.timeout_secs === 'number' && typeof pol.source === 'string';
+  const listOk = Array.isArray(sessions) && Array.isArray(inbox);
+  const policyEl = document.getElementById('policy');
+  policyEl.hidden = !polOk;
+  if (!listOk) {
+    if (lastGood) {
+      showConn(`Cannot reach Fleet. Showing the last list from ${lastGood.at.toLocaleTimeString()}. Retrying.`);
+      renderInbox(lastGood.inbox);
+      renderSessions(lastGood.sessions);
+    } else {
+      showConn('Cannot reach Fleet. Retrying.');
+      if (!boardErrShown) {
+        boardErrShown = true;
+        lastListKey = '';
+        document.getElementById('sessions').setAttribute('aria-busy', 'false');
+        document.getElementById('sessions').innerHTML =
+          '<div class="emptyboard"><h2>The board cannot reach Fleet</h2><p>Check that Fleet is running. This page reconnects on its own every few seconds.</p></div>';
+      }
     }
     return;
   }
+  lastGood = { sessions, inbox, at: new Date() };
   document.getElementById('connNote').hidden = true;
   boardLoaded = true;
   boardErrShown = false;
   document.getElementById('sessions').setAttribute('aria-busy', 'false');
-  const agentBits = (pol.agents || []).map(a => `${a.name} ${a.found ? 'found' : 'not found'}`).join(', ');
-  const modelBit = pol.model ? ` Model for opencode sessions: ${pol.model}.` : '';
-  const defaultBit = pol.default_agent
-    ? `Default agent: ${pol.default_agent_engine === 'custom' ? 'a custom command (test mode)' : pol.default_agent}.`
-    : 'No default agent is set.';
-  document.getElementById('policy').textContent =
-    `Up to ${pol.max_parallel} sessions run at once. An agent or check that runs past ${pol.timeout_secs} seconds is handed back to Needs you. Checks come from ${pol.source}. ${defaultBit}${modelBit}`;
-  renderEngines(pol.agents || []);
+  if (polOk) {
+    const defaultBit = pol.default_agent
+      ? `Default agent: ${pol.default_agent_engine === 'custom' ? 'a custom command (test mode)' : pol.default_agent}.`
+      : 'No default agent is set.';
+    const modelBit = pol.model ? ` Model for opencode sessions: ${pol.model}.` : '';
+    policyEl.textContent =
+      `Up to ${pol.max_parallel} sessions run at once. An agent or check that runs past ${pol.timeout_secs} seconds is handed back to Needs you. Checks come from ${pol.source}. ${defaultBit}${modelBit}`;
+    renderEngines(pol.agents);
+  }
   const sel = document.getElementById('agent');
   if (sel.options.length <= 1) {
-    for (const a of (pol.agents || []).filter(a => a.found)) {
+    for (const a of (polOk ? pol.agents : []).filter(a => a.found)) {
       const o = document.createElement('option'); o.value = a.name; o.textContent = a.name; sel.appendChild(o);
     }
   }
@@ -844,8 +864,17 @@ document.addEventListener('keydown', (e) => {
   if (selected) closeSelection();
 });
 
+let submitting = false;
 document.getElementById('composer').addEventListener('submit', async (e) => {
   e.preventDefault();
+  // A second press while the request is in flight is ignored: one press, one session.
+  if (submitting) return;
+  submitting = true;
+  const sub = document.querySelector('#composer button[type=submit]');
+  if (sub) sub.disabled = true;
+  try { await handOut(); } finally { submitting = false; if (sub) sub.disabled = false; }
+});
+async function handOut() {
   const err = document.getElementById('formErr');
   const repoEl = document.getElementById('repo'), taskEl = document.getElementById('task');
   const problems = [];
@@ -894,7 +923,7 @@ document.getElementById('composer').addEventListener('submit', async (e) => {
   document.getElementById('check').value = '';
   dlg.close();
   refresh();
-});
+}
 refresh();
 setInterval(refresh, 2000);
 </script>
