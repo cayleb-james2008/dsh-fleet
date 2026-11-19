@@ -185,3 +185,64 @@ The run found two defects, both fixed: the arrow-key handler read `currentTarget
 **Checks (`.loop/checks/`):** `ui.sh` and `theme.sh` were rewritten in round 2 and pass on this build.
 
 **Not done:** the two lint FAILs above; the WARN; the elapsed time (no field); a browser run of the phone bottom bar's popover (only its keys and sizes were measured); the 768 detail in the picture set.
+
+
+## Colour scheme (2026-11-19, owner: "Color schemes need alignment with the Anthropic / my ideal color schemes")
+
+Source: the shared palette `_fe/palette-claude.css` (Anthropic brand neutrals and accents, plus the owner's colour rules: neutral ramps, hairlines lighter than the ground, flat colour, colour only as state, one clay accent for the primary key, the current selection and focus, no pure #000 or #fff). Values live in `src/theme.css`, which is now set by hand (it was generated from the Vantage theme; the generator is no longer the source of colour). Fonts, radii, the heading recipe and the receipt signature are unchanged.
+
+**Default theme is light** (`index.html` shell and `readTheme()`); dark is a full second theme. Choice stored under `fleet-theme`. `.loop/checks/theme.sh` asserts the light default (its own commit).
+
+### Role meanings
+
+| Role | Light | Dark | Used for |
+| --- | --- | --- | --- |
+| canvas / board / surface | #f5f4ee / #eeede5 / #fdfcfa | #141413 / #1c1c1a / #1f1e1c | page, selected row, cards |
+| hairline / edge | #e3e1d6 / #8a887f | #33322f / #6f6e67 | decorative rules / input edges (3:1) |
+| ink / ink-2 / ink-3 | #141413 / #4d4c47 / #66655e | #faf9f5 / #c8c7bd / #9d9c92 | text, secondary text, placeholder and labels |
+| blue (ACCENT, clay) | #d97757 | #d97757 | primary key (New session, Retry, Merge this work), current selection (the selected tab), needs-you tracker block |
+| ring | #cc6a49 | #d97757 | focus ring (one step darker on light so it reaches 3:1) |
+| dot-green / success-foreground | #788c5d / #4f6038 | #8fa86d / #a9c188 | verified: green rule on verified receipts, verified badge, scan strip verified reading, tracker block |
+| unread (red) / destructive-foreground | #c4483a / #9a2f24 | #e0675a / #f0988e | failed check: the red fill (tracker) and the red TEXT (hero, card reasons, alerts, merge error) |
+| dot-amber / warning-foreground | #c99a3e / #7a5a14 | #d9a84a / #e7c277 | queued, "check passed but this session needs you" banner (state only) |
+| info-foreground | #9c4326 | #e6a387 | needs-you TEXT (clay text, readable on light) |
+| tag, pill and avatar rows | fill L94 C.04, text L36 C.10 | fill L28 C.05, text L84 C.11 | re-hued per the palette note: plan clay 40, ops/sky blue 250, design rose 10, research lilac 300, mint sage 130, dev ochre 85, neutral warm grey 90; pill-pro red 25, pill-warn ochre 85 |
+
+### State decisions
+
+- **Verified** (done or merged with a passing check) is sage. The lime of the Vantage theme is gone.
+- **Failed** (needs you, and its check ran and did not pass; `isFailed()` in `src/api.ts`) is red: the tracker block, the red reason text, the red eyebrow of the hero, the badge `error`.
+- **Needs you** without a failed check (no check result, or a stop) is clay: the tracker block, the clay reason text, the badge `info`, and a clay soft wash behind the detail's reason box. Clay is used here because it is the one thing asking a person; it is not used decoratively.
+- **Queued and honest** (a passing check on a session that still needs you) are amber.
+- **Idle and working** tracker blocks are warm grey and track.
+- The primary key is clay with ink text (5.9:1 light and dark). The selected detail tab is an ink pill with the label in the ink-button foreground (17.5:1); the earlier label colour was ink on ink and is fixed.
+- Clay appears only as the primary key, the selected tab, focus, and needs-you state. Chrome, dividers and tags do not use it as decoration.
+
+### Measured contrast (WCAG; text 4.5:1, large text and UI 3:1)
+
+Role pairs (computed from the hex values):
+
+| Pair | Light | Dark |
+| --- | --- | --- |
+| ink on canvas | 16.7 | 17.5 |
+| ink-2 on surface | 8.4 | 9.8 |
+| ink-3 on canvas / board | 5.3 / 5.0 | 6.2 on board |
+| blue-fg (ink) on blue (primary key) | 5.9 | 5.9 |
+| ink-button-fg on ink-button | 17.5 | 17.5 |
+| info-foreground on blue-soft (needs you text) | 5.2 | 6.5 |
+| destructive-foreground on canvas (failed text) | 6.8 | 8.4 |
+| success-foreground on surface (verified) | 6.7 | 8.5 |
+| warning-foreground on surface | 6.2 | 9.8 |
+| tag and pill text on fill (all rows) | 8.9 to 9.4 | 8.4 to 9.0 |
+| focus ring on canvas / surface | 3.3 / 3.6 | 5.9 / 5.3 |
+| input edge (`--edge`) on canvas / surface | 3.2 / 3.5 | 3.6 / 3.3 |
+
+Browser measurement (`_fe/colour/measure.mjs`, Playwright, computed styles with translucent backgrounds composited): every visible text node on the empty board, the seeded board (verified, failed, needs-you), the detail and the New session dialog, at 1440, 768, 390 and 320, both themes: minimum text contrast 5.31:1 light and 5.9:1 dark, 0 text failures, 0 overflow. Input edges: 3:1 or more in every state that has an input.
+
+One known false positive: the selected detail tab reads as ink-button-fg on its own button background, but its ink highlight is a sibling element that the measure does not composite. The true pair is 17.5:1 (above).
+
+Not 3:1: the disabled state (2.2:1 on surface) is exempt by WCAG and is kept muted on purpose. Red as a fill (`unread`, 4.4:1 against canvas) is used only for fills and edges, never for small text.
+
+### Hallmark lint
+
+`sloplint --scope app --render`: 2 FAIL and 2 WARN, the same as the last round. Both FAILs come from Tailwind's own generated CSS (the `transition` utility's `box-shadow`, and the base ring offset `#fff`), not from the palette. Both WARNs are the search slot.
