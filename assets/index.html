@@ -1055,7 +1055,7 @@ async function handOut() {
   if (!r.ok) {
     let msg = 'Could not hand out the task.';
     try { msg = (await r.json()).error || msg; } catch (x) {}
-    if (/repo/i.test(msg)) showRepoErr(msg);
+    if (/repo|folder|git/i.test(msg)) showRepoErr(msg);
     else { err.textContent = msg; err.hidden = false; }
     return;
   }
