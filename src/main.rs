@@ -482,6 +482,22 @@ struct Session {
     transcript: Vec<String>,
 }
 
+/// The branch a merge into this repo lands on: its checked-out branch.
+fn merge_target(repo: &str) -> Option<String> {
+    if repo.is_empty() {
+        return None;
+    }
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|b| !b.is_empty())
+}
+
 /// A refused merge, kept on its session.
 #[derive(Clone, Serialize, serde::Deserialize)]
 struct MergeRefusal {
@@ -2691,6 +2707,9 @@ fn sessions_json(sessions: &[Session]) -> serde_json::Value {
             v["check_passed"] = serde_json::json!(s.check_passed);
             v["check_ran"] = serde_json::json!(s.check_ran);
             v["check_exit"] = serde_json::json!(s.check_exit);
+            // Where Merge will land: the repo's checked-out branch, null
+            // when the repo is unknown or its HEAD is detached.
+            v["merge_target"] = serde_json::json!(merge_target(&s.repo));
             // A needs-you session whose steering is still waiting says
             // so in its reason: the message is not silently pending.
             if s.status == "needs-you" && !s.steer.is_empty() {
@@ -2789,8 +2808,16 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                     .output()
                     .map(|o| o.status.success())
                     .unwrap_or(false);
+            if !Path::new(&repo).is_dir() {
+                return error_response(400, &format!("There is no folder at {repo}."));
+            }
             if !repo_ok {
-                return error_response(400, "repo is not a git repository");
+                return error_response(
+                    400,
+                    &format!(
+                        "That folder is not a git repository: {repo}. Give the path of a folder that contains a .git folder, for example the one you run git in."
+                    ),
+                );
             }
             // A blank explicit check is no check: the policy default applies.
             let check_cmd = match req["check"].as_str().map(str::trim) {
@@ -4167,6 +4194,59 @@ mod tests {
         settle(&app, "s1");
         let count = std::fs::read_to_string(&runs).unwrap_or_default().lines().count();
         assert_eq!(count, 2, "runs: {count}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bad_repo_paths_get_plain_next_steps_and_merge_target_is_named() {
+        let dir = std::env::temp_dir().join(format!("fleet-fb10-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let missing = dir.join("missing");
+        let agent = script_agent(&dir, "noop.sh", "").to_string_lossy().to_string();
+        let app = test_app(dir.join("data"), Vec::new());
+        let post = |repo: &Path| {
+            handle(
+                &app,
+                "POST",
+                "/api/sessions",
+                &serde_json::json!({ "task": "t", "repo": repo.to_string_lossy(), "agent": agent }).to_string(),
+            )
+        };
+
+        let resp = post(&plain);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{}", resp.lines().next().unwrap_or(""));
+        let p = plain.to_string_lossy();
+        assert_eq!(
+            response_body(&resp)["error"],
+            format!("That folder is not a git repository: {p}. Give the path of a folder that contains a .git folder, for example the one you run git in."),
+            "{resp}"
+        );
+        let resp = post(&missing);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{}", resp.lines().next().unwrap_or(""));
+        assert_eq!(
+            response_body(&resp)["error"],
+            format!("There is no folder at {}.", missing.to_string_lossy()),
+            "{resp}"
+        );
+
+        // merge_target: the repo's checked-out branch; null when unknown.
+        let on_main = git_repo(&dir.join("main"));
+        let detached = git_repo(&dir.join("detached"));
+        git_run(&detached, &["checkout", "--detach"]);
+        let mut sessions = Vec::new();
+        for (id, repo) in [("on-main", on_main), ("detached", detached), ("plain", plain.clone())] {
+            let mut s = test_session(id, Status::Done, &dir);
+            s.repo = repo.to_string_lossy().to_string();
+            sessions.push(s);
+        }
+        app.sessions.lock().unwrap().extend(sessions);
+        let get = |id: &str| response_body(&handle(&app, "GET", &format!("/api/sessions/{id}"), ""));
+        assert_eq!(get("on-main")["merge_target"], "main");
+        assert!(get("detached")["merge_target"].is_null(), "{}", get("detached"));
+        assert!(get("plain")["merge_target"].is_null(), "{}", get("plain"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
