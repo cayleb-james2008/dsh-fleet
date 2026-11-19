@@ -1,5 +1,8 @@
 # Fleet
 
+[![latest release](https://img.shields.io/github/v/release/cayleb-james2008/dsh-fleet)](https://github.com/cayleb-james2008/dsh-fleet/releases)
+
+
 Your agents, working in parallel, under one screen. You hand out the work; it
 comes back verified done — or it lands in a **Needs you** inbox with the reason
 attached. Nothing is babysat, and nothing calls itself done without the
@@ -186,10 +189,12 @@ the session's repo.
 
 ## Versions and updates
 
+**Releasing:** bump `version` in `Cargo.toml`, add a `## X.Y.Z - date` entry to `CHANGELOG.md`, and merge to `main`. `.github/workflows/release.yml` sees the new version, builds every platform and publishes the GitHub Release `vX.Y.Z` with the binaries and `SHA256SUMS`; a push that does not change the version publishes nothing, and a new version without a changelog entry fails the workflow. Pushing a `vX.Y.Z` tag by hand does the same.
+
 The running version is `fleet-rs --version` (or `-V`), `GET /api/version`, and
 `version` in `GET /api/policy`. Every release is tagged `vX.Y.Z` on GitHub, with a
-`CHANGELOG.md` entry, one binary per platform and a `SHA256SUMS` file. Pushing a
-tag runs `.github/workflows/release.yml`, which refuses a tag that does not match
+`CHANGELOG.md` entry, one binary per platform and a `SHA256SUMS` file. Merging a new version to `main` (or pushing a
+tag) runs `.github/workflows/release.yml`, which refuses a tag that does not match
 the version in `Cargo.toml`.
 
 Self-update (`src/update.rs`): the app asks the newest GitHub release of its
