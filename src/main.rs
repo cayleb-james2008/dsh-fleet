@@ -1029,6 +1029,34 @@ impl App {
         // 1. Isolated worktree on its own branch. On a retry the
         // worktree already exists with the agent's earlier work in it —
         // reuse it, so the agent continues from what it already did.
+        // A worktree whose link to the repo is gone (the repo's admin
+        // record for it was lost) cannot be reused: its files move
+        // aside, and the work is re-attached from the session's branch.
+        if wt.join(".git").exists() && !Self::worktree_attached(&wt) {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let aside = wt.with_file_name(format!("{}.detached-{secs}", session.id));
+            match std::fs::rename(&wt, &aside) {
+                Ok(()) => self.log(
+                    id,
+                    format!(
+                        "the worktree had lost its link to the repo — its files were moved to {}",
+                        aside.display()
+                    ),
+                ),
+                Err(e) => {
+                    self.log(id, format!("could not move the detached worktree aside: {e}"));
+                    self.set_needs_you(
+                        id,
+                        "the worktree lost its link to the repo and could not be moved aside",
+                    );
+                    self.pump_queue();
+                    return;
+                }
+            }
+        }
         if wt.join(".git").exists() {
             self.log(
                 id,
@@ -1783,6 +1811,17 @@ impl App {
             }
         }
         self.pump_queue();
+    }
+
+    /// Is this worktree still linked to a repository git can read?
+    fn worktree_attached(wt: &Path) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(wt)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 
     fn branch_exists(&self, repo: &str, branch: &str) -> bool {
@@ -3848,6 +3887,59 @@ mod tests {
         assert!(idle["check_passed"].is_null(), "{idle}");
         assert_eq!(idle["check_ran"], false);
         assert!(idle["check_exit"].is_null(), "{idle}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn settle(app: &Arc<App>, id: &str) {
+        for _ in 0..600 {
+            let st = app.status_of(id).unwrap_or_default();
+            if !matches!(st.as_str(), "queued" | "working" | "checking") {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn retry_after_restart_reattaches_the_worktree() {
+        let dir = std::env::temp_dir().join(format!("fleet-fr1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir);
+        let agent = script_agent(&dir, "writer.sh", "echo done > out.txt").to_string_lossy().to_string();
+        let data = dir.join("data");
+        let mut s = test_session("s1", Status::Queued, &dir);
+        s.repo = repo.to_string_lossy().to_string();
+        s.agent = agent;
+        s.check_cmd = "false".to_string();
+        s.check_output = None;
+        s.check_passed = None;
+        s.verified_commit = None;
+        let app = test_app(data.clone(), vec![s]);
+        app.set_status("s1", Status::Working);
+        app.run_session("s1");
+        assert_eq!(app.status_of("s1").as_deref(), Some("needs-you"));
+        drop(app);
+
+        // Restart from the same data dir: a retry reuses the worktree.
+        let (restored, _) = load_persisted(&data);
+        let app = test_app(data.clone(), restored);
+        app.retry("s1").unwrap();
+        settle(&app, "s1");
+        let reason = app.sessions.lock().unwrap()[0].reason.clone().unwrap_or_default();
+        assert!(reason.starts_with("Check failed"), "after restart: {reason}");
+        drop(app);
+
+        // The repo lost this worktree's link (its admin record is gone).
+        // A retry after another restart must re-attach the work, not fail
+        // at the commit step.
+        std::fs::remove_dir_all(repo.join(".git/worktrees/s1")).unwrap();
+        let (restored, _) = load_persisted(&data);
+        let app = test_app(data.clone(), restored);
+        app.retry("s1").unwrap();
+        settle(&app, "s1");
+        let reason = app.sessions.lock().unwrap()[0].reason.clone().unwrap_or_default();
+        assert!(reason.starts_with("Check failed"), "after losing the link: {reason}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
