@@ -29,6 +29,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const DEFAULT_API: &str = "https://api.github.com";
+const MAX_REDIRECTS: usize = 5;
 const MAX_ASSET_BYTES: u64 = 300 * 1024 * 1024;
 const MAX_JSON_BYTES: u64 = 2 * 1024 * 1024;
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
@@ -102,6 +104,9 @@ struct State {
 pub struct Updater {
     pub cfg: Config,
     state: Mutex<State>,
+    /// Held for a whole apply (download, prove, swap): two callers never race
+    /// on the staging file.
+    apply_lock: Mutex<()>,
 }
 
 pub fn now_secs() -> u64 {
@@ -217,53 +222,143 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 // ---------------------------------------------------------------- network
 
-/// GET with a size cap, by running `curl`. Redirects are followed (release
-/// assets live on a CDN); the caller verifies content by hash, not by where it
-/// came from. The URL gate is checked first, and the cap is enforced both by
-/// curl and on the bytes received.
-fn http_get(url: &str, max: u64) -> Result<Vec<u8>, String> {
-    if !url_allowed(url) {
-        return Err(format!("refusing to fetch {url}: only https is allowed"));
+/// The host part of an http(s) URL, lowercased, without port or credentials.
+fn host_of(url: &str) -> String {
+    let rest = url.split("://").nth(1).unwrap_or("");
+    let auth = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let auth = auth.rsplit('@').next().unwrap_or("");
+    let host = if let Some(r) = auth.strip_prefix('[') {
+        format!("[{}]", r.split(']').next().unwrap_or(""))
+    } else {
+        auth.split(':').next().unwrap_or("").to_string()
+    };
+    host.to_ascii_lowercase()
+}
+
+/// Hosts a real GitHub release may be served from: github.com itself, its API,
+/// and the CDN that stores release assets. Matched on a dot boundary, so
+/// `github.com.evil.example` is not one of them.
+pub fn github_host(url: &str) -> bool {
+    let h = host_of(url);
+    h == "github.com" || h == "githubusercontent.com" || h.ends_with(".github.com") || h.ends_with(".githubusercontent.com")
+}
+
+/// A URL for an error message: scheme and host only, so a signed asset URL or
+/// a path never ends up in what the page shows.
+fn short_url(url: &str) -> String {
+    let scheme_end = url.find("://").map(|i| i + 3).unwrap_or(0);
+    let end = url[scheme_end..].find(['/', '?', '#']).map(|i| i + scheme_end).unwrap_or(url.len());
+    url[..end].to_string()
+}
+
+/// The curl command line for one request. `-q` comes first so that the user's
+/// ~/.curlrc is never read. Redirects are not followed by curl: the caller
+/// checks each hop itself. The body goes to `out`; the answer on stdout is the
+/// status and the redirect target.
+fn curl_args(url: &str, max: u64, out: &Path) -> Vec<String> {
+    vec![
+        "-q".into(),
+        "-sS".into(),
+        "--proto".into(),
+        "=https,http".into(),
+        "--max-redirs".into(),
+        "0".into(),
+        "--max-time".into(),
+        "300".into(),
+        "--max-filesize".into(),
+        max.to_string(),
+        "-A".into(),
+        "fleet-updater".into(),
+        "-H".into(),
+        "Accept: application/vnd.github+json, application/octet-stream".into(),
+        "-o".into(),
+        out.to_string_lossy().into_owned(),
+        "-w".into(),
+        "%{http_code} %{redirect_url}".into(),
+        url.into(),
+    ]
+}
+
+/// A temporary file that is removed when it goes out of scope, on every path.
+struct TempBody(PathBuf);
+
+static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl TempBody {
+    fn new() -> TempBody {
+        let n = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        TempBody(std::env::temp_dir().join(format!("fleet-updater-{}-{}-{n}", std::process::id(), now_secs())))
     }
-    let out = std::process::Command::new("curl")
-        .args([
-            "-fsSL",
-            "--proto",
-            "=https,http",
-            "--proto-redir",
-            "=https",
-            "--max-time",
-            "300",
-            "--max-filesize",
-            &max.to_string(),
-            "-A",
-            "fleet-updater",
-            "-H",
-            "Accept: application/vnd.github+json, application/octet-stream",
-            url,
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                "curl is not installed, so the update cannot be fetched — install curl and try again".to_string()
+}
+
+impl Drop for TempBody {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// GET with a size cap, by running `curl` once per hop. Redirects are followed
+/// by hand, at most `MAX_REDIRECTS`, and every hop must pass the same URL rule
+/// as the first request: https, or http to a loopback address when the first
+/// request was one. With `github_only` (the real GitHub API) every hop must
+/// also be a GitHub host. Content is verified by hash afterwards, not by where
+/// it came from.
+fn http_get(url: &str, max: u64, github_only: bool) -> Result<Vec<u8>, String> {
+    let loopback_http = url.starts_with("http://");
+    let mut cur = url.to_string();
+    for _hop in 0..=MAX_REDIRECTS {
+        let allowed = if cur.starts_with("http://") { loopback_http && url_allowed(&cur) } else { url_allowed(&cur) };
+        if !allowed || (github_only && !github_host(&cur)) {
+            return Err(format!("refusing to fetch {}: only https from GitHub is allowed", short_url(&cur)));
+        }
+        let body = TempBody::new();
+        let out = std::process::Command::new("curl")
+            .args(curl_args(&cur, max, &body.0))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    "curl is not installed, so the update cannot be fetched — install curl and try again".to_string()
+                }
+                _ => format!("could not run curl: {e}"),
+            })?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(match out.status.code() {
+                Some(63) => format!("download is larger than the {max} byte limit"),
+                _ => format!("could not reach {} ({err})", short_url(&cur)),
+            });
+        }
+        let answer = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let mut parts = answer.splitn(2, ' ');
+        let code: u16 = parts
+            .next()
+            .unwrap_or("")
+            .parse()
+            .map_err(|_| format!("could not read the answer from {}", short_url(&cur)))?;
+        let target = parts.next().unwrap_or("").trim().to_string();
+        if (300..400).contains(&code) {
+            if target.is_empty() {
+                return Err("a redirect had no location".to_string());
             }
-            _ => format!("could not run curl: {e}"),
-        })?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(match out.status.code() {
-            Some(22) => format!("{url} answered an HTTP error ({err})"),
-            Some(63) => format!("download is larger than the {max} byte limit"),
-            _ => format!("could not reach {url} ({err})"),
-        });
+            if !(target.starts_with("https://") || target.starts_with("http://")) {
+                return Err("a redirect pointed somewhere this updater does not follow".to_string());
+            }
+            cur = target;
+            continue;
+        }
+        if !(200..300).contains(&code) {
+            return Err(format!("{} answered HTTP {code}", short_url(&cur)));
+        }
+        let len = std::fs::metadata(&body.0).map(|m| m.len()).unwrap_or(0);
+        if len > max {
+            return Err(format!("download is larger than the {max} byte limit"));
+        }
+        return std::fs::read(&body.0).map_err(|e| format!("download failed: {e}"));
     }
-    if out.stdout.len() as u64 > max {
-        return Err(format!("download is larger than the {max} byte limit"));
-    }
-    Ok(out.stdout)
+    Err("too many redirects".to_string())
 }
 
 // --------------------------------------------------------------- updater
@@ -288,7 +383,7 @@ impl Updater {
 
     pub fn new(cfg: Config) -> Updater {
         cleanup_leftovers(&cfg.exe);
-        Updater { cfg, state: Mutex::new(State::default()) }
+        Updater { cfg, state: Mutex::new(State::default()), apply_lock: Mutex::new(()) }
     }
 
     /// Fetches the newest release and records whether it is newer.
@@ -312,7 +407,7 @@ impl Updater {
 
     fn fetch_latest(&self) -> Result<Release, String> {
         let url = format!("{}/repos/{}/releases/latest", self.cfg.api, self.cfg.repo);
-        let body = http_get(&url, MAX_JSON_BYTES)?;
+        let body = http_get(&url, MAX_JSON_BYTES, self.cfg.api == DEFAULT_API)?;
         let v: Value = serde_json::from_slice(&body).map_err(|e| format!("release answer was not JSON: {e}"))?;
         parse_release(&v, self.cfg.bin)
     }
@@ -358,6 +453,9 @@ impl Updater {
         if self.cfg.mode == Mode::Off {
             return Err("updates are turned off".to_string());
         }
+        // One apply at a time: a second caller waits here and then finds the
+        // version already installed.
+        let _one_at_a_time = self.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.is_dev_build() {
             return Err("this is a cargo-built binary; update it with git pull and cargo build".to_string());
         }
@@ -416,6 +514,7 @@ impl Updater {
 
 /// Download, verify, prove and swap. Any failure leaves the installed file alone.
 fn install(cfg: &Config, rel: &Release) -> Result<(), String> {
+    let github_only = cfg.api == DEFAULT_API;
     if let Some(n) = rel.asset_size {
         if n > MAX_ASSET_BYTES {
             return Err(format!("the release file is {n} bytes, over the {MAX_ASSET_BYTES} byte limit"));
@@ -423,7 +522,7 @@ fn install(cfg: &Config, rel: &Release) -> Result<(), String> {
     }
     let expected = match (&rel.digest, &rel.sums_url) {
         (_, Some(u)) => {
-            let sums = String::from_utf8_lossy(&http_get(u, MAX_JSON_BYTES)?).to_string();
+            let sums = String::from_utf8_lossy(&http_get(u, MAX_JSON_BYTES, github_only)?).to_string();
             let h = hash_from_sums(&sums, &rel.asset_name).ok_or_else(|| format!("SHA256SUMS has no entry for {}", rel.asset_name))?;
             if let Some(d) = &rel.digest {
                 if *d != h {
@@ -435,7 +534,7 @@ fn install(cfg: &Config, rel: &Release) -> Result<(), String> {
         (Some(d), None) => d.clone(),
         (None, None) => return Err("the release has no checksum, so it will not be installed".to_string()),
     };
-    let bytes = http_get(&rel.asset_url, MAX_ASSET_BYTES)?;
+    let bytes = http_get(&rel.asset_url, MAX_ASSET_BYTES, github_only)?;
     if let Some(n) = rel.asset_size {
         if bytes.len() as u64 != n {
             return Err(format!("downloaded {} bytes, the release says {n}", bytes.len()));
@@ -447,7 +546,7 @@ fn install(cfg: &Config, rel: &Release) -> Result<(), String> {
     }
     let dir = cfg.exe.parent().ok_or("cannot find the install folder")?;
     let staged = dir.join(format!("{}.new", file_name(&cfg.exe)));
-    std::fs::write(&staged, &bytes).map_err(|e| format!("cannot write {}: {e}", staged.display()))?;
+    std::fs::write(&staged, &bytes).map_err(|e| format!("cannot write {}: {e}", file_name(&staged)))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -498,20 +597,20 @@ fn prove_version(staged: &Path, version: &str) -> Result<(), String> {
     if out.split_whitespace().any(|w| w.trim_start_matches('v') == version) {
         Ok(())
     } else {
-        Err(format!("the downloaded file reports '{}' instead of version {version}", out.trim()))
+        Err(format!("the downloaded file reports '{}' instead of version {version}", out.trim().chars().take(60).collect::<String>()))
     }
 }
 
 #[cfg(unix)]
 fn swap(exe: &Path, staged: &Path) -> Result<(), String> {
-    std::fs::rename(staged, exe).map_err(|e| format!("cannot replace {}: {e}", exe.display()))
+    std::fs::rename(staged, exe).map_err(|e| format!("cannot replace {}: {e}", file_name(exe)))
 }
 
 #[cfg(windows)]
 fn swap(exe: &Path, staged: &Path) -> Result<(), String> {
     let old = exe.with_extension("old");
     let _ = std::fs::remove_file(&old);
-    std::fs::rename(exe, &old).map_err(|e| format!("cannot move {} aside: {e}", exe.display()))?;
+    std::fs::rename(exe, &old).map_err(|e| format!("cannot move {} aside: {e}", file_name(exe)))?;
     if let Err(e) = std::fs::rename(staged, exe) {
         let _ = std::fs::rename(&old, exe);
         return Err(format!("cannot put the new build in place: {e}"));
@@ -612,6 +711,10 @@ mod tests {
                 let n = s.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]).to_string();
                 let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                if let Some(loc) = redirect_target(&path) {
+                    let _ = s.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
+                    continue;
+                }
                 let (ctype, body): (&str, Vec<u8>) = if path.ends_with("/releases/latest") {
                     let mut assets = vec![json!({"name": name, "browser_download_url": format!("http://127.0.0.1:{port}/dl/asset"), "size": declared_size.unwrap_or(asset.len())})];
                     if sums.is_some() {
@@ -632,6 +735,18 @@ mod tests {
             }
         });
         Mock { port }
+    }
+
+    /// Redirect routes for the mock: a hop to file://, a hop to another
+    /// loopback address, a loop, and a relative hop to the asset.
+    fn redirect_target(path: &str) -> Option<&'static str> {
+        match path {
+            "/dl/r-file" => Some("file:///etc/passwd"),
+            "/dl/r-http" => Some("http://127.0.0.2:1/x"),
+            "/dl/r-loop" => Some("/dl/r-loop"),
+            "/dl/r-rel" => Some("/dl/asset"),
+            _ => None,
+        }
     }
 
     fn fake_exe(dir: &Path, version: &str) -> PathBuf {
@@ -761,5 +876,93 @@ mod tests {
         assert_eq!(snap["available"], json!(false));
         let insecure = Updater::new(Config { api: "http://example.com".into(), ..down.cfg.clone() });
         assert!(insecure.check_now()["error"].as_str().unwrap().contains("only https"));
+    }
+
+    #[test]
+    fn curl_runs_without_the_users_curlrc_and_never_follows_redirects() {
+        let args = curl_args("https://x/y", 10, Path::new("/tmp/o"));
+        assert_eq!(args[0], "-q", "-q must come first, so ~/.curlrc is never read");
+        assert!(args.windows(2).any(|w| w == ["--max-redirs", "0"]));
+        assert!(!args.iter().any(|a| a == "-L" || a == "--location"));
+    }
+
+    #[test]
+    fn redirects_are_followed_by_hand_and_every_hop_is_checked() {
+        let payload = b"payload".to_vec();
+        let m = mock("0.3.0", payload.clone(), None, None);
+        let base = format!("http://127.0.0.1:{}", m.port);
+        assert_eq!(http_get(&format!("{base}/dl/r-rel"), 1000, false).unwrap(), payload, "a relative redirect to an allowed place is followed");
+        for p in ["r-file", "r-http"] {
+            let e = http_get(&format!("{base}/dl/{p}"), 1000, false).unwrap_err();
+            assert!(e.contains("refusing to fetch") || e.contains("does not follow"), "{p}: {e}");
+        }
+        assert!(http_get(&format!("{base}/dl/r-loop"), 1000, false).unwrap_err().contains("too many redirects"));
+    }
+
+    #[test]
+    fn the_real_github_api_only_lets_github_hosts_through() {
+        for ok in ["https://github.com/o/r/releases/download/v1/x", "https://api.github.com/repos/o/r", "https://objects.githubusercontent.com/x", "https://release-assets.githubusercontent.com/x?sig=1"] {
+            assert!(github_host(ok), "{ok}");
+        }
+        for bad in ["https://evil.example/x", "https://github.com.evil.example/x", "https://notgithub.com/x", "https://githubusercontent.com.evil.example/", "https://evil.example/@github.com/x"] {
+            assert!(!github_host(bad), "{bad}");
+        }
+        // Refused before any request is made.
+        assert!(http_get("https://example.com/x", 10, true).unwrap_err().contains("refusing to fetch"));
+        assert!(http_get("http://127.0.0.1:1/x", 10, true).unwrap_err().contains("refusing to fetch"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_simultaneous_applies_install_once_and_both_succeed() {
+        let dir = tmp("race");
+        let exe = fake_exe(&dir, "0.2.0");
+        let new = b"#!/bin/sh\necho 'fleet-rs 0.3.0'\n".to_vec();
+        let m = mock("0.3.0", new.clone(), Some(sha256_hex(&new)), None);
+        let u = Arc::new(updater(&m, &exe, Mode::Notify, true));
+        u.check_now();
+        let a = { let u = u.clone(); std::thread::spawn(move || u.apply()) };
+        let b = { let u = u.clone(); std::thread::spawn(move || u.apply()) };
+        assert_eq!(a.join().unwrap().unwrap(), "0.3.0");
+        assert_eq!(b.join().unwrap().unwrap(), "0.3.0");
+        assert_eq!(std::fs::read(&exe).unwrap(), new);
+        assert!(!dir.join("fleet-rs.new").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn errors_name_files_never_folders_and_echoes_are_cut() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("nofolder");
+        let sub = dir.join("locked");
+        std::fs::create_dir_all(&sub).unwrap();
+        let exe = fake_exe(&sub, "0.2.0");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let new = b"#!/bin/sh\necho 'fleet-rs 0.3.0'\n".to_vec();
+        let m = mock("0.3.0", new.clone(), Some(sha256_hex(&new)), None);
+        let u = updater(&m, &exe, Mode::Notify, true);
+        u.check_now();
+        let e = u.apply().unwrap_err();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(e.contains("cannot write fleet-rs.new"), "{e}");
+        assert!(!e.contains("locked") && !e.contains("/tmp") && !e.contains("fleet-upd"), "{e}");
+
+        // A build that echoes a long line reports only its first 60 characters.
+        let dir2 = tmp("echo");
+        let exe2 = fake_exe(&dir2, "0.2.0");
+        let long = format!("#!/bin/sh\necho '{}'\n", "z".repeat(300));
+        let m2 = mock("0.3.0", long.clone().into_bytes(), Some(sha256_hex(long.as_bytes())), None);
+        let u2 = updater(&m2, &exe2, Mode::Notify, true);
+        u2.check_now();
+        let e2 = u2.apply().unwrap_err();
+        assert!(e2.contains("instead of version 0.3.0") && e2.len() < 200, "{e2}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_http_error_names_the_host_not_the_path() {
+        let m = mock("0.3.0", Vec::new(), None, None);
+        let e = http_get(&format!("http://127.0.0.1:{}/missing/secret-path", m.port), 10, false).unwrap_err();
+        assert!(e.contains("answered HTTP 404") && !e.contains("secret-path"), "{e}");
     }
 }
