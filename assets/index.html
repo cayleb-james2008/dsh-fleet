@@ -166,6 +166,7 @@
   .receiptcard .check { font-family: var(--font-mono); font-size: 13px; overflow-wrap: anywhere; }
   .receiptcard .cmd { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); overflow-wrap: anywhere; }
   .nextline { margin-top: 12px; }
+  .okline { margin: 12px 0 0; color: var(--ok-text); font-size: 13px; line-height: 1.45; }
   #repoErr { margin: 8px 0 0; }
   #repoErr .fix { display: block; color: var(--ink-3); font-size: 12px; }
   .mergeerr { margin-top: 12px; padding: 12px 16px; border-radius: var(--r-card); background: var(--bad-tint); color: var(--bad-text); line-height: 1.45; }
@@ -401,6 +402,7 @@ let boardErrShown = false;
 let curSession = null;
 let activeTab = 'tr';
 let pendingAct = null;
+let mergeOk = null;
 // A steer draft is kept per session in sessionStorage, so a reload does
 // not lose a message half written to a running agent.
 const steerDrafts = {};
@@ -577,6 +579,13 @@ function renderInbox(inbox) {
     };
     box.appendChild(div);
   }
+}
+// The merge confirm names both branches; the target only when the server names one.
+function mergeQuestion(s) {
+  const from = esc(s.branch || 'this session');
+  return s.merge_target
+    ? `Merge ${from} into ${esc(s.merge_target)}? Fleet refuses if the target is dirty or in the middle of a merge.`
+    : `Merge ${from}? Fleet refuses if the target is dirty or in the middle of a merge.`;
 }
 // A popover takes focus when it opens; its heading is the first stop.
 function focusPanel(id) {
@@ -761,7 +770,7 @@ function renderDetail(s) {
     const isMerge = pendingAct.act === 'merge';
     const isDismiss = pendingAct.act === 'dismiss';
     html += `<div class="confirm" role="group" aria-label="Confirm">
-      <p>${isMerge ? 'Merge this verified work into its target branch? Fleet refuses if the target is dirty or in the middle of a merge.' : isDismiss ? 'Dismiss this session? It leaves the board and the inbox. Its log stays on disk.' : 'Stop this run now? It lands in Needs you as stopped by you.'}</p>
+      <p>${isMerge ? mergeQuestion(s) : isDismiss ? 'Dismiss this session? It leaves the board and the inbox. Its log stays on disk.' : 'Stop this run now? It lands in Needs you as stopped by you.'}</p>
       <div class="actions">
         <button class="btn ${isMerge ? 'merge' : 'stop'}" id="${isMerge ? 'mergeConfirm' : isDismiss ? 'dismissConfirm' : 'stopConfirm'}">${sym(isMerge ? 'i-merge' : isDismiss ? 'i-x' : 'i-stop')}${isMerge ? 'Merge now' : isDismiss ? 'Dismiss now' : 'Stop now'}</button>
         <button class="btn" id="cancelAct">Keep it</button>
@@ -857,10 +866,28 @@ function renderDetail(s) {
   }
   const errEl = d.querySelector('#actErr');
   if (errEl && detailError) { errEl.textContent = detailError; errEl.hidden = false; }
+  if (mergeOk && mergeOk.id === s.id) {
+    const ok = document.createElement('p');
+    ok.className = 'okline'; ok.id = 'mergeOk'; ok.setAttribute('role', 'status');
+    ok.textContent = mergeOk.text;
+    d.querySelector('.actions') && d.querySelector('.actions').after(ok);
+  }
   const mb = d.querySelector('#mergeBtn');
   if (mb) mb.onclick = () => { pendingAct = { id: s.id, act: 'merge' }; detailError = ''; lastDetailKey = ''; renderDetail(s); };
   const mc = d.querySelector('#mergeConfirm');
-  if (mc) mc.onclick = async () => { pendingAct = null; detailError = (await post(`/api/sessions/${s.id}/merge`)) || ''; refresh(); };
+  if (mc) mc.onclick = async () => {
+    pendingAct = null;
+    const r = await fetch(`/api/sessions/${s.id}/merge`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    if (r.ok) {
+      const j = await r.json().catch(() => ({}));
+      mergeOk = { id: s.id, text: `Merged ${s.branch} into ${j.branch || s.merge_target || 'the target branch'}.` };
+      detailError = '';
+    } else {
+      mergeOk = null;
+      detailError = await r.json().then(j => j.error || 'request failed', () => 'request failed');
+    }
+    refresh();
+  };
   const rb = d.querySelector('#retryBtn');
   if (rb) rb.onclick = async () => { detailError = (await post(`/api/sessions/${s.id}/retry`)) || ''; refresh(); };
   const tb = d.querySelector('#stopBtn');
