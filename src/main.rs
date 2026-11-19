@@ -3346,8 +3346,9 @@ fn load_persisted(data_dir: &Path) -> (Vec<Session>, u64) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    // Answered before anything else, so `--version` never reads the policies path.
-    if args.get(1).is_some_and(|a| a == "--version" || a == "-V") {
+    // Answered before anything else, in any argument position, so `--version`
+    // never reads the policies path.
+    if args.iter().skip(1).any(|a| a == "--version" || a == "-V") {
         println!("fleet-rs {}", env!("CARGO_PKG_VERSION"));
         return;
     }
@@ -3369,9 +3370,20 @@ fn main() {
         .get(1)
         .cloned()
         .unwrap_or_else(|| "policies.rn".to_string());
-    let script = std::fs::read_to_string(&policy_path)
-        .unwrap_or_else(|e| panic!("cannot read policy script {policy_path}: {e}"));
-    let policy = Policy::load(&script).unwrap_or_else(|e| panic!("policy load failed: {e}"));
+    let script = match std::fs::read_to_string(&policy_path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("fleet-rs: cannot read the policies file {policy_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let policy = match Policy::load(&script) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("fleet-rs: the policies file {policy_path} is not valid: {e}");
+            std::process::exit(1);
+        }
+    };
     let data_dir = std::env::var("FLEET_DATA")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./fleet-data"));
