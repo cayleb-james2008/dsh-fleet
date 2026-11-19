@@ -62,8 +62,9 @@ export function DetailBody({ s, onClose, onChanged, onDismissed }: { s: Session;
     if (j === null) return;
     e.preventDefault();
     setTab(order[j]);
-    const id = order[j];
-    requestAnimationFrame(() => e.currentTarget.querySelector<HTMLElement>(`[data-id="${id}"]`)?.focus());
+    // The buttons already exist; focus the next one now (React clears currentTarget after the handler returns).
+    const host = e.currentTarget;
+    host.querySelector<HTMLElement>(`[data-id="${order[j]}"]`)?.focus();
   }
 
   async function run(fn: () => Promise<string | null>, ok: string) {
@@ -225,7 +226,7 @@ export function DetailBody({ s, onClose, onChanged, onDismissed }: { s: Session;
               role="tab"
               aria-selected={tab === id}
               tabIndex={tab === id ? 0 : -1}
-              className="h-8 cursor-pointer rounded-sm px-3 text-sm font-medium text-ink-2 data-[checked=true]:text-canvas outline-none transition-colors duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-blue data-[checked=true]:text-ink"
+              className="h-8 cursor-pointer rounded-sm px-3 text-sm font-medium text-ink-2 aria-[selected=true]:text-canvas outline-none transition-colors duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-blue data-[checked=true]:text-ink"
             >
               {label}
             </button>

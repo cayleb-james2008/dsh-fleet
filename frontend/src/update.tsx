@@ -49,6 +49,8 @@ export function useUpdate() {
   const [busy, setBusy] = useState(false);
   const [checking, setChecking] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  const [dismissSeq, setDismissSeq] = useState(0);
+  const [restartSeq, setRestartSeq] = useState(0);
   const [raw, setRaw] = useState("");
 
   const load = useCallback(async () => {
@@ -63,11 +65,14 @@ export function useUpdate() {
     return () => clearInterval(t);
   }, [load]);
 
+  // Focus moves when the state says so: after Dismiss, to "Show update" (it is rendered by this change).
+  useEffect(() => { if (dismissSeq) document.getElementById("show-update")?.focus(); }, [dismissSeq]);
+
   const dismiss = () => {
     const v = snap?.latest || "";
     try { localStorage.setItem(DISMISS_KEY, v); } catch { /* keep it for this view only */ }
     setDismissed(v);
-    setTimeout(() => document.getElementById("show-update")?.focus(), 60);
+    setDismissSeq((n) => n + 1);
   };
   const show = () => {
     try { localStorage.removeItem(DISMISS_KEY); } catch { /* nothing stored */ }
@@ -108,6 +113,7 @@ export function useUpdate() {
   };
 
   const restart = async () => {
+    setRestartSeq((n) => n + 1);
     const r = await postJson("/api/update/restart", {});
     if (r) {
       const m = /(\d+) session/.exec(r);
@@ -136,7 +142,7 @@ export function useUpdate() {
   const available = !!snap?.available && !!snap.latest;
   const staged = snap?.staged || "";
   const hidden = !staged && (!available || dismissed === snap?.latest);
-  return { snap, version, dismissed, live, liveBad, raw, busy, checking, restarting, hidden, staged, available, dismiss, show, check, apply, restart };
+  return { snap, version, dismissed, live, liveBad, raw, restartSeq, busy, checking, restarting, hidden, staged, available, dismiss, show, check, apply, restart };
 }
 
 type U = ReturnType<typeof useUpdate>;
@@ -144,7 +150,7 @@ type U = ReturnType<typeof useUpdate>;
 /** The slim strip under the top bar. Results are read out through its live region; errors stay on screen. */
 export function UpdateStrip({ u }: { u: U }) {
   const statusRef = useRef<HTMLParagraphElement>(null);
-  useEffect(() => { if (u.busy || u.restarting) statusRef.current?.focus(); }, [u.busy, u.restarting]);
+  useEffect(() => { if (u.busy || u.restartSeq) statusRef.current?.focus(); }, [u.busy, u.restartSeq]);
   if (u.hidden) return null;
   const s = u.snap || {};
   const canApply = !!s.can_apply && onThisMachine();
@@ -152,7 +158,7 @@ export function UpdateStrip({ u }: { u: U }) {
     <section aria-label="Fleet update" className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-hairline bg-surface px-4 py-2.5 md:px-6">
       {u.staged ? (
         <>
-          <p ref={statusRef} tabIndex={-1} className="text-sm text-ink outline-none">{u.staged} installed. Restart to use it.</p>
+          <p id="upd-status" ref={statusRef} tabIndex={-1} className="text-sm text-ink outline-none">{u.staged} installed. Restart to use it.</p>
           <Button size="sm" onClick={u.restart} className="ml-auto" disabled={u.restarting}>Restart now</Button>
         </>
       ) : (

@@ -48,9 +48,10 @@ export function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [inboxOpen, setInboxOpen] = useState(false);
+  const [inbox, setInbox] = useState<Session[]>([]);
   const [inboxErr, setInboxErr] = useState<Record<string, string>>({});
   const wide = useMediaQuery("(min-width: 1100px)");
+  const md = useMediaQuery("(min-width: 768px)");
   const upd = useUpdate();
   const searchRef = useRef<HTMLInputElement>(null);
 
@@ -60,8 +61,10 @@ export function App() {
   }, [theme]);
 
   const refresh = useCallback(async () => {
-    const [pol, list] = await Promise.all([getJson<Policy>("/api/policy"), getJson<Session[]>("/api/sessions")]);
+    // The same three reads the old page made every two seconds: policy, the session list and the Needs you inbox.
+    const [pol, list, inb] = await Promise.all([getJson<Policy>("/api/policy"), getJson<Session[]>("/api/sessions"), getJson<Session[]>("/api/inbox")]);
     if (pol && Array.isArray(pol.agents)) setPolicy(pol);
+    if (Array.isArray(inb)) setInbox(inb);
     if (Array.isArray(list)) { setSessions(list); setLastGood(new Date()); setUnreachable(false); }
     else setUnreachable(true);
   }, []);
@@ -104,7 +107,7 @@ export function App() {
   const hero = needsAll[0] ?? all.find(isVerified) ?? null;
   const testMode = policy?.default_agent_engine === "custom" || all.some((s) => s.test_mode);
 
-  const open = (id: string) => { setSelected(id); setInboxOpen(false); };
+  const open = (id: string) => { setSelected(id); };
   const focusLane = () => requestAnimationFrame(() => document.getElementById("lane-needs-h")?.focus());
   const closeDetail = () => { setSelected(null); focusLane(); };
   const retry = async (id: string) => {
@@ -148,7 +151,7 @@ export function App() {
               <Button id="show-update" size="sm" variant="ghost" onClick={upd.show}>Show update</Button>
             )}
           </div>
-          <InputGroup className="order-last w-full md:order-none md:ml-auto md:w-72">
+          <InputGroup className="order-last flex h-9 w-full md:order-none md:ml-auto md:w-56 lg:w-72">
             <InputGroupAddon><Search className="size-4 text-icon" strokeWidth={1.5} aria-hidden /></InputGroupAddon>
             <InputGroupInput
               ref={searchRef}
@@ -161,44 +164,8 @@ export function App() {
             <InputGroupAddon align="inline-end"><Kbd>/</Kbd></InputGroupAddon>
           </InputGroup>
           <div className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-2 md:ml-0">
-            <Popover open={inboxOpen} onOpenChange={setInboxOpen}>
-              <PopoverTrigger
-                aria-label={`Needs you, ${needsCount}`}
-                className={cn(
-                  "inline-flex h-9 cursor-pointer items-center gap-2 whitespace-nowrap rounded-control border px-3 text-sm font-medium outline-none transition-colors duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-blue",
-                  needsCount ? "border-unread text-unread hover:bg-pill-pro-bg" : "border-hairline text-ink hover:bg-raised",
-                )}
-              >
-                Needs you
-                <span className="font-mono text-xs tabular-nums">{needsCount}</span>
-              </PopoverTrigger>
-              <PopoverContent align="end" sideOffset={8} className="w-full max-w-[380px] rounded-dialog border border-hairline bg-surface p-0 text-ink shadow-lift">
-                <div className="p-4">
-                  <h2 className="font-heading text-lg font-light text-ink">Needs you</h2>
-                  <p className="mt-1 text-sm leading-relaxed text-ink-2">Sessions that need a person: a failed check, a refused merge, a stopped or timed-out run.</p>
-                </div>
-                <div className="max-h-[60dvh] overflow-y-auto border-t border-hairline">
-                  {needsAll.length === 0 && (
-                    <p className="p-4 text-sm text-ink-2">Nothing needs you right now. Failed checks and stopped runs appear here with the reason.</p>
-                  )}
-                  {needsAll.map((s) => (
-                    <div key={s.id} className="border-t border-hairline p-4 first:border-t-0">
-                      <p className="font-medium text-ink">{s.task}</p>
-                      <p className="mt-1 text-sm leading-relaxed text-unread">{s.reason || "needs you"}</p>
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        <Button size="sm" variant="outline" onClick={() => open(s.id)}>View session</Button>
-                        <Button size="sm" onClick={() => retry(s.id)}>Retry</Button>
-                      </div>
-                      {inboxErr[s.id] && <p role="alert" className="mt-2 text-sm text-unread">{inboxErr[s.id]}</p>}
-                    </div>
-                  ))}
-                </div>
-                <div className="border-t border-hairline p-3 text-right">
-                  <Button size="sm" variant="ghost" onClick={() => { setInboxOpen(false); focusLane(); }}>Go to Needs you</Button>
-                </div>
-              </PopoverContent>
-            </Popover>
-            <span data-answers-via="4">
+            <InboxPopover inbox={inbox} errs={inboxErr} onView={open} onRetry={retry} onGo={focusLane} side="bottom" className="hidden md:inline-flex" />
+            <span data-answers-via="4" className="hidden md:inline-flex">
               <NewSession policy={policy} onHanded={(id) => { setSelected(id); refresh(); }} />
             </span>
             <Tooltip>
@@ -273,7 +240,7 @@ export function App() {
         )}
 
         <div className="flex min-h-0 flex-1">
-          <div className="min-w-0 flex-1">
+          <div className="min-w-0 flex-1 pb-28 md:pb-0">
             {hero && (
               <HeroReceipt s={hero} onOpen={open} onRetry={retry} onDismiss={dismiss} />
             )}
@@ -372,7 +339,13 @@ export function App() {
           </Drawer.Portal>
         </Drawer.Root>
 
-        <Toaster position="bottom-right" theme={theme} style={{ "--normal-bg": "var(--surface)", "--normal-text": "var(--ink)", "--normal-border": "var(--hairline)", "--border-radius": "10px", fontSize: "14px" } as React.CSSProperties} />
+        {/* Phone: the two board actions sit in a bottom bar; the lanes get bottom padding so nothing covers them. */}
+        <nav aria-label="Board actions" className="fixed inset-x-0 bottom-0 z-30 flex gap-2 border-t border-hairline bg-surface px-4 pt-2 md:hidden" style={{ paddingBottom: "max(8px, env(safe-area-inset-bottom))" }}>
+          <InboxPopover inbox={inbox} errs={inboxErr} onView={open} onRetry={retry} onGo={focusLane} side="top" className="h-11 flex-1 justify-center" />
+          <NewSession policy={policy} onHanded={(id) => { setSelected(id); refresh(); }} className="h-11 flex-1 justify-center" />
+        </nav>
+
+        <Toaster position={md ? "bottom-right" : "top-center"} theme={theme} style={{ "--normal-bg": "var(--surface)", "--normal-text": "var(--ink)", "--normal-border": "var(--hairline)", "--border-radius": "10px", fontSize: "14px" } as React.CSSProperties} />
       </div>
     </TooltipProvider>
   );
@@ -422,19 +395,24 @@ function Card({ s, selected, onOpen }: { s: Session; selected: boolean; onOpen: 
   );
 }
 
-function NewSession({ policy, onHanded }: { policy: Policy | null; onHanded: (id: string) => void }) {
+function NewSession({ policy, onHanded, className }: { policy: Policy | null; onHanded: (id: string) => void; className?: string }) {
+  const wrap = useRef<HTMLSpanElement>(null);
+  // The dialog does not return focus to its trigger by itself; the form hands focus back when it closes.
+  const returnFocus = () => wrap.current?.querySelector<HTMLElement>("button")?.focus();
   return (
+    <span ref={wrap} className="contents">
     <MorphingDialog transition={glide}>
-      <MorphingDialogTrigger className="inline-flex h-9 cursor-pointer items-center gap-2 whitespace-nowrap rounded-control bg-blue px-3.5 text-sm font-medium text-blue-fg outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:bg-blue-hover focus-visible:ring-2 focus-visible:ring-blue focus-visible:ring-offset-2 focus-visible:ring-offset-surface">
+      <MorphingDialogTrigger className={cn("inline-flex h-9 cursor-pointer items-center gap-2 whitespace-nowrap rounded-control bg-blue px-3.5 text-sm font-medium text-blue-fg outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:bg-blue-hover focus-visible:ring-2 focus-visible:ring-blue focus-visible:ring-offset-2 focus-visible:ring-offset-surface", className)}>
         <Plus className="size-4" strokeWidth={1.5} aria-hidden />
         <span>New session</span>
       </MorphingDialogTrigger>
       <MorphingDialogContainer>
         <MorphingDialogContent className="relative flex max-h-[calc(100dvh-32px)] w-full max-w-[560px] flex-col overflow-hidden rounded-dialog border border-hairline bg-surface text-ink">
-          <Composer policy={policy} onHanded={onHanded} />
+          <Composer policy={policy} onHanded={onHanded} onClosed={returnFocus} />
         </MorphingDialogContent>
       </MorphingDialogContainer>
     </MorphingDialog>
+    </span>
   );
 }
 
@@ -442,6 +420,10 @@ function NewSession({ policy, onHanded }: { policy: Policy | null; onHanded: (id
 function AgentPicker({ agents, value, onChange, testDefault }: { agents: Agent[]; value: string; onChange: (v: string) => void; testDefault: boolean }) {
   const items = ["", ...agents.filter((a) => a.found).map((a) => a.name)];
   const label = (v: string) => (v ? v : testDefault ? "Test script" : "Default");
+  if (items.length === 1) {
+    // Only the default agent is installed: there is no choice to make, so say what will run.
+    return <p className="rounded-control border border-hairline bg-canvas px-3 py-2 text-sm text-ink">{label("")}</p>;
+  }
   if (items.length <= 3) {
     return (
       <SegmentedControl aria-label="Agent" size="sm">
@@ -469,7 +451,8 @@ function AgentPicker({ agents, value, onChange, testDefault }: { agents: Agent[]
   );
 }
 
-function Composer({ policy, onHanded }: { policy: Policy | null; onHanded: (id: string) => void }) {
+function Composer({ policy, onHanded, onClosed }: { policy: Policy | null; onHanded: (id: string) => void; onClosed: () => void }) {
+  useEffect(() => () => onClosed(), []); // eslint-disable-line react-hooks/exhaustive-deps
   const [repo, setRepo] = useState("");
   const [project, setProject] = useState("fixture");
   const [agent, setAgent] = useState("");
@@ -532,7 +515,7 @@ function Composer({ policy, onHanded }: { policy: Policy | null; onHanded: (id: 
 
         <Field id="repo" label="Repo path" hint="The folder of a git repository, for example /home/you/projects/app." err={repoErr}>
           <InputGroup>
-            <InputGroupInput ref={repoRef} id="repo" value={repo} onChange={(e) => setRepo(e.target.value)} autoComplete="off" aria-invalid={!!repoErr} />
+            <InputGroupInput ref={repoRef} id="repo" value={repo} onChange={(e) => setRepo(e.target.value)} autoComplete="off" aria-invalid={repoErr ? true : undefined} />
           </InputGroup>
         </Field>
         <Field id="project" label="Project" hint="The policy file names this project and its check. Leave it as it is unless your policy names another.">
@@ -544,7 +527,7 @@ function Composer({ policy, onHanded }: { policy: Policy | null; onHanded: (id: 
           <AgentPicker agents={policy?.agents ?? []} value={agent} onChange={setAgent} testDefault={testDefault} />
         </Field>
         <Field id="task" label="Task" hint="Say what the agent should change, in one or two sentences. Ctrl+Enter or Cmd+Enter hands it out.">
-          <Textarea ref={taskRef} id="task" rows={3} value={task} onChange={(e) => setTask(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(); } }} aria-invalid={!task.trim() && !!formErr} />
+          <Textarea ref={taskRef} id="task" rows={3} value={task} onChange={(e) => setTask(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(); } }} aria-invalid={!task.trim() && !!formErr ? true : undefined} />
         </Field>
         <Field id="check" label="Check command (optional)" hint="Leave it empty to use the project’s check from the policy file. Its output becomes the receipt.">
           <InputGroup>
@@ -577,5 +560,51 @@ function Field({ id, label, hint, err, children }: { id: string; label: string; 
       <p className="text-xs leading-relaxed text-ink-3">{hint}</p>
       {err && <p role="alert" className="text-sm text-unread">{err}</p>}
     </div>
+  );
+}
+
+/** Needs you: the inbox from /api/inbox (the old page's source), in a popover. Each instance keeps its own open state. */
+function InboxPopover({ inbox, errs, onView, onRetry, onGo, side, className }: {
+  inbox: Session[]; errs: Record<string, string>; onView: (id: string) => void; onRetry: (id: string) => void; onGo: () => void; side: "top" | "bottom"; className?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const n = inbox.length;
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger
+        aria-label={`Needs you, ${n}`}
+        className={cn(
+          "inline-flex h-9 cursor-pointer items-center gap-2 whitespace-nowrap rounded-control border px-3 text-sm font-medium outline-none transition-colors duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-blue",
+          n ? "border-unread text-unread hover:bg-pill-pro-bg" : "border-hairline text-ink hover:bg-raised",
+          className,
+        )}
+      >
+        Needs you
+        <span className="font-mono text-xs tabular-nums">{n}</span>
+      </PopoverTrigger>
+      <PopoverContent side={side} align={side === "top" ? "center" : "end"} sideOffset={8} className="w-full max-w-[380px] rounded-dialog border border-hairline bg-surface p-0 text-ink shadow-lift">
+        <div className="p-4">
+          <h2 className="font-heading text-lg font-light text-ink">Needs you</h2>
+          <p className="mt-1 text-sm leading-relaxed text-ink-2">Sessions that need a person: a failed check, a refused merge, a stopped or timed-out run.</p>
+        </div>
+        <div className="max-h-[60dvh] overflow-y-auto border-t border-hairline">
+          {n === 0 && <p className="p-4 text-sm text-ink-2">Nothing needs you right now. Failed checks and stopped runs appear here with the reason.</p>}
+          {inbox.map((s) => (
+            <div key={s.id} className="border-t border-hairline p-4 first:border-t-0">
+              <p className="font-medium text-ink">{s.task}</p>
+              <p className="mt-1 text-sm leading-relaxed text-unread">{s.reason || "needs you"}</p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button size="sm" variant="outline" onClick={() => { setOpen(false); onView(s.id); }}>View session</Button>
+                <Button size="sm" onClick={() => onRetry(s.id)}>Retry</Button>
+              </div>
+              {errs[s.id] && <p role="alert" className="mt-2 text-sm text-unread">{errs[s.id]}</p>}
+            </div>
+          ))}
+        </div>
+        <div className="border-t border-hairline p-3 text-right">
+          <Button size="sm" variant="ghost" onClick={() => { setOpen(false); onGo(); }}>Go to Needs you</Button>
+        </div>
+      </PopoverContent>
+    </Popover>
   );
 }
