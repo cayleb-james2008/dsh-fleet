@@ -1044,7 +1044,7 @@ impl App {
         // A worktree whose link to the repo is gone (the repo's admin
         // record for it was lost) cannot be reused: its files move
         // aside, and the work is re-attached from the session's branch.
-        if wt.join(".git").exists() && !Self::worktree_attached(&wt) {
+        if wt.exists() && !Self::worktree_attached(&wt) {
             let secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -1083,12 +1083,14 @@ impl App {
         // directory was deleted after an earlier run), restore the
         // worktree from the branch — `add -b` would refuse, the branch
         // exists, and the session's committed work would be stranded.
+        // Admin records of worktrees whose directories are gone must go
+        // first, or git refuses to add the path again.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "prune"])
+            .output();
         let out = if self.branch_exists(&session.repo, &session.branch) {
-            let _ = Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(["worktree", "prune"])
-                .output();
             self.log(
                 id,
                 "worktree directory was missing — restored from the session's branch; earlier committed work is intact"
@@ -1827,13 +1829,16 @@ impl App {
 
     /// Is this worktree still linked to a repository git can read?
     fn worktree_attached(wt: &Path) -> bool {
-        Command::new("git")
-            .arg("-C")
-            .arg(wt)
-            .args(["rev-parse", "--git-dir"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        // The worktree's own link file must exist; without it git would
+        // walk up to an enclosing repository and wrongly report success.
+        wt.join(".git").exists()
+            && Command::new("git")
+                .arg("-C")
+                .arg(wt)
+                .args(["rev-parse", "--git-dir"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
     }
 
     fn branch_exists(&self, repo: &str, branch: &str) -> bool {
@@ -2006,6 +2011,12 @@ fn retry_prompt_text(
                 .iter_mut()
                 .find(|s| s.id == id)
                 .ok_or("no such session")?;
+            if matches!(s.status.as_str(), "queued" | "working" | "checking") {
+                return Err(format!(
+                    "this session is already running ({}) — there is nothing to retry",
+                    s.status
+                ));
+            }
             if s.status != "needs-you" {
                 return Err(format!(
                     "session is '{}' — only a needs-you session can be retried",
@@ -2025,9 +2036,25 @@ fn retry_prompt_text(
                 s.check_output.as_deref(),
                 s.reason.as_deref(),
             ));
+            // Claim the session in the same step as the status check, so
+            // a second Retry finds it queued and is refused. The stop
+            // flag is cleared before the queued status is visible, as
+            // requeue does.
+            self.stop_flag(id)
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            s.check_output = None;
+            s.check_passed = None;
+            s.check_ran = false;
+            s.check_exit = None;
+            s.reason = None;
+            s.diff = String::new();
+            s.verified_commit = None;
+            s.status = Status::Queued.label().to_string();
+            s.bucket = Status::Queued.bucket().to_string();
         }
         self.log(id, "retry: handed back to the agent".to_string());
-        self.requeue(id);
+        self.persist();
+        self.maybe_start(id);
         Ok(())
     }
 
@@ -4043,6 +4070,103 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200"), "{}", resp.lines().next().unwrap_or(""));
         let got = response_body(&handle(&app, "GET", "/api/sessions/s2", ""));
         assert!(got["merge_error"].is_null(), "{got}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Set up a session that has run once and landed in needs-you with
+    /// its worktree attached. Returns the repo and the agent it used.
+    fn needs_you_session(dir: &Path, data: &Path, counter: Option<&Path>) -> (PathBuf, String) {
+        let repo = git_repo(dir);
+        let body = match counter {
+            Some(c) => format!("echo run >> '{}'", c.display()),
+            None => "echo done > out.txt".to_string(),
+        };
+        let agent = script_agent(dir, "agent.sh", &body).to_string_lossy().to_string();
+        let mut s = test_session("s1", Status::Queued, dir);
+        s.repo = repo.to_string_lossy().to_string();
+        s.agent = agent.clone();
+        s.check_cmd = "false".to_string();
+        s.check_output = None;
+        s.check_passed = None;
+        s.verified_commit = None;
+        let app = test_app(data.to_path_buf(), vec![s]);
+        app.set_status("s1", Status::Working);
+        app.run_session("s1");
+        assert_eq!(app.status_of("s1").as_deref(), Some("needs-you"));
+        (repo, agent)
+    }
+
+    /// A new App from the same data dir, as after a restart.
+    fn restart(data: &Path) -> Arc<App> {
+        let (restored, _) = load_persisted(data);
+        test_app(data.to_path_buf(), restored)
+    }
+
+    #[test]
+    fn retry_recovers_a_worktree_whose_git_file_is_gone() {
+        let dir = std::env::temp_dir().join(format!("fleet-fr1b-a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("data");
+        needs_you_session(&dir, &data, None);
+        // Only the worktree's own link file is lost; the directory stays.
+        std::fs::remove_file(data.join("worktrees/s1/.git")).unwrap();
+        let app = restart(&data);
+        app.retry("s1").unwrap();
+        settle(&app, "s1");
+        let reason = app.sessions.lock().unwrap()[0].reason.clone().unwrap_or_default();
+        assert!(reason.starts_with("Check failed"), "after losing the .git file: {reason}");
+        let aside = std::fs::read_dir(data.join("worktrees")).unwrap().flatten().any(|e| {
+            e.file_name().to_string_lossy().starts_with("s1.detached-")
+        });
+        assert!(aside, "the detached directory was not kept aside");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retry_recovers_a_session_whose_worktree_and_record_are_gone() {
+        let dir = std::env::temp_dir().join(format!("fleet-fr1b-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("data");
+        let (repo, _) = needs_you_session(&dir, &data, None);
+        std::fs::remove_dir_all(data.join("worktrees/s1")).unwrap();
+        std::fs::remove_dir_all(repo.join(".git/worktrees/s1")).unwrap();
+        let app = restart(&data);
+        app.retry("s1").unwrap();
+        settle(&app, "s1");
+        let reason = app.sessions.lock().unwrap()[0].reason.clone().unwrap_or_default();
+        assert!(reason.starts_with("Check failed"), "after losing worktree and record: {reason}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_double_retry_leaves_exactly_one_run() {
+        let dir = std::env::temp_dir().join(format!("fleet-fr1b-c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("data");
+        let runs = dir.join("runs.txt");
+        needs_you_session(&dir, &data, Some(&runs));
+        let app = restart(&data);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let app = app.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    app.retry("s1")
+                })
+            })
+            .collect();
+        let results: Vec<Result<(), String>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1, "{results:?}");
+        let refused = results.iter().find_map(|r| r.as_ref().err()).cloned().unwrap_or_default();
+        assert!(refused.contains("already running"), "refusal was: {refused}");
+        settle(&app, "s1");
+        let count = std::fs::read_to_string(&runs).unwrap_or_default().lines().count();
+        assert_eq!(count, 2, "runs: {count}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
