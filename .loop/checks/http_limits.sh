@@ -22,7 +22,7 @@ port = int(sys.argv[1])
 
 # 1. Oversized declared body: refused 413, promptly, without the body.
 s = socket.create_connection(("127.0.0.1", port), timeout=10)
-s.sendall(b"POST /api/sessions HTTP/1.1\r\nHost: x\r\nContent-Length: 5000000\r\n\r\n")
+s.sendall(b"POST /api/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5000000\r\n\r\n")
 s.settimeout(10)
 resp = s.recv(4096).decode("utf-8", "replace")
 s.close()
@@ -30,7 +30,7 @@ assert "413" in resp, f"expected a 413 for an oversized declared body, got: {res
 
 # 2. A request that never completes is dropped by the read timeout.
 s = socket.create_connection(("127.0.0.1", port), timeout=10)
-s.sendall(b"GET /api/sessions HTTP/1.1\r\nHost: x\r\n")  # no terminating blank line
+s.sendall(b"GET /api/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\n")  # no terminating blank line
 s.settimeout(25)
 t0 = time.time()
 try:
