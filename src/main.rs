@@ -469,6 +469,12 @@ struct Session {
     /// task plus what failed last time. Set by retry(), read by the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retry_prompt: Option<String>,
+    /// Whether the check command actually started, and the exit code
+    /// it ended with when it exited normally.
+    #[serde(default)]
+    check_ran: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    check_exit: Option<i32>,
     transcript: Vec<String>,
 }
 
@@ -527,6 +533,8 @@ enum RunEnd {
 
 struct RunOutcome {
     end: RunEnd,
+    /// The exit code, when the process exited with one.
+    code: Option<i32>,
     /// Every output line (both streams, arrival order), each line
     /// already truncated to LINE_CAP.
     lines: Vec<String>,
@@ -584,6 +592,7 @@ fn run_bounded(
         Err(e) => {
             return RunOutcome {
                 end: RunEnd::SpawnFailed(e.to_string()),
+                code: None,
                 lines: Vec::new(),
             }
         }
@@ -619,6 +628,7 @@ fn run_bounded(
         });
     let mut lines: Vec<String> = Vec::new();
     let mut child_status: Option<bool> = None;
+    let mut child_code: Option<i32> = None;
     // After the child exits, the pipes get a grace — but measured as
     // INACTIVITY, not wall time: a fast producer's backlog is still
     // being forwarded line by line, and draining it is progress, not
@@ -641,6 +651,7 @@ fn run_bounded(
             match child.try_wait() {
                 Ok(Some(st)) => {
                     child_status = Some(st.success());
+                    child_code = st.code();
                     exited_at = Some(std::time::Instant::now());
                 }
                 Ok(None) => {}
@@ -684,6 +695,7 @@ fn run_bounded(
                     match child.try_wait() {
                         Ok(Some(st)) => {
                             child_status = Some(st.success());
+                            child_code = st.code();
                             break;
                         }
                         Ok(None) => {
@@ -721,7 +733,7 @@ fn run_bounded(
             Err(_) => break,
         }
     }
-    RunOutcome { end, lines }
+    RunOutcome { end, code: child_code, lines }
 }
 
 impl App {
@@ -1532,6 +1544,8 @@ impl App {
                 .args(["worktree", "prune"])
                 .output();
         }
+        let check_ran = !pristine_failed && !matches!(outcome.end, RunEnd::SpawnFailed(_));
+        let check_exit = outcome.code;
         let (passed, output, check_timed_out, check_pipes_held, check_stopped) = if pristine_failed {
             (
                 false,
@@ -1601,11 +1615,14 @@ impl App {
         // The full check output goes to the session's log file before
         // the stored copy is capped — the cap must never lose it.
         self.append_log_text(id, &format!("--- check output ---\n{output}\n--- end check output ---"));
+        let failed_reason = Self::check_failure_reason(&session.check_cmd, check_exit, &output);
         {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
                 s.check_output = Some(truncate_output(output));
                 s.check_passed = Some(passed);
+                s.check_ran = check_ran;
+                s.check_exit = check_exit;
                 s.diff = truncate_output(diff.clone());
                 // Provisional: every needs-you path below clears it.
                 s.verified_commit = tip.clone();
@@ -1737,7 +1754,12 @@ impl App {
             self.set_needs_you(id, "stopped by you while the check was running");
         } else {
             self.log(id, "check FAILED — this needs you".to_string());
-            self.set_needs_you(id, &format!("check failed: {}", session.check_cmd));
+            let reason = if check_ran {
+                failed_reason
+            } else {
+                format!("the check did not run: {}", session.check_cmd)
+            };
+            self.set_needs_you(id, &reason);
         }
         // Steering that arrived while the check ran must not be
         // stranded on a settled session. If the session finished
@@ -1908,6 +1930,21 @@ fn retry_prompt_text(
     format!("{task}\n\n--- retry: the previous attempt did not pass ---\n{note}\n--- end of retry note ---")
 }
 
+    /// The reason a failed check gives: its command, its exit code and
+    /// the head of its output, or that it printed nothing.
+    fn check_failure_reason(cmd: &str, exit: Option<i32>, output: &str) -> String {
+        let code = match exit {
+            Some(c) => format!("exit {c}"),
+            None => "no exit code".to_string(),
+        };
+        let head: String = output.trim().chars().take(200).collect();
+        if head.is_empty() {
+            format!("Check failed ({code}): {cmd}. The check printed nothing.")
+        } else {
+            format!("Check failed ({code}): {cmd}. Output: {head}")
+        }
+    }
+
 /// Hand a needs-you session back to its agent: the check state is
     /// cleared and the session re-queues; its worktree (with the agent's
     /// earlier work in it) is reused by run_session.
@@ -1962,6 +1999,8 @@ fn retry_prompt_text(
             if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
                 s.check_output = None;
                 s.check_passed = None;
+                s.check_ran = false;
+                s.check_exit = None;
                 s.reason = None;
                 s.diff = String::new();
                 s.verified_commit = None;
@@ -2032,6 +2071,8 @@ fn retry_prompt_text(
                 spawned_from: Some(id.to_string()),
                 successor: None,
                 retry_prompt: None,
+                check_ran: false,
+                check_exit: None,
                 transcript: Vec::new(),
             };
             sessions.push(child);
@@ -2552,6 +2593,11 @@ fn sessions_json(sessions: &[Session]) -> serde_json::Value {
             let kind = engine_kind(&s.agent);
             v["engine"] = serde_json::json!(kind.label());
             v["test_mode"] = serde_json::json!(kind == EngineKind::Custom);
+            // The receipt facts are always present: null until a check ran.
+            v["check_output"] = serde_json::json!(s.check_output.clone().unwrap_or_default());
+            v["check_passed"] = serde_json::json!(s.check_passed);
+            v["check_ran"] = serde_json::json!(s.check_ran);
+            v["check_exit"] = serde_json::json!(s.check_exit);
             // A needs-you session whose steering is still waiting says
             // so in its reason: the message is not silently pending.
             if s.status == "needs-you" && !s.steer.is_empty() {
@@ -2653,7 +2699,8 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
             if !repo_ok {
                 return error_response(400, "repo is not a git repository");
             }
-            let check_cmd = match req["check"].as_str() {
+            // A blank explicit check is no check: the policy default applies.
+            let check_cmd = match req["check"].as_str().map(str::trim) {
                 Some(c) if !c.is_empty() => c.to_string(),
                 _ => match app.policy.default_check(&project) {
                     Ok(c) => c,
@@ -2723,6 +2770,8 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 spawned_from: None,
                 successor: None,
                 retry_prompt: None,
+                check_ran: false,
+                check_exit: None,
                 transcript: Vec::new(),
             };
             app.sessions.lock().unwrap().push(session.clone());
@@ -2964,6 +3013,8 @@ fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
             spawned_from: None,
             successor: None,
             retry_prompt: None,
+            check_ran: false,
+            check_exit: None,
             transcript: cap_transcript(lines),
         });
     }
@@ -3336,6 +3387,8 @@ mod tests {
             spawned_from: None,
             successor: None,
             retry_prompt: None,
+            check_ran: false,
+            check_exit: None,
             transcript: Vec::new(),
         };
         app.sessions.lock().unwrap().push(session);
@@ -3384,6 +3437,8 @@ mod tests {
             spawned_from: None,
             successor: None,
             retry_prompt: None,
+            check_ran: false,
+            check_exit: None,
             transcript: Vec::new(),
         }
     }
@@ -3704,5 +3759,108 @@ mod tests {
             reason.contains("Your message is still waiting: \"also fix the tests\""),
             "{reason}"
         );
+    }
+
+    fn script_agent(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let agent = dir.join(name);
+        std::fs::write(&agent, format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        agent
+    }
+
+    #[test]
+    fn whitespace_check_falls_back_to_the_policy_default() {
+        let dir = std::env::temp_dir().join(format!("fleet-fb6-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir);
+        let agent = script_agent(&dir, "noop.sh", "");
+        let app = test_app(dir.join("data"), Vec::new());
+        let body = serde_json::json!({
+            "task": "do nothing",
+            "repo": repo.to_string_lossy(),
+            "project": "fixture",
+            "check": "   ",
+            "agent": agent.to_string_lossy(),
+        });
+        let resp = handle(&app, "POST", "/api/sessions", &body.to_string());
+        assert!(resp.starts_with("HTTP/1.1 201"), "{}", resp.lines().next().unwrap_or(""));
+        let created = response_body(&resp);
+        assert_eq!(created["check_cmd"], "test -s output.txt", "{created}");
+        let id = created["id"].as_str().unwrap_or("").to_string();
+        // The run settles on its own; the policy check fails on an empty tree.
+        for _ in 0..400 {
+            let st = app.status_of(&id).unwrap_or_default();
+            if !matches!(st.as_str(), "queued" | "working" | "checking") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(app.status_of(&id).as_deref(), Some("needs-you"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_json_carries_the_receipt_facts() {
+        let dir = std::env::temp_dir().join(format!("fleet-fb8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir).to_string_lossy().to_string();
+        let agent = script_agent(&dir, "writer.sh", "echo done > out.txt").to_string_lossy().to_string();
+        let cases = [("ok", "true"), ("bad", "echo x; exit 3"), ("quiet", "false")];
+        let mut sessions = Vec::new();
+        for (id, check) in cases {
+            let mut s = test_session(id, Status::Queued, &dir);
+            s.repo = repo.clone();
+            s.agent = agent.clone();
+            s.check_cmd = check.to_string();
+            s.check_output = None;
+            s.check_passed = None;
+            s.verified_commit = None;
+            sessions.push(s);
+        }
+        // Never run: no check has run, so the receipt says so.
+        let mut idle = test_session("idle", Status::NeedsYou, &dir);
+        idle.check_output = None;
+        idle.check_passed = None;
+        idle.verified_commit = None;
+        sessions.push(idle);
+        let app = test_app(dir.join("data"), sessions);
+        for (id, _) in cases {
+            app.set_status(id, Status::Working);
+            app.run_session(id);
+        }
+        let get = |id: &str| response_body(&handle(&app, "GET", &format!("/api/sessions/{id}"), ""));
+
+        let ok = get("ok");
+        assert_eq!(ok["status"], "done", "{ok}");
+        assert_eq!(ok["check_cmd"], "true");
+        assert_eq!(ok["check_output"], "");
+        assert_eq!(ok["check_passed"], true);
+        assert_eq!(ok["check_ran"], true);
+        assert_eq!(ok["check_exit"], 0);
+
+        let bad = get("bad");
+        assert_eq!(bad["check_output"], "x", "{bad}");
+        assert_eq!(bad["check_passed"], false);
+        assert_eq!(bad["check_ran"], true);
+        assert_eq!(bad["check_exit"], 3);
+        assert_eq!(bad["reason"], "Check failed (exit 3): echo x; exit 3. Output: x", "{bad}");
+
+        let quiet = get("quiet");
+        assert_eq!(quiet["check_exit"], 1, "{quiet}");
+        assert_eq!(quiet["reason"], "Check failed (exit 1): false. The check printed nothing.", "{quiet}");
+
+        let idle = get("idle");
+        assert_eq!(idle["check_cmd"], "test -s output.txt");
+        assert_eq!(idle["check_output"], "");
+        assert!(idle["check_passed"].is_null(), "{idle}");
+        assert_eq!(idle["check_ran"], false);
+        assert!(idle["check_exit"].is_null(), "{idle}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
