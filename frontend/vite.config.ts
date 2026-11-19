@@ -28,6 +28,8 @@ function runeUsed(): Plugin {
   };
 }
 
+const STAMP = "/* Hallmark · checked: 2026-11-19 · genre: modern-minimal · app scope · built: the project · Vantage (dark native) · v2.0.0 */";
+
 // After the build: inline the script, the stylesheet and (through assetsInlineLimit) the fonts into one page.
 function singleFile(): Plugin {
   return {
@@ -42,7 +44,8 @@ function singleFile(): Plugin {
       });
       html = html.replace(/<link[^>]*rel="stylesheet"[^>]*href="([^"]+)"[^>]*>/g, (_m, href) => {
         const css = fs.readFileSync(path.join(dist, href.replace(/^\.?\//, "")), "utf8");
-        return `<style>${css}</style>`;
+        // The Hallmark stamp is the first line of the page CSS (the lint reads that line); the minifier drops comments, so it is added here.
+        return `<style>${STAMP}\n${css}</style>`;
       });
       const out = path.resolve(root, "../assets/index.html");
       fs.writeFileSync(out, html);

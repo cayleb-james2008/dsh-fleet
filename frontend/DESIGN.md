@@ -152,3 +152,36 @@ Sonner toasts: handed out, steering sent, merged, refused actions, installed upd
 - Input edge: `--input` and `--edge` are 3:1 in both themes (theme.css).
 - Lint: the Hallmark render lint is down from 38 FAIL to 16 FAIL. The parts' edits are in `rune/used/LOCAL-EDITS.md`; `sync-used.mjs` keeps those files. The remaining FAILs are the COSS focus-within borders and disabled states, a mask-image literal in the avatar stack, one `transition` in the Tracker, and the stamp that the minifier strips.
 - Not done: the Needs-you inbox does not poll `/api/inbox` (it reads the same sessions list); the arrow-key roving is not tested in a browser run; the elapsed time for a running agent; the tablet 768 picture is taken but not re-reviewed after the last edit.
+
+
+## Round 3 (lead review, 2026-11-19)
+
+**Phone (below 768):** row 1 is the wordmark, the test-mode chip, the settings key and the theme switch; row 2 is the search field at full width. A bottom bar (`nav`, `md:hidden`, safe-area aware through `viewport-fit=cover` and `env(safe-area-inset-bottom)`) holds "Needs you N" (secondary, opens the inbox popover upward) and "New session" (lime). Both keys are 44 px tall. The lanes get `pb-28` so the bar never covers them. At 768 and above the top bar is the desktop one; the search narrows to 224 px at 768 so the row fits.
+
+**Parity:** the old page read the inbox from `GET /api/inbox` with the policy and session list every two seconds, and its count was the inbox's length. The board now reads all three on the same poll and uses `/api/inbox` for the popover list and its count. The Needs you reading in the scan strip still counts the session list's needs-you bucket. Elapsed time for a running agent is left out: a session carries no start or created timestamp in the API (the only timing field is the transcript's own log text).
+
+**Focus:** after Dismiss on the update strip, focus moves to "Show update" by an effect on a dismiss counter (no timer). After Restart, focus moves to the status line by an effect on a restart counter. After closing the New session dialog (Escape or Cancel), the form hands focus back to the trigger on unmount. Closing a session's detail returns focus to the Needs you lane heading.
+
+**Browser verification (Playwright, the live fixture app on 9630; only the update endpoints mocked, since a staged update cannot be produced in the fixture).** Run: `_fe/browser-r3.mjs`, 15 of 15 passed:
+- arrow keys, Home and End rove across Transcript, Diff and Receipt (`df, rc, tr, tr, rc, df` for the key sequence), and the focused view is the one with `aria-selected`;
+- Escape closes an open session;
+- Escape closes the New session dialog and focus returns to its trigger;
+- a session created through the dialog (repo, task, Hand it out) fires the "Handed out" toast and appears on the board;
+- Escape closes the Needs you popover and focus returns to its key;
+- focus after Dismiss lands on "Show update";
+- focus after a refused Restart (mocked 409) lands on the status line, and the refusal's words are shown;
+- phone (390): the bottom bar sits at the bottom with two keys of 44 px each, and no horizontal overflow;
+- no page errors during the run.
+
+The run found two defects, both fixed: the arrow-key handler read `currentTarget` after React had cleared it (roving did not move, and it threw a page error), and the dialog did not return focus to its trigger.
+
+**Lint (Hallmark `--scope app --render`):** 38 FAIL at the start of round 2, 16 at the end of round 2, and now 2 FAIL and 2 WARN.
+- Fixed in `rune/used` (listed in `rune/used/LOCAL-EDITS.md`, skipped by `sync-used.mjs`): the focus-ring transitions, `transition: all` and top/left transitions, the disabled opacity-only states (now a fill, ink and cursor), the focus-by-border states, the avatar stack's mask literal, the Tracker's `transition` and `px-[0.5px]`, and the dark fill overrides that read as dark surfaces with no text colour.
+- Fixed in the app: the dialog width (no 100vw), the header overflow at 390, the input edge at 3:1, the stamp, and the Tailwind scan (it read the Markdown notes as class names; now `source(none)` with `src` and the copied `.tsx` only).
+- Still open, both from Tailwind's own generated CSS rather than the parts: (1) the core `.transition` utility's property list includes `box-shadow`. The emitted rule is Tailwind's; a `@utility transition` override did not replace it. (2) The base ring-offset colour `#fff` is emitted in Tailwind's base layer. Both are reported, not hidden.
+- WARN: the search field's slot is read as collapsed (343 px on a phone, 288 px on desktop). It is a full-width field by design; the heuristic reads it as a shrink-to-fit slot. Not changed.
+- The stamp is prepended to the built CSS by the single-file step in `vite.config.ts` (the minifier drops comments), as OpenBell's builder does.
+
+**Checks (`.loop/checks/`):** `ui.sh` and `theme.sh` were rewritten in round 2 and pass on this build.
+
+**Not done:** the two lint FAILs above; the WARN; the elapsed time (no field); a browser run of the phone bottom bar's popover (only its keys and sizes were measured); the 768 detail in the picture set.
