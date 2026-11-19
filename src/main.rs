@@ -3104,6 +3104,12 @@ fn cap_transcript(lines: Vec<String>) -> Vec<String> {
 /// lost sessions.json; the sessions must not silently vanish with
 /// it. A recovered session says what happened and lands in Needs
 /// you — its repo and check settings lived only in the store.
+/// Added to a session's transcript when it is rebuilt from its record
+/// after the session store was lost.
+const RESTORED_LINE: &str = "restored from its record after the session store was lost";
+/// Appended to the reason of a needs-you session rebuilt that way.
+const RESTORED_REASON: &str = "(recovered from its record after the session store was lost)";
+
 fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
     let logs_dir = data_dir.join("logs");
     let mut sessions = Vec::new();
@@ -3132,7 +3138,15 @@ fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
             .and_then(|t| serde_json::from_str::<Session>(&t).ok())
             .filter(|r| r.id == id);
         if let Some(mut s) = record {
+            // Say so, once, in the transcript; a session that needs the
+            // operator says it in its reason too. Status is unchanged.
+            let mut lines = lines;
+            lines.push(RESTORED_LINE.to_string());
             s.transcript = cap_transcript(lines);
+            if s.status == "needs-you" && !s.reason.as_deref().unwrap_or("").contains(RESTORED_REASON) {
+                let base = s.reason.clone().unwrap_or_else(|| "needs you".to_string());
+                s.reason = Some(format!("{base} {RESTORED_REASON}"));
+            }
             sessions.push(s);
             continue;
         }
@@ -3631,15 +3645,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let data = dir.join("data");
         std::fs::create_dir_all(&data).unwrap();
+        let mut stuck = test_session("s3", Status::NeedsYou, &dir);
+        stuck.reason = Some("check failed: false".to_string());
         let app = test_app(
             data.clone(),
             vec![
                 test_session("s1", Status::Done, &dir),
                 test_session("s2", Status::Merged, &dir),
+                stuck,
             ],
         );
         app.log("s1", "check passed — verified done".to_string());
         app.log("s2", "merged into main".to_string());
+        app.log("s3", "needs you: check failed: false".to_string());
         app.persist();
         std::fs::remove_file(data.join("sessions.json")).unwrap();
         let (restored, _) = load_persisted(&data);
@@ -3655,11 +3673,26 @@ mod tests {
         let s2 = restored.iter().find(|s| s.id == "s2").unwrap();
         assert_eq!((s2.status.as_str(), s2.bucket.as_str()), ("merged", "done"));
         assert_eq!(s2.repo, repo);
+        // Every session rebuilt from its record says so in its transcript;
+        // only a needs-you one also says so in its reason.
+        let restored_line = "restored from its record after the session store was lost";
+        for id in ["s1", "s2", "s3"] {
+            let r = restored.iter().find(|s| s.id == id).unwrap();
+            assert!(r.transcript.iter().any(|l| l == restored_line), "{id}: {:?}", r.transcript);
+        }
+        assert_eq!(s1.reason, None);
+        let s3 = restored.iter().find(|s| s.id == "s3").unwrap();
+        assert_eq!((s3.status.as_str(), s3.bucket.as_str()), ("needs-you", "needs-you"));
+        assert_eq!(
+            s3.reason.as_deref(),
+            Some("check failed: false (recovered from its record after the session store was lost)")
+        );
         // A session with no record keeps the honest needs-you recovery.
         std::fs::write(data.join("logs/s9.log"), "agent started: old task\n").unwrap();
         let (restored, _) = load_persisted(&data);
         let s9 = restored.iter().find(|s| s.id == "s9").unwrap();
         assert_eq!(s9.bucket, "needs-you");
+        assert!(!s9.transcript.iter().any(|l| l.starts_with("restored from its record")));
         assert!(s9.reason.as_deref().unwrap_or("").contains("recovered"));
         let _ = std::fs::remove_dir_all(&dir);
     }
