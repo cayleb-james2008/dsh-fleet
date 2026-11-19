@@ -250,10 +250,10 @@
   }
   @media (max-width: 399px) {
     .top-actions .btn { flex: none; min-width: 44px; padding: 0 12px; }
-    #inboxBtn .lbl, #engBtn .lbl { display: none; }
+    #inboxBtn .lbl { display: none; }
   }
   @media (max-width: 359px) {
-    #newBtn .lbl { display: none; }
+    #newBtn .lbl, #engBtn .lbl { display: none; }
     #newBtn { width: 44px; padding: 0; }
   }
   @media (prefers-reduced-motion: reduce) {
@@ -517,7 +517,7 @@ async function refresh() {
     btn.classList.remove('bump'); void btn.offsetWidth; btn.classList.add('bump');
   }
   btn.classList.toggle('attn', inbox.length > 0);
-  btn.setAttribute('aria-label', `Needs you inbox, ${inbox.length} waiting`);
+  btn.setAttribute('aria-label', `Needs you, ${inbox.length}`);
   renderInbox(inbox);
   renderSessions(sessions);
   curSession = null;
