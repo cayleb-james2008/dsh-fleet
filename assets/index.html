@@ -193,12 +193,16 @@
   #scrim { display: none; }
 
   /* Dialog: New session. */
-  dialog#newDlg { width: min(540px, calc(100% - 32px)); max-height: calc(100vh - 48px); overflow-y: auto; padding: 0; border: 0; border-radius: var(--r-dialog); background: var(--surface); color: var(--ink); box-shadow: var(--float); }
+  dialog#newDlg { width: min(540px, calc(100% - 32px)); max-height: calc(100vh - 48px); overflow: hidden; padding: 0; border: 0; border-radius: var(--r-dialog); background: var(--surface); color: var(--ink); box-shadow: var(--float); }
   dialog#newDlg::backdrop { background: var(--scrim); }
-  dialog#newDlg[open] { animation: rise var(--dur-short) var(--ease-out); }
-  .dlg { padding: 24px; }
-  .dlg h2 { font-size: 18px; margin-bottom: 8px; }
-  .dlg .lead { color: var(--ink-2); font-size: 13px; line-height: 1.5; }
+  dialog#newDlg[open] { display: flex; flex-direction: column; animation: rise var(--dur-short) var(--ease-out); }
+  #composer { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+  .dlgbody { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 22px; }
+  .dlgfoot { flex: none; padding: 14px 22px; border-top: 1px solid var(--hairline); background: var(--surface); }
+  .dlgfoot .err { margin: 0 0 10px; }
+  .dlgfoot .actions { justify-content: flex-end; margin-top: 0; }
+  .dlgbody h2 { font-size: 18px; margin-bottom: 8px; }
+  .dlgbody .lead { color: var(--ink-2); font-size: 13px; line-height: 1.5; }
   .field { margin-top: 16px; }
   .field label { display: block; font-size: 13px; font-weight: 500; color: var(--ink); margin-bottom: 8px; }
   .field input, .field textarea, .field select { display: block; width: 100%; min-height: 44px; padding: 8px 12px; background: var(--canvas); border: 1px solid var(--hairline); border-radius: var(--r-control); color: var(--ink); transition: border-color var(--dur-micro) var(--ease-out); }
@@ -207,8 +211,6 @@
   .field input:focus-visible, .field textarea:focus-visible, .field select:focus-visible { outline: 2px solid var(--focus); outline-offset: 0; border-color: var(--focus); }
   .field input[aria-invalid="true"], .field textarea[aria-invalid="true"] { border-color: var(--bad); }
   .field .hint { margin-top: 8px; }
-  .dlg .actions { justify-content: flex-end; margin-top: 24px; }
-  .dlg .err { margin-top: 16px; }
 
   @media (min-width: 1100px) {
     #sessions { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -235,7 +237,12 @@
     .steer textarea { min-height: 88px; }
     .field input, .field textarea, .field select { min-height: 44px; }
     dialog#newDlg { width: calc(100% - 24px); }
-    .dlg { padding: 16px; }
+    .dlgbody { padding: 16px; }
+  }
+  @media (max-width: 399px) {
+    .top-actions .btn { flex: none; min-width: 44px; padding: 0 12px; }
+    .top-actions .btn .lbl { display: none; }
+    .top-actions #newBtn { width: 44px; padding: 0; }
   }
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
@@ -267,9 +274,9 @@
       <h1 class="brand"><svg class="ic" aria-hidden="true"><use href="#i-mark"/></svg>Fleet</h1>
       <div class="top-actions">
         <button class="btn" id="inboxBtn" aria-haspopup="true" aria-expanded="false" aria-label="Needs you inbox">
-          <svg class="ic" aria-hidden="true"><use href="#i-tray"/></svg><span>Needs you</span><span class="count" id="inboxCount">0</span>
+          <svg class="ic" aria-hidden="true"><use href="#i-tray"/></svg><span class="lbl">Needs you</span><span class="count" id="inboxCount">0</span>
         </button>
-        <button class="btn primary" id="newBtn"><svg class="ic" aria-hidden="true"><use href="#i-plus"/></svg>New session</button>
+        <button class="btn primary" id="newBtn" aria-label="New session"><svg class="ic" aria-hidden="true"><use href="#i-plus"/></svg><span class="lbl">New session</span></button>
         <button class="btn icon" id="engBtn" aria-haspopup="true" aria-expanded="false" aria-label="Engines and settings" title="Engines and settings"><svg class="ic" aria-hidden="true"><use href="#i-cpu"/></svg><span class="lbl">Engines</span></button>
       </div>
     </header>
@@ -302,6 +309,7 @@
       <h3>What this machine can run</h3>
       <ul id="agentList"></ul>
     </div>
+    <p class="lead testnote">Test mode: a script stands in for a coding agent, so nothing here used a real model.</p>
     <div class="sect">
       <h3>Theme</h3>
       <button class="switch" id="themeBtn" role="switch" aria-checked="true"><span>Dark</span><span class="track" aria-hidden="true"><span class="knob"></span></span></button>
@@ -309,7 +317,8 @@
   </section>
 
   <dialog id="newDlg" aria-labelledby="newTitle">
-    <form id="composer" class="dlg" novalidate>
+    <form id="composer" novalidate>
+    <div class="dlgbody">
       <h2 id="newTitle">New session</h2>
       <p class="lead">Fleet runs the agent in its own git worktree of this repo. When the agent stops, Fleet runs your check. The session is done only when that check passes.</p>
 
@@ -344,12 +353,15 @@
         <p class="hint" id="nextHint">Starts on its own only when this session is verified done.</p>
       </div>
 
-      <p class="err" id="formErr" hidden></p>
+    </div>
+    <div class="dlgfoot">
+      <p class="err" id="formErr" aria-live="polite" hidden></p>
       <div class="actions">
         <button type="button" class="btn quiet" id="cancelNew">Cancel</button>
         <button type="submit" class="btn primary">Hand it out</button>
       </div>
-    </form>
+    </div>
+  </form>
   </dialog>
 
 <script>
@@ -389,7 +401,19 @@ function setPopover(id, btnId, open) {
   document.getElementById(btnId).setAttribute('aria-expanded', open ? 'true' : 'false');
 }
 function closePopovers() { setPopover('settings', 'engBtn', false); inboxOpen = false; }
-function closeSelection() { selected = null; curSession = null; pendingAct = null; detailError = ''; lastDetailKey = ''; refresh(); }
+// Opening a session moves focus to its heading; closing returns it to the row.
+function openSession(id) {
+  selected = id; detailError = ''; pendingAct = null; lastDetailKey = ''; closePopovers();
+  refresh().then(() => { const h = document.querySelector('#detail h2'); if (h) { h.tabIndex = -1; h.focus(); } });
+}
+function closeSelection() {
+  const back = selected;
+  selected = null; curSession = null; pendingAct = null; detailError = ''; lastDetailKey = '';
+  refresh().then(() => {
+    const row = back && document.querySelector(`.card[data-sid="${CSS.escape(back)}"]`);
+    if (row) row.focus();
+  });
+}
 
 // Every poll is guarded: a non-ok or malformed reply never throws. The
 // last good list stays on screen with a note that says when it was read.
@@ -509,7 +533,7 @@ function renderInbox(inbox) {
       <div class="acts"><button class="btn" data-act="view">View session</button><button class="btn" data-act="retry">Retry</button></div>`;
     div.querySelector('.t').textContent = s.task;
     div.querySelector('.r').textContent = s.reason || 'needs you';
-    div.querySelector('[data-act="view"]').onclick = () => { selected = s.id; detailError = ''; pendingAct = null; lastDetailKey = ''; inboxOpen = false; closePopovers(); refresh(); };
+    div.querySelector('[data-act="view"]').onclick = () => { inboxOpen = false; openSession(s.id); };
     div.querySelector('[data-act="retry"]').onclick = async () => {
       // A refused retry (409, the session already moved on) must be
       // SEEN, not swallowed: post() reports the server's own words.
@@ -600,11 +624,13 @@ function sessionCard(s) {
   const div = document.createElement('div');
   const cls = statusCls(s);
   div.className = 'card' + (s.bucket === 'needs-you' ? ' needs' : '');
+  div.setAttribute('role', 'button');
   div.setAttribute('tabindex', '0');
+  div.setAttribute('data-sid', s.id);
   div.setAttribute('aria-label', `Open session: ${s.task}`);
   div.setAttribute('aria-current', s.id === selected ? 'true' : 'false');
   const live = (s.bucket === 'working' && s.status !== 'queued') ? '<span class="live" aria-hidden="true"></span>' : '';
-  const agent = s.test_mode ? '<span class="chip testmode">test mode</span>' : `<span class="chip">${esc(s.engine || s.agent || 'agent')}</span>`;
+  const agent = s.test_mode ? '<span class="chip testmode" title="Test mode: a script stands in for a coding agent, so nothing here used a real model.">test mode</span>' : `<span class="chip">${esc(s.engine || s.agent || 'agent')}</span>`;
   let inner = `<div class="cardtop"><span class="pill project"></span><span class="pill s-${cls}">${live}<span class="st"></span></span></div>
     <div class="task"></div>`;
   if (s.bucket === 'needs-you') inner += `<p class="reason"></p>`;
@@ -624,7 +650,7 @@ function sessionCard(s) {
   const rl = div.querySelector('.receipt .line');
   if (rl) rl.textContent = receiptLine(s);
   div.querySelector('.branch').textContent = s.branch || '';
-  div.onclick = () => { selected = s.id; detailError = ''; pendingAct = null; lastDetailKey = ''; closePopovers(); refresh(); };
+  div.onclick = () => openSession(s.id);
   div.onkeydown = (e) => {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); div.onclick(); }
   };
@@ -739,6 +765,7 @@ function renderDetail(s) {
   d.querySelector('.st').textContent = statusText(s);
   d.querySelector('.pj').textContent = s.project;
   d.querySelector('.ag').textContent = agentLabel;
+  d.querySelector('.ag').title = s.test_mode ? 'Test mode: a script stands in for a coding agent, so nothing here used a real model.' : '';
   d.querySelector('.br').textContent = s.branch || '';
   const bb = d.querySelector('#backBtn');
   if (bb) bb.onclick = () => closeSelection();
@@ -880,6 +907,8 @@ async function handOut() {
   const problems = [];
   repoEl.setAttribute('aria-invalid', repoEl.value.trim() ? 'false' : 'true');
   taskEl.setAttribute('aria-invalid', taskEl.value.trim() ? 'false' : 'true');
+  repoEl.setAttribute('aria-describedby', repoEl.value.trim() ? 'repoHint' : 'repoHint formErr');
+  taskEl.setAttribute('aria-describedby', taskEl.value.trim() ? 'taskHint' : 'taskHint formErr');
   if (!repoEl.value.trim()) problems.push('Give the repo path: the folder of the git repository the agent works in.');
   if (!taskEl.value.trim()) problems.push('Write the task: say what the agent should do.');
   if (problems.length) {
