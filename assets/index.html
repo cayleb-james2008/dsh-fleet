@@ -164,6 +164,8 @@
   .receiptcard.fail .verdict { color: var(--bad-text); }
   .receiptcard .check { font-family: var(--font-mono); font-size: 13px; overflow-wrap: anywhere; }
   .receiptcard .cmd { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); overflow-wrap: anywhere; }
+  .nextline { margin-top: 12px; }
+  .rccmd { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); margin-bottom: 12px; overflow-wrap: anywhere; }
   .reasonbox { margin-top: 12px; padding: 12px 16px; border-radius: var(--r-card); background: var(--bad-tint); color: var(--bad-text); display: flex; gap: 8px; align-items: flex-start; line-height: 1.45; }
   .reasonbox .v { color: var(--ink); overflow-wrap: anywhere; }
   .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
@@ -649,7 +651,10 @@ function renderDetail(s) {
       ${s.queue_position ? `<span><span class="k">Queue</span>#${s.queue_position}</span>` : ''}
     </div>`;
   if (chainBits.length) html += `<div class="chain">${chainBits.map(b => `<span>${esc(b)}</span>`).join('')}</div>`;
-  if (hasCheck) {
+  const showReceipt = s.check_passed === true;
+  // The check state, derived until the server sends check_ran.
+  const ranCheck = s.check_ran !== undefined ? !!s.check_ran : hasCheck;
+  if (showReceipt) {
     html += `<div class="receiptcard ${verified ? 'pass' : noted ? 'noted' : 'fail'}">
       <div class="verdict">${sym(verified ? 'i-check' : noted ? 'i-alert' : 'i-x')}<span class="vt"></span></div>
       <div class="check"></div>
@@ -677,6 +682,7 @@ function renderDetail(s) {
     html += `</div>`;
   }
 
+  html += `<p class="err" id="actErr" hidden></p>`;
   html += `<div class="tabs" role="tablist" aria-label="Session views">
       <button class="tab" role="tab" id="tab-tr" data-tab="tr" aria-controls="panel-tr">Transcript</button>
       <button class="tab" role="tab" id="tab-df" data-tab="df" aria-controls="panel-df">Diff</button>
@@ -692,9 +698,11 @@ function renderDetail(s) {
       <pre id="df"></pre>
     </div>
     <div class="panel" role="tabpanel" id="panel-rc" aria-labelledby="tab-rc" hidden>
-      <p class="dstat">The receipt is the check's own output. A session is done only when this check passed.</p>
+      <p class="dstat" id="rcVerdict"></p>
+      <p class="rccmd" id="rcCmd"></p>
       <pre id="co"></pre>
     </div>`;
+  if (s.status === 'needs-you') html += `<p class="hint nextline">Retry runs the agent again with the failure attached. Steer sends it a message. Dismiss removes it from the board; its log stays on disk.</p>`;
   if (s.status !== 'merged') {
     const hint = s.status === 'needs-you'
       ? 'Sending also retries the session: your message goes to the agent first, before anything is re-checked.'
@@ -706,7 +714,6 @@ function renderDetail(s) {
       <div class="actions"><button class="btn" id="steerBtn">${sym('i-send')}Send to the agent</button></div>
       <p class="hint" id="steerHint">${esc(hint)}</p></div>`;
   }
-  html += `<p class="err" id="actErr" hidden></p>`;
   d.innerHTML = html;
   d.querySelector('h2').textContent = s.task;
   d.querySelector('.st').textContent = statusText(s);
@@ -715,7 +722,7 @@ function renderDetail(s) {
   d.querySelector('.br').textContent = s.branch || '';
   const bb = d.querySelector('#backBtn');
   if (bb) bb.onclick = () => closeSelection();
-  if (hasCheck) {
+  if (showReceipt) {
     d.querySelector('.vt').textContent = verified ? 'Check passed: verified done'
       : noted ? 'Check passed, but this session needs you' : 'Check failed';
     d.querySelector('.receiptcard .check').textContent = rc;
@@ -731,7 +738,15 @@ function renderDetail(s) {
     trNote.textContent = `Showing the most recent lines. The full log is kept on disk as logs/${s.id}.log in the Fleet data folder.`;
   }
   d.querySelector('.dstat').textContent = `${s.transcript.length} line${s.transcript.length === 1 ? '' : 's'} so far.`;
-  d.querySelector('#co').textContent = s.check_output || 'No check has run yet.';
+  const rv = d.querySelector('#rcVerdict');
+  if (!ranCheck) {
+    rv.textContent = 'No check has run yet.';
+    d.querySelector('#rcCmd').textContent = s.check_cmd ? `Check command: ${s.check_cmd}` : '';
+  } else {
+    rv.textContent = s.check_passed ? 'Passed.' : `Failed${s.check_exit != null ? ` with exit code ${s.check_exit}` : ''}.`;
+    d.querySelector('#rcCmd').textContent = `Command: ${s.check_cmd || ''}`;
+  }
+  d.querySelector('#co').textContent = ranCheck ? (s.check_output || '(printed nothing)') : '';
   d.querySelector('#df').textContent = s.diff || 'No changes on this branch yet.';
   // The action error lives in detailError, outside the DOM, so a
   // re-render can never erase it before it is read.
@@ -783,6 +798,8 @@ function renderDetail(s) {
   d.scrollTop = prevScroll;
   const tr2 = d.querySelector('#tr');
   if (tr2) tr2.scrollTop = prevTrAtBottom ? tr2.scrollHeight : prevTrScroll;
+  const ae = d.querySelector('#actErr');
+  if (ae && !ae.hidden) ae.scrollIntoView({ block: 'nearest' });
   if (activeId) {
     const again = d.querySelector('#' + CSS.escape(activeId));
     if (again) again.focus();
