@@ -1,3 +1,4 @@
+/* Hallmark · checked: 2026-11-19 · genre: modern-minimal · app scope · built: the project · Vantage (dark native) · v2.0.0 */
 @import "tailwindcss";
 /* Tokens: the house roles (tokens.css), then this app's Hallmark theme values (theme.css), then its fonts. */
 @import "./tokens.css";
@@ -7,6 +8,8 @@
 
 /* Hallmark floor: no sideways scroll on the page; heads wrap evenly. */
 html, body { overflow-x: clip; }
+/* Focus offsets sit on the canvas, not on Tailwind's literal white. */
+*, ::before, ::after, ::backdrop { --tw-ring-offset-color: var(--canvas); }
 h1, h2, h3 { text-wrap: balance; }
 
 /* Tremor Raw animation block (documented install step: paste its @theme into globals.css).

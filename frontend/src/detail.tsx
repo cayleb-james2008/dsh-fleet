@@ -11,6 +11,7 @@ import { glide } from "@/motion";
 import { cn } from "@/lib/utils";
 import { diffStat, HONEST, isHonest, isVerified, postJson, receiptLine, statusText, type Session } from "./api";
 import { toast } from "sonner";
+import { Expandable, ExpandableContent, ExpandableTrigger } from "@/components/ui/expandable";
 
 type Tab = "tr" | "df" | "rc";
 type Act = "merge" | "stop" | "dismiss" | null;
@@ -25,7 +26,7 @@ function draftSet(id: string, v: string) {
 
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
 
-export function DetailBody({ s, onClose, onChanged }: { s: Session; onClose: () => void; onChanged: () => void }) {
+export function DetailBody({ s, onClose, onChanged, onDismissed }: { s: Session; onClose: () => void; onChanged: () => void; onDismissed: () => void }) {
   const [tab, setTab] = useState<Tab>("tr");
   const [act, setAct] = useState<Act>(null);
   const [err, setErr] = useState("");
@@ -48,6 +49,22 @@ export function DetailBody({ s, onClose, onChanged }: { s: Session; onClose: () 
       : s.status === "done"
         ? "Sending reopens this session: the agent gets your message and the work is re-checked before it can be merged."
         : "Delivered when the current run ends, before anything is committed or checked.";
+
+  const order: Tab[] = ["tr", "df", "rc"];
+  // Arrow keys, Home and End move between the views (roving focus, as the old page did).
+  function onTabKey(e: React.KeyboardEvent<HTMLElement>) {
+    const i = order.indexOf(tab);
+    let j: number | null = null;
+    if (e.key === "ArrowRight") j = (i + 1) % 3;
+    else if (e.key === "ArrowLeft") j = (i + 2) % 3;
+    else if (e.key === "Home") j = 0;
+    else if (e.key === "End") j = 2;
+    if (j === null) return;
+    e.preventDefault();
+    setTab(order[j]);
+    const id = order[j];
+    requestAnimationFrame(() => e.currentTarget.querySelector<HTMLElement>(`[data-id="${id}"]`)?.focus());
+  }
 
   async function run(fn: () => Promise<string | null>, ok: string) {
     const e = await fn();
@@ -93,7 +110,7 @@ export function DetailBody({ s, onClose, onChanged }: { s: Session; onClose: () 
   return (
     <div className="flex min-h-0 flex-col gap-5">
       <div className="flex items-center gap-2">
-        <Badge variant={verified ? "success" : s.bucket === "needs-you" ? "error" : s.bucket === "done" ? "success" : "default"} size="sm">
+        <Badge variant={verified ? "success" : s.bucket === "needs-you" ? "error" : s.bucket === "done" ? "success" : "secondary"} size="sm">
           {verified ? "verified" : statusText(s)}
         </Badge>
         <Button variant="ghost" size="sm" className="ml-auto" onClick={onClose} aria-label="Close this session">
@@ -117,6 +134,9 @@ export function DetailBody({ s, onClose, onChanged }: { s: Session; onClose: () 
           {s.queue_position ? <div className="flex gap-2"><dt className="text-ink-3">Queue</dt><dd>#{s.queue_position}</dd></div> : null}
         </dl>
         {chain.map((c) => <p key={c} className="mt-2 text-sm text-ink-2">{c}</p>)}
+        {s.transcript.some((l) => l.includes("restored from its record")) && (
+          <p className="mt-2 text-sm text-ink-2">This session was restored from its record after the session store was lost.</p>
+        )}
       </div>
 
       {verified && (
@@ -124,6 +144,18 @@ export function DetailBody({ s, onClose, onChanged }: { s: Session; onClose: () 
           <p className="border-l-2 border-blue pl-2 font-medium text-ink">Check passed: verified done</p>
           <p className="mt-2 font-mono text-sm text-ink">{receiptLine(s)}</p>
           <p className="mt-1 font-mono text-xs text-ink-3">Check: {s.check_cmd || ""}</p>
+          <Expandable expandDirection="vertical" expandBehavior="push" className="mt-3">
+            {({ isExpanded }) => (
+              <>
+                <ExpandableTrigger aria-label="Details of the check output" className="cursor-pointer rounded-control text-sm text-ink-2 outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-blue">
+                  {isExpanded ? "Hide details" : "Details"}
+                </ExpandableTrigger>
+                <ExpandableContent preset="fade">
+                  <pre className="mt-2 max-h-[30vh] overflow-auto whitespace-pre-wrap break-all rounded-control bg-canvas p-2 font-mono text-xs text-ink-2">{s.check_output || "(printed nothing)"}</pre>
+                </ExpandableContent>
+              </>
+            )}
+          </Expandable>
         </section>
       )}
       {s.status === "needs-you" && s.reason && !honest && (
@@ -138,7 +170,7 @@ export function DetailBody({ s, onClose, onChanged }: { s: Session; onClose: () 
               : "Stop this run now? It lands in Needs you as stopped by you."}
           </p>
           <div className="mt-3 flex flex-wrap gap-2">
-            <Button variant={act === "merge" ? "default" : "destructive-outline"} onClick={() => (act === "merge" ? doMerge() : run(() => postJson(`/api/sessions/${s.id}/${act}`), act === "stop" ? "Stopped" : "Dismissed").then(() => { if (act === "dismiss") onClose(); }))}>
+            <Button variant={act === "merge" ? "default" : "destructive-outline"} onClick={() => (act === "merge" ? doMerge() : act === "dismiss" ? onDismissed() : run(() => postJson(`/api/sessions/${s.id}/stop`), "Stopped"))}>
               {act === "merge" ? "Merge now" : act === "dismiss" ? "Dismiss now" : "Stop now"}
             </Button>
             <Button variant="outline" onClick={() => setAct(null)}>Keep it</Button>
@@ -160,21 +192,29 @@ export function DetailBody({ s, onClose, onChanged }: { s: Session; onClose: () 
         <div className="rounded-card bg-pill-pro-bg p-3 text-unread">
           <p className="text-ink">{s.merge_error.message || "The merge was refused."}</p>
           {s.merge_error.detail && (
-            <details className="mt-2">
-              <summary className="cursor-pointer text-sm">Details</summary>
-              <pre className="mt-2 max-h-[30vh] overflow-auto whitespace-pre-wrap break-all rounded-control bg-canvas p-2 font-mono text-xs text-ink-2">{s.merge_error.detail}</pre>
-            </details>
+            <Expandable expandDirection="vertical" expandBehavior="push" className="mt-2">
+              {({ isExpanded }) => (
+                <>
+                  <ExpandableTrigger aria-label="Details of the refused merge" className="cursor-pointer rounded-control text-sm outline-none focus-visible:ring-2 focus-visible:ring-blue">
+                    {isExpanded ? "Hide details" : "Details"}
+                  </ExpandableTrigger>
+                  <ExpandableContent preset="fade">
+                    <pre className="mt-2 max-h-[30vh] overflow-auto whitespace-pre-wrap break-all rounded-control bg-canvas p-2 font-mono text-xs text-ink-2">{s.merge_error!.detail}</pre>
+                  </ExpandableContent>
+                </>
+              )}
+            </Expandable>
           )}
         </div>
       )}
       {err && <p role="alert" className="text-sm text-unread">{err}</p>}
 
       <div>
-        <div className="inline-flex gap-0.5 rounded-control bg-track p-0.5">
+        <div role="tablist" aria-label="Session views" onKeyDown={onTabKey} className="inline-flex gap-0.5 rounded-control bg-track p-0.5">
         <AnimatedBackground
           defaultValue={tab}
           onValueChange={(id) => id && setTab(id as Tab)}
-          className="rounded-sm bg-raised shadow-raised"
+          className="rounded-sm bg-ink"
           transition={glide}
         >
           {([["tr", "Transcript"], ["df", "Diff"], ["rc", "Receipt"]] as const).map(([id, label]) => (
@@ -182,8 +222,10 @@ export function DetailBody({ s, onClose, onChanged }: { s: Session; onClose: () 
               key={id}
               type="button"
               data-id={id}
-              aria-pressed={tab === id}
-              className="h-8 cursor-pointer rounded-sm px-3 text-sm font-medium text-ink-2 outline-none transition-colors duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-blue data-[checked=true]:text-ink"
+              role="tab"
+              aria-selected={tab === id}
+              tabIndex={tab === id ? 0 : -1}
+              className="h-8 cursor-pointer rounded-sm px-3 text-sm font-medium text-ink-2 data-[checked=true]:text-canvas outline-none transition-colors duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-blue data-[checked=true]:text-ink"
             >
               {label}
             </button>

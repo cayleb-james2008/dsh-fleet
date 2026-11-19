@@ -40,14 +40,14 @@ A finished session is a measured scan card: four corner ticks (the Vantage frame
 | --- | --- | --- | --- |
 | Motion Primitives | a tab-like switch that glides between Transcript, Diff and Receipt; a figure that rolls when a session finishes; a running card that shows it runs; the New session dialog that grows from its button | `AnimatedBackground` (detail views), `SlidingNumber` (scan readings), `BorderTrail` and `TextShimmer` (running cards), `MorphingDialog` (New session) | `rune/used/components/ui/animated-background.tsx`, `sliding-number.tsx`, `border-trail.tsx`, `text-shimmer.tsx`, `morphing-dialog.tsx` |
 | COSS UI | compact hairline controls: buttons, the search field with its key hint, the theme switch with icons, badges for states, the avatar for an agent, a tooltip for the icon-only engines key, text areas and inputs in the form | `Button`, `InputGroup`/`InputGroupInput`/`InputGroupAddon`, `Kbd`, `SegmentedControl`/`SegmentedControlItem`, `Badge`, `Avatar`/`AvatarFallback`, `Tooltip`, `Textarea`, `Input` | `rune/used/components/ui/*.tsx` (listed in `rune/used/MANIFEST.md`) |
-| Cult UI | none this round (see below) | none | none |
+| Cult UI | every disclosure: the refused-merge Details, the check output Details on a verified receipt | `Expandable`, `ExpandableTrigger`, `ExpandableContent` | `rune/used/components/ui/expandable.tsx` |
 | Kibo UI | lane count pills; a stack of the agents that are running | `Pill` (lane heads), `AvatarStack` (scan strip) | `rune/used/components/kibo-ui/pill/index.tsx`, `avatar-stack/index.tsx` |
 | Tremor | the recent-sessions strip: one block per session, coloured by its outcome, with a tooltip | `Tracker` | `rune/used/components/Tracker/Tracker.tsx` (its relative import of `utils/cx` is copied too, see the sync fix below) |
 | Vaul | the detail drawer on narrow screens (bottom sheet); the settings sheet on every size (right side) | `Drawer.Root` with bottom and right directions | `vaul` package |
 | Sonner | the toast that says what happened: handed out, steering sent, merged, a refused action with the server's words | `Toaster`, `toast.success`, `toast.error` | `sonner` package |
 | Motion | the lane move when a session changes state (`layoutId` plus `layout`, on the `layout` preset); every duration and spring comes from `src/motion.ts` | `motion/react` `motion.div` | `src/motion.ts` (copied from the house starter, unchanged) |
 
-Cult UI: no need here. The product has no card that opens into a page of its own: the one thing that opens is the session, and the drawer and column already answer it. The receipt is drawn by hand from the house tokens, and a morphing card would add motion the product does not need.
+Cult UI: used for disclosures (round 2). The native `<details>` is gone.
 
 ## Parity inventory (old page `git show HEAD:assets/index.html`)
 
@@ -137,3 +137,18 @@ Sonner toasts: handed out, steering sent, merged, refused actions, installed upd
 - Hallmark sloplint (`--scope app --render`): 35 FAIL and 4 WARN remain. Most come from the library parts' own utilities (literal white, black and shadow values in `button`, `input-group`, `dialog` and the Tailwind defaults; `focus-within` borders and `opacity-64` disabled states in COSS). Two are mine and open: the New session dialog's width uses `min(560px, 100vw − 24px)`, and input fields sit at 1.28:1 against the canvas (the Vantage hairline is quiet by design). Not fixed in round 1.
 - No screenshot at 768 or 320 px, no probe run for console errors, overflow or tap targets, and no contrast measurement of every token pair.
 - Both themes were looked at at 1440 by 900 and 390 by 844 (empty and working states, the detail and the dialog). The light theme's lime is a fill and a rule only, because lime text fails 4.5:1 on the light surface.
+
+
+## Round 2 (lead review, 2026-11-19)
+
+- Hero: the top Needs-you session (its reason in the red at headline weight, keys Retry, Dismiss, Open); else the newest verified receipt. Capped: desktop max 260 px, headline two lines; phone one receipt row. Its lane card becomes a "shown above" row.
+- Scan strip: the avatar stack only with two or more agents running; one agent shows `running <engine>`. No elapsed time: the API returns no start time for a session.
+- Test mode: one chip in the top bar; cards no longer repeat it. The explanation sits in the chip's title and in the detail.
+- New session: the native select is replaced by a SegmentedControl for up to three agents (a popover list above that). Fields use InputGroup. The check field shows a Kbd example. Dialog width no longer uses 100vw.
+- Inbox: the "Needs you N" header key opens a Popover with each session's reason, View, Retry, and a "Go to Needs you" key. Focus returns to the Needs you lane after Dismiss and after a detail close.
+- Detail: arrow keys, Home and End move between Transcript, Diff and Receipt (roving focus). The highlight is a solid ink pill. A restored session (transcript line from the server) shows a note.
+- Updates: the copy under Update now is in place; focus goes to the "Show update" control after Dismiss and to the status line on Restart.
+- Skeletons: lane-shaped while the board loads.
+- Input edge: `--input` and `--edge` are 3:1 in both themes (theme.css).
+- Lint: the Hallmark render lint is down from 38 FAIL to 16 FAIL. The parts' edits are in `rune/used/LOCAL-EDITS.md`; `sync-used.mjs` keeps those files. The remaining FAILs are the COSS focus-within borders and disabled states, a mask-image literal in the avatar stack, one `transition` in the Tracker, and the stamp that the minifier strips.
+- Not done: the Needs-you inbox does not poll `/api/inbox` (it reads the same sessions list); the arrow-key roving is not tested in a browser run; the elapsed time for a running agent; the tablet 768 picture is taken but not re-reviewed after the last edit.

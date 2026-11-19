@@ -1,18 +1,19 @@
-// Fleet: the board. Top bar (wordmark, version, search, New session, engines, theme), the update strip, the scan strip
-// (four readings and the recent sessions), the hero receipt, three lanes (Needs you, Working, Done), and the session
-// detail (a column on wide screens, a drawer on narrow ones). Data: /api/policy, /api/sessions, /api/update, polled.
+// Fleet: the board. Top bar (wordmark, version, search, Needs you inbox, New session, engines, theme), the update strip,
+// the scan strip (readings and recent sessions), the hero (the session that needs a person, else the newest receipt),
+// three lanes (Needs you, Working, Done), and the session detail (a column on wide screens, a drawer on narrow ones).
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "motion/react";
 import { Toaster, toast } from "sonner";
 import { Drawer } from "vaul";
 import { Search, Plus, Sun, Moon, Cpu, ScanLine, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import { Kbd } from "@/components/ui/kbd";
 import { Textarea } from "@/components/ui/textarea";
 import { SegmentedControl, SegmentedControlItem } from "@/components/ui/segmented-control";
 import { Tooltip, TooltipPopup, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { SlidingNumber } from "@/components/ui/sliding-number";
 import {
@@ -25,13 +26,14 @@ import { AvatarStack } from "@/components/kibo-ui/avatar-stack";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import { layout, glide } from "@/motion";
 import { cn } from "@/lib/utils";
-import { getJson, isVerified, type Policy, type Session, statusText } from "./api";
+import { getJson, isVerified, postJson, type Agent, type Policy, type Session, statusText } from "./api";
 import { DetailBody } from "./detail";
-import { HeroReceipt, ReceiptCard } from "./receipt";
+import { HeroReceipt, ReceiptCard, ShownAbove } from "./receipt";
 import { resultLine as resultLineOf, UpdateStrip, useUpdate } from "./update";
 
 type Theme = "dark" | "light";
 const THEME_KEY = "fleet-theme";
+const TEST_NOTE = "Test mode: a script stands in for a coding agent, so nothing here used a real model.";
 
 function readTheme(): Theme {
   try { return localStorage.getItem(THEME_KEY) === "light" ? "light" : "dark"; } catch { return "dark"; }
@@ -46,6 +48,8 @@ export function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [inboxOpen, setInboxOpen] = useState(false);
+  const [inboxErr, setInboxErr] = useState<Record<string, string>>({});
   const wide = useMediaQuery("(min-width: 1100px)");
   const upd = useUpdate();
   const searchRef = useRef<HTMLInputElement>(null);
@@ -69,7 +73,8 @@ export function App() {
 
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
-      if (e.key === "/" && document.activeElement?.tagName !== "INPUT" && document.activeElement?.tagName !== "TEXTAREA") {
+      const tag = document.activeElement?.tagName;
+      if (e.key === "/" && tag !== "INPUT" && tag !== "TEXTAREA") {
         e.preventDefault(); searchRef.current?.focus();
       }
       if (e.key === "Escape" && selected && !document.querySelector('[role="dialog"]')) setSelected(null);
@@ -92,14 +97,31 @@ export function App() {
   const current = selected ? all.find((s) => s.id === selected) ?? null : null;
   useEffect(() => { if (selected && sessions && !current) setSelected(null); }, [selected, sessions, current]);
   const verifiedCount = all.filter(isVerified).length;
-  const needsCount = all.filter((s) => s.bucket === "needs-you").length;
+  const needsAll = all.filter((s) => s.bucket === "needs-you");
+  const workingAll = all.filter((s) => s.bucket === "working" && s.status !== "queued");
+  const needsCount = needsAll.length;
   const workingCount = all.filter((s) => s.bucket === "working").length;
-  const hero = lanes.done[0] ?? null;
+  const hero = needsAll[0] ?? all.find(isVerified) ?? null;
+  const testMode = policy?.default_agent_engine === "custom" || all.some((s) => s.test_mode);
 
-  const open = (id: string) => { setSelected(id); };
+  const open = (id: string) => { setSelected(id); setInboxOpen(false); };
+  const focusLane = () => requestAnimationFrame(() => document.getElementById("lane-needs-h")?.focus());
+  const closeDetail = () => { setSelected(null); focusLane(); };
+  const retry = async (id: string) => {
+    const e = await postJson(`/api/sessions/${id}/retry`);
+    setInboxErr((m) => ({ ...m, [id]: e || "" }));
+    if (e) toast.error(e); else toast.success("Retrying the session");
+    refresh();
+  };
+  const dismiss = async (id: string) => {
+    const e = await postJson(`/api/sessions/${id}/dismiss`);
+    if (e) toast.error(e); else { toast.success("Dismissed. Its log stays on disk."); if (selected === id) setSelected(null); }
+    refresh();
+    focusLane();
+  };
 
   const detailBody = current && (
-    <DetailBody s={current} onClose={() => setSelected(null)} onChanged={refresh} />
+    <DetailBody s={current} onClose={closeDetail} onChanged={refresh} onDismissed={() => dismiss(current.id)} />
   );
 
   return (
@@ -119,8 +141,11 @@ export function App() {
                 Fleet {upd.version}
               </a>
             )}
+            {testMode && (
+              <Badge variant="warning" size="sm" title={TEST_NOTE} className="shrink-0">test mode</Badge>
+            )}
             {upd.hidden && upd.snap?.available && upd.dismissed && (
-              <Button size="sm" variant="ghost" onClick={upd.show}>Show update</Button>
+              <Button id="show-update" size="sm" variant="ghost" onClick={upd.show}>Show update</Button>
             )}
           </div>
           <InputGroup className="order-last w-full md:order-none md:ml-auto md:w-72">
@@ -135,21 +160,50 @@ export function App() {
             />
             <InputGroupAddon align="inline-end"><Kbd>/</Kbd></InputGroupAddon>
           </InputGroup>
-          <div className="ml-auto flex items-center gap-2 md:ml-0">
+          <div className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-2 md:ml-0">
+            <Popover open={inboxOpen} onOpenChange={setInboxOpen}>
+              <PopoverTrigger
+                aria-label={`Needs you, ${needsCount}`}
+                className={cn(
+                  "inline-flex h-9 cursor-pointer items-center gap-2 whitespace-nowrap rounded-control border px-3 text-sm font-medium outline-none transition-colors duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-blue",
+                  needsCount ? "border-unread text-unread hover:bg-pill-pro-bg" : "border-hairline text-ink hover:bg-raised",
+                )}
+              >
+                Needs you
+                <span className="font-mono text-xs tabular-nums">{needsCount}</span>
+              </PopoverTrigger>
+              <PopoverContent align="end" sideOffset={8} className="w-full max-w-[380px] rounded-dialog border border-hairline bg-surface p-0 text-ink shadow-lift">
+                <div className="p-4">
+                  <h2 className="font-heading text-lg font-light text-ink">Needs you</h2>
+                  <p className="mt-1 text-sm leading-relaxed text-ink-2">Sessions that need a person: a failed check, a refused merge, a stopped or timed-out run.</p>
+                </div>
+                <div className="max-h-[60dvh] overflow-y-auto border-t border-hairline">
+                  {needsAll.length === 0 && (
+                    <p className="p-4 text-sm text-ink-2">Nothing needs you right now. Failed checks and stopped runs appear here with the reason.</p>
+                  )}
+                  {needsAll.map((s) => (
+                    <div key={s.id} className="border-t border-hairline p-4 first:border-t-0">
+                      <p className="font-medium text-ink">{s.task}</p>
+                      <p className="mt-1 text-sm leading-relaxed text-unread">{s.reason || "needs you"}</p>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <Button size="sm" variant="outline" onClick={() => open(s.id)}>View session</Button>
+                        <Button size="sm" onClick={() => retry(s.id)}>Retry</Button>
+                      </div>
+                      {inboxErr[s.id] && <p role="alert" className="mt-2 text-sm text-unread">{inboxErr[s.id]}</p>}
+                    </div>
+                  ))}
+                </div>
+                <div className="border-t border-hairline p-3 text-right">
+                  <Button size="sm" variant="ghost" onClick={() => { setInboxOpen(false); focusLane(); }}>Go to Needs you</Button>
+                </div>
+              </PopoverContent>
+            </Popover>
             <span data-answers-via="4">
               <NewSession policy={policy} onHanded={(id) => { setSelected(id); refresh(); }} />
             </span>
             <Tooltip>
               <TooltipTrigger
-                render={
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    id="settings-open"
-                    aria-label="Engines and settings"
-                    onClick={() => setSettingsOpen(true)}
-                  />
-                }
+                render={<Button variant="outline" size="icon" id="settings-open" aria-label="Engines and settings" onClick={() => setSettingsOpen(true)} />}
               >
                 <Cpu className="size-4" strokeWidth={1.5} aria-hidden />
               </TooltipTrigger>
@@ -176,17 +230,21 @@ export function App() {
         <section aria-label="Scan" className="grid grid-cols-2 border-b border-hairline md:grid-cols-[repeat(4,minmax(0,1fr))_minmax(0,1.7fr)]">
           <Reading label="Sessions" value={all.length} />
           <Reading label="Needs you" value={needsCount} tone={needsCount ? "bad" : undefined} />
-          <div className="flex items-center justify-between gap-3 border-r border-hairline px-4 py-3 md:block">
-            <Reading label="Working" value={workingCount} inline />
-            <span className="md:mt-2 md:block">
-              <AvatarStack>
-                {all.filter((s) => s.bucket === "working").slice(0, 4).map((s) => (
-                  <Avatar key={s.id} className="size-6 ring-2 ring-surface">
-                    <AvatarFallback className="text-xs">{(s.engine || s.agent || "a").slice(0, 1).toUpperCase()}</AvatarFallback>
-                  </Avatar>
-                ))}
-              </AvatarStack>
-            </span>
+          <div className="min-w-0 border-r border-hairline">
+            <Reading label="Working" value={workingCount} />
+            <div className="mt-2 min-h-6 px-4 pb-3">
+              {workingAll.length >= 2 ? (
+                <AvatarStack>
+                  {workingAll.slice(0, 4).map((s) => (
+                    <Avatar key={s.id} className="size-6 ring-2 ring-surface">
+                      <AvatarFallback className="text-xs">{(s.engine || s.agent || "a").slice(0, 1).toUpperCase()}</AvatarFallback>
+                    </Avatar>
+                  ))}
+                </AvatarStack>
+              ) : workingAll.length === 1 ? (
+                <p className="truncate font-mono text-xs text-ink-2">running {workingAll[0].engine || workingAll[0].agent || "agent"}</p>
+              ) : null}
+            </div>
           </div>
           <Reading label="Verified" value={verifiedCount} tone={verifiedCount ? "good" : undefined} />
           <div className="col-span-2 flex min-w-0 flex-col justify-center gap-2 px-4 py-3 md:col-span-1">
@@ -216,22 +274,40 @@ export function App() {
 
         <div className="flex min-h-0 flex-1">
           <div className="min-w-0 flex-1">
-            <div className="p-4 md:p-6">
-              <HeroReceipt s={hero} onOpen={open} newSession={<NewSession policy={policy} onHanded={(id) => { setSelected(id); refresh(); }} />} />
-            </div>
+            {hero && (
+              <HeroReceipt s={hero} onOpen={open} onRetry={retry} onDismiss={dismiss} />
+            )}
 
-            <div className="grid gap-px border-y border-hairline bg-hairline md:grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)_minmax(0,1fr)]">
-                <Lane id="needs" label="Needs you" count={lanes.needs.length} empty="Nothing needs you. Failed checks and stopped runs land here with the reason." answers="1">
-                  {lanes.needs.map((s) => <Card key={s.id} s={s} selected={selected === s.id} onOpen={() => open(s.id)} />)}
-                </Lane>
-                <Lane id="working" label="Working" count={lanes.working.length} empty="No agent is running right now." answers="2">
-                  {lanes.working.map((s) => <Card key={s.id} s={s} selected={selected === s.id} onOpen={() => open(s.id)} />)}
-                </Lane>
-                <Lane id="done" label="Done" count={lanes.done.length} empty="Work appears here once its check passes, with the check line as its receipt." answers="3">
-                  {lanes.done.map((s) => <Card key={s.id} s={s} selected={selected === s.id} onOpen={() => open(s.id)} />)}
-                </Lane>
+            <div className="grid gap-px border-b border-hairline bg-hairline md:grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)_minmax(0,1fr)]">
+              {sessions === null ? (
+                <>
+                  <LaneSkeleton label="Needs you" cards={2} />
+                  <LaneSkeleton label="Working" cards={1} />
+                  <LaneSkeleton label="Done" cards={2} />
+                </>
+              ) : (
+                <>
+                  <Lane id="needs" label="Needs you" count={lanes.needs.length} empty="Nothing needs you. Failed checks and stopped runs land here with the reason." answers="1">
+                    {lanes.needs.map((s) => s.id === hero?.id
+                      ? <ShownAbove key={s.id} s={s} onOpen={() => open(s.id)} />
+                      : <Card key={s.id} s={s} selected={selected === s.id} onOpen={() => open(s.id)} />)}
+                  </Lane>
+                  <Lane id="working" label="Working" count={lanes.working.length} empty="No agent is running right now." answers="2">
+                    {lanes.working.map((s) => s.id === hero?.id
+                      ? <ShownAbove key={s.id} s={s} onOpen={() => open(s.id)} />
+                      : <Card key={s.id} s={s} selected={selected === s.id} onOpen={() => open(s.id)} />)}
+                  </Lane>
+                  <Lane id="done" label="Done" count={lanes.done.length} empty="Work appears here once its check passes, with the check line as its receipt." answers="3">
+                    {lanes.done.map((s) => s.id === hero?.id
+                      ? <ShownAbove key={s.id} s={s} onOpen={() => open(s.id)} />
+                      : <Card key={s.id} s={s} selected={selected === s.id} onOpen={() => open(s.id)} />)}
+                  </Lane>
+                </>
+              )}
             </div>
-            {sessions === null && <p className="px-4 pt-3 text-sm text-ink-2 md:px-6">Loading the board.</p>}
+            {sessions !== null && all.length === 0 && (
+              <p className="px-4 py-4 text-sm text-ink-2 md:px-6">Hand out a task with New session. Each one runs in its own worktree, and its check decides whether it is done.</p>
+            )}
           </div>
 
           {wide && current && (
@@ -242,7 +318,7 @@ export function App() {
         </div>
 
         {!wide && (
-          <Drawer.Root open={!!current} onOpenChange={(o) => { if (!o) setSelected(null); }}>
+          <Drawer.Root open={!!current} onOpenChange={(o) => { if (!o) closeDetail(); }}>
             <Drawer.Portal>
               <Drawer.Overlay className="fixed inset-0 z-40 bg-canvas/60" />
               <Drawer.Content className="fixed inset-x-0 bottom-0 z-50 flex max-h-[92dvh] flex-col rounded-t-panel border-t border-hairline bg-surface text-ink outline-none">
@@ -281,7 +357,7 @@ export function App() {
                       </li>
                     ))}
                   </ul>
-                  <p className="mt-2 text-xs text-ink-3">Test mode: a script stands in for a coding agent, so nothing here used a real model.</p>
+                  <p className="mt-2 text-xs text-ink-3">{TEST_NOTE}</p>
                 </section>
                 <section className="border-t border-hairline pt-5">
                   <h2 className="mb-2 text-sm font-medium text-ink">Version and updates</h2>
@@ -302,9 +378,9 @@ export function App() {
   );
 }
 
-function Reading({ label, value, tone, inline }: { label: string; value: number; tone?: "bad" | "good"; inline?: boolean }) {
+function Reading({ label, value, tone }: { label: string; value: number; tone?: "bad" | "good" }) {
   return (
-    <div className={cn("border-r border-hairline px-4 py-3", inline && "border-r-0 p-0")}>
+    <div className="border-r border-hairline px-4 py-3 last:border-r-0">
       <p className="text-sm text-ink-2">{label}</p>
       <div className={cn("mt-1 border-l-2 font-heading text-[28px] font-light leading-none tabular-nums", tone === "bad" ? "border-unread pl-2 text-unread" : tone === "good" ? "border-blue pl-2 text-ink" : "border-transparent pl-0 text-ink")}>
         <SlidingNumber value={value} />
@@ -317,7 +393,7 @@ function Lane({ id, label, count, empty, answers, children }: { id: string; labe
   return (
     <section id={`lane-${id}`} aria-labelledby={`lane-${id}-h`} data-answers={answers} className="flex min-w-0 flex-col gap-3 bg-canvas p-4 md:p-5">
       <div className="flex items-center gap-2">
-        <h2 id={`lane-${id}-h`} className="text-base font-medium text-ink">{label}</h2>
+        <h2 id={`lane-${id}-h`} tabIndex={-1} className="text-base font-medium text-ink outline-none">{label}</h2>
         <Pill className="ml-auto bg-track px-2 py-0.5 font-mono text-xs tabular-nums text-ink-2">{count}</Pill>
       </div>
       {count === 0 ? (
@@ -325,6 +401,15 @@ function Lane({ id, label, count, empty, answers, children }: { id: string; labe
       ) : (
         <div className="flex flex-col gap-2.5">{children}</div>
       )}
+    </section>
+  );
+}
+
+function LaneSkeleton({ label, cards }: { label: string; cards: number }) {
+  return (
+    <section aria-label={`${label}, loading`} className="flex min-w-0 flex-col gap-3 bg-canvas p-4 md:p-5">
+      <div className="flex items-center gap-2"><span className="h-5 w-24 rounded-control bg-track" /></div>
+      {Array.from({ length: cards }, (_, i) => <div key={i} className="h-[92px] rounded-card border border-hairline bg-track/60" />)}
     </section>
   );
 }
@@ -340,18 +425,47 @@ function Card({ s, selected, onOpen }: { s: Session; selected: boolean; onOpen: 
 function NewSession({ policy, onHanded }: { policy: Policy | null; onHanded: (id: string) => void }) {
   return (
     <MorphingDialog transition={glide}>
-      <MorphingDialogTrigger
-        className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-control bg-blue px-3.5 text-sm font-medium text-blue-fg outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:bg-blue-hover focus-visible:ring-2 focus-visible:ring-blue focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-      >
+      <MorphingDialogTrigger className="inline-flex h-9 cursor-pointer items-center gap-2 whitespace-nowrap rounded-control bg-blue px-3.5 text-sm font-medium text-blue-fg outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:bg-blue-hover focus-visible:ring-2 focus-visible:ring-blue focus-visible:ring-offset-2 focus-visible:ring-offset-surface">
         <Plus className="size-4" strokeWidth={1.5} aria-hidden />
         <span>New session</span>
       </MorphingDialogTrigger>
       <MorphingDialogContainer>
-        <MorphingDialogContent className="relative flex max-h-[calc(100dvh-32px)] w-[min(560px,calc(100vw-24px))] flex-col overflow-hidden rounded-dialog border border-hairline bg-surface text-ink">
+        <MorphingDialogContent className="relative flex max-h-[calc(100dvh-32px)] w-full max-w-[560px] flex-col overflow-hidden rounded-dialog border border-hairline bg-surface text-ink">
           <Composer policy={policy} onHanded={onHanded} />
         </MorphingDialogContent>
       </MorphingDialogContainer>
     </MorphingDialog>
+  );
+}
+
+/** Agent choice from the house parts: a SegmentedControl for up to three agents, else a popover list. */
+function AgentPicker({ agents, value, onChange, testDefault }: { agents: Agent[]; value: string; onChange: (v: string) => void; testDefault: boolean }) {
+  const items = ["", ...agents.filter((a) => a.found).map((a) => a.name)];
+  const label = (v: string) => (v ? v : testDefault ? "Test script" : "Default");
+  if (items.length <= 3) {
+    return (
+      <SegmentedControl aria-label="Agent" size="sm">
+        {items.map((v) => (
+          <SegmentedControlItem key={v || "default"} aria-pressed={value === v} data-checked={value === v ? "" : undefined} onClick={() => onChange(v)}>
+            {label(v)}
+          </SegmentedControlItem>
+        ))}
+      </SegmentedControl>
+    );
+  }
+  return (
+    <Popover>
+      <PopoverTrigger className="inline-flex h-9 w-full cursor-pointer items-center justify-between rounded-control border border-input bg-canvas px-3 text-sm text-ink outline-none focus-visible:ring-2 focus-visible:ring-blue">
+        {label(value)}
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-64 rounded-control border border-hairline bg-surface p-1 text-ink">
+        {items.map((v) => (
+          <button key={v || "default"} type="button" aria-pressed={value === v} onClick={() => onChange(v)} className={cn("flex h-9 w-full items-center rounded-sm px-2.5 text-left text-sm outline-none hover:bg-raised focus-visible:ring-2 focus-visible:ring-blue", value === v && "font-medium")}>
+            {label(v)}
+          </button>
+        ))}
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -409,11 +523,7 @@ function Composer({ policy, onHanded }: { policy: Policy | null; onHanded: (id: 
   };
 
   return (
-    <form
-      className="flex min-h-0 flex-col"
-      noValidate
-      onSubmit={(e) => { e.preventDefault(); submit(); }}
-    >
+    <form className="flex min-h-0 flex-col" noValidate onSubmit={(e) => { e.preventDefault(); submit(); }}>
       <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-6">
         <MorphingDialogTitle className="font-heading text-xl font-light text-ink">New session</MorphingDialogTitle>
         <MorphingDialogDescription className="text-sm leading-relaxed text-ink-2">
@@ -421,30 +531,31 @@ function Composer({ policy, onHanded }: { policy: Policy | null; onHanded: (id: 
         </MorphingDialogDescription>
 
         <Field id="repo" label="Repo path" hint="The folder of a git repository, for example /home/you/projects/app." err={repoErr}>
-          <Input ref={repoRef} id="repo" value={repo} onChange={(e) => setRepo(e.target.value)} autoComplete="off" aria-invalid={!!repoErr} />
+          <InputGroup>
+            <InputGroupInput ref={repoRef} id="repo" value={repo} onChange={(e) => setRepo(e.target.value)} autoComplete="off" aria-invalid={!!repoErr} />
+          </InputGroup>
         </Field>
         <Field id="project" label="Project" hint="The policy file names this project and its check. Leave it as it is unless your policy names another.">
-          <Input id="project" value={project} onChange={(e) => setProject(e.target.value)} autoComplete="off" />
+          <InputGroup>
+            <InputGroupInput id="project" value={project} onChange={(e) => setProject(e.target.value)} autoComplete="off" />
+          </InputGroup>
         </Field>
         <Field id="agent" label="Agent" hint={testDefault ? "Default agent: a test script (no real model). Engines lists what is installed." : "Only agents found on this machine are listed. Engines shows what is installed."}>
-          <select
-            id="agent"
-            value={agent}
-            onChange={(e) => setAgent(e.target.value)}
-            className="block h-9 w-full rounded-control border border-input bg-canvas px-3 text-sm text-ink outline-none focus-visible:ring-2 focus-visible:ring-blue"
-          >
-            <option value="">{testDefault ? "Default agent: a test script (no real model)" : "Default agent"}</option>
-            {(policy?.agents ?? []).filter((a) => a.found).map((a) => <option key={a.name} value={a.name}>{a.name}</option>)}
-          </select>
+          <AgentPicker agents={policy?.agents ?? []} value={agent} onChange={setAgent} testDefault={testDefault} />
         </Field>
         <Field id="task" label="Task" hint="Say what the agent should change, in one or two sentences. Ctrl+Enter or Cmd+Enter hands it out.">
           <Textarea ref={taskRef} id="task" rows={3} value={task} onChange={(e) => setTask(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(); } }} aria-invalid={!task.trim() && !!formErr} />
         </Field>
         <Field id="check" label="Check command (optional)" hint="Leave it empty to use the project’s check from the policy file. Its output becomes the receipt.">
-          <Input id="check" value={check} onChange={(e) => setCheck(e.target.value)} autoComplete="off" />
+          <InputGroup>
+            <InputGroupInput id="check" value={check} onChange={(e) => setCheck(e.target.value)} autoComplete="off" placeholder="cargo test" />
+          </InputGroup>
+          <p className="text-xs text-ink-3">Example: <Kbd>cargo test</Kbd></p>
         </Field>
         <Field id="next" label="Then (optional)" hint="Starts on its own only when this session is verified done.">
-          <Input id="next" value={next} onChange={(e) => setNext(e.target.value)} placeholder="The next task in the chain" autoComplete="off" />
+          <InputGroup>
+            <InputGroupInput id="next" value={next} onChange={(e) => setNext(e.target.value)} placeholder="The next task in the chain" autoComplete="off" />
+          </InputGroup>
         </Field>
       </div>
       <div className="flex flex-col gap-3 border-t border-hairline bg-surface px-6 py-4">

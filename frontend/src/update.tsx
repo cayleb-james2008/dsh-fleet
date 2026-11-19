@@ -67,6 +67,7 @@ export function useUpdate() {
     const v = snap?.latest || "";
     try { localStorage.setItem(DISMISS_KEY, v); } catch { /* keep it for this view only */ }
     setDismissed(v);
+    setTimeout(() => document.getElementById("show-update")?.focus(), 60);
   };
   const show = () => {
     try { localStorage.removeItem(DISMISS_KEY); } catch { /* nothing stored */ }
@@ -143,7 +144,7 @@ type U = ReturnType<typeof useUpdate>;
 /** The slim strip under the top bar. Results are read out through its live region; errors stay on screen. */
 export function UpdateStrip({ u }: { u: U }) {
   const statusRef = useRef<HTMLParagraphElement>(null);
-  useEffect(() => { if (u.busy) statusRef.current?.focus(); }, [u.busy]);
+  useEffect(() => { if (u.busy || u.restarting) statusRef.current?.focus(); }, [u.busy, u.restarting]);
   if (u.hidden) return null;
   const s = u.snap || {};
   const canApply = !!s.can_apply && onThisMachine();
@@ -162,7 +163,7 @@ export function UpdateStrip({ u }: { u: U }) {
           </p>
           <div className="ml-auto flex flex-wrap items-center gap-2">
             {canApply ? (
-              <Button size="sm" onClick={u.apply} disabled={u.busy}>Update now</Button>
+              <div className="flex flex-col items-end gap-1"><Button size="sm" onClick={u.apply} disabled={u.busy}>Update now</Button><p className="max-w-xs text-right text-xs text-ink-3">Update now downloads it, checks it, and replaces this app. Restart to start using it.</p></div>
             ) : (
               <p className="text-sm text-ink-2">
                 {onThisMachine()
