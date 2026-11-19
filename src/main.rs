@@ -2333,22 +2333,8 @@ fn retry_prompt_text(
                 String::from_utf8_lossy(&out.stderr)
             );
             *detail = raw.trim().to_string();
-            if raw.contains("identity unknown")
-                || raw.contains("Please tell me who you are")
-                || raw.contains("auto-detection is disabled")
-            {
-                return Err("Git has no name and email for the merge commit. Set them with git config user.name and git config user.email in this repo, then merge again. Nothing was merged.".to_string());
-            }
-            if raw.contains("CONFLICT") {
-                let files: Vec<&str> = raw
-                    .lines()
-                    .filter_map(|l| l.split_once("Merge conflict in ").map(|(_, f)| f.trim()))
-                    .collect();
-                return Err(if files.is_empty() {
-                    "Merge conflict. Nothing was merged.".to_string()
-                } else {
-                    format!("Merge conflict in {}. Nothing was merged.", files.join(", "))
-                });
+            if let Some(plain) = plain_merge_refusal(&raw) {
+                return Err(plain);
             }
             let lines: Vec<&str> = raw
                 .lines()
@@ -3240,6 +3226,30 @@ fn main() {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Git's refusal text for a merge, in plain words, for the two cases
+/// the operator can act on: a missing committer identity and a content
+/// conflict. Anything else is described by the caller from git's own lines.
+fn plain_merge_refusal(raw: &str) -> Option<String> {
+    if raw.contains("identity unknown")
+        || raw.contains("Please tell me who you are")
+        || raw.contains("auto-detection is disabled")
+    {
+        return Some("Git has no name and email for the merge commit. Set them with git config user.name and git config user.email in this repo, then merge again. Nothing was merged.".to_string());
+    }
+    if raw.contains("CONFLICT") {
+        let files: Vec<&str> = raw
+            .lines()
+            .filter_map(|l| l.split_once("Merge conflict in ").map(|(_, f)| f.trim()))
+            .collect();
+        return Some(if files.is_empty() {
+            "Merge conflict. Nothing was merged.".to_string()
+        } else {
+            format!("Merge conflict in {}. Nothing was merged.", files.join(", "))
+        });
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3630,42 +3640,20 @@ mod tests {
         assert_eq!(body["error"], "Merge conflict in README.md. Nothing was merged.", "{body}");
         assert!(body["detail"].as_str().unwrap_or("").contains("CONFLICT"), "{body}");
 
-        // A merge commit with no identity configured: the refusal names
-        // the two settings to fix. Global config is switched off for
-        // this process so the outcome does not depend on the machine.
-        let dir2 = std::env::temp_dir().join(format!("fleet-f4b-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir2);
-        std::fs::create_dir_all(&dir2).unwrap();
-        let repo2 = git_repo(&dir2);
-        git_run(&repo2, &["config", "user.useConfigOnly", "true"]);
-        git_run(&repo2, &["checkout", "-b", "fleet/s1"]);
-        std::fs::write(repo2.join("new.txt"), "new\n").unwrap();
-        git_run(&repo2, &["add", "-A"]);
-        git_run(&repo2, &["commit", "-m", "branch"]);
-        let pin2 = git_run(&repo2, &["rev-parse", "HEAD"]);
-        git_run(&repo2, &["checkout", "main"]);
-        std::fs::write(repo2.join("other.txt"), "other\n").unwrap();
-        git_run(&repo2, &["add", "-A"]);
-        git_run(&repo2, &["commit", "-m", "main"]);
-        let mut s2 = test_session("s2", Status::Done, &dir2);
-        s2.repo = repo2.to_string_lossy().to_string();
-        s2.branch = "fleet/s1".to_string();
-        s2.verified_commit = Some(pin2);
-        let app2 = test_app(dir2.join("data"), vec![s2]);
-        std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
-        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
-        let resp = handle(&app2, "POST", "/api/sessions/s2/merge", "{}");
-        assert!(resp.starts_with("HTTP/1.1 409"), "{}", resp.lines().next().unwrap_or(""));
-        let body = response_body(&resp);
-        let msg = body["error"].as_str().unwrap_or("");
-        assert!(msg.contains("git config user.name") && msg.contains("git config user.email"), "{body}");
-        assert!(body["detail"].as_str().unwrap_or("").contains("identity unknown"), "{body}");
+        // A merge commit with no identity configured: git's own words map to a
+        // plain sentence naming the two settings (pure mapping: no process-wide
+        // environment is touched, so tests that run git elsewhere cannot race).
+        let identity_raw = "Committer identity unknown\n\n*** Please tell me who you are.\n\nRun\n\n  git config --global user.email \"you@example.com\"\n  git config --global user.name \"Your Name\"\n";
+        let msg = plain_merge_refusal(identity_raw).unwrap_or_default();
+        assert!(msg.contains("git config user.name") && msg.contains("git config user.email"), "{msg}");
+        assert!(plain_merge_refusal("Auto-merging a.txt\nCONFLICT (content): Merge conflict in a.txt\n").unwrap().contains("Merge conflict in a.txt"));
+        assert!(plain_merge_refusal("fatal: something else").is_none());
+        let app2 = test_app(dir.join("data2"), vec![test_session("s2", Status::Done, &dir)]);
 
         // An unknown session is a 404, as GET answers.
         let resp = handle(&app2, "POST", "/api/sessions/nope/merge", "{}");
         assert!(resp.starts_with("HTTP/1.1 404"), "{}", resp.lines().next().unwrap_or(""));
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]
@@ -3814,7 +3802,7 @@ mod tests {
         let cases = [("ok", "true"), ("bad", "echo x; exit 3"), ("quiet", "false")];
         let mut sessions = Vec::new();
         for (id, check) in cases {
-            let mut s = test_session(id, Status::Queued, &dir);
+            let mut s = test_session(id, Status::Working, &dir);
             s.repo = repo.clone();
             s.agent = agent.clone();
             s.check_cmd = check.to_string();
@@ -3831,7 +3819,6 @@ mod tests {
         sessions.push(idle);
         let app = test_app(dir.join("data"), sessions);
         for (id, _) in cases {
-            app.set_status(id, Status::Working);
             app.run_session(id);
         }
         let get = |id: &str| response_body(&handle(&app, "GET", &format!("/api/sessions/{id}"), ""));
