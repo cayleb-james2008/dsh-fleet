@@ -29,6 +29,7 @@ Operate. Scanability, consistency and honest status outrank expression.
 - Familiar shell: session sidebar + selected session's thread, one composer.
 - Light and dark themes, toggle in settings, dark is the default.
 - Icons are drawn symbols, never letters, never emoji.
-- Status words are plain: queued, working, checking, done, needs you, merged.
+- Status words are plain: queued, working, checking, done, needs you, merged;
+  a needs-you session the operator dismisses leaves the board as archived.
 - A claim on screen must be true of the system behind it (an agent that is
   not installed is shown as not installed; a check that failed says failed).

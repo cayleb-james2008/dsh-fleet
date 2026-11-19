@@ -51,7 +51,7 @@ wait_status 1 needs-you
 inbox=$(api /api/inbox)
 n=$(echo "$inbox" | jq 'length')
 [ "$n" = "2" ] || { echo "FAIL: inbox holds $n entries, expected 2: $inbox"; exit 1; }
-echo "$inbox" | jq -e '.[] | select(.task=="alpha task") | select(.reason | test("check failed"))' >/dev/null \
+echo "$inbox" | jq -e '.[] | select(.task=="alpha task") | select(.reason | test("[Cc]heck failed"))' >/dev/null \
   || { echo "FAIL: alpha's inbox reason does not name the failed check: $inbox"; exit 1; }
 echo "$inbox" | jq -e '.[] | select(.task=="crash task") | select(.reason | test("agent exited"))' >/dev/null \
   || { echo "FAIL: crash's inbox reason does not name the agent exit: $inbox"; exit 1; }

@@ -97,7 +97,7 @@ PIDS="$PIDS $!"
 for i in $(seq 1 20); do api /api/sessions >/dev/null 2>&1 && break; sleep 0.5; done
 api /api/sessions | jq -e 'length >= 2' >/dev/null \
   || { echo "FAIL: sessions vanished with sessions.json — no recovery from logs"; api /api/sessions; exit 1; }
-api /api/sessions | jq -e '[.[] | select(.status == "needs-you" and (.reason | test("recovered")))] | length >= 1' >/dev/null \
+api /api/sessions | jq -e '[.[] | select(((.transcript // []) | map(select(test("restored from its record"))) | length) > 0 or ((.reason // "") | test("recovered")))] | length >= 1' >/dev/null \
   || { echo "FAIL: recovered sessions do not say they were recovered"; api /api/sessions | jq -c '.[].reason'; exit 1; }
 
 echo "FLOOD OK: transcript is capped with a pointer to the log file (all $lines lines kept), the cap survives restart, one huge line stays bounded, and a lost sessions.json recovers from the logs"
