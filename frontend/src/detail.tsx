@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { glide } from "@/motion";
 import { cn } from "@/lib/utils";
-import { diffStat, HONEST, isHonest, isVerified, postJson, receiptLine, statusText, type Session } from "./api";
+import { diffStat, HONEST, isFailed, isHonest, isVerified, postJson, receiptLine, statusText, type Session } from "./api";
 import { toast } from "sonner";
 import { Expandable, ExpandableContent, ExpandableTrigger } from "@/components/ui/expandable";
 
@@ -111,7 +111,7 @@ export function DetailBody({ s, onClose, onChanged, onDismissed }: { s: Session;
   return (
     <div className="flex min-h-0 flex-col gap-5">
       <div className="flex items-center gap-2">
-        <Badge variant={verified ? "success" : s.bucket === "needs-you" ? "error" : s.bucket === "done" ? "success" : "secondary"} size="sm">
+        <Badge variant={verified ? "success" : isFailed(s) ? "error" : s.bucket === "needs-you" ? "info" : s.bucket === "done" ? "success" : "secondary"} size="sm">
           {verified ? "verified" : statusText(s)}
         </Badge>
         <Button variant="ghost" size="sm" className="ml-auto" onClick={onClose} aria-label="Close this session">
@@ -142,13 +142,13 @@ export function DetailBody({ s, onClose, onChanged, onDismissed }: { s: Session;
 
       {verified && (
         <section aria-label="Receipt" className="relative rounded-card border border-hairline bg-canvas p-4">
-          <p className="border-l-2 border-blue pl-2 font-medium text-ink">Check passed: verified done</p>
+          <p className="border-l-2 border-dot-green pl-2 font-medium text-ink">Check passed: verified done</p>
           <p className="mt-2 font-mono text-sm text-ink">{receiptLine(s)}</p>
           <p className="mt-1 font-mono text-xs text-ink-3">Check: {s.check_cmd || ""}</p>
           <Expandable expandDirection="vertical" expandBehavior="push" className="mt-3">
             {({ isExpanded }) => (
               <>
-                <ExpandableTrigger aria-label="Details of the check output" className="cursor-pointer rounded-control text-sm text-ink-2 outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-blue">
+                <ExpandableTrigger aria-label="Details of the check output" className="cursor-pointer rounded-control text-sm text-ink-2 outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-ring">
                   {isExpanded ? "Hide details" : "Details"}
                 </ExpandableTrigger>
                 <ExpandableContent preset="fade">
@@ -160,7 +160,7 @@ export function DetailBody({ s, onClose, onChanged, onDismissed }: { s: Session;
         </section>
       )}
       {s.status === "needs-you" && s.reason && !honest && (
-        <p role="status" className="rounded-card bg-pill-pro-bg p-3 text-unread">{s.reason}</p>
+        <p role="status" className={cn("rounded-card p-3", isFailed(s) ? "bg-pill-pro-bg" : "bg-blue-soft", isFailed(s) ? "text-destructive-foreground" : "text-info-foreground")}>{s.reason}</p>
       )}
 
       {act && (
@@ -188,15 +188,15 @@ export function DetailBody({ s, onClose, onChanged, onDismissed }: { s: Session;
           )}
         </div>
       )}
-      {mergeOk && <p role="status" className="border-l-2 border-blue pl-2 text-sm text-ink">{mergeOk}</p>}
+      {mergeOk && <p role="status" className="border-l-2 border-dot-green pl-2 text-sm text-ink">{mergeOk}</p>}
       {s.merge_error && (
-        <div className="rounded-card bg-pill-pro-bg p-3 text-unread">
+        <div className="rounded-card bg-pill-pro-bg p-3 text-destructive-foreground">
           <p className="text-ink">{s.merge_error.message || "The merge was refused."}</p>
           {s.merge_error.detail && (
             <Expandable expandDirection="vertical" expandBehavior="push" className="mt-2">
               {({ isExpanded }) => (
                 <>
-                  <ExpandableTrigger aria-label="Details of the refused merge" className="cursor-pointer rounded-control text-sm outline-none focus-visible:ring-2 focus-visible:ring-blue">
+                  <ExpandableTrigger aria-label="Details of the refused merge" className="cursor-pointer rounded-control text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring">
                     {isExpanded ? "Hide details" : "Details"}
                   </ExpandableTrigger>
                   <ExpandableContent preset="fade">
@@ -208,7 +208,7 @@ export function DetailBody({ s, onClose, onChanged, onDismissed }: { s: Session;
           )}
         </div>
       )}
-      {err && <p role="alert" className="text-sm text-unread">{err}</p>}
+      {err && <p role="alert" className="text-sm text-destructive-foreground">{err}</p>}
 
       <div>
         <div role="tablist" aria-label="Session views" onKeyDown={onTabKey} className="inline-flex gap-0.5 rounded-control bg-track p-0.5">
@@ -226,7 +226,7 @@ export function DetailBody({ s, onClose, onChanged, onDismissed }: { s: Session;
               role="tab"
               aria-selected={tab === id}
               tabIndex={tab === id ? 0 : -1}
-              className="h-8 cursor-pointer rounded-sm px-3 text-sm font-medium text-ink-2 aria-[selected=true]:text-canvas outline-none transition-colors duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-blue data-[checked=true]:text-ink"
+              className="h-8 cursor-pointer rounded-sm px-3 text-sm font-medium text-ink-2 aria-[selected=true]:text-ink-button-fg outline-none transition-colors duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring data-[checked=true]:text-ink-button-fg"
             >
               {label}
             </button>
@@ -257,7 +257,7 @@ export function DetailBody({ s, onClose, onChanged, onDismissed }: { s: Session;
           )}
           {tab === "rc" && (
             <>
-              <p className={cn("mb-1 text-sm font-medium", ranCheck ? (s.check_passed ? "text-ink" : "text-unread") : "text-ink-2")}>
+              <p className={cn("mb-1 text-sm font-medium", ranCheck ? (s.check_passed ? "text-ink" : "text-destructive-foreground") : "text-ink-2")}>
                 {!ranCheck ? "No check has run yet." : s.check_passed ? "Passed." : `Failed${s.check_exit != null ? ` with exit code ${s.check_exit}` : ""}.`}
               </p>
               <p className="mb-2 font-mono text-xs text-ink-3">{ranCheck ? `Command: ${s.check_cmd || ""}` : s.check_cmd ? `Check command: ${s.check_cmd}` : ""}</p>

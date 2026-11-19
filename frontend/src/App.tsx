@@ -26,7 +26,7 @@ import { AvatarStack } from "@/components/kibo-ui/avatar-stack";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import { layout, glide } from "@/motion";
 import { cn } from "@/lib/utils";
-import { getJson, isVerified, postJson, type Agent, type Policy, type Session, statusText } from "./api";
+import { getJson, isFailed, isVerified, postJson, type Agent, type Policy, type Session, statusText } from "./api";
 import { DetailBody } from "./detail";
 import { HeroReceipt, ReceiptCard, ShownAbove } from "./receipt";
 import { resultLine as resultLineOf, UpdateStrip, useUpdate } from "./update";
@@ -35,8 +35,9 @@ type Theme = "dark" | "light";
 const THEME_KEY = "fleet-theme";
 const TEST_NOTE = "Test mode: a script stands in for a coding agent, so nothing here used a real model.";
 
+// Light is the default (owner colour and theme alignment); dark is the full second theme.
 function readTheme(): Theme {
-  try { return localStorage.getItem(THEME_KEY) === "light" ? "light" : "dark"; } catch { return "dark"; }
+  try { return localStorage.getItem(THEME_KEY) === "dark" ? "dark" : "light"; } catch { return "light"; }
 }
 
 export function App() {
@@ -221,7 +222,7 @@ export function App() {
                 className="h-6"
                 data={all.slice(0, 32).map((s) => ({
                   key: s.id,
-                  color: isVerified(s) ? "bg-blue" : s.bucket === "needs-you" ? "bg-unread" : s.status === "queued" ? "bg-dot-amber" : s.bucket === "working" ? "bg-ink-3" : "bg-track",
+                  color: isVerified(s) ? "bg-dot-green" : isFailed(s) ? "bg-unread" : s.bucket === "needs-you" ? "bg-dot-clay" : s.status === "queued" ? "bg-dot-amber" : s.bucket === "working" ? "bg-ink-3" : "bg-track",
                   tooltip: `${s.task}: ${statusText(s)}`,
                 }))}
               />
@@ -232,7 +233,7 @@ export function App() {
         </section>
 
         {unreachable && (
-          <p role="status" className="border-b border-hairline bg-pill-pro-bg px-4 py-2 text-sm text-unread md:px-6">
+          <p role="status" className="border-b border-hairline bg-pill-pro-bg px-4 py-2 text-sm text-destructive-foreground md:px-6">
             {lastGood
               ? `Cannot reach Fleet. Showing the last list from ${lastGood.toLocaleTimeString()}. Retrying.`
               : "Cannot reach Fleet. Retrying."}
@@ -355,7 +356,7 @@ function Reading({ label, value, tone }: { label: string; value: number; tone?: 
   return (
     <div className="border-r border-hairline px-4 py-3 last:border-r-0">
       <p className="text-sm text-ink-2">{label}</p>
-      <div className={cn("mt-1 border-l-2 font-heading text-[28px] font-light leading-none tabular-nums", tone === "bad" ? "border-unread pl-2 text-unread" : tone === "good" ? "border-blue pl-2 text-ink" : "border-transparent pl-0 text-ink")}>
+      <div className={cn("mt-1 border-l-2 font-heading text-[28px] font-light leading-none tabular-nums", tone === "bad" ? "border-unread pl-2 text-destructive-foreground" : tone === "good" ? "border-dot-green pl-2 text-ink" : "border-transparent pl-0 text-ink")}>
         <SlidingNumber value={value} />
       </div>
     </div>
@@ -402,7 +403,7 @@ function NewSession({ policy, onHanded, className }: { policy: Policy | null; on
   return (
     <span ref={wrap} className="contents">
     <MorphingDialog transition={glide}>
-      <MorphingDialogTrigger className={cn("inline-flex h-9 cursor-pointer items-center gap-2 whitespace-nowrap rounded-control bg-blue px-3.5 text-sm font-medium text-blue-fg outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:bg-blue-hover focus-visible:ring-2 focus-visible:ring-blue focus-visible:ring-offset-2 focus-visible:ring-offset-surface", className)}>
+      <MorphingDialogTrigger className={cn("inline-flex h-9 cursor-pointer items-center gap-2 whitespace-nowrap rounded-control bg-blue px-3.5 text-sm font-medium text-blue-fg outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:bg-blue-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface", className)}>
         <Plus className="size-4" strokeWidth={1.5} aria-hidden />
         <span>New session</span>
       </MorphingDialogTrigger>
@@ -437,12 +438,12 @@ function AgentPicker({ agents, value, onChange, testDefault }: { agents: Agent[]
   }
   return (
     <Popover>
-      <PopoverTrigger className="inline-flex h-9 w-full cursor-pointer items-center justify-between rounded-control border border-input bg-canvas px-3 text-sm text-ink outline-none focus-visible:ring-2 focus-visible:ring-blue">
+      <PopoverTrigger className="inline-flex h-9 w-full cursor-pointer items-center justify-between rounded-control border border-input bg-canvas px-3 text-sm text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring">
         {label(value)}
       </PopoverTrigger>
       <PopoverContent align="start" className="w-64 rounded-control border border-hairline bg-surface p-1 text-ink">
         {items.map((v) => (
-          <button key={v || "default"} type="button" aria-pressed={value === v} onClick={() => onChange(v)} className={cn("flex h-9 w-full items-center rounded-sm px-2.5 text-left text-sm outline-none hover:bg-raised focus-visible:ring-2 focus-visible:ring-blue", value === v && "font-medium")}>
+          <button key={v || "default"} type="button" aria-pressed={value === v} onClick={() => onChange(v)} className={cn("flex h-9 w-full items-center rounded-sm px-2.5 text-left text-sm outline-none hover:bg-raised focus-visible:ring-2 focus-visible:ring-ring", value === v && "font-medium")}>
             {label(v)}
           </button>
         ))}
@@ -542,9 +543,9 @@ function Composer({ policy, onHanded, onClosed }: { policy: Policy | null; onHan
         </Field>
       </div>
       <div className="flex flex-col gap-3 border-t border-hairline bg-surface px-6 py-4">
-        {formErr && <p role="alert" className="text-sm text-unread">{formErr}</p>}
+        {formErr && <p role="alert" className="text-sm text-destructive-foreground">{formErr}</p>}
         <div className="flex justify-end gap-2">
-          <MorphingDialogClose className="new-cancel static inline-flex h-9 cursor-pointer items-center rounded-control border border-hairline px-3.5 text-sm font-medium text-ink outline-none hover:bg-raised focus-visible:ring-2 focus-visible:ring-blue">Cancel</MorphingDialogClose>
+          <MorphingDialogClose className="new-cancel static inline-flex h-9 cursor-pointer items-center rounded-control border border-hairline px-3.5 text-sm font-medium text-ink outline-none hover:bg-raised focus-visible:ring-2 focus-visible:ring-ring">Cancel</MorphingDialogClose>
           <Button type="submit" disabled={busy}>Hand it out</Button>
         </div>
       </div>
@@ -558,7 +559,7 @@ function Field({ id, label, hint, err, children }: { id: string; label: string; 
       <label htmlFor={id} className="block text-sm font-medium text-ink">{label}</label>
       {children}
       <p className="text-xs leading-relaxed text-ink-3">{hint}</p>
-      {err && <p role="alert" className="text-sm text-unread">{err}</p>}
+      {err && <p role="alert" className="text-sm text-destructive-foreground">{err}</p>}
     </div>
   );
 }
@@ -574,8 +575,8 @@ function InboxPopover({ inbox, errs, onView, onRetry, onGo, side, className }: {
       <PopoverTrigger
         aria-label={`Needs you, ${n}`}
         className={cn(
-          "inline-flex h-9 cursor-pointer items-center gap-2 whitespace-nowrap rounded-control border px-3 text-sm font-medium outline-none transition-colors duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-blue",
-          n ? "border-unread text-unread hover:bg-pill-pro-bg" : "border-hairline text-ink hover:bg-raised",
+          "inline-flex h-9 cursor-pointer items-center gap-2 whitespace-nowrap rounded-control border px-3 text-sm font-medium outline-none transition-colors duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring",
+          n ? "border-unread text-destructive-foreground hover:bg-pill-pro-bg" : "border-hairline text-ink hover:bg-raised",
           className,
         )}
       >
@@ -592,12 +593,12 @@ function InboxPopover({ inbox, errs, onView, onRetry, onGo, side, className }: {
           {inbox.map((s) => (
             <div key={s.id} className="border-t border-hairline p-4 first:border-t-0">
               <p className="font-medium text-ink">{s.task}</p>
-              <p className="mt-1 text-sm leading-relaxed text-unread">{s.reason || "needs you"}</p>
+              <p className={cn("mt-1 text-sm leading-relaxed", isFailed(s) ? "text-destructive-foreground" : "text-info-foreground")}>{s.reason || "needs you"}</p>
               <div className="mt-3 flex flex-wrap gap-2">
                 <Button size="sm" variant="outline" onClick={() => { setOpen(false); onView(s.id); }}>View session</Button>
                 <Button size="sm" onClick={() => onRetry(s.id)}>Retry</Button>
               </div>
-              {errs[s.id] && <p role="alert" className="mt-2 text-sm text-unread">{errs[s.id]}</p>}
+              {errs[s.id] && <p role="alert" className="mt-2 text-sm text-destructive-foreground">{errs[s.id]}</p>}
             </div>
           ))}
         </div>

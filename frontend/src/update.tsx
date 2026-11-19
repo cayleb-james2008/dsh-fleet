@@ -184,7 +184,7 @@ export function UpdateStrip({ u }: { u: U }) {
           </div>
         </>
       )}
-      {u.live && <p role="status" aria-live="polite" className={u.liveBad ? "w-full text-sm text-unread" : "sr-only"}>{u.live}</p>}
+      {u.live && <p role="status" aria-live="polite" className={u.liveBad ? "w-full text-sm text-destructive-foreground" : "sr-only"}>{u.live}</p>}
       {u.live && u.liveBad && u.raw && <details className="w-full text-xs text-ink-3"><summary className="cursor-pointer">Details</summary><p className="mt-1 break-all">{u.raw}</p></details>}
     </section>
   );

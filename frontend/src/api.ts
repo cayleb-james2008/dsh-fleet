@@ -112,3 +112,5 @@ export function diffStat(d?: string) {
 export const HONEST = "Check passed — but this session needs you";
 export const isVerified = (s: Session) => s.check_passed === true && (s.status === "done" || s.status === "merged");
 export const isHonest = (s: Session) => s.check_passed === true && s.status === "needs-you";
+// A session whose check ran and failed: red. Other needs-you sessions (no check result, or a stop) are clay.
+export const isFailed = (s: Session) => s.status === "needs-you" && s.check_ran === true && s.check_passed === false;
