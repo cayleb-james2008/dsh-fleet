@@ -6,6 +6,8 @@
 //! Session policies (parallel cap, default checks) live in policies.rn and
 //! are executed through Rune — they drive behaviour, they are not metadata.
 
+mod update;
+
 use serde::Serialize;
 use std::os::unix::ffi::OsStrExt as _;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -528,6 +530,8 @@ struct App {
     /// endpoint sets it. In-memory only — a restart already lands
     /// every live session in needs-you with the reason stated.
     stops: Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    /// Version checks and self-update (see `update`).
+    updater: Arc<update::Updater>,
 }
 
 /// How a bounded run ended.
@@ -2716,6 +2720,112 @@ const MAX_TASK_BYTES: usize = 100_000;
 /// handler drops it — a stalled request must not hold a thread forever.
 const READ_TIMEOUT_SECS: u64 = 10;
 
+/// Answers one request: the Host, body-size, content-type and origin rules
+/// first, then the update routes, then the API.
+#[allow(clippy::too_many_arguments)]
+fn respond(
+    app: &Arc<App>,
+    allowed_hosts: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+    content_type: &str,
+    origin: &str,
+    host: &str,
+) -> String {
+    if method == "__headers_too_large__" {
+        error_response(431, "request headers are too large")
+    } else if !host_allowed(host, allowed_hosts) {
+        error_response(403, "this board answers only to its own host name")
+    } else if method == "__too_large__" {
+        error_response(413, "request body too large")
+    } else if method == "POST" && !content_type.starts_with("application/json") {
+        // A browser "simple request" (text/plain, no preflight) must never
+        // reach a handler: requiring JSON is what makes a drive-by POST from
+        // another site impossible.
+        error_response(415, "POST requires Content-Type: application/json")
+    } else if method == "POST" && !origin.is_empty() && !origin_is_local(origin) {
+        error_response(403, "cross-origin requests are refused")
+    } else {
+        let route = path.split('?').next().unwrap_or("");
+        update_route(app, method, route, host).unwrap_or_else(|| handle(app, method, path, body))
+    }
+}
+
+/// The version and self-update routes. Replacing the program, or starting the
+/// new one, is for whoever sits at this machine: a name from FLEET_ALLOWED_HOSTS
+/// does not count, only loopback does.
+fn update_route(app: &Arc<App>, method: &str, route: &str, host: &str) -> Option<String> {
+    Some(match (method, route) {
+        ("GET", "/api/version") => json_response(
+            200,
+            &serde_json::json!({"name": "fleet-rs", "version": env!("CARGO_PKG_VERSION")}).to_string(),
+        ),
+        ("GET", "/api/update") => json_response(200, &app.updater.snapshot().to_string()),
+        ("POST", "/api/update/check") => json_response(200, &app.updater.check_now().to_string()),
+        ("POST", "/api/update/apply") | ("POST", "/api/update/restart") => {
+            if !host_allowed(host, "") {
+                return Some(error_response(
+                    403,
+                    "updating is only allowed from this machine, not through a shared address",
+                ));
+            }
+            if route == "/api/update/apply" {
+                match app.updater.apply() {
+                    Ok(v) => {
+                        let mut snap = app.updater.snapshot();
+                        snap["applied"] = serde_json::json!(v);
+                        json_response(200, &snap.to_string())
+                    }
+                    Err(e) => error_response(409, &e),
+                }
+            } else {
+                restart_response(app)
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// Starts the staged build. Refused when nothing is staged, and while any
+/// session is queued, working or checking: a restart would send those to Needs
+/// you. The new process starts after this answer has been written.
+fn restart_response(app: &Arc<App>) -> String {
+    if app.updater.snapshot()["staged"].is_null() {
+        return error_response(409, "no update is waiting for a restart");
+    }
+    let busy = |app: &App| {
+        app.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| matches!(s.status.as_str(), "queued" | "working" | "checking"))
+            .count()
+    };
+    let running = busy(app);
+    if running > 0 {
+        return error_response(
+            409,
+            &format!(
+                "{running} session(s) are still queued, working or checking — a restart would send them to Needs you; wait for them or stop them, then restart"
+            ),
+        );
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        // Checked again at the last moment: a hand-out may have arrived.
+        if busy(&app) > 0 {
+            eprintln!("fleet-rs: restart cancelled — a session started while the update was waiting");
+            return;
+        }
+        if let Err(e) = app.updater.restart() {
+            eprintln!("fleet-rs: restart failed: {e}");
+        }
+    });
+    json_response(200, &serde_json::json!({"restarting": true}).to_string())
+}
+
 /// Serialize sessions for the API with queue positions computed in:
 /// a queued session's position is its place among the queued, in
 /// hand-out order. Non-queued sessions carry null.
@@ -2798,7 +2908,8 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 "model": app.policy.model,
                 "model_engine": "opencode",
                 "timeout_secs": app.policy.timeout_secs,
-                "source": app.policy_source
+                "source": app.policy_source,
+                "version": env!("CARGO_PKG_VERSION")
             })
             .to_string(),
         ),
@@ -3235,6 +3346,12 @@ fn load_persisted(data_dir: &Path) -> (Vec<Session>, u64) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Answered before anything else, in any argument position, so `--version`
+    // never reads the policies path.
+    if args.iter().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("fleet-rs {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -3253,9 +3370,20 @@ fn main() {
         .get(1)
         .cloned()
         .unwrap_or_else(|| "policies.rn".to_string());
-    let script = std::fs::read_to_string(&policy_path)
-        .unwrap_or_else(|e| panic!("cannot read policy script {policy_path}: {e}"));
-    let policy = Policy::load(&script).unwrap_or_else(|e| panic!("policy load failed: {e}"));
+    let script = match std::fs::read_to_string(&policy_path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("fleet-rs: cannot read the policies file {policy_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let policy = match Policy::load(&script) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("fleet-rs: the policies file {policy_path} is not valid: {e}");
+            std::process::exit(1);
+        }
+    };
     let data_dir = std::env::var("FLEET_DATA")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./fleet-data"));
@@ -3278,7 +3406,17 @@ fn main() {
         lines_since_persist: std::sync::atomic::AtomicU64::new(0),
         counter: Mutex::new(restored_counter),
         stops: Mutex::new(std::collections::HashMap::new()),
+        updater: update::Updater::from_env(
+            "FLEET",
+            "fleet-rs",
+            env!("CARGO_PKG_VERSION"),
+            "cayleb-james2008/dsh-fleet",
+            true,
+        ),
     });
+    // The periodic release check is started here, by the real binary only;
+    // tests never call out.
+    app.updater.start_background();
 
     // Recovery: a session that was mid-work when the server died cannot
     // honestly still be "working" — nobody is running it. Mark it
@@ -3375,28 +3513,7 @@ fn main() {
                     if let Some((method, path, body, content_type, origin, host)) =
                         read_request(&mut stream)
                     {
-                        let response = if method == "__headers_too_large__" {
-                            error_response(431, "request headers are too large")
-                        } else if !host_allowed(&host, &allowed_hosts) {
-                            error_response(403, "this board answers only to its own host name")
-                        } else if method == "__too_large__" {
-                            error_response(413, "request body too large")
-                        } else if method == "POST"
-                            && !content_type.starts_with("application/json")
-                        {
-                            // A browser "simple request" (text/plain,
-                            // no preflight) must never reach a handler:
-                            // requiring JSON is what makes a drive-by
-                            // POST from another site impossible.
-                            error_response(415, "POST requires Content-Type: application/json")
-                        } else if method == "POST"
-                            && !origin.is_empty()
-                            && !origin_is_local(&origin)
-                        {
-                            error_response(403, "cross-origin requests are refused")
-                        } else {
-                            handle(&app, &method, &path, &body)
-                        };
+                        let response = respond(&app, &allowed_hosts, &method, &path, &body, &content_type, &origin, &host);
                         let _ = stream.write_all(response.as_bytes());
                     }
                 });
@@ -3558,6 +3675,17 @@ mod tests {
             lines_since_persist: std::sync::atomic::AtomicU64::new(0),
             counter: Mutex::new(0),
             stops: Mutex::new(std::collections::HashMap::new()),
+            updater: update::Updater::new(update::Config {
+                bin: "fleet-rs",
+                current: env!("CARGO_PKG_VERSION"),
+                repo: "o/r".to_string(),
+                api: "http://127.0.0.1:1".to_string(),
+                mode: update::Mode::Notify,
+                exe: std::env::temp_dir().join("fleet-rs-test-no-such-binary"),
+                allow_dev: false,
+                may_apply: true,
+            })
+            .into(),
         });
         // Drive the same path the HTTP layer drives.
         let session = Session {
@@ -3607,6 +3735,17 @@ mod tests {
             lines_since_persist: std::sync::atomic::AtomicU64::new(0),
             counter: Mutex::new(0),
             stops: Mutex::new(std::collections::HashMap::new()),
+            updater: update::Updater::new(update::Config {
+                bin: "fleet-rs",
+                current: env!("CARGO_PKG_VERSION"),
+                repo: "o/r".to_string(),
+                api: "http://127.0.0.1:1".to_string(),
+                mode: update::Mode::Notify,
+                exe: std::env::temp_dir().join("fleet-rs-test-no-such-binary"),
+                allow_dev: false,
+                may_apply: true,
+            })
+            .into(),
         })
     }
 
@@ -4314,6 +4453,64 @@ mod tests {
         assert_eq!(get("on-main")["merge_target"], "main");
         assert!(get("detached")["merge_target"].is_null(), "{}", get("detached"));
         assert!(get("plain")["merge_target"].is_null(), "{}", get("plain"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn version_and_update_routes_are_local_only_and_gate_restart() {
+        let dir = std::env::temp_dir().join(format!("fleet-upd-ep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app = test_app(dir.join("data"), Vec::new());
+        let call = |method: &str, path: &str, host: &str, allowed: &str| {
+            respond(&app, allowed, method, path, "{}", "application/json", "", host)
+        };
+
+        let r = call("GET", "/api/version", "127.0.0.1:9840", "");
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        let v = response_body(&r);
+        assert_eq!(v["name"], "fleet-rs");
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        let p = response_body(&call("GET", "/api/policy", "127.0.0.1:9840", ""));
+        assert_eq!(p["version"], env!("CARGO_PKG_VERSION"));
+
+        // Looking at the update state fetches nothing.
+        let r = call("GET", "/api/update", "127.0.0.1:9840", "");
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        let u = response_body(&r);
+        assert_eq!(u["current"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(u["mode"], "notify");
+        assert_eq!(u["available"], false);
+        assert!(u["checked_at"].is_null(), "{u}");
+        assert!(u["latest"].is_null() && u["staged"].is_null(), "{u}");
+
+        // A name from FLEET_ALLOWED_HOSTS may look, never apply or restart.
+        for path in ["/api/update/apply", "/api/update/restart"] {
+            let r = call("POST", path, "lan-desk.local:9840", "lan-desk.local");
+            assert!(r.starts_with("HTTP/1.1 403"), "{path} through a shared name: {r}");
+        }
+        // A name nobody allowed is refused by the Host rule.
+        let r = call("GET", "/api/version", "evil.example", "");
+        assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+        // Restart with nothing staged is a plain refusal.
+        let r = call("POST", "/api/update/restart", "127.0.0.1:9840", "");
+        assert!(r.starts_with("HTTP/1.1 409"), "{r}");
+        assert!(response_body(&r)["error"].as_str().unwrap_or("").contains("no update is waiting"), "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restart_is_refused_while_a_session_is_working() {
+        let dir = std::env::temp_dir().join(format!("fleet-upd-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = test_app(dir.join("data"), vec![test_session("s1", Status::Working, &dir)]);
+        app.updater.stage_for_test("0.3.0");
+        let r = respond(&app, "", "POST", "/api/update/restart", "{}", "application/json", "", "127.0.0.1:9840");
+        assert!(r.starts_with("HTTP/1.1 409"), "{r}");
+        let msg = response_body(&r)["error"].as_str().unwrap_or("").to_string();
+        assert!(msg.contains("1 session(s) are still queued, working or checking"), "{msg}");
+        // Nothing was restarted: the session is still working.
+        assert_eq!(app.status_of("s1").as_deref(), Some("working"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
