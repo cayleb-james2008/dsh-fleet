@@ -842,6 +842,36 @@ impl App {
             .map(|s| s.status.clone())
     }
 
+    /// The session JSON for the API. Each distinct repo's merge target
+    /// is resolved with git outside the sessions lock, once per request;
+    /// the JSON is then built under the lock with no git calls in it. A
+    /// session that appears while the targets are being resolved is
+    /// picked up on the next pass.
+    fn sessions_view(&self) -> serde_json::Value {
+        let mut targets: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
+        loop {
+            let missing: Vec<String> = {
+                let sessions = self.sessions.lock().unwrap();
+                let mut repos: Vec<String> = sessions
+                    .iter()
+                    .filter(|s| !s.repo.is_empty() && !targets.contains_key(&s.repo))
+                    .map(|s| s.repo.clone())
+                    .collect();
+                repos.sort();
+                repos.dedup();
+                if repos.is_empty() {
+                    return sessions_json(&sessions, &targets);
+                }
+                repos
+            };
+            for repo in missing {
+                let target = merge_target(&repo);
+                targets.insert(repo, target);
+            }
+        }
+    }
+
     /// The session's stop flag, created on first use. The worker
     /// thread clones it before a run; the stop endpoint sets it.
     fn stop_flag(&self, id: &str) -> Arc<std::sync::atomic::AtomicBool> {
@@ -2689,7 +2719,10 @@ const READ_TIMEOUT_SECS: u64 = 10;
 /// Serialize sessions for the API with queue positions computed in:
 /// a queued session's position is its place among the queued, in
 /// hand-out order. Non-queued sessions carry null.
-fn sessions_json(sessions: &[Session]) -> serde_json::Value {
+fn sessions_json(
+    sessions: &[Session],
+    targets: &std::collections::HashMap<String, Option<String>>,
+) -> serde_json::Value {
     let mut pos = 0usize;
     let arr: Vec<serde_json::Value> = sessions
         .iter()
@@ -2709,7 +2742,12 @@ fn sessions_json(sessions: &[Session]) -> serde_json::Value {
             v["check_exit"] = serde_json::json!(s.check_exit);
             // Where Merge will land: the repo's checked-out branch, null
             // when the repo is unknown or its HEAD is detached.
-            v["merge_target"] = serde_json::json!(merge_target(&s.repo));
+            let target = if s.repo.is_empty() {
+                None
+            } else {
+                targets.get(&s.repo).cloned().flatten()
+            };
+            v["merge_target"] = serde_json::json!(target);
             // A needs-you session whose steering is still waiting says
             // so in its reason: the message is not silently pending.
             if s.status == "needs-you" && !s.steer.is_empty() {
@@ -2765,8 +2803,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
             .to_string(),
         ),
         ("GET", "/api/sessions") => {
-            let sessions = app.sessions.lock().unwrap();
-            json_response(200, &sessions_json(&sessions).to_string())
+            json_response(200, &app.sessions_view().to_string())
         }
         ("POST", "/api/sessions") => {
             let req: serde_json::Value = match serde_json::from_str(body) {
@@ -2898,8 +2935,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
             app.sessions.lock().unwrap().push(session.clone());
             app.persist();
             app.maybe_start(&id);
-            let sessions = app.sessions.lock().unwrap();
-            let all = sessions_json(&sessions);
+            let all = app.sessions_view();
             let mine = all
                 .as_array()
                 .and_then(|a| {
@@ -2912,8 +2948,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
         }
         ("GET", route) if route.starts_with("/api/sessions/") => {
             let id = &route["/api/sessions/".len()..];
-            let sessions = app.sessions.lock().unwrap();
-            let all = sessions_json(&sessions);
+            let all = app.sessions_view();
             match all
                 .as_array()
                 .and_then(|a| a.iter().find(|v| v["id"].as_str() == Some(id)).cloned())
@@ -2986,8 +3021,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
             }
         }
         ("GET", "/api/inbox") => {
-            let sessions = app.sessions.lock().unwrap();
-            let all = sessions_json(&sessions);
+            let all = app.sessions_view();
             let inbox: Vec<serde_json::Value> = all
                 .as_array()
                 .cloned()
@@ -3878,7 +3912,7 @@ mod tests {
         let mut s = test_session("s1", Status::NeedsYou, Path::new("."));
         s.reason = Some("check failed: false".to_string());
         s.steer = vec!["also fix the tests".to_string()];
-        let v = sessions_json(&[s]);
+        let v = sessions_json(&[s], &std::collections::HashMap::new());
         let reason = v[0]["reason"].as_str().unwrap_or("");
         assert!(reason.starts_with("check failed: false"), "{reason}");
         assert!(
