@@ -18,6 +18,7 @@ const LIB = [
 ];
 const lib = (rel) => LIB.find(([re]) => re.test(rel)) || [null, "House frontend starter", "owner's"];
 const find = (base, id) => { for (const e of exts) { const p = path.join(base, id + e); if (fs.existsSync(p) && fs.statSync(p).isFile()) return p; } return null; };
+const LOCAL = new Set([...(fs.existsSync(path.join(used, "LOCAL-EDITS.md")) ? fs.readFileSync(path.join(used, "LOCAL-EDITS.md"), "utf8") : "").matchAll(/`((?:components|lib|utils|hooks)\/[^`]+\.tsx?)`/g)].map((m) => m[1]));
 const seen = new Map(); // rel path in rune/used -> importers
 const queue = [];
 const walkSrc = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walkSrc(path.join(d, e.name)) : /\.(tsx?|css)$/.test(e.name) ? [path.join(d, e.name)] : []));
@@ -32,7 +33,8 @@ while (queue.length) {
   seen.set(rel, new Set([by]));
   const dest = path.join(used, rel);
   fs.mkdirSync(path.dirname(dest), { recursive: true });
-  fs.copyFileSync(src, dest);
+  // Parts listed in rune/used/LOCAL-EDITS.md carry this repo's own edits: keep the local copy, never overwrite it.
+  if (!(LOCAL.has(rel) && fs.existsSync(dest))) fs.copyFileSync(src, dest);
   for (const sub of importsOf(src)) queue.push([sub, "rune/used/" + rel]);
   // Relative imports inside a part (e.g. Tracker reads ../../utils/cx) are followed too, from the same house tree.
   for (const m of fs.readFileSync(src, "utf8").matchAll(/(?:from|import)\s+["'](\.{1,2}\/[^"']+)["']/g)) queue.push([path.posix.normalize(path.posix.join(path.posix.dirname(rel.split(path.sep).join("/")), m[1])), "rune/used/" + rel]);
