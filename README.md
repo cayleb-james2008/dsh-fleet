@@ -125,7 +125,10 @@ the task, status, bucket and transcript, each carries:
   `archived`). Actions on a session in the wrong state answer 409 with a plain
   sentence; an unknown session answers 404.
 - `GET /api/inbox` lists the needs-you sessions. `GET /api/policy` shows the
-  parallel cap, detected agents, default agent and model.
+  parallel cap, detected agents, default agent, model and `version`.
+- `GET /api/version`, `GET /api/update`, `POST /api/update/check`,
+  `POST /api/update/apply`, `POST /api/update/restart` — see "Versions and
+  updates".
 - Only loopback Host names are answered: `localhost`, `127.0.0.1` and `[::1]`,
   plus any names in `FLEET_ALLOWED_HOSTS` (comma-separated). Any other Host is
   a 403. A request with more than 100 header lines, or more than 32 KiB of
@@ -174,11 +177,41 @@ cargo run -- policies.rn               # serves the board on $PORT (default 8471
 
 Environment: `PORT` (default 8471), `FLEET_DATA` (default `./fleet-data`),
 `FLEET_AGENT` (the default agent, otherwise the first detected one),
-`FLEET_ALLOWED_HOSTS` (extra Host names, see HTTP).
+`FLEET_ALLOWED_HOSTS` (extra Host names, see HTTP), and the `FLEET_UPDATE_*`
+variables under "Versions and updates".
 
 State lands in `./fleet-data/` (override with `FLEET_DATA`): the session
 store, `logs/`, and the worktrees — one per session, each on its own branch of
 the session's repo.
+
+## Versions and updates
+
+The running version is `fleet-rs --version` (or `-V`), `GET /api/version`, and
+`version` in `GET /api/policy`. Every release is tagged `vX.Y.Z` on GitHub, with a
+`CHANGELOG.md` entry, one binary per platform and a `SHA256SUMS` file. Pushing a
+tag runs `.github/workflows/release.yml`, which refuses a tag that does not match
+the version in `Cargo.toml`.
+
+Self-update (`src/update.rs`): the app asks the newest GitHub release of its
+repository whether a newer version exists (shortly after start and every 6 hours
+in `notify` and `auto` modes). `POST /api/update/apply` downloads the binary for
+this platform (`fleet-rs-<target>`), checks its SHA-256 against the release's
+`SHA256SUMS`, runs it with `--version` to confirm the build, and only then swaps
+it in. `POST /api/update/restart` starts the new build. A failed step leaves the
+installed program untouched. Downloads use `curl`, which must be installed.
+
+Restart is refused while any session is queued, working or checking, because it
+would send those sessions to Needs you; wait for them to settle or stop them.
+Apply and restart answer only to a loopback Host name: a name from
+`FLEET_ALLOWED_HOSTS` is not enough. Updating is also refused for a cargo-built
+binary (one under a `target` folder) unless `FLEET_UPDATE_DEV=1`.
+
+| Var | Default |
+| --- | --- |
+| `FLEET_UPDATE_MODE` | `notify` (check and tell); `auto` also downloads and installs (a restart is still yours to press); `off` never contacts GitHub |
+| `FLEET_UPDATE_REPO` | `cayleb-james2008/dsh-fleet` |
+| `FLEET_UPDATE_API` | `https://api.github.com` (plain http only for a loopback address) |
+| `FLEET_UPDATE_DEV` | unset; `1` allows replacing a cargo-built binary (tests) |
 
 ## Tests and checks
 
