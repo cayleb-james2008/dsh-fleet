@@ -178,12 +178,20 @@ is signed in.
 cargo run -- policies.rn               # serves the board on $PORT (default 8471)
 ```
 
-Environment: `PORT` (default 8471), `FLEET_DATA` (default `./fleet-data`),
-`FLEET_AGENT` (the default agent, otherwise the first detected one),
-`FLEET_ALLOWED_HOSTS` (extra Host names, see HTTP), and the `FLEET_UPDATE_*`
-variables under "Versions and updates".
+Environment: `PORT` (default 8471; a busy default falls back to the next free
+port and the banner says which), `FLEET_DATA` (default the platform data folder
+— `$XDG_DATA_HOME/fleet`, else `~/.local/share/fleet` on Linux,
+`~/Library/Application Support/fleet` on macOS), `FLEET_AGENT` (the default
+agent, otherwise the first detected one), `FLEET_ALLOWED_HOSTS` (extra Host
+names, see HTTP), `FLEET_NO_OPEN` (do not open the browser on launch), and the
+`FLEET_UPDATE_*` variables under "Versions and updates".
 
-State lands in `./fleet-data/` (override with `FLEET_DATA`): the session
+The board opens in the operator's browser on launch, unless there is no display
+(a headless service), `FLEET_NO_OPEN` is set, `--no-open` is passed, or
+`INVOCATION_ID` is set (a systemd service). The browser open is silent if it
+fails — the board is still reachable at the URL on the banner.
+
+State lands in the platform data folder (override with `FLEET_DATA`): the session
 store, `logs/`, and the worktrees — one per session, each on its own branch of
 the session's repo.
 
