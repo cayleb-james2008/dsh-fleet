@@ -3344,6 +3344,66 @@ fn load_persisted(data_dir: &Path) -> (Vec<Session>, u64) {
     (recover_from_logs(data_dir), 0)
 }
 
+/// Where Fleet keeps its state when the operator has not set `FLEET_DATA`:
+/// the platform data folder (`$XDG_DATA_HOME/fleet`, else
+/// `~/.local/share/fleet` on Linux, `~/Library/Application Support/fleet` on
+/// macOS). A relative `./fleet-data` default would scatter sessions across
+/// every directory the binary is launched from.
+fn default_data_dir() -> std::path::PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|s| !s.is_empty()) {
+        return std::path::PathBuf::from(xdg).join("fleet");
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
+        let home = std::path::PathBuf::from(home);
+        if cfg!(target_os = "macos") {
+            return home.join("Library/Application Support/fleet");
+        }
+        return home.join(".local/share/fleet");
+    }
+    std::path::PathBuf::from("./fleet-data")
+}
+
+/// The port to listen on. An explicit `PORT` that is busy is an error the
+/// operator asked for — fail loudly. An unset `PORT` (the default 8471) that
+/// is busy falls back to the next free port, so a second Fleet (or a stale
+/// one) does not crash the launch.
+fn listen_port() -> Result<u16, String> {
+    match std::env::var("PORT").ok().and_then(|p| p.parse::<u16>().ok()) {
+        Some(explicit) => Ok(explicit),
+        None => {
+            for candidate in 8471u16..=8490 {
+                if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+                    return Ok(candidate);
+                }
+            }
+            Err("no free port in 8471..=8490".to_string())
+        }
+    }
+}
+
+/// Open the board in the operator's browser once, at the given URL — the way
+/// a desktop app does. Suppressed when there is no display (a headless
+/// service), when the operator opts out (`FLEET_NO_OPEN` or `--no-open`), or
+/// when this is a systemd service (`INVOCATION_ID` set). Failures are silent:
+/// the board is still reachable at the URL.
+fn open_in_browser(url: &str) {
+    let opted_out = std::env::var_os("FLEET_NO_OPEN").is_some()
+        || std::env::var_os("INVOCATION_ID").is_some()
+        || std::env::args().any(|a| a == "--no-open");
+    let has_display = std::env::var_os("DISPLAY").is_some()
+        || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    if opted_out || !has_display {
+        return;
+    }
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     // Answered before anything else, in any argument position, so `--version`
@@ -3352,10 +3412,10 @@ fn main() {
         println!("fleet-rs {}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8471);
+    let port: u16 = listen_port().unwrap_or_else(|e| {
+        eprintln!("fleet-rs: {e}");
+        std::process::exit(1);
+    });
     let agents = detect_agents();
     let default_agent = std::env::var("FLEET_AGENT")
         .ok()
@@ -3386,7 +3446,8 @@ fn main() {
     };
     let data_dir = std::env::var("FLEET_DATA")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./fleet-data"));
+        .unwrap_or_else(|_| default_data_dir());
+    let data_dir_label = data_dir.display().to_string();
     let _ = std::fs::create_dir_all(data_dir.join("worktrees"));
     let _ = std::fs::create_dir_all(data_dir.join("logs"));
 
@@ -3488,7 +3549,16 @@ fn main() {
     }
     app.pump_queue();
 
-    let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind failed");
+    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            eprintln!(
+                "fleet-rs: port {port} is busy. Set PORT to a free port, or stop the process using it."
+            );
+        } else {
+            eprintln!("fleet-rs: cannot listen on port {port}: {e}");
+        }
+        std::process::exit(1);
+    });
     let allowed_hosts = std::env::var("FLEET_ALLOWED_HOSTS").unwrap_or_default();
     let detected: Vec<String> = app
         .agents
@@ -3496,11 +3566,17 @@ fn main() {
         .map(|a| format!("{}:{}", a.name, if a.found { "found" } else { "not found" }))
         .collect();
     println!(
-        "fleet-rs listening on http://127.0.0.1:{port} (agents: {}; default: {}; max_parallel: {})",
+        "fleet-rs listening on http://127.0.0.1:{port}/ (agents: {}; default: {}; max_parallel: {})",
         detected.join(", "),
         app.default_agent.as_deref().unwrap_or("none"),
         app.policy.max_parallel
     );
+    println!("  Data:    {}", data_dir_label);
+    println!(
+        "  Updates: {}",
+        std::env::var("FLEET_UPDATE_MODE").unwrap_or_else(|_| "notify".to_string())
+    );
+    open_in_browser(&format!("http://127.0.0.1:{port}/"));
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {

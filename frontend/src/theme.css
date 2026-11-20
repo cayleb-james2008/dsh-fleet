@@ -1,0 +1,111 @@
+/* Fleet colour scheme: the shared Anthropic / owner palette (_fe/palette-claude.css), set by hand in this file.
+   Colour roles only: fonts, radii, the heading recipe and the Vantage signature are unchanged below.
+   Roles: --blue is the ONE clay accent (primary key, current selection, focus); green, red, amber are state only.
+   Needs you = clay, failed check = red, verified = sage. Decisions and measured contrast: frontend/DESIGN.md "Colour scheme". */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --canvas: #f5f4ee;       /* page */
+  --board: #eeede5;        /* hover / selected tint */
+  --surface: #fdfcfa;      /* cards, panels (warm white, never #fff) */
+  --hairline: #e3e1d6;     /* 1px lines */
+  --edge: #8a887f; --input: var(--edge);   /* input edges, 3.2:1 on canvas, 3.5:1 on surface */
+  --track: #ebe9df;        /* segmented track, count chip */
+  --raised: #fefefc;       /* the raised segment / key face */
+  --ink: #141413;
+  --ink-2: #4d4c47;
+  --ink-3: #66655e;
+  --icon: #7d7c75;
+  --disabled: #b0aea5;
+  --blue: #d97757; --blue-fg: #141413; --blue-hover: #cc6a49; --blue-soft: #f6e3d9;  /* ACCENT (clay); ink text 5.9:1 */
+  --ring: #cc6a49;         /* focus ring: clay one step darker, 3.3:1 on canvas, 3.6:1 on surface */
+  --info-foreground: #9c4326;   /* accent-coloured TEXT on light (5.2:1 on blue-soft) */
+  --ink-button: #141413; --ink-button-fg: #faf9f5;
+  --dot-green: #788c5d;  --success-foreground: #4f6038;   /* verified: sage */
+  --dot-blue: #6a9bcc;     /* instrument / info, not the accent */
+  --dot-red: #c4483a;    --destructive-foreground: #9a2f24;  --unread: #c4483a;   /* failed: red fill, red TEXT is the dark one (7.3:1) */
+  --dot-clay: #d97757;   /* needs you */
+  --dot-amber: #c99a3e;  --warning-foreground: #7a5a14;   /* queued, honest-but-needs-you */
+  --dot-online: #788c5d;
+  --tag-plan-bg: #ffe3d7; --tag-plan-fg: #67260c;
+  --tag-ops-bg: #d8eeff; --tag-ops-fg: #023f6f;
+  --tag-design-bg: #ffe1e5; --tag-design-fg: #672131;
+  --tag-research-bg: #efe6ff; --tag-research-fg: #462e69;
+  --tag-mint-bg: #e2f1d5; --tag-mint-fg: #2b4700;
+  --tag-dev-bg: #f8eace; --tag-dev-fg: #553700;
+  --tag-neutral-bg: #f5ebce; --tag-neutral-fg: #513900;
+  --tag-sky-bg: #d8eeff; --tag-sky-fg: #023f6f;
+  --pill-active-bg: #e2f1d5; --pill-active-fg: #2b4700;
+  --pill-pro-bg: #ffe2de; --pill-pro-fg: #682321;
+  --pill-inactive-bg: #f5ebce; --pill-inactive-fg: #513900;
+  --pill-warn-bg: #f8eace; --pill-warn-fg: #553700;
+  --av-rose-bg: #ffe1e5; --av-rose-fg: #672131;
+  --av-violet-bg: #efe6ff; --av-violet-fg: #462e69;
+  --av-sky-bg: #d8eeff; --av-sky-fg: #023f6f;
+  --av-grey-bg: #f5ebce; --av-grey-fg: #513900;
+  --elev-shell: none; --elev-card: none; --elev-raised: none; --elev-lift: 0 10px 24px rgba(20, 20, 19, 0.14); --elev-primary: none;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --canvas: #141413;
+  --board: #1c1c1a;
+  --surface: #1f1e1c;
+  --hairline: #33322f;
+  --edge: #6f6e67; --input: var(--edge);
+  --track: #262523;
+  --raised: #2a2926;
+  --ink: #faf9f5;
+  --ink-2: #c8c7bd;
+  --ink-3: #9d9c92;
+  --icon: #8c8b82;
+  --disabled: #5b5a55;
+  --blue: #d97757; --blue-fg: #141413; --blue-hover: #e08a6d; --blue-soft: #3a2a22;
+  --ring: #d97757;
+  --info-foreground: #e6a387;
+  --ink-button: #faf9f5; --ink-button-fg: #141413;
+  --dot-green: #8fa86d;  --success-foreground: #a9c188;
+  --dot-blue: #7fb0e0;
+  --dot-red: #e0675a;    --destructive-foreground: #f0988e;  --unread: #e0675a;
+  --dot-clay: #d97757;
+  --dot-amber: #d9a84a;  --warning-foreground: #e7c277;
+  --dot-online: #8fa86d;
+  --tag-plan-bg: #3e2015; --tag-plan-fg: #ffb294;
+  --tag-ops-bg: #142a41; --tag-ops-fg: #92d0ff;
+  --tag-design-bg: #3e1e23; --tag-design-fg: #ffacba;
+  --tag-research-bg: #2d233e; --tag-research-fg: #d5baff;
+  --tag-mint-bg: #212e12; --tag-mint-fg: #b3d98c;
+  --tag-dev-bg: #342707; --tag-dev-fg: #ebc573;
+  --tag-neutral-bg: #322707; --tag-neutral-fg: #e6c873;
+  --tag-sky-bg: #142a41; --tag-sky-fg: #92d0ff;
+  --pill-active-bg: #212e12; --pill-active-fg: #b3d98c;
+  --pill-pro-bg: #3e1e1c; --pill-pro-fg: #ffaea6;
+  --pill-inactive-bg: #322707; --pill-inactive-fg: #e6c873;
+  --pill-warn-bg: #342707; --pill-warn-fg: #ebc573;
+  --av-rose-bg: #3e1e23; --av-rose-fg: #ffacba;
+  --av-violet-bg: #2d233e; --av-violet-fg: #d5baff;
+  --av-sky-bg: #142a41; --av-sky-fg: #92d0ff;
+  --av-grey-bg: #322707; --av-grey-fg: #e6c873;
+  --elev-shell: none; --elev-card: none; --elev-raised: none; --elev-lift: 0 10px 24px rgba(0, 0, 0, 0.55); --elev-primary: none;
+}
+:root {
+  /* Vantage: type voice, radii and the heading recipe (Hallmark theme values) */
+  --font-sans: "Geologica", ui-sans-serif, system-ui, sans-serif;
+  --font-heading: "Geologica", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, monospace;
+  --radius-shell: 10px; --radius-panel: 6px; --radius-dialog: 8px; --radius-card: 4px;
+  --radius-segment: 999px; --radius-chip: 999px; --radius-menu: 8px; --radius: 8px;
+  --display-weight: 300; --tracking-display: -0.035em;
+}
+h1, h2, h3, .font-heading { font-family: var(--font-heading); font-weight: var(--display-weight); letter-spacing: var(--tracking-display); }
+.num, .mono, [data-measured] { font-family: var(--font-mono); font-variant-numeric: tabular-nums ; }
+::selection { background: color-mix(in oklab, var(--blue) 28%, transparent); }
+
+/* Round 2: an input edge that reads at 3:1 (WCAG non-text), and the two literal colours Tailwind ships (white, black) on tokens. */
+@theme inline {
+  --color-edge: var(--edge);
+  --color-white: var(--surface);
+  --color-black: var(--ink);
+  --shadow-xs: var(--elev-card);
+  --shadow: var(--elev-raised);
+  --shadow-md: var(--elev-lift);
+  --shadow-xl: var(--elev-lift);
+}
