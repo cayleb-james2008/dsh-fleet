@@ -129,7 +129,7 @@ export function DetailBody({ s, onClose, onChanged, onDismissed }: { s: Session;
       <div className="min-w-0">
         <h2 className="break-words font-heading text-[26px] font-light leading-tight text-ink md:text-[32px]">{s.task}</h2>
         <dl className="mt-3 flex flex-wrap gap-x-5 gap-y-1.5 text-sm text-ink-2 tabular-nums">
-          <div className="flex gap-2"><dt className="text-ink-3">Project</dt><dd>{s.project}</dd></div>
+          <div className="flex min-w-0 gap-2"><dt className="text-ink-3">Project</dt><dd className="min-w-0 [overflow-wrap:anywhere]">{s.project}</dd></div>
           <div className="flex gap-2"><dt className="text-ink-3">Agent</dt><dd>{agent}</dd></div>
           <div className="flex min-w-0 gap-2"><dt className="text-ink-3">Branch</dt><dd className="min-w-0 break-all font-mono text-xs text-ink">{s.branch || ""}</dd></div>
           {s.queue_position ? <div className="flex gap-2"><dt className="text-ink-3">Queue</dt><dd>#{s.queue_position}</dd></div> : null}
