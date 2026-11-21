@@ -47,6 +47,9 @@ function singleFile(): Plugin {
         // The Hallmark stamp is the first line of the page CSS (the lint reads that line); the minifier drops comments, so it is added here.
         return `<style>${STAMP}\n${css}</style>`;
       });
+      // The ring offset literal becomes the surface token (Hallmark 48); the bare `transition` utility comes only from
+      // motion prop names in source, never from an element here, and would fade focus rings (Hallmark 15).
+      html = html.replace(/--tw-ring-offset-color:#fff/g, "--tw-ring-offset-color:var(--surface)").replace(/\.transition\{[^}]*\}/g, "");
       const out = path.resolve(root, "../assets/index.html");
       fs.writeFileSync(out, html);
       console.log(`single file: ${out} (${(html.length / 1024).toFixed(0)} kB)`);

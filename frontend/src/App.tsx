@@ -1,8 +1,7 @@
 // Fleet: the board. Top bar (wordmark, version, search, Needs you inbox, New session, engines, theme), the update strip,
-// the scan strip (readings and recent sessions), the hero (the session that needs a person, else the newest receipt),
-// three lanes (Needs you, Working, Done), and the session detail (a column on wide screens, a drawer on narrow ones).
+// the scan strip (readings and recent sessions), the control room wall (a live pane per running or waiting session,
+// receipts docked below), and the session detail (pinned on the wall on wide screens, a drawer on narrow ones).
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { motion } from "motion/react";
 import { Toaster, toast } from "sonner";
 import { Drawer } from "vaul";
 import { Search, Plus, Sun, Moon, Cpu, ScanLine, X } from "lucide-react";
@@ -21,14 +20,13 @@ import {
   MorphingDialogDescription, MorphingDialogTitle, MorphingDialogTrigger,
 } from "@/components/ui/morphing-dialog";
 import { Tracker } from "@/components/Tracker/Tracker";
-import { Pill } from "@/components/kibo-ui/pill";
 import { AvatarStack } from "@/components/kibo-ui/avatar-stack";
 import { useMediaQuery } from "@/lib/useMediaQuery";
-import { layout, glide } from "@/motion";
+import { glide } from "@/motion";
 import { cn } from "@/lib/utils";
 import { getJson, isFailed, isVerified, postJson, type Agent, type Policy, type Session, statusText } from "./api";
 import { DetailBody } from "./detail";
-import { HeroReceipt, ReceiptCard, ShownAbove } from "./receipt";
+import { Wall } from "./wall";
 import { resultLine as resultLineOf, UpdateStrip, useUpdate } from "./update";
 
 type Theme = "dark" | "light";
@@ -93,11 +91,6 @@ export function App() {
     if (!q) return all;
     return all.filter((s) => [s.task, s.project, s.branch].some((v) => (v || "").toLowerCase().includes(q)));
   }, [all, query]);
-  const lanes = {
-    needs: shown.filter((s) => s.bucket === "needs-you"),
-    working: shown.filter((s) => s.bucket === "working"),
-    done: shown.filter((s) => s.bucket === "done"),
-  };
   const current = selected ? all.find((s) => s.id === selected) ?? null : null;
   useEffect(() => { if (selected && sessions && !current) setSelected(null); }, [selected, sessions, current]);
   const verifiedCount = all.filter(isVerified).length;
@@ -105,12 +98,16 @@ export function App() {
   const workingAll = all.filter((s) => s.bucket === "working" && s.status !== "queued");
   const needsCount = needsAll.length;
   const workingCount = all.filter((s) => s.bucket === "working").length;
-  const hero = needsAll[0] ?? all.find(isVerified) ?? null;
   const testMode = policy?.default_agent_engine === "custom" || all.some((s) => s.test_mode);
 
   const open = (id: string) => { setSelected(id); };
-  const focusLane = () => requestAnimationFrame(() => document.getElementById("lane-needs-h")?.focus());
-  const closeDetail = () => { setSelected(null); focusLane(); };
+  // Focus goes to the first pane that waits on a person (the inbox's "go"), or back to the opener of a closed session.
+  const focusLane = () => requestAnimationFrame(() => (document.querySelector<HTMLElement>('section[aria-label="Live panes"] article button') ?? document.getElementById("receipts-h"))?.focus());
+  const closeDetail = () => {
+    const id = selected;
+    setSelected(null);
+    requestAnimationFrame(() => (document.querySelector<HTMLElement>(`[data-open="${id}"]`) ?? document.getElementById("receipts-h"))?.focus());
+  };
   const retry = async (id: string) => {
     const e = await postJson(`/api/sessions/${id}/retry`);
     setInboxErr((m) => ({ ...m, [id]: e || "" }));
@@ -152,13 +149,14 @@ export function App() {
               <Button id="show-update" size="sm" variant="ghost" onClick={upd.show}>Show update</Button>
             )}
           </div>
-          <InputGroup className="order-last flex h-9 w-full md:order-none md:ml-auto md:w-56 lg:w-72">
+          <InputGroup className="order-last flex h-11 w-full md:order-none md:ml-auto md:h-9 md:w-56 lg:w-72">
             <InputGroupAddon><Search className="size-4 text-icon" strokeWidth={1.5} aria-hidden /></InputGroupAddon>
             <InputGroupInput
               ref={searchRef}
               type="search"
               aria-label="Search sessions"
               placeholder="Search tasks, projects, branches"
+              className="max-md:[&_input]:!h-11 max-md:!h-11"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
@@ -171,7 +169,7 @@ export function App() {
             </span>
             <Tooltip>
               <TooltipTrigger
-                render={<Button variant="outline" size="icon" id="settings-open" aria-label="Engines and settings" onClick={() => setSettingsOpen(true)} />}
+                render={<Button variant="outline" size="icon" id="settings-open" className="max-md:size-11" aria-label="Engines and settings" onClick={() => setSettingsOpen(true)} />}
               >
                 <Cpu className="size-4" strokeWidth={1.5} aria-hidden />
               </TooltipTrigger>
@@ -185,6 +183,7 @@ export function App() {
                   data-checked={theme === t ? "" : undefined}
                   onClick={() => setTheme(t)}
                   aria-label={t === "light" ? "Light theme" : "Dark theme"}
+                  className="max-md:!h-11 max-md:!min-w-11"
                 >
                   {t === "light" ? <Sun className="size-4" strokeWidth={1.5} aria-hidden /> : <Moon className="size-4" strokeWidth={1.5} aria-hidden />}
                 </SegmentedControlItem>
@@ -240,48 +239,11 @@ export function App() {
           </p>
         )}
 
-        <div className="flex min-h-0 flex-1">
-          <div className="min-w-0 flex-1 pb-28 md:pb-0">
-            {hero && (
-              <HeroReceipt s={hero} onOpen={open} onRetry={retry} onDismiss={dismiss} />
-            )}
-
-            <div className="grid gap-px border-b border-hairline bg-hairline md:grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)_minmax(0,1fr)]">
-              {sessions === null ? (
-                <>
-                  <LaneSkeleton label="Needs you" cards={2} />
-                  <LaneSkeleton label="Working" cards={1} />
-                  <LaneSkeleton label="Done" cards={2} />
-                </>
-              ) : (
-                <>
-                  <Lane id="needs" label="Needs you" count={lanes.needs.length} empty="Nothing needs you. Failed checks and stopped runs land here with the reason." answers="1">
-                    {lanes.needs.map((s) => s.id === hero?.id
-                      ? <ShownAbove key={s.id} s={s} onOpen={() => open(s.id)} />
-                      : <Card key={s.id} s={s} selected={selected === s.id} onOpen={() => open(s.id)} />)}
-                  </Lane>
-                  <Lane id="working" label="Working" count={lanes.working.length} empty="No agent is running right now." answers="2">
-                    {lanes.working.map((s) => s.id === hero?.id
-                      ? <ShownAbove key={s.id} s={s} onOpen={() => open(s.id)} />
-                      : <Card key={s.id} s={s} selected={selected === s.id} onOpen={() => open(s.id)} />)}
-                  </Lane>
-                  <Lane id="done" label="Done" count={lanes.done.length} empty="Work appears here once its check passes, with the check line as its receipt." answers="3">
-                    {lanes.done.map((s) => s.id === hero?.id
-                      ? <ShownAbove key={s.id} s={s} onOpen={() => open(s.id)} />
-                      : <Card key={s.id} s={s} selected={selected === s.id} onOpen={() => open(s.id)} />)}
-                  </Lane>
-                </>
-              )}
-            </div>
-            {sessions !== null && all.length === 0 && (
-              <p className="px-4 py-4 text-sm text-ink-2 md:px-6">Hand out a task with New session. Each one runs in its own worktree, and its check decides whether it is done.</p>
-            )}
-          </div>
-
-          {wide && current && (
-            <aside aria-label="Session details" className="sticky top-14 hidden h-[calc(100dvh-56px)] w-[460px] shrink-0 overflow-y-auto border-l border-hairline bg-surface p-6 min-[1100px]:block">
-              {detailBody}
-            </aside>
+        <div className="min-w-0 flex-1 pb-28 md:pb-0">
+          <Wall sessions={sessions === null ? null : shown} selected={selected} pinWide={wide} detail={wide ? detailBody : null}
+            onOpen={open} onRetry={retry} onDismiss={dismiss} />
+          {sessions !== null && all.length > 0 && !shown.length && (
+            <p role="status" className="px-4 pb-4 text-sm text-ink-2 md:px-6">No session matches “{query.trim()}”.</p>
           )}
         </div>
 
@@ -360,39 +322,6 @@ function Reading({ label, value, tone }: { label: string; value: number; tone?: 
         <SlidingNumber value={value} />
       </div>
     </div>
-  );
-}
-
-function Lane({ id, label, count, empty, answers, children }: { id: string; label: string; count: number; empty: string; answers: string; children: React.ReactNode }) {
-  return (
-    <section id={`lane-${id}`} aria-labelledby={`lane-${id}-h`} data-answers={answers} className="flex min-w-0 flex-col gap-3 bg-canvas p-4 md:p-5">
-      <div className="flex items-center gap-2">
-        <h2 id={`lane-${id}-h`} tabIndex={-1} className="text-base font-medium text-ink outline-none">{label}</h2>
-        <Pill className="ml-auto bg-track px-2 py-0.5 font-mono text-xs tabular-nums text-ink-2">{count}</Pill>
-      </div>
-      {count === 0 ? (
-        <p className="rounded-card border border-dashed border-hairline p-4 text-sm leading-relaxed text-ink-3">{empty}</p>
-      ) : (
-        <div className="flex flex-col gap-2.5">{children}</div>
-      )}
-    </section>
-  );
-}
-
-function LaneSkeleton({ label, cards }: { label: string; cards: number }) {
-  return (
-    <section aria-label={`${label}, loading`} className="flex min-w-0 flex-col gap-3 bg-canvas p-4 md:p-5">
-      <div className="flex items-center gap-2"><span className="h-5 w-24 rounded-control bg-track" /></div>
-      {Array.from({ length: cards }, (_, i) => <div key={i} className="h-[92px] rounded-card border border-hairline bg-track/60" />)}
-    </section>
-  );
-}
-
-function Card({ s, selected, onOpen }: { s: Session; selected: boolean; onOpen: () => void }) {
-  return (
-    <motion.div layout layoutId={s.id} transition={layout} className="min-w-0">
-      <ReceiptCard s={s} selected={selected} onOpen={onOpen} />
-    </motion.div>
   );
 }
 
