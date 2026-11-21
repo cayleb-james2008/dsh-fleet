@@ -19,14 +19,15 @@ const motionLayout = { transition: layout };
 /** The transcript's newest lines, like `tail`: each new line pushes the oldest out. The whole transcript is in the detail. */
 const TAIL = 5;
 function Log({ s }: { s: Session }) {
-  const n = s.transcript.length;
+  const lines = Array.isArray(s.transcript) ? s.transcript : [];
+  const n = lines.length;
   const from = Math.max(0, n - TAIL);
   return (
     <div className="rounded-control bg-board p-3">
       {from > 0 && <p className="mb-1 text-xs text-ink-3">{from} earlier {from === 1 ? "line" : "lines"} in the detail</p>}
       <ol aria-label={`Newest lines of the transcript of ${s.task}`} className="font-mono text-sm leading-relaxed text-ink-2">
         {n === 0 && <li>No output yet.</li>}
-        {s.transcript.slice(from).map((l, i) => <li key={from + i} className="break-words">{l}</li>)}
+        {lines.slice(from).map((l, i) => <li key={from + i} className="break-words">{l}</li>)}
       </ol>
     </div>
   );
@@ -46,12 +47,12 @@ function Pane({ s, small, onOpen, onRetry, onDismiss }: { s: Session; small?: bo
           <Maximize2 className="size-4" strokeWidth={1.5} aria-hidden />
         </Button>
       </div>
-      <h2 className={cn("font-heading font-light tracking-[-0.03em] text-balance text-ink", small ? "text-base leading-snug" : "text-lg leading-snug")}>{s.task}</h2>
+      <h2 className={cn("font-heading font-light tracking-[-0.03em] text-balance text-ink [overflow-wrap:anywhere]", small ? "text-base leading-snug" : "text-lg leading-snug")}>{s.task}</h2>
       {!small && <Log s={s} />}
       <div className="text-sm">
         {s.bucket === "needs-you" ? (
           <div className="flex flex-wrap items-center gap-2">
-            <p className={cn("min-w-0 basis-full text-pretty", isFailed(s) ? "text-destructive-foreground" : "text-info-foreground")}>
+            <p className={cn("min-w-0 basis-full text-pretty [overflow-wrap:anywhere]", isFailed(s) ? "text-destructive-foreground" : "text-info-foreground")}>
               {isHonest(s) ? HONEST : s.reason || "This session stopped and needs you."}
             </p>
             <Button variant="outline" className="min-h-11" onClick={onRetry}><RotateCcw className="size-4" strokeWidth={1.5} aria-hidden />Retry</Button>
@@ -81,10 +82,17 @@ function Receipt({ s, selected, onOpen }: { s: Session; selected: boolean; onOpe
   );
 }
 
-export function Wall({ sessions, selected, pinWide, detail, onOpen, onRetry, onDismiss }: {
-  sessions: Session[] | null; selected: string | null; pinWide: boolean; detail: ReactNode;
+export function Wall({ sessions, unreachable, selected, pinWide, detail, onOpen, onRetry, onDismiss }: {
+  sessions: Session[] | null; unreachable: boolean; selected: string | null; pinWide: boolean; detail: ReactNode;
   onOpen: (id: string) => void; onRetry: (id: string) => void; onDismiss: (id: string) => void;
 }) {
+  if (sessions === null && unreachable) {
+    return (
+      <p role="alert" className="m-4 rounded-card border border-hairline bg-surface p-4 text-sm text-ink md:m-6">
+        Fleet has not answered yet, so there is no session list to show. Check that Fleet is running; this page asks again every two seconds.
+      </p>
+    );
+  }
   if (sessions === null) {
     return (
       <div aria-label="Live panes, loading" className="grid gap-3 p-4 sm:grid-cols-2 md:p-6">

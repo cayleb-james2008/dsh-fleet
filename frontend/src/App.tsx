@@ -195,10 +195,10 @@ export function App() {
         <UpdateStrip u={upd} />
 
         <section aria-label="Scan" className="grid grid-cols-2 border-b border-hairline md:grid-cols-[repeat(4,minmax(0,1fr))_minmax(0,1.7fr)]">
-          <Reading label="Sessions" value={all.length} />
-          <Reading label="Needs you" value={needsCount} tone={needsCount ? "bad" : undefined} />
+          <Reading label="Sessions" value={sessions ? all.length : null} />
+          <Reading label="Needs you" value={sessions ? needsCount : null} tone={needsCount ? "bad" : undefined} />
           <div className="min-w-0 border-r border-hairline">
-            <Reading label="Working" value={workingCount} />
+            <Reading label="Working" value={sessions ? workingCount : null} />
             <div className="mt-2 min-h-6 px-4 pb-3">
               {workingAll.length >= 2 ? (
                 <AvatarStack>
@@ -213,7 +213,7 @@ export function App() {
               ) : null}
             </div>
           </div>
-          <Reading label="Verified" value={verifiedCount} tone={verifiedCount ? "good" : undefined} />
+          <Reading label="Verified" value={sessions ? verifiedCount : null} tone={verifiedCount ? "good" : undefined} />
           <div className="col-span-2 flex min-w-0 flex-col justify-center gap-2 px-4 py-3 md:col-span-1">
             <p className="text-sm text-ink-2">Recent sessions</p>
             {all.length ? (
@@ -240,7 +240,7 @@ export function App() {
         )}
 
         <div className="min-w-0 flex-1 pb-28 md:pb-0">
-          <Wall sessions={sessions === null ? null : shown} selected={selected} pinWide={wide} detail={wide ? detailBody : null}
+          <Wall sessions={sessions === null ? null : shown} unreachable={unreachable} selected={selected} pinWide={wide} detail={wide ? detailBody : null}
             onOpen={open} onRetry={retry} onDismiss={dismiss} />
           {sessions !== null && all.length > 0 && !shown.length && (
             <p role="status" className="px-4 pb-4 text-sm text-ink-2 md:px-6">No session matches “{query.trim()}”.</p>
@@ -314,12 +314,13 @@ export function App() {
   );
 }
 
-function Reading({ label, value, tone }: { label: string; value: number; tone?: "bad" | "good" }) {
+// Before the first good list a reading shows a placeholder, never a zero that would read as real.
+function Reading({ label, value, tone }: { label: string; value: number | null; tone?: "bad" | "good" }) {
   return (
     <div className="border-r border-hairline px-4 py-3 last:border-r-0">
       <p className="text-sm text-ink-2">{label}</p>
       <div className={cn("mt-1 border-l-2 font-heading text-[28px] font-light leading-none tabular-nums", tone === "bad" ? "border-unread pl-2 text-destructive-foreground" : tone === "good" ? "border-dot-green pl-2 text-ink" : "border-transparent pl-0 text-ink")}>
-        <SlidingNumber value={value} />
+        {value === null ? <span className="block h-7 w-10 rounded-control bg-track" aria-label="not loaded yet" /> : <SlidingNumber value={value} />}
       </div>
     </div>
   );
