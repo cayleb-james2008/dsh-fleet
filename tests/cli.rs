@@ -268,3 +268,73 @@ fn the_browser_stays_closed_for_opt_out_service_and_no_display() {
         assert!(!bin_dir.join("called").exists(), "{name}: a browser was opened");
     }
 }
+
+#[test]
+fn app_flag_opens_chromeless_window_without_policies_arg_even_under_invocation_id() {
+    let home = scratch("app-flag");
+    let bin_dir = home.join("bin");
+    fake_opener(&bin_dir, "chromium");
+    fake_opener(&bin_dir, "xdg-open");
+    fake_opener(&bin_dir, "open");
+    let port = free_port();
+    let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+    // Launch directly with `--app` (NO positional policies.rn, CWD has no policies.rn,
+    // and INVOCATION_ID is set like an Omarchy/UWSM .desktop launcher!).
+    let mut c = Command::new(bin());
+    c.env_clear()
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .env("LANG", "C.UTF-8")
+        .env("PORT", port.to_string())
+        .env("DISPLAY", ":0")
+        .env("INVOCATION_ID", "desktop-launcher-unit")
+        .current_dir(&home)
+        .arg("--app")
+        .stdin(std::process::Stdio::null())
+        .stdout(File::create(home.join("out.log")).unwrap())
+        .stderr(File::create(home.join("err.log")).unwrap());
+    let _kid = Kid(c.spawn().unwrap());
+    assert!(wait_answering(port), "{}", read(home.join("err.log")));
+    let t = Instant::now();
+    while !bin_dir.join("called").exists() && t.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let called = read(bin_dir.join("called"));
+    assert!(
+        called.contains(&format!("http://127.0.0.1:{port}/")),
+        "expected desktop app window launch under --app: {called:?}"
+    );
+    if cfg!(target_os = "linux") {
+        assert!(
+            called.contains(&format!("--app=http://127.0.0.1:{port}/"))
+                && called.contains("--class=fleet"),
+            "expected chromeless --app + --class=fleet: {called:?}"
+        );
+    }
+}
+
+#[test]
+fn no_open_flag_boots_with_builtin_policies_without_positional_arg() {
+    let home = scratch("no-open-builtin");
+    let bin_dir = home.join("bin");
+    fake_opener(&bin_dir, "chromium");
+    fake_opener(&bin_dir, "xdg-open");
+    let port = free_port();
+    let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+    let mut c = Command::new(bin());
+    c.env_clear()
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .env("LANG", "C.UTF-8")
+        .env("PORT", port.to_string())
+        .env("DISPLAY", ":0")
+        .current_dir(&home)
+        .arg("--no-open")
+        .stdin(std::process::Stdio::null())
+        .stdout(File::create(home.join("out.log")).unwrap())
+        .stderr(File::create(home.join("err.log")).unwrap());
+    let _kid = Kid(c.spawn().unwrap());
+    assert!(wait_answering(port), "{}", read(home.join("err.log")));
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(!bin_dir.join("called").exists(), "should not open browser with --no-open");
+}

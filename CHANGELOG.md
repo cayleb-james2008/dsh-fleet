@@ -4,6 +4,33 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running app shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.8.0 - 2026-11-22
+
+- Full **Fleet** Rebrand (`Cargo.toml`, `src/`, `frontend/`, `assets/index.html`,
+  `README.md`, `PRODUCT.md`, `.github/workflows/release.yml`, standalone web
+  bundle `shared-live-web/fleet/index.html`): renamed crate, binary (`fleet`),
+  self-updater repository (`cayleb-james2008/fleet`), release links, and every
+  user-facing title, badge, and Settings label cleanly to **Fleet** with zero
+  legacy `dsh-fleet` / `fleet-rs` / `DeepSeek Harness` branding or internal
+  engine jargon.
+- First-Class Native Windows (`x86_64-pc-windows-msvc`) Support: moved `libc`
+  under `[target.'cfg(unix)'.dependencies]`, gated Unix-only process-group /
+  `/proc` calls with `#[cfg(unix)]`, added native Windows `taskkill /PID <pid> /T`
+  and `/T /F` process-tree teardown, `cmd /C` check execution, `where` agent
+  probing, `core.hooksPath=NUL`, `%LOCALAPPDATA%\fleet` default data folder,
+  and `;`-separated `FLEET_REPOS_DIR`, and restored `windows-latest`
+  (`fleet-x86_64-pc-windows-msvc.exe`) to `.github/workflows/release.yml`
+  (4-platform release matrix: Linux x86_64/arm64, macOS arm64, Windows x86_64).
+- Standalone Chromeless Desktop App Launcher (`src/main.rs`): automatically
+  opens Fleet in a dedicated chromeless desktop window (`chromium`/`google-chrome`/
+  `brave`/`microsoft-edge --app=<url> --class=fleet` on Linux, `msedge.exe`/
+  `chrome.exe --app=<url>` on Windows, fallback `xdg-open` / `cmd /C start` /
+  `open`), embeds the default `policies.rn` for zero-config launch from `.desktop`
+  shortcuts or double-clicked Windows `.exe` builds outside a repo checkout,
+  supports `--app` to open the app window even under systemd/UWSM desktop
+  launchers (`INVOCATION_ID`), and strictly honors `--no-open`, `FLEET_NO_OPEN=1`,
+  `FLEET_APP_WINDOW=0`, background `INVOCATION_ID`, and headless display checks.
+
 ## 0.7.0 - 2026-11-22
 
 - Interactive Multi-Wave DAG Dependency Visualizer (`frontend/src/dag-graph.tsx`,
