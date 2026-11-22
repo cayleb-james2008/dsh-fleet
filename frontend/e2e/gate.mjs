@@ -189,7 +189,48 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
 {
   const { ctx, p } = await open(1440, 900, 'light', { acceptDownloads: true })
   let sseHits = 0
-  await p.route('**/api/version', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ name: 'fleet-rs', version: '0.5.0' }) }))
+  // v0.6.0 Board Metrics Strip, Auto-Heal Attempt Badges & Timeline, Playbooks Save/Select + Cmd+K, Zero Rune Jargon
+  await p.route('**/api/version', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ name: 'fleet-rs', version: '0.6.0' }) }))
+  await p.route('**/api/metrics', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      total: 5,
+      first_pass_count: 1,
+      auto_healed_count: 1,
+      needs_you_count: 1,
+      first_pass_rate_pct: 33.3,
+      effective_pass_rate_pct: 66.7,
+      median_check_ms: 820,
+      active_slots: 2,
+      max_parallel: 4,
+      queued_count: 0,
+      per_repo_breakdown: [{ repo: 'fixture', total: 5, first_pass: 1, auto_healed: 1, needs_you: 1, median_check_ms: 820 }],
+    }),
+  }))
+  const mockTemplates = [
+    {
+      id: 'tpl-default-1',
+      name: 'Feature + Unit Tests',
+      description: 'Scoped feature with lint and unit tests',
+      check_steps: [{ name: 'unit', cmd: 'cargo test', timeout_secs: 300 }],
+      allowed_globs: ['src/**'],
+      forbidden_globs: ['.env*'],
+      auto_steer_budget: 2,
+      tasks: [{ task: 'Implement scoped feature with tests', check: 'cargo test' }],
+      builtin: true,
+    },
+  ]
+  await p.route('**/api/templates', async r => {
+    if (r.request().method() === 'POST') {
+      const b = r.request().postDataJSON()
+      const created = { ...b, id: 'tpl-saved-1', builtin: false }
+      mockTemplates.push(created)
+      return r.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify(created) })
+    }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(mockTemplates) })
+  })
+  await p.route('**/api/templates/*', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ deleted: true }) }))
   await p.route('**/api/events/stream', r => {
     sseHits++
     r.fulfill({
@@ -241,6 +282,12 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
           transcript: bigLines,
           transcript_total: 55000,
           depends_on: ['s-base'],
+          auto_healed: true,
+          auto_steer_budget: 2,
+          heal_attempts: [
+            { attempt: 1, trigger_step: 'lint', exit_code: 1, stderr_tail: 'unused import in reports.rs', prompt_sent: 'Auto-heal attempt 1/2: remove unused import in reports.rs', started_ms: 1000, elapsed_ms: 340, healed: false },
+            { attempt: 2, trigger_step: 'unit-tests', exit_code: 0, stderr_tail: 'assertion expected 6 got 5', prompt_sent: 'Auto-heal attempt 2/2: fix export counter off-by-one', started_ms: 1400, elapsed_ms: 480, healed: true },
+          ],
           check_steps: [
             { name: 'lint', cmd: 'cargo clippy', status: 'passed', passed: true, exit_code: 0, elapsed_ms: 410, tail_line: '0 warnings', output: 'clippy clean' },
             { name: 'unit-tests', cmd: arr[doneIdx].check_cmd || 'cargo test', status: 'passed', passed: true, exit_code: 0, elapsed_ms: 820, tail_line: '6 passed in 0.82s', output: arr[doneIdx].check_output || 'ok' },
@@ -282,10 +329,22 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
     conflictBadgeText.includes('2 conflicts') && splitRendered && dl.suggestedFilename().endsWith('.patch'),
     `badge=${conflictBadgeText} split=${splitRendered} file=${dl.suggestedFilename()}`)
 
-  // Receipt tab: Per-Step Timed Receipt Timeline
+  // Receipt tab: Per-Step Timed Receipt Timeline + Auto-Heal Attempt Timeline
   await p.keyboard.press('r'); await p.waitForTimeout(250)
   const stepRows = await inspector.locator('ol[aria-label="Check pipeline steps"] > li').count()
   ok('Receipt tab renders per-step timed timeline with durations', stepRows === 2 && (await inspector.locator('[data-testid="receipt-timeline"]').innerText()).includes('410ms'), `steps=${stepRows}`)
+  const healTimelineText = await inspector.locator('[data-testid="auto-heal-timeline"]').innerText()
+  ok('Auto-Heal badge & timeline show Healed on attempt 2/2 with attempts',
+    healTimelineText.includes('Healed on attempt 2/2') && (await inspector.locator('ol[aria-label="Auto-heal attempts"] > li').count()) === 2)
+
+  // Board Metrics Strip telemetry
+  const metricsText = await p.locator('[data-testid="board-metrics-strip"]').innerText()
+  ok('Board Metrics Strip renders First-pass %, Auto-healed, Median check, and Active/Max slots',
+    metricsText.includes('33%') && metricsText.includes('Auto-healed') && metricsText.includes('820ms') && metricsText.includes('2 / 4'))
+
+  // Zero user-facing "Rune" jargon check (#155)
+  const visibleBodyText = await p.locator('body').innerText()
+  ok('Zero user-facing Rune jargon rendered on board or inspector', !/\brune\b/i.test(visibleBodyText))
 
   // Multi-select bulk bar + status filter
   await p.keyboard.press('Escape'); await p.waitForTimeout(250)
@@ -296,13 +355,18 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
     bulkRegionText.includes('Bulk Retry') && bulkRegionText.includes('Bulk Dismiss') && bulkRegionText.includes('Bulk Merge'))
   await p.getByRole('button', { name: /Selecting/ }).click(); await p.waitForTimeout(150)
 
-  // Cmd+K Global Command Palette -> Batch Fan-Out Composer
+  // Cmd+K Global Command Palette -> Playbooks + Batch Fan-Out Composer + Save as playbook
   await p.keyboard.press('Control+k'); await p.waitForTimeout(250)
   const cmdkOpen = await p.locator('[cmdk-root]').isVisible()
+  const cmdkHasPlaybook = (await p.locator('[cmdk-root]').innerText()).includes('Feature + Unit Tests')
   await p.locator('[cmdk-input]').fill('Batch fan-out'); await p.waitForTimeout(150)
   await p.keyboard.press('Enter'); await p.waitForTimeout(450)
   const batchOpen = await p.locator('#batch-task-0').isVisible()
-  ok('Ctrl+K Command Palette opens Batch Fan-Out & depends_on composer', cmdkOpen && batchOpen, `cmdk=${cmdkOpen} batch=${batchOpen}`)
+  ok('Ctrl+K Command Palette lists Playbooks and opens Batch Fan-Out & depends_on composer', cmdkOpen && cmdkHasPlaybook && batchOpen, `cmdk=${cmdkOpen} tpl=${cmdkHasPlaybook} batch=${batchOpen}`)
+  await p.getByRole('button', { name: 'Save as playbook' }).click(); await p.waitForTimeout(200)
+  await p.locator('#playbook-name').fill('Custom Nightly Wave')
+  await p.getByRole('button', { name: 'Save playbook', exact: true }).click(); await p.waitForTimeout(300)
+  ok('Composer saves custom playbook via POST /api/templates', (await p.locator('section[aria-label="Playbooks"]').innerText()).includes('Custom Nightly Wave'))
   await p.keyboard.press('Escape'); await p.waitForTimeout(250)
 
   // Live Policy Tester inside #settings Vaul drawer

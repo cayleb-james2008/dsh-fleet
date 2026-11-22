@@ -1,12 +1,73 @@
 (() => {
-  const APP_VERSION = "0.5.0";
-  const DB_NAME = "fleet-worktrees-v2";
+  const APP_VERSION = "0.6.0";
+  const DB_NAME = "fleet-worktrees-v3";
   const STORE_NAME = "state";
   const BYOK_KEY_SS = "fleet-byok-api-key";
   const BYOK_URL_LS = "fleet-byok-url";
   const BYOK_MODEL_LS = "fleet-byok-model";
   const LOCAL_URL_LS = "fleet-local-url";
   const MAX_PARALLEL = 4;
+
+  const DEFAULT_TEMPLATES = () => [
+    {
+      id: "feature-with-tests",
+      name: "Feature + Unit Tests",
+      description: "Implement a scoped change with syntax lint, test suite, and auto-heal recovery.",
+      repo: "/workspace/ledger-kit",
+      check_steps: [
+        { name: "syntax-lint", cmd: "lint", timeout_secs: 60 },
+        { name: "unit-tests", cmd: "npm test", timeout_secs: 300 }
+      ],
+      allowed_globs: ["src/**", "tests/**"],
+      forbidden_globs: [".env*", "*.pem"],
+      auto_steer_budget: 2,
+      tasks: [{ repo: "/workspace/ledger-kit", task: "Implement the requested feature and cover edge cases with unit tests", check: "npm test" }],
+      builtin: true
+    },
+    {
+      id: "two-wave-dag",
+      name: "Two-Wave DAG Rollout",
+      description: "Wave 1 lands core API helper; Wave 2 runs automatically once Wave 1 is verified done.",
+      check_steps: [{ name: "verify", cmd: "npm test", timeout_secs: 300 }],
+      allowed_globs: ["src/**", "tests/**"],
+      forbidden_globs: [".env*"],
+      auto_steer_budget: 2,
+      tasks: [
+        { alias: "#1", repo: "/workspace/ledger-kit", task: "Wave 1: Implement shared summary helper and baseline tests", check: "npm test" },
+        { alias: "#2", repo: "/workspace/dag-scheduler", task: "Wave 2: Integrate downstream wave planner and regression checks", check: "npm test", depends_on: ["#1"] }
+      ],
+      builtin: true
+    },
+    {
+      id: "strict-scope-hotfix",
+      name: "Strict-Scope Hotfix",
+      description: "Restricts edits to src/** and tests/** with zero unplanned file drift and auto-heal enabled.",
+      repo: "/workspace/rate-limiter",
+      check_steps: [{ name: "regression-suite", cmd: "npm test", timeout_secs: 180 }],
+      allowed_globs: ["src/**", "tests/**"],
+      forbidden_globs: ["package-lock.json", "Cargo.lock", ".env*"],
+      auto_steer_budget: 2,
+      tasks: [{ repo: "/workspace/rate-limiter", task: "Fix the reported defect without touching configuration or lockfiles", check: "npm test" }],
+      builtin: true
+    },
+    {
+      id: "parallel-audit-fanout",
+      name: "Parallel Repo Audit Fan-Out",
+      description: "Runs parallel hardening tasks across multiple repositories under shared concurrency limits.",
+      check_steps: [
+        { name: "syntax-lint", cmd: "lint", timeout_secs: 60 },
+        { name: "test-suite", cmd: "npm test", timeout_secs: 300 }
+      ],
+      allowed_globs: ["src/**", "tests/**"],
+      forbidden_globs: [".env*", "*.key"],
+      auto_steer_budget: 1,
+      tasks: [
+        { alias: "#1", repo: "/workspace/ledger-kit", task: "Add boundary input validation and unit coverage", check: "npm test" },
+        { alias: "#2", repo: "/workspace/rate-limiter", task: "Audit error paths and add deterministic regression assertions", check: "npm test" }
+      ],
+      builtin: true
+    }
+  ];
 
   const INITIAL_REPOS = () => ({
     "/workspace/ledger-kit": {
@@ -603,7 +664,7 @@
     }
   }
 
-  let state = { repos: INITIAL_REPOS(), sessions: [], seq: 1 };
+  let state = { repos: INITIAL_REPOS(), sessions: [], templates: DEFAULT_TEMPLATES(), seq: 1 };
   let localMode = false;
   let localUrl = (() => {
     try { return localStorage.getItem(LOCAL_URL_LS) || "http://127.0.0.1:8471"; } catch { return "http://127.0.0.1:8471"; }
@@ -777,8 +838,17 @@
 
     if (isRetryOrSteer) {
       if (files["src/limiter.js"] && files["src/limiter.js"].includes("if (tokens > 1)")) {
-        files["src/limiter.js"] = files["src/limiter.js"].replace("if (tokens > 1)", "if (tokens >= 1)");
-        return "fixed boundary condition in src/limiter.js (tokens > 1 -> tokens >= 1)";
+        files["src/limiter.js"] = files["src/limiter.js"].replace(
+          "if (tokens > 1)",
+          "// boundary fix: allow exact 1-token refill threshold\n      if (tokens >= 1)"
+        );
+        if (files["tests/limiter.test.js"] && !files["tests/limiter.test.js"].includes("boundary token")) {
+          files["tests/limiter.test.js"] = files["tests/limiter.test.js"].replace(
+            "return 'limiter.test.js: 4 assertions passed';",
+            "assert.equal(b.remaining(), 0, 'boundary token consumed cleanly');\n  return 'limiter.test.js: 5 assertions passed';"
+          );
+        }
+        return "fixed boundary condition in src/limiter.js (tokens > 1 -> tokens >= 1) and added regression assertion";
       }
       if (files["src/ledger.js"] && files["src/ledger.js"].includes("return entries.reduce((sum, e) => sum - e.cents, 0);")) {
         files["src/ledger.js"] = files["src/ledger.js"].replace(
@@ -902,21 +972,27 @@
     return "added " + fnName + "() to " + targetSrc + " and updated tests";
   }
 
-  async function runPipelineChecks(session, commitHash, skipSchedule = false) {
-    const specs =
-      Array.isArray(session._checkStepSpecs) && session._checkStepSpecs.length > 0
-        ? session._checkStepSpecs
-        : [{ name: "verify", cmd: session.check_cmd || "npm test", timeout_secs: 300 }];
-
-    // Enforce file-scope guardrails before marking done
-    const violations = checkFileScopeGuardrails(
-      session._baseFiles,
-      session._branchFiles,
-      session.allowed_globs,
-      session.forbidden_globs
+  function buildHealPrompt(session, failedStep, attemptNum, budget) {
+    return (
+      "Auto-heal attempt " +
+      attemptNum +
+      "/" +
+      budget +
+      " for " +
+      session.id +
+      ": check step \"" +
+      failedStep.name +
+      "\" (" +
+      failedStep.cmd +
+      ") failed with exit " +
+      failedStep.exit_code +
+      ".\nDiagnostic tail: " +
+      failedStep.tail_line +
+      "\nRepair the branch worktree files so all check steps pass."
     );
-    session.guardrail_violations = violations;
+  }
 
+  async function executeSingleCheckPass(session, specs) {
     const receipts = specs.map((sp) => ({
       name: sp.name || sp.cmd,
       cmd: sp.cmd,
@@ -933,6 +1009,7 @@
     let allPassed = true;
     let firstFailExit = 0;
     let firstFailReason = "";
+    let failedStep = null;
     let totalMs = 0;
 
     for (let idx = 0; idx < specs.length; idx++) {
@@ -964,6 +1041,7 @@
         allPassed = false;
         firstFailExit = result.exitCode;
         firstFailReason = (result.stderr || result.stdout || "non-zero exit").split("\n")[0];
+        failedStep = receipts[idx];
         for (let k = idx + 1; k < receipts.length; k++) {
           receipts[k].status = "skipped";
           receipts[k].tail_line = "Skipped after earlier step failed";
@@ -973,10 +1051,122 @@
       }
     }
 
+    return {
+      receipts,
+      combinedOutput: combinedChunks.join("\n\n").trim(),
+      allPassed,
+      firstFailExit,
+      firstFailReason,
+      failedStep,
+      totalMs
+    };
+  }
+
+  async function runPipelineChecks(session, commitHash, skipSchedule = false, allowAutoHeal = true) {
+    const specs =
+      Array.isArray(session._checkStepSpecs) && session._checkStepSpecs.length > 0
+        ? session._checkStepSpecs
+        : [{ name: "verify", cmd: session.check_cmd || "npm test", timeout_secs: 300 }];
+
+    // Enforce file-scope guardrails before marking done
+    let violations = checkFileScopeGuardrails(
+      session._baseFiles,
+      session._branchFiles,
+      session.allowed_globs,
+      session.forbidden_globs
+    );
+    session.guardrail_violations = violations;
+
+    let pass = await executeSingleCheckPass(session, specs);
+    let activeHash = commitHash;
+
+    // Autonomous Auto-Heal loop when check fails within auto_steer_budget (with identical-error loop guard)
+    const budget = typeof session.auto_steer_budget === "number" ? Math.max(0, Math.min(session.auto_steer_budget, 5)) : 2;
+    let lastErrorSig = "";
+    if (allowAutoHeal && violations.length === 0 && !pass.allPassed && pass.failedStep && budget > 0) {
+      session.heal_attempts = Array.isArray(session.heal_attempts) ? session.heal_attempts : [];
+      while (session.heal_attempts.length < budget && !pass.allPassed && pass.failedStep) {
+        const sig = pass.failedStep.name + "::" + pass.failedStep.tail_line;
+        if (lastErrorSig && sig === lastErrorSig) {
+          appendLine(session, "auto-heal loop guard: identical failure repeated, halting for review");
+          break;
+        }
+        lastErrorSig = sig;
+        const attemptNum = session.heal_attempts.length + 1;
+        const startedMs = Date.now();
+        const promptSent = buildHealPrompt(session, pass.failedStep, attemptNum, budget);
+        session.status = "healing";
+        session.bucket = "working";
+        appendLine(session, "auto-heal attempt " + attemptNum + "/" + budget + ": steering agent from " + pass.failedStep.name + " stderr");
+        await persistState();
+        emitSse("session_update", { session: publicSession(session) });
+
+        try {
+          const byokNote = await runByokAgent(session, promptSent);
+          if (byokNote) {
+            appendLine(session, "auto-heal byok (" + byokModel + "): " + byokNote);
+          } else {
+            session.check_output = pass.combinedOutput;
+            const note = applyBuiltInPatch(session, promptSent, true);
+            appendLine(session, "auto-heal " + session.engine + ": " + note);
+          }
+        } catch (err) {
+          const msg = err && err.message ? err.message : String(err);
+          const failedRec = {
+            attempt: attemptNum,
+            trigger_step: pass.failedStep.name,
+            exit_code: pass.firstFailExit,
+            stderr_tail: pass.firstFailReason,
+            prompt_sent: promptSent,
+            started_ms: startedMs,
+            elapsed_ms: Math.max(1, Date.now() - startedMs),
+            healed: false
+          };
+          session.heal_attempts = [...session.heal_attempts, failedRec];
+          emitSse("auto_heal_attempt", { session_id: session.id, attempt: failedRec });
+          appendLine(session, "auto-heal error: " + msg);
+          break;
+        }
+
+        session.diff = computeTreeDiff(session._baseFiles, session._branchFiles);
+        activeHash = shortHash(session.id + ":heal:" + attemptNum + ":" + JSON.stringify(session._branchFiles));
+        violations = checkFileScopeGuardrails(
+          session._baseFiles,
+          session._branchFiles,
+          session.allowed_globs,
+          session.forbidden_globs
+        );
+        session.guardrail_violations = violations;
+        const prevFailStep = pass.failedStep;
+        const prevFailExit = pass.firstFailExit;
+        const prevFailReason = pass.firstFailReason;
+        pass = await executeSingleCheckPass(session, specs);
+        const healedNow = violations.length === 0 && pass.allPassed;
+        const attemptRec = {
+          attempt: attemptNum,
+          trigger_step: prevFailStep.name,
+          exit_code: prevFailExit,
+          stderr_tail: prevFailReason,
+          prompt_sent: promptSent,
+          started_ms: startedMs,
+          elapsed_ms: Math.max(1, Date.now() - startedMs + pass.totalMs),
+          healed: healedNow
+        };
+        session.heal_attempts = [...session.heal_attempts, attemptRec];
+        emitSse("auto_heal_attempt", { session_id: session.id, attempt: attemptRec });
+        if (healedNow) {
+          session.auto_healed = true;
+          appendLine(session, "auto-healed on attempt " + attemptNum + "/" + budget + " at " + activeHash);
+          break;
+        }
+        if (violations.length > 0) break;
+      }
+    }
+
     session.check_ran = true;
-    session.check_output = combinedChunks.join("\n\n").trim();
-    session.check_exit = allPassed ? 0 : firstFailExit;
-    session.elapsed_ms = totalMs;
+    session.check_output = pass.combinedOutput;
+    session.check_exit = pass.allPassed ? 0 : pass.firstFailExit;
+    session.elapsed_ms = pass.totalMs;
 
     if (violations.length > 0) {
       session.check_passed = false;
@@ -985,27 +1175,28 @@
       session.verified_commit = null;
       session.reason = "File-scope guardrail blocked edits outside allowed globs: " + violations.join("; ");
       appendLine(session, "guardrail blocked: " + violations.join(", "));
-    } else if (allPassed) {
+    } else if (pass.allPassed) {
       session.check_passed = true;
       session.status = "done";
       session.bucket = "done";
-      session.verified_commit = commitHash;
+      session.verified_commit = activeHash;
       session.reason = null;
       appendLine(
         session,
-        "all " + receipts.length + " check step(s) passed (exit 0 in " + totalMs + "ms) — verified done at " + commitHash
+        "all " + pass.receipts.length + " check step(s) passed (exit 0 in " + pass.totalMs + "ms) — verified done at " + activeHash
       );
     } else {
       session.check_passed = false;
       session.status = "needs-you";
       session.bucket = "needs-you";
       session.verified_commit = null;
-      session.reason = "Check failed (exit " + firstFailExit + "): " + session.check_cmd + ". " + firstFailReason;
-      appendLine(session, "check failed (exit " + firstFailExit + "): " + firstFailReason);
+      session.reason = "Check failed (exit " + pass.firstFailExit + "): " + session.check_cmd + ". " + pass.firstFailReason;
+      appendLine(session, "check failed (exit " + pass.firstFailExit + "): " + pass.firstFailReason);
     }
 
     await persistState();
     emitSse("session_update", { session: publicSession(session) });
+    emitSse("metrics_updated", {});
     if (!skipSchedule) await evaluateDagScheduler();
   }
 
@@ -1130,7 +1321,7 @@
     await persistState();
     emitSse("session_update", { session: publicSession(session) });
 
-    await runPipelineChecks(session, commitHash);
+    await runPipelineChecks(session, commitHash, false, false);
   }
 
   function createSessionRecord({
@@ -1143,7 +1334,8 @@
     next,
     dependsOn,
     allowedGlobs,
-    forbiddenGlobs
+    forbiddenGlobs,
+    autoSteerBudget
   }) {
     const head = repoHead(repoPath);
     const id = "s-" + String(state.seq++).padStart(3, "0");
@@ -1162,6 +1354,9 @@
         : null;
     const effectiveCmd = (checkCmd || "").trim() || (cleanSteps && cleanSteps[0]?.cmd) || "npm test";
     const cleanDeps = Array.isArray(dependsOn) ? dependsOn.map((d) => String(d).trim()).filter(Boolean) : [];
+    const budget = typeof autoSteerBudget === "number" && Number.isFinite(autoSteerBudget)
+      ? Math.max(0, Math.min(Math.trunc(autoSteerBudget), 5))
+      : 2;
     return {
       id,
       task,
@@ -1180,6 +1375,9 @@
       check_ran: false,
       check_exit: null,
       check_steps: [],
+      heal_attempts: [],
+      auto_healed: false,
+      auto_steer_budget: budget,
       diff: "",
       reason: null,
       verified_commit: null,
@@ -1236,18 +1434,20 @@
         { name: "syntax-lint", cmd: "lint" },
         { name: "unit-tests", cmd: "npm test" }
       ],
-      allowedGlobs: ["src/**", "tests/**"]
+      allowedGlobs: ["src/**", "tests/**"],
+      autoSteerBudget: 2
     });
     const s2 = createSessionRecord({
       repoPath: "/workspace/rate-limiter",
       project: "rate-limiter",
-      task: "Investigate off-by-one token bucket refill threshold bug in rate-limiter",
+      task: "Fix off-by-one token bucket refill threshold bug in rate-limiter",
       agent: "web-worker",
       checkCmd: "npm test",
       checkSteps: [
         { name: "syntax-lint", cmd: "lint" },
         { name: "unit-tests", cmd: "npm test" }
-      ]
+      ],
+      autoSteerBudget: 2
     });
     const s3 = createSessionRecord({
       repoPath: "/workspace/dag-scheduler",
@@ -1260,12 +1460,26 @@
         { name: "unit-tests", cmd: "npm test" }
       ],
       dependsOn: [s1.id],
-      allowedGlobs: ["src/**", "tests/**"]
+      allowedGlobs: ["src/**", "tests/**"],
+      autoSteerBudget: 2
     });
-    state.sessions = [s3, s2, s1];
+    const s4 = createSessionRecord({
+      repoPath: "/workspace/ledger-kit",
+      project: "ledger-kit",
+      task: "Verify audit export gate without writing output artifact",
+      agent: "web-worker",
+      checkCmd: "test -s audit-report.txt",
+      checkSteps: [
+        { name: "syntax-lint", cmd: "lint" },
+        { name: "artifact-check", cmd: "test -s audit-report.txt" }
+      ],
+      autoSteerBudget: 0
+    });
+    state.sessions = [s4, s3, s2, s1];
     await executeSessionRun(s1, s1.task, false, true);
     await executeSessionRun(s2, s2.task, false, true);
     await executeSessionRun(s3, s3.task, false, true);
+    await executeSessionRun(s4, s4.task, false, true);
   }
 
   async function ensureReady() {
@@ -1274,13 +1488,89 @@
         const saved = await idbGet("workspace");
         if (saved && saved.repos && Array.isArray(saved.sessions) && saved.sessions.length > 0) {
           state = saved;
+          if (!Array.isArray(state.templates) || state.templates.length === 0) {
+            state.templates = DEFAULT_TEMPLATES();
+          }
         } else {
-          state = { repos: INITIAL_REPOS(), sessions: [], seq: 1 };
+          state = { repos: INITIAL_REPOS(), sessions: [], templates: DEFAULT_TEMPLATES(), seq: 1 };
           await seedRealInitialRuns();
         }
       })();
     }
     return readyPromise;
+  }
+
+  function computeMetrics() {
+    const activeSessions = state.sessions.filter((s) => s.bucket !== "archived");
+    let firstPass = 0;
+    let autoHealed = 0;
+    let needsYou = 0;
+    let activeSlots = 0;
+    let queuedCount = 0;
+    const durs = [];
+    const byRepo = new Map();
+
+    for (const s of activeSessions) {
+      const repoKey = s.project || "default";
+      const rec = byRepo.get(repoKey) || { repo: repoKey, total: 0, first_pass: 0, auto_healed: 0, needs_you: 0, durs: [] };
+      rec.total++;
+      if (typeof s.elapsed_ms === "number" && s.elapsed_ms > 0) {
+        durs.push(s.elapsed_ms);
+        rec.durs.push(s.elapsed_ms);
+      }
+      if (s.check_passed === true && (s.status === "done" || s.status === "merged")) {
+        if (s.auto_healed) {
+          autoHealed++;
+          rec.auto_healed++;
+        } else {
+          firstPass++;
+          rec.first_pass++;
+        }
+      } else if (s.bucket === "needs-you") {
+        needsYou++;
+        rec.needs_you++;
+      } else if (s.bucket === "working" && (s.status === "queued" || s.status === "blocked")) {
+        queuedCount++;
+      } else if (s.bucket === "working") {
+        activeSlots++;
+      }
+      byRepo.set(repoKey, rec);
+    }
+
+    const med = (arr) => {
+      if (!arr.length) return null;
+      const sorted = [...arr].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      return sorted.length % 2 === 1 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+    };
+
+    const settled = firstPass + autoHealed + needsYou;
+    return {
+      total: activeSessions.length,
+      first_pass_count: firstPass,
+      auto_healed_count: autoHealed,
+      needs_you_count: needsYou,
+      first_pass_rate_pct: settled > 0 ? Math.round((firstPass / settled) * 1000) / 10 : 0,
+      effective_pass_rate_pct: settled > 0 ? Math.round(((firstPass + autoHealed) / settled) * 1000) / 10 : 0,
+      median_check_ms: med(durs),
+      active_slots: activeSlots,
+      max_slots: MAX_PARALLEL,
+      max_parallel: MAX_PARALLEL,
+      queued_count: queuedCount,
+      blocked_count: 0,
+      per_repo_breakdown: Array.from(byRepo.values()).map((r) => ({
+        repo: r.repo,
+        project: r.repo,
+        total: r.total,
+        first_pass: r.first_pass,
+        first_pass_count: r.first_pass,
+        auto_healed: r.auto_healed,
+        auto_healed_count: r.auto_healed,
+        needs_you: r.needs_you,
+        needs_you_count: r.needs_you,
+        median_check_ms: med(r.durs)
+      }))
+    };
   }
 
   function publicSession(s) {
@@ -1351,10 +1641,12 @@
       return this.getStatus();
     },
     async resetWorkspace() {
-      state = { repos: INITIAL_REPOS(), sessions: [], seq: 1 };
+      state = { repos: INITIAL_REPOS(), sessions: [], templates: DEFAULT_TEMPLATES(), seq: 1 };
       await seedRealInitialRuns();
       await persistState();
       emitSse("sessions", { sessions: state.sessions.filter((s) => s.bucket !== "archived").map(publicSession) });
+      emitSse("templates_updated", {});
+      emitSse("metrics_updated", {});
     },
     getSessionFiles(sessionId) {
       const s = state.sessions.find((x) => x.id === sessionId);
@@ -1432,8 +1724,56 @@
         default_agent_engine: hasByok ? "byok-llm" : "web-worker",
         model: hasByok ? byokModel : null,
         version: APP_VERSION,
-        features: { sse: true, batch: true, merge_check: true, policy_test: true, prune_worktrees: true }
+        features: {
+          sse: true,
+          batch: true,
+          merge_check: true,
+          policy_test: true,
+          prune_worktrees: true,
+          auto_heal: true,
+          templates: true,
+          metrics: true
+        }
       });
+    }
+    if (method === "GET" && u.pathname === "/api/metrics") {
+      return jsonResp(computeMetrics());
+    }
+    if (method === "GET" && u.pathname === "/api/templates") {
+      return jsonResp(Array.isArray(state.templates) ? state.templates : DEFAULT_TEMPLATES());
+    }
+    if (method === "POST" && u.pathname === "/api/templates") {
+      const name = String(body.name || "").trim();
+      if (!name) return jsonResp({ error: "Playbook name is required." }, 400);
+      const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32) || "playbook";
+      const created = {
+        id: slug + "-" + Date.now().toString(36),
+        name,
+        description: String(body.description || "").trim(),
+        repo: body.repo ? String(body.repo).trim() : undefined,
+        check_steps: Array.isArray(body.check_steps) ? body.check_steps : undefined,
+        allowed_globs: Array.isArray(body.allowed_globs) ? body.allowed_globs : [],
+        forbidden_globs: Array.isArray(body.forbidden_globs) ? body.forbidden_globs : [],
+        auto_steer_budget: typeof body.auto_steer_budget === "number" ? body.auto_steer_budget : 2,
+        tasks: Array.isArray(body.tasks) ? body.tasks : undefined,
+        builtin: false
+      };
+      state.templates = [...(Array.isArray(state.templates) ? state.templates : DEFAULT_TEMPLATES()), created];
+      await persistState();
+      emitSse("templates_updated", {});
+      return jsonResp(created, 201);
+    }
+    const tplDelMatch = /^\/api\/templates\/([^/]+)$/.exec(u.pathname);
+    if (method === "DELETE" && tplDelMatch) {
+      const id = decodeURIComponent(tplDelMatch[1]);
+      const list = Array.isArray(state.templates) ? state.templates : DEFAULT_TEMPLATES();
+      const target = list.find((t) => t.id === id);
+      if (!target) return jsonResp({ error: "Playbook not found." }, 404);
+      if (target.builtin) return jsonResp({ error: "Built-in playbooks cannot be deleted." }, 409);
+      state.templates = list.filter((t) => t.id !== id);
+      await persistState();
+      emitSse("templates_updated", {});
+      return jsonResp({ deleted: true, id });
     }
     if (method === "POST" && u.pathname === "/api/policies/test") {
       const repo = String(body.repo || "").trim();
@@ -1540,7 +1880,8 @@
           next: String(it.next || "").trim(),
           dependsOn: Array.isArray(it.depends_on) ? it.depends_on : [],
           allowedGlobs: Array.isArray(it.allowed_globs) ? it.allowed_globs : [],
-          forbiddenGlobs: Array.isArray(it.forbidden_globs) ? it.forbidden_globs : []
+          forbiddenGlobs: Array.isArray(it.forbidden_globs) ? it.forbidden_globs : [],
+          autoSteerBudget: typeof it.auto_steer_budget === "number" ? it.auto_steer_budget : undefined
         });
         if (it.alias) aliasMap.set(String(it.alias), rec.id);
         aliasMap.set("#" + (i + 1), rec.id);
@@ -1581,7 +1922,8 @@
         next: String(body.next || "").trim(),
         dependsOn: Array.isArray(body.depends_on) ? body.depends_on : [],
         allowedGlobs: Array.isArray(body.allowed_globs) ? body.allowed_globs : [],
-        forbiddenGlobs: Array.isArray(body.forbidden_globs) ? body.forbidden_globs : []
+        forbiddenGlobs: Array.isArray(body.forbidden_globs) ? body.forbidden_globs : [],
+        autoSteerBudget: typeof body.auto_steer_budget === "number" ? body.auto_steer_budget : undefined
       });
       const cycle = detectDagCycle([...state.sessions, created]);
       if (cycle) {

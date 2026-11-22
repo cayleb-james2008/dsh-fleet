@@ -14,6 +14,7 @@ import {
   Send,
   ShieldAlert,
   Square,
+  Wrench,
   X,
   XCircle,
 } from "lucide-react";
@@ -28,6 +29,7 @@ import { cn } from "@/lib/utils";
 import {
   formatDurationMs,
   getWebEngine,
+  healBadgeInfo,
   HONEST,
   isActivelyRunning,
   isFailed,
@@ -152,6 +154,99 @@ function BranchFileEditor({ sessionId, onSaved }: { sessionId: string; onSaved: 
   );
 }
 
+function AutoHealTimeline({ s }: { s: Session }) {
+  const attempts = s.heal_attempts ?? [];
+  if (attempts.length === 0) return null;
+  const badge = healBadgeInfo(s);
+  const totalMs = attempts.reduce((acc, a) => acc + (typeof a.elapsed_ms === "number" ? a.elapsed_ms : 0), 0);
+
+  return (
+    <section
+      aria-label="Auto-heal timeline"
+      data-testid="auto-heal-timeline"
+      className="space-y-2.5 rounded-card border border-hairline bg-canvas p-3"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="inline-flex items-center gap-1.5 text-sm font-medium text-ink">
+          <Wrench className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
+          <span>Auto-heal timeline</span>
+        </span>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {badge && (
+            <Pill
+              variant={badge.tone === "healed" ? "success" : badge.tone === "healing" ? "secondary" : "destructive"}
+              className="px-2 py-0.5 font-mono text-xs"
+            >
+              <PillIndicator
+                variant={badge.tone === "healed" ? "success" : badge.tone === "healing" ? "warning" : "error"}
+                pulse={badge.tone === "healing"}
+              />
+              <span>{badge.fullLabel}</span>
+            </Pill>
+          )}
+          {totalMs > 0 && (
+            <span className="rounded-chip bg-track px-1.5 py-0.5 font-mono text-xs tabular-nums text-ink-2">
+              {formatDurationMs(totalMs)}
+            </span>
+          )}
+        </div>
+      </div>
+
+      <ol aria-label="Auto-heal attempts" className="space-y-2">
+        {attempts.map((a) => (
+          <li key={a.attempt} className="rounded-control border border-hairline bg-surface p-2.5 text-xs">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="inline-flex size-5 shrink-0 items-center justify-center rounded-full bg-track font-mono text-xs text-ink-2">
+                {a.attempt}
+              </span>
+              {a.healed ? (
+                <CheckCircle2 className="size-4 shrink-0 text-success-foreground" strokeWidth={1.5} aria-hidden />
+              ) : (
+                <XCircle className="size-4 shrink-0 text-destructive-foreground" strokeWidth={1.5} aria-hidden />
+              )}
+              <span className="font-mono font-medium text-ink">{a.trigger_step}</span>
+              <Badge variant={a.healed ? "success" : "warning"} size="sm" className="ml-auto font-mono">
+                {a.healed ? "healed" : a.exit_code !== null ? `exit ${a.exit_code}` : "retried"}
+              </Badge>
+              {a.elapsed_ms !== null && (
+                <span className="rounded-chip bg-track px-1.5 py-0.5 font-mono text-xs tabular-nums text-ink-2">
+                  {formatDurationMs(a.elapsed_ms)}
+                </span>
+              )}
+            </div>
+
+            {a.stderr_tail && (
+              <p className="mt-1.5 border-l-2 border-unread pl-2 font-mono text-xs text-destructive-foreground [overflow-wrap:anywhere]">
+                {a.stderr_tail}
+              </p>
+            )}
+
+            {a.prompt_sent && (
+              <Expandable expandDirection="vertical" expandBehavior="push" className="mt-2">
+                {({ isExpanded }) => (
+                  <>
+                    <ExpandableTrigger
+                      aria-label={`Diagnostic steer prompt for attempt ${a.attempt}`}
+                      className="inline-flex cursor-pointer items-center rounded-control text-xs font-medium text-ink-2 outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11 max-md:px-2"
+                    >
+                      {isExpanded ? "Hide steer prompt" : "Show steer prompt"}
+                    </ExpandableTrigger>
+                    <ExpandableContent preset="fade">
+                      <pre className="mt-1.5 max-h-[24vh] overflow-y-auto whitespace-pre-wrap break-all rounded-control border border-hairline bg-canvas p-2 font-mono text-xs leading-relaxed text-ink">
+                        {a.prompt_sent}
+                      </pre>
+                    </ExpandableContent>
+                  </>
+                )}
+              </Expandable>
+            )}
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
 function ReceiptStepTimeline({ s, ranCheck }: { s: Session; ranCheck: boolean }) {
   const steps: CheckStepReceipt[] = useMemo(() => {
     if (s.check_steps && s.check_steps.length > 0) return s.check_steps;
@@ -211,6 +306,8 @@ function ReceiptStepTimeline({ s, ranCheck }: { s: Session; ranCheck: boolean })
           </ul>
         </div>
       )}
+
+      <AutoHealTimeline s={s} />
 
       {steps.length > 0 ? (
         <ol aria-label="Check pipeline steps" className="space-y-2">
@@ -349,6 +446,7 @@ export function DetailBody({
 
   const verified = isVerified(s);
   const honest = isHonest(s);
+  const healBadge = healBadgeInfo(s);
   const ranCheck = s.check_ran !== undefined ? Boolean(s.check_ran) : s.check_passed === true || s.check_passed === false;
   const agent = s.test_mode ? "test mode (custom command)" : s.engine || s.agent || "unknown";
   const chain: string[] = [];
@@ -461,6 +559,19 @@ export function DetailBody({
         >
           {verified ? (s.status === "merged" ? "merged" : "verified") : statusText(s)}
         </Badge>
+        {healBadge && (
+          <Pill
+            variant={healBadge.tone === "healed" ? "success" : healBadge.tone === "healing" ? "secondary" : "destructive"}
+            className="px-2 py-0.5 font-mono text-xs"
+            data-testid="inspector-heal-badge"
+          >
+            <PillIndicator
+              variant={healBadge.tone === "healed" ? "success" : healBadge.tone === "healing" ? "warning" : "error"}
+              pulse={healBadge.tone === "healing"}
+            />
+            <span>{healBadge.fullLabel}</span>
+          </Pill>
+        )}
         {s.status === "done" && mergeCheck && (
           <Pill variant={mergeCheck.clean ? "success" : "destructive"} className="px-2 py-0.5 font-mono text-xs">
             <PillIndicator variant={mergeCheck.clean ? "success" : "error"} />

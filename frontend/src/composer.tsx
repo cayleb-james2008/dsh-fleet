@@ -1,8 +1,20 @@
 // New Session & Batch Fan-Out / DAG Dependency Composer inside Motion Primitives MorphingDialog.
-// Supports both Single Task dispatch (preserving exact v0.4.0 fields & IDs) and Batch Fan-Out
-// across repos with depends_on DAG chaining, multi-step check pipelines, and allowed/forbidden file globs.
+// Supports Single Task dispatch, Batch Fan-Out across repos with depends_on DAG chaining,
+// Playbooks / Templates selector & Save-as-Playbook (GET/POST/DELETE /api/templates),
+// multi-step check pipelines, auto-heal retry budget, and allowed/forbidden file globs.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { FolderGit2, GitBranch, Layers, ListChecks, Plus, Shield, Trash2 } from "lucide-react";
+import {
+  BookMarked,
+  FolderGit2,
+  GitBranch,
+  Layers,
+  ListChecks,
+  Plus,
+  Save,
+  Shield,
+  Trash2,
+  Wrench,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { InputGroup, InputGroupInput } from "@/components/ui/input-group";
 import { Kbd } from "@/components/ui/kbd";
@@ -22,15 +34,18 @@ import { Expandable, ExpandableContent, ExpandableTrigger } from "@/components/u
 import { glide } from "@/motion";
 import { cn } from "@/lib/utils";
 import {
+  deletePlaybook,
   dispatchBatchSessions,
   getJson,
   isWebEngineMode,
   normalizeRepos,
   normalizeSessions,
   repoBasename,
+  savePlaybook,
   type Agent,
   type BatchDispatchItem,
   type CheckStepSpec,
+  type PlaybookTemplate,
   type Policy,
   type RepoInfo,
   type Session,
@@ -66,19 +81,27 @@ function parseGlobs(raw: string): string[] {
 export function NewSession({
   policy,
   sessions,
+  playbooks,
   supportsServerV050,
+  supportsServerV060,
   initialModeRef,
+  initialPlaybookRef,
   onHanded,
   onHandedBatch,
+  onPlaybooksChanged,
   thing,
   className,
 }: {
   policy: Policy | null;
   sessions: Session[];
+  playbooks: PlaybookTemplate[];
   supportsServerV050: boolean;
+  supportsServerV060: boolean;
   initialModeRef: React.MutableRefObject<ComposerMode>;
+  initialPlaybookRef: React.MutableRefObject<PlaybookTemplate | null>;
   onHanded: (s: Session) => void;
   onHandedBatch: (created: Session[]) => void;
+  onPlaybooksChanged: () => void;
   thing?: string;
   className?: string;
 }) {
@@ -98,16 +121,21 @@ export function NewSession({
           <span>New session</span>
         </MorphingDialogTrigger>
         <MorphingDialogContainer>
-          <MorphingDialogContent className="relative flex max-h-[calc(100dvh-32px)] w-full max-w-[640px] flex-col overflow-hidden rounded-dialog border border-hairline bg-surface text-ink">
+          <MorphingDialogContent className="relative flex max-h-[calc(100dvh-32px)] w-full max-w-[660px] flex-col overflow-hidden rounded-dialog border border-hairline bg-surface text-ink">
             <Composer
               policy={policy}
               sessions={sessions}
+              playbooks={playbooks}
               supportsServerV050={supportsServerV050}
+              supportsServerV060={supportsServerV060}
               initialModeRef={initialModeRef}
+              initialPlaybookRef={initialPlaybookRef}
               onHanded={onHanded}
               onHandedBatch={onHandedBatch}
+              onPlaybooksChanged={onPlaybooksChanged}
               onClosed={() => {
                 initialModeRef.current = "single";
+                initialPlaybookRef.current = null;
                 returnFocus();
               }}
             />
@@ -179,23 +207,35 @@ function AgentPicker({
 function Composer({
   policy,
   sessions,
+  playbooks,
   supportsServerV050,
+  supportsServerV060,
   initialModeRef,
+  initialPlaybookRef,
   onHanded,
   onHandedBatch,
+  onPlaybooksChanged,
   onClosed,
 }: {
   policy: Policy | null;
   sessions: Session[];
+  playbooks: PlaybookTemplate[];
   supportsServerV050: boolean;
+  supportsServerV060: boolean;
   initialModeRef: React.MutableRefObject<ComposerMode>;
+  initialPlaybookRef: React.MutableRefObject<PlaybookTemplate | null>;
   onHanded: (s: Session) => void;
   onHandedBatch: (created: Session[]) => void;
+  onPlaybooksChanged: () => void;
   onClosed: () => void;
 }) {
   useEffect(() => () => onClosed(), []); // eslint-disable-line react-hooks/exhaustive-deps
   const webEngine = isWebEngineMode();
-  const [mode, setMode] = useState<ComposerMode>(() => initialModeRef.current);
+  const [mode, setMode] = useState<ComposerMode>(() => {
+    const pre = initialPlaybookRef.current;
+    if (pre && pre.tasks && pre.tasks.length > 1) return "batch";
+    return initialModeRef.current;
+  });
   const [repos, setRepos] = useState<RepoInfo[]>([]);
 
   // Single task state
@@ -208,10 +248,20 @@ function Composer({
   const [next, setNext] = useState("");
   const [dependsOn, setDependsOn] = useState<string[]>([]);
 
-  // Shared multi-step checks & file-scope guardrails
+  // Shared multi-step checks, auto-heal budget & file-scope guardrails
   const [steps, setSteps] = useState<StepDraft[]>([]);
   const [allowedGlobsText, setAllowedGlobsText] = useState("");
   const [forbiddenGlobsText, setForbiddenGlobsText] = useState("");
+  const [healBudget, setHealBudget] = useState<string>(() =>
+    String(policy?.auto_steer_budget ?? 2),
+  );
+
+  // Playbook save drawer state
+  const [activePlaybookId, setActivePlaybookId] = useState<string | null>(null);
+  const [saveOpen, setSaveOpen] = useState(false);
+  const [tplName, setTplName] = useState("");
+  const [tplDesc, setTplDesc] = useState("");
+  const [savingTpl, setSavingTpl] = useState(false);
 
   // Batch fan-out rows
   const [batchRows, setBatchRows] = useState<BatchRowDraft[]>([
@@ -225,6 +275,70 @@ function Composer({
   const repoRef = useRef<HTMLInputElement>(null);
   const taskRef = useRef<HTMLTextAreaElement>(null);
   const testDefault = policy?.default_agent_engine === "custom";
+
+  const applyPlaybook = (tpl: PlaybookTemplate, discovered: RepoInfo[] = repos, silent = false) => {
+    setActivePlaybookId(tpl.id);
+    setFormErr("");
+    setRepoErr("");
+    const fallbackRepo = tpl.repo || repo || discovered[0]?.path || "";
+    const fallbackProj = repoBasename(fallbackRepo) || discovered[0]?.name || "";
+
+    if (tpl.check_steps && tpl.check_steps.length > 0) {
+      setSteps(
+        tpl.check_steps.map((st, idx) => ({
+          id: `tpl-step-${idx}-${Date.now()}`,
+          name: st.name,
+          cmd: st.cmd,
+          timeoutSecs: String(st.timeout_secs ?? 300),
+        })),
+      );
+      setCheck(tpl.check_steps[0]?.cmd || "");
+    } else {
+      setSteps([]);
+    }
+    setAllowedGlobsText((tpl.allowed_globs || []).join(", "));
+    setForbiddenGlobsText((tpl.forbidden_globs || []).join(", "));
+    if (typeof tpl.auto_steer_budget === "number") {
+      setHealBudget(String(tpl.auto_steer_budget));
+    }
+
+    const tplTasks = tpl.tasks ?? [];
+    if (tplTasks.length > 1) {
+      setMode("batch");
+      const keyToAlias = new Map<string, string>();
+      tplTasks.forEach((t, idx) => {
+        const slot = `#${idx + 1}`;
+        if (t.key) keyToAlias.set(t.key, slot);
+        if (t.alias) keyToAlias.set(t.alias, slot);
+      });
+      setBatchRows(
+        tplTasks.map((t, idx) => {
+          const rPath = t.repo || tpl.repo || discovered[idx % Math.max(discovered.length, 1)]?.path || fallbackRepo;
+          return {
+            id: `tpl-row-${idx}-${Date.now()}`,
+            repo: rPath,
+            project: t.project || repoBasename(rPath) || fallbackProj,
+            task: t.task,
+            agent: t.agent || "",
+            check: t.check || tpl.check_steps?.[0]?.cmd || "",
+            dependsOn: (t.depends_on || []).map((dep) => keyToAlias.get(dep) ?? dep),
+          };
+        }),
+      );
+    } else {
+      setMode("single");
+      const first = tplTasks[0];
+      const rPath = first?.repo || tpl.repo || fallbackRepo;
+      if (rPath) {
+        setRepo(rPath);
+        if (!projectTouched) setProject(first?.project || repoBasename(rPath));
+      }
+      if (first?.task) setTask(first.task);
+      if (first?.check) setCheck(first.check);
+      if (first?.agent) setAgent(first.agent);
+    }
+    if (!silent) toast.success(`Applied playbook: ${tpl.name}`);
+  };
 
   useEffect(() => {
     let alive = true;
@@ -249,11 +363,14 @@ function Composer({
           }),
         );
       }
+      if (initialPlaybookRef.current) {
+        applyPlaybook(initialPlaybookRef.current, list, true);
+      }
     });
     return () => {
       alive = false;
     };
-  }, [webEngine]);
+  }, [webEngine]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (mode === "single") {
@@ -303,8 +420,10 @@ function Composer({
 
   const buildCheckSteps = (primaryCheck: string): CheckStepSpec[] => {
     const out: CheckStepSpec[] = [];
-    if (primaryCheck.trim()) {
+    const seen = new Set<string>();
+    if (primaryCheck.trim() && steps.length === 0) {
       out.push({ name: "primary", cmd: primaryCheck.trim() });
+      seen.add(primaryCheck.trim());
     }
     for (const st of steps) {
       if (!st.cmd.trim()) continue;
@@ -314,8 +433,93 @@ function Composer({
         cmd: st.cmd.trim(),
         timeout_secs: Number.isFinite(t) && t > 0 ? t : undefined,
       });
+      seen.add(st.cmd.trim());
+    }
+    if (primaryCheck.trim() && steps.length > 0 && !seen.has(primaryCheck.trim())) {
+      out.unshift({ name: "primary", cmd: primaryCheck.trim() });
     }
     return out;
+  };
+
+  const parsedHealBudget = (): number | undefined => {
+    const n = Number.parseInt(healBudget.trim(), 10);
+    if (!Number.isFinite(n) || n < 0) return undefined;
+    return Math.min(n, 5);
+  };
+
+  const handleSavePlaybook = async () => {
+    const cleanName = tplName.trim();
+    if (!cleanName) {
+      setFormErr("Give the playbook a short name before saving.");
+      return;
+    }
+    const allowed = parseGlobs(allowedGlobsText);
+    const forbidden = parseGlobs(forbiddenGlobsText);
+    const checkSteps = buildCheckSteps(check);
+    const tasksList =
+      mode === "batch"
+        ? batchRows
+            .filter((r) => r.task.trim())
+            .map((r, idx) => ({
+              key: `#${idx + 1}`,
+              alias: `#${idx + 1}`,
+              repo: r.repo.trim() || undefined,
+              project: r.project.trim() || undefined,
+              task: r.task.trim(),
+              agent: r.agent || undefined,
+              check: r.check.trim() || undefined,
+              depends_on: r.dependsOn.length ? r.dependsOn : undefined,
+            }))
+        : task.trim()
+          ? [
+              {
+                repo: repo.trim() || undefined,
+                project: derivedProject || undefined,
+                task: task.trim(),
+                agent: agent || undefined,
+                check: check.trim() || undefined,
+              },
+            ]
+          : [];
+
+    setSavingTpl(true);
+    const res = await savePlaybook(
+      {
+        name: cleanName,
+        description: tplDesc.trim() || `${mode === "batch" ? "Batch" : "Single"} workflow playbook`,
+        repo: repo.trim() || undefined,
+        check_steps: checkSteps.length ? checkSteps : undefined,
+        allowed_globs: allowed.length ? allowed : undefined,
+        forbidden_globs: forbidden.length ? forbidden : undefined,
+        auto_steer_budget: parsedHealBudget(),
+        tasks: tasksList.length ? tasksList : undefined,
+      },
+      supportsServerV060,
+    );
+    setSavingTpl(false);
+    if (res.ok) {
+      toast.success(`Saved playbook: ${cleanName}`);
+      setSaveOpen(false);
+      setTplName("");
+      setTplDesc("");
+      setFormErr("");
+      if (res.template) setActivePlaybookId(res.template.id);
+      onPlaybooksChanged();
+    } else {
+      setFormErr(res.error || "Could not save playbook.");
+      toast.error(res.error || "Could not save playbook.");
+    }
+  };
+
+  const handleDeletePlaybook = async (tpl: PlaybookTemplate) => {
+    const res = await deletePlaybook(tpl.id, supportsServerV060);
+    if (res.ok) {
+      toast.success(`Deleted playbook: ${tpl.name}`);
+      if (activePlaybookId === tpl.id) setActivePlaybookId(null);
+      onPlaybooksChanged();
+    } else {
+      toast.error(res.error || "Could not delete playbook.");
+    }
   };
 
   const fanOutAllRepos = () => {
@@ -362,6 +566,7 @@ function Composer({
     const allowed = parseGlobs(allowedGlobsText);
     const forbidden = parseGlobs(forbiddenGlobsText);
     const extraSteps = buildCheckSteps(check);
+    const budget = parsedHealBudget();
     const body: Record<string, unknown> = {
       repo: repo.trim(),
       project: derivedProject,
@@ -374,6 +579,7 @@ function Composer({
     if (steps.length > 0 && extraSteps.length > 0) body.check_steps = extraSteps;
     if (allowed.length) body.allowed_globs = allowed;
     if (forbidden.length) body.forbidden_globs = forbidden;
+    if (typeof budget === "number") body.auto_steer_budget = budget;
 
     setBusy(true);
     let r: Response;
@@ -428,6 +634,7 @@ function Composer({
 
     const allowed = parseGlobs(allowedGlobsText);
     const forbidden = parseGlobs(forbiddenGlobsText);
+    const budget = parsedHealBudget();
     const items: BatchDispatchItem[] = nonEmpty.map((row, idx) => {
       const rowSteps = steps.length > 0 ? buildCheckSteps(row.check) : undefined;
       return {
@@ -441,6 +648,7 @@ function Composer({
         depends_on: row.dependsOn.length ? row.dependsOn : undefined,
         allowed_globs: allowed.length ? allowed : undefined,
         forbidden_globs: forbidden.length ? forbidden : undefined,
+        auto_steer_budget: budget,
       };
     });
 
@@ -511,6 +719,104 @@ function Composer({
             </SegmentedControlItem>
           </SegmentedControl>
         </div>
+
+        <section aria-label="Playbooks" className="space-y-2 rounded-card border border-hairline bg-canvas p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="inline-flex items-center gap-1.5 text-xs font-medium text-ink">
+              <BookMarked className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
+              <span>Playbooks</span>
+            </span>
+            <Button
+              type="button"
+              size="sm"
+              variant={saveOpen ? "default" : "outline"}
+              onClick={() => setSaveOpen((v) => !v)}
+              className="h-7 px-2.5 text-xs max-md:min-h-11"
+            >
+              <Save className="size-3.5" strokeWidth={1.5} aria-hidden />
+              <span>Save as playbook</span>
+            </Button>
+          </div>
+
+          <div className="flex flex-wrap gap-1.5">
+            {playbooks.map((tpl) => {
+              const active = activePlaybookId === tpl.id;
+              return (
+                <div key={tpl.id} className="inline-flex items-center gap-0.5">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={active ? "default" : "outline"}
+                    title={tpl.description}
+                    onClick={() => applyPlaybook(tpl)}
+                    className="h-7 px-2.5 text-xs max-md:min-h-11"
+                  >
+                    {tpl.name}
+                  </Button>
+                  {!tpl.builtin && (
+                    <Button
+                      type="button"
+                      size="icon-sm"
+                      variant="ghost"
+                      aria-label={`Delete playbook ${tpl.name}`}
+                      onClick={() => void handleDeletePlaybook(tpl)}
+                      className="size-7 max-md:size-11"
+                    >
+                      <Trash2 className="size-3.5 text-ink-3" strokeWidth={1.5} aria-hidden />
+                    </Button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {saveOpen && (
+            <div className="mt-2 space-y-2 border-t border-hairline pt-2.5" data-testid="save-playbook-form">
+              <div className="grid gap-2 sm:grid-cols-2">
+                <InputGroup>
+                  <InputGroupInput
+                    id="playbook-name"
+                    aria-label="Playbook name"
+                    value={tplName}
+                    onChange={(e) => setTplName(e.target.value)}
+                    placeholder="Playbook name (e.g. API Security Fix)"
+                    className="text-xs max-md:!h-11"
+                  />
+                </InputGroup>
+                <InputGroup>
+                  <InputGroupInput
+                    id="playbook-desc"
+                    aria-label="Playbook description"
+                    value={tplDesc}
+                    onChange={(e) => setTplDesc(e.target.value)}
+                    placeholder="Short description (optional)"
+                    className="text-xs max-md:!h-11"
+                  />
+                </InputGroup>
+              </div>
+              <div className="flex items-center justify-end gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setSaveOpen(false)}
+                  className="h-7 px-2.5 text-xs max-md:min-h-11"
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={savingTpl}
+                  onClick={() => void handleSavePlaybook()}
+                  className="h-7 px-3 text-xs max-md:min-h-11"
+                >
+                  {savingTpl ? "Saving..." : "Save playbook"}
+                </Button>
+              </div>
+            </div>
+          )}
+        </section>
 
         {mode === "single" ? (
           <>
@@ -899,12 +1205,12 @@ function Composer({
           {({ isExpanded }) => (
             <>
               <ExpandableTrigger
-                aria-label="Multi-step check pipeline and file-scope guardrails"
+                aria-label="Multi-step check pipeline, auto-heal budget, and file-scope guardrails"
                 className="flex w-full cursor-pointer items-center justify-between gap-2 text-left text-sm font-medium text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11"
               >
                 <span className="inline-flex items-center gap-1.5">
                   <ListChecks className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
-                  <span>Check pipeline steps &amp; file-scope guardrails</span>
+                  <span>Check pipeline, auto-heal &amp; file-scope guardrails</span>
                   {(steps.length > 0 || allowedGlobsText.trim() || forbiddenGlobsText.trim()) && (
                     <span className="rounded-chip bg-track px-1.5 py-0.5 font-mono text-xs text-ink-2">
                       {steps.length} {steps.length === 1 ? "step" : "steps"}
@@ -990,6 +1296,30 @@ function Composer({
                         ))}
                       </div>
                     )}
+                  </div>
+
+                  <div className="space-y-2 border-t border-hairline pt-3">
+                    <span className="inline-flex items-center gap-1.5 text-xs font-medium text-ink-2">
+                      <Wrench className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
+                      <span>Autonomous auto-heal budget</span>
+                    </span>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <InputGroup className="w-24">
+                        <InputGroupInput
+                          id="auto-heal-budget"
+                          type="number"
+                          min={0}
+                          max={5}
+                          aria-label="Auto-heal retry budget"
+                          value={healBudget}
+                          onChange={(e) => setHealBudget(e.target.value)}
+                          className="font-mono text-xs tabular-nums max-md:!h-11"
+                        />
+                      </InputGroup>
+                      <p className="min-w-0 flex-1 text-xs text-ink-3">
+                        Maximum diagnostic auto-steer attempts when a check step fails (`0` disables auto-heal).
+                      </p>
+                    </div>
                   </div>
 
                   <div className="space-y-2 border-t border-hairline pt-3">
