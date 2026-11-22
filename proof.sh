@@ -1,5 +1,5 @@
 #!/bin/bash
-# fleet-rs proof: two fixture-agent sessions run in parallel in separate
+# fleet proof: two fixture-agent sessions run in parallel in separate
 # worktrees of a fixture repo, both reach verified-done through the app's
 # own API, their diffs are served, and one is merged into the repo.
 set -u
@@ -26,7 +26,7 @@ EOF
 chmod +x "$WORK/agent.sh"
 
 FLEET_AGENT="$WORK/agent.sh" FLEET_DATA="$WORK/data" PORT=$PORT \
-  "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" policies.rn > "$WORK/server.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/fleet" policies.rn > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 1
 

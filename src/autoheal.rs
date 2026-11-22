@@ -1,4 +1,4 @@
-//! Autonomous Auto-Heal / Auto-Steer feedback loop for `fleet-rs`.
+//! Autonomous Auto-Heal / Auto-Steer feedback loop for `fleet`.
 //!
 //! When a session's verification check fails, this module:
 //! - Decides whether an automatic repair attempt is allowed under the configured

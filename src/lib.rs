@@ -1,5 +1,5 @@
 //! Modular orchestration, policy, verification, auto-heal, playbook, telemetry, PR,
-//! worktree, budget, and merge-check engines for `fleet-rs`.
+//! worktree, budget, and merge-check engines for `fleet`.
 //!
 //! - [`dag`]: Task dependency DAG scheduler with cycle detection, topological readiness,
 //!   upstream-failure propagation, and multi-repo batch/matrix dispatch.

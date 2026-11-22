@@ -1,6 +1,6 @@
 # Fleet
 
-[![latest release](https://img.shields.io/github/v/release/cayleb-james2008/dsh-fleet)](https://github.com/cayleb-james2008/dsh-fleet/releases)
+[![latest release](https://img.shields.io/github/v/release/cayleb-james2008/fleet)](https://github.com/cayleb-james2008/fleet/releases)
 
 
 Your agents, working in parallel, under one screen. You hand out the work; it
@@ -230,18 +230,22 @@ cargo run -- policies.rn               # serves the board on $PORT (default 8471
 Environment: `PORT` (default 8471; a busy default falls back to the next free
 port and the banner says which), `FLEET_DATA` (default the platform data folder
 — `$XDG_DATA_HOME/fleet`, else `~/.local/share/fleet` on Linux,
-`~/Library/Application Support/fleet` on macOS), `FLEET_AGENT` (the default
-agent, otherwise the first detected one), `FLEET_MODEL` / `FLEET_CLAUDE_MODEL` /
-`FLEET_CODEX_MODEL` (startup model overrides), `FLEET_REPOS_DIR` (optional
-colon-separated git repo discovery roots for `GET /api/repos`),
+`~/Library/Application Support/fleet` on macOS, `%LOCALAPPDATA%\fleet` on
+Windows), `FLEET_AGENT` (the default agent, otherwise the first detected one),
+`FLEET_MODEL` / `FLEET_CLAUDE_MODEL` / `FLEET_CODEX_MODEL` (startup model
+overrides), `FLEET_REPOS_DIR` (optional colon-separated on Unix / semicolon-
+separated on Windows git repo discovery roots for `GET /api/repos`),
 `FLEET_ALLOWED_HOSTS` (extra Host names, see HTTP), `FLEET_NO_OPEN` (do not
-open the browser on launch), and the `FLEET_UPDATE_*` variables under
-"Versions and updates".
+open the desktop app window on launch), `FLEET_APP_WINDOW=0` (open in a regular
+browser tab instead of a chromeless app window), and the `FLEET_UPDATE_*`
+variables under "Versions and updates".
 
-The board opens in the operator's browser on launch, unless there is no display
-(a headless service), `FLEET_NO_OPEN` is set, `--no-open` is passed, or
-`INVOCATION_ID` is set (a systemd service). The browser open is silent if it
-fails — the board is still reachable at the URL on the banner.
+The board opens once in a chromeless desktop app window (`chromium --app=` on
+Linux, `msedge.exe --app=` on Windows, with automatic fallback to `xdg-open` /
+`open` / `cmd /C start`), unless there is no display on Linux (a headless
+service), `FLEET_NO_OPEN` is set, `--no-open` is passed, or `INVOCATION_ID` is
+set (a systemd service). Launch failures are silent — the board is still
+reachable at the URL on the banner.
 
 State lands in the platform data folder (override with `FLEET_DATA`): the session
 store, `logs/`, and the worktrees — one per session, each on its own branch of
@@ -251,16 +255,17 @@ the session's repo.
 
 **Releasing:** bump `version` in `Cargo.toml`, add a `## X.Y.Z - date` entry to `CHANGELOG.md`, and merge to `main`. `.github/workflows/release.yml` sees the new version, builds every platform and publishes the GitHub Release `vX.Y.Z` with the binaries and `SHA256SUMS`; a push that does not change the version publishes nothing, and a new version without a changelog entry fails the workflow. Pushing a `vX.Y.Z` tag by hand does the same.
 
-The running version is `fleet-rs --version` (or `-V`), `GET /api/version`, and
+The running version is `fleet --version` (or `-V`), `GET /api/version`, and
 `version` in `GET /api/policy`. Every release is tagged `vX.Y.Z` on GitHub, with a
-`CHANGELOG.md` entry, one binary per platform and a `SHA256SUMS` file. Merging a new version to `main` (or pushing a
+`CHANGELOG.md` entry, one binary per platform (Linux x86_64/arm64, macOS arm64,
+and Windows x86_64 `.exe`) and a `SHA256SUMS` file. Merging a new version to `main` (or pushing a
 tag) runs `.github/workflows/release.yml`, which refuses a tag that does not match
 the version in `Cargo.toml`.
 
 Self-update (`src/update.rs`): the app asks the newest GitHub release of its
 repository whether a newer version exists (shortly after start and every 6 hours
 in `notify` and `auto` modes). `POST /api/update/apply` downloads the binary for
-this platform (`fleet-rs-<target>`), checks its SHA-256 against the release's
+this platform (`fleet-<target>[.exe]`), checks its SHA-256 against the release's
 `SHA256SUMS`, runs it with `--version` to confirm the build, and only then swaps
 it in. `POST /api/update/restart` starts the new build. A failed step leaves the
 installed program untouched. Downloads use `curl`, which must be installed.
@@ -274,7 +279,7 @@ binary (one under a `target` folder) unless `FLEET_UPDATE_DEV=1`.
 | Var | Default |
 | --- | --- |
 | `FLEET_UPDATE_MODE` | `notify` (check and tell); `auto` also downloads and installs (a restart is still yours to press); `off` never contacts GitHub |
-| `FLEET_UPDATE_REPO` | `cayleb-james2008/dsh-fleet` |
+| `FLEET_UPDATE_REPO` | `cayleb-james2008/fleet` |
 | `FLEET_UPDATE_API` | `https://api.github.com` (plain http only for a loopback address) |
 | `FLEET_UPDATE_DEV` | unset; `1` allows replacing a cargo-built binary (tests) |
 

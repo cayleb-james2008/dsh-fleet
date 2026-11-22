@@ -1,4 +1,4 @@
-//! Live Board Telemetry for `fleet-rs`.
+//! Live Board Telemetry for `fleet`.
 //!
 //! Computes honest pass-rate, auto-heal effectiveness, median verification latency,
 //! active/queued slot utilization, and per-repository breakdowns in a single linear pass
@@ -11,7 +11,7 @@ use std::path::Path;
 
 /// Read-only projection of a session used by [`compute_metrics`].
 ///
-/// Implemented for [`SessionMetricInput`] and trivially implementable for `fleet-rs`'s
+/// Implemented for [`SessionMetricInput`] and trivially implementable for `fleet`'s
 /// internal `Session` struct with zero allocation or cloning.
 pub trait SessionMetricView {
     fn status(&self) -> &str;

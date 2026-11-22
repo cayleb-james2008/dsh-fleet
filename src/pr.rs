@@ -22,7 +22,7 @@ const MAX_FILES_IN_BODY: usize = 25;
 
 /// Read-only projection of a Fleet session used to construct a PR preview.
 ///
-/// Implemented for [`PrSessionInput`] and trivially implementable for `fleet-rs`'s
+/// Implemented for [`PrSessionInput`] and trivially implementable for `fleet`'s
 /// internal `Session` struct with zero cloning.
 pub trait PrSessionView {
     fn id(&self) -> &str;
@@ -188,9 +188,16 @@ pub struct PrError {
 
 fn git_cmd(repo: &Path) -> Command {
     let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(repo)
-        .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]);
+    cmd.arg("-C").arg(repo).args([
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        if cfg!(windows) {
+            "core.hooksPath=NUL"
+        } else {
+            "core.hooksPath=/dev/null"
+        },
+    ]);
     cmd
 }
 
