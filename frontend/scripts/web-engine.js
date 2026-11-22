@@ -1,5 +1,5 @@
 (() => {
-  const APP_VERSION = "0.7.0";
+  const APP_VERSION = "0.8.0";
   const DB_NAME = "fleet-worktrees-v4";
   const STORE_NAME = "state";
   const BYOK_KEY_SS = "fleet-byok-api-key";
@@ -1597,7 +1597,7 @@
       base_branch: baseBranch,
       head_branch: headBranch,
       gh_available: false,
-      gh_status: "Browser standalone dry-run preview — copy Markdown or connect local fleet-rs with gh CLI to publish to GitHub.",
+      gh_status: "Browser standalone dry-run preview — copy Markdown or connect local Fleet with gh CLI to publish to GitHub.",
       ready_to_create: true,
       can_create: true,
       warnings,
@@ -1762,7 +1762,7 @@
       }
       try {
         const r = await realFetch(clean + "/api/version", { cache: "no-store" });
-        if (!r.ok) return { ok: false, error: "Local fleet-rs responded with HTTP " + r.status };
+        if (!r.ok) return { ok: false, error: "Local Fleet responded with HTTP " + r.status };
         localMode = true;
         return { ok: true };
       } catch {
@@ -1838,7 +1838,7 @@
     try { body = bodyText ? JSON.parse(bodyText) : {}; } catch {}
 
     if (method === "GET" && u.pathname === "/api/version") {
-      return jsonResp({ name: "fleet-rs", version: APP_VERSION });
+      return jsonResp({ name: "fleet", version: APP_VERSION });
     }
     if (method === "GET" && u.pathname === "/api/update") {
       return jsonResp({
@@ -2065,7 +2065,7 @@
           prev.head_branch +
           " -> " +
           prev.base_branch +
-          " (copy Markdown or connect local fleet-rs with gh CLI to publish to GitHub)."
+          " (copy Markdown or connect local Fleet with gh CLI to publish to GitHub)."
       });
     }
 

@@ -1,4 +1,4 @@
-// House-frontend build for a Rune (Rust) app: React + Tailwind 4, the library parts live in ../rune/used,
+// House-frontend build for Fleet (Rust): React + Tailwind 4, the library parts live in ../rune/used,
 // and the result is ONE html file (js, css and fonts inline) at ../assets/index.html, which the Rust binary embeds.
 import fs from "node:fs";
 import path from "node:path";
@@ -28,7 +28,7 @@ function runeUsed(): Plugin {
   };
 }
 
-const STAMP = "/* Hallmark · checked: 2026-11-22 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v0.7.0 */";
+const STAMP = "/* Hallmark · checked: 2026-11-22 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v0.8.0 */";
 
 // After the build: inline the script, the stylesheet and (through assetsInlineLimit) the fonts into one page.
 function singleFile(): Plugin {

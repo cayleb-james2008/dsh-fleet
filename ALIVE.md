@@ -1,4 +1,4 @@
-# Aliveness Inventory — Fleet v0.7.0 Mission Control Board
+# Aliveness Inventory — Fleet v0.8.0 Mission Control Board
 
 Every motion value comes from `frontend/src/motion.ts` (`press`, `glide`, `open`, `roll`, `layout`, `reveal`, `instant`) and the matching CSS tokens (`--dur-press`, `--dur-reveal`, `--dur-swap`, `--dur-enter`, `--dur-sheet`, `--ease-house`). `<MotionConfig reducedMotion="user">` wraps the root application, and `prefers-reduced-motion: reduce` silences travel and infinite loops.
 

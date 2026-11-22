@@ -1,8 +1,8 @@
 // build-live-web.mjs: Produces the standalone real functional Fleet web app
-// (shared-live-web/dsh-fleet/index.html) by embedding ./web-engine.js (real
+// (shared-live-web/fleet/index.html) by embedding ./web-engine.js (real
 // in-browser git worktree store, unified diff engine, IndexedDB persistence,
 // real sandboxed Web Worker check evaluator, optional BYOK OpenAI-compatible
-// agent in sessionStorage, and local fleet-rs connector) into assets/index.html.
+// agent in sessionStorage, and local Fleet connector) into assets/index.html.
 import fs from "node:fs";
 import path from "node:path";
 
@@ -11,7 +11,7 @@ const srcHtml = path.join(root, "assets/index.html");
 const engineJs = path.join(import.meta.dirname, "web-engine.js");
 const outDir =
   process.env.LIVE_WEB_OUT_DIR ||
-  "/home/cayleb/Work/scratch/swarm-v080/shared-live-web/dsh-fleet";
+  "/home/cayleb/Work/scratch/swarm-v080/shared-live-web/fleet";
 const outFile = path.join(outDir, "index.html");
 
 if (!fs.existsSync(srcHtml)) {
