@@ -10,7 +10,7 @@ PIDS=""
 cleanup() { for p in $PIDS; do kill -9 $p 2>/dev/null; done; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-[ -x "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" ] || cargo build >/dev/null 2>&1
+[ -x "${CARGO_TARGET_DIR:-./target}/debug/fleet" ] || cargo build >/dev/null 2>&1
 
 git init -q -b main "$WORK/repo"
 echo "seed" > "$WORK/repo/README.md"
@@ -26,7 +26,7 @@ EOF
 chmod +x "$WORK/agent.sh"
 
 FLEET_AGENT="$WORK/agent.sh" FLEET_DATA="$WORK/data" PORT=$PORT \
-  "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" policies.rn > "$WORK/server.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/fleet" policies.rn > "$WORK/server.log" 2>&1 &
 PIDS="$PIDS $!"
 api() { curl -s "http://127.0.0.1:$PORT$1"; }
 for i in $(seq 1 20); do api /api/sessions >/dev/null 2>&1 && break; sleep 0.5; done
@@ -55,7 +55,7 @@ lines=$(wc -l < "$WORK/data/logs/$ID.log")
 kill -9 $(ps aux | grep "[f]leet-rs policies.rn" | awk '{print $2}') 2>/dev/null
 sleep 1
 FLEET_AGENT="$WORK/agent.sh" FLEET_DATA="$WORK/data" PORT=$PORT \
-  "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" policies.rn > "$WORK/server2.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/fleet" policies.rn > "$WORK/server2.log" 2>&1 &
 PIDS="$PIDS $!"
 for i in $(seq 1 20); do api /api/sessions >/dev/null 2>&1 && break; sleep 0.5; done
 n2=$(api /api/sessions | jq '.[0].transcript | length')
@@ -92,7 +92,7 @@ kill -9 $(ps aux | grep "[f]leet-rs policies.rn" | awk '{print $2}') 2>/dev/null
 sleep 1
 rm "$WORK/data/sessions.json"
 FLEET_AGENT="$WORK/agent.sh" FLEET_DATA="$WORK/data" PORT=$PORT \
-  "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" policies.rn > "$WORK/server3.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/fleet" policies.rn > "$WORK/server3.log" 2>&1 &
 PIDS="$PIDS $!"
 for i in $(seq 1 20); do api /api/sessions >/dev/null 2>&1 && break; sleep 0.5; done
 api /api/sessions | jq -e 'length >= 2' >/dev/null \

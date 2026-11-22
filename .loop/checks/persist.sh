@@ -10,7 +10,7 @@ PIDS=""
 cleanup() { for p in $PIDS; do kill -9 $p 2>/dev/null; done; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-[ -x "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" ] || cargo build >/dev/null 2>&1
+[ -x "${CARGO_TARGET_DIR:-./target}/debug/fleet" ] || cargo build >/dev/null 2>&1
 
 git init -q -b main "$WORK/repo"
 echo "seed" > "$WORK/repo/README.md"
@@ -30,7 +30,7 @@ api() { curl -s "http://127.0.0.1:$PORT$1"; }
 post() { curl -s -X POST "http://127.0.0.1:$PORT$1" -H 'Content-Type: application/json' -d "$2"; }
 start_server() {
   FLEET_AGENT="$WORK/agent.sh" FLEET_DATA="$WORK/data" PORT=$PORT \
-    "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" policies.rn > "$WORK/server-$1.log" 2>&1 &
+    "${CARGO_TARGET_DIR:-./target}/debug/fleet" policies.rn > "$WORK/server-$1.log" 2>&1 &
   PIDS="$PIDS $!"
   for i in $(seq 1 20); do api /api/sessions >/dev/null 2>&1 && return 0; sleep 0.5; done
   echo "FAIL: server $1 did not come up"; exit 1

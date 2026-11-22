@@ -1,4 +1,4 @@
-//! Session & Daily Dispatch Budget Guardrails for `fleet-rs`.
+//! Session & Daily Dispatch Budget Guardrails for `fleet`.
 //!
 //! Prevents runaway daily session dispatch loops, unbounded run durations, and excessive
 //! autonomous repair attempts via [`BudgetConfig`], [`BudgetStatus`], and the atomically

@@ -29,7 +29,7 @@ Operate. Scanability, consistency and honest status outrank expression.
 - Familiar mission-control shell: command bar, scan strip & latest verified receipt hero, three-lane board (`Needs you` · `Working` · `Done`), and split-pane session inspector.
 - Light and dark themes, `SegmentedControl` toggle in the top bar (`#themeBtn`), light is the default.
 - Icons are drawn symbols, never letters, never emoji.
-- Every build shows its version (`fleet-rs --version`, the API, the policy
+- Every build shows its version (`fleet --version`, the API, the policy
   answer). An update is offered, installed only after its checksum and a version
   proof, and started only when no session is running.
 - Status words are plain: queued, working, checking, done, needs you, merged;

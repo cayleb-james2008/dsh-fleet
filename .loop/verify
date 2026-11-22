@@ -1,5 +1,5 @@
 #!/bin/bash
-# Ultra-loop verify kit for fleet-rs. Usage: bash .loop/verify <label>
+# Ultra-loop verify kit for fleet. Usage: bash .loop/verify <label>
 # Runs every hermetic check, cheapest first, each under a timeout.
 # Raw output lands in .loop/runs/<label>/; prints one summary line;
 # exits non-zero when any check fails.

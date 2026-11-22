@@ -1,15 +1,15 @@
 //! Comprehensive integration, scale, security, and real-git tests for the `v0.5.0`
 //! Fleet orchestration engines (`dag`, `checks`, `merge_check`, `policy`).
 
-use fleet_rs::checks::{
+use fleet::checks::{
     changed_files_between, glob_matches, verify_git_scope, verify_worktree_scope, CheckPipeline,
     CheckStep, FileScope, StepStatus,
 };
-use fleet_rs::dag::{BatchSpec, BatchTaskSpec, DagError, DagGraph, DagNodeState, DagReadiness, TaskNode};
-use fleet_rs::merge_check::{
+use fleet::dag::{BatchSpec, BatchTaskSpec, DagError, DagGraph, DagNodeState, DagReadiness, TaskNode};
+use fleet::merge_check::{
     dry_run_merge, execute_merge, export_patch, MergeStrategy, PatchFormat,
 };
-use fleet_rs::policy::{test_policy, test_policy_script, Policy, DEFAULT_FREE_MODEL};
+use fleet::policy::{test_policy, test_policy_script, Policy, DEFAULT_FREE_MODEL};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -748,7 +748,7 @@ fn rune_policy_dry_run_routing_and_fuzz_resilience() {
     let policy = Policy::load(SHIPPED_POLICY).unwrap();
 
     // Docs-only task gets narrowed allowed_globs + shorter 600s timeout.
-    let docs = test_policy(&policy, "/home/dev/dsh-fleet", "docs-only update README", None);
+    let docs = test_policy(&policy, "/home/dev/fleet", "docs-only update README", None);
     assert_eq!(docs.engine, "opencode");
     assert_eq!(docs.model.as_deref(), Some(DEFAULT_FREE_MODEL));
     assert_eq!(docs.timeout_secs, 600);
@@ -814,9 +814,9 @@ fn single_repo_batch_and_send_sync_engine_types() {
     assert_send_sync::<DagGraph>();
     assert_send_sync::<CheckPipeline>();
     assert_send_sync::<FileScope>();
-    assert_send_sync::<fleet_rs::merge_check::MergeCheckResult>();
-    assert_send_sync::<fleet_rs::merge_check::PatchExport>();
-    assert_send_sync::<fleet_rs::policy::PolicyDecision>();
+    assert_send_sync::<fleet::merge_check::MergeCheckResult>();
+    assert_send_sync::<fleet::merge_check::PatchExport>();
+    assert_send_sync::<fleet::policy::PolicyDecision>();
 
     let raw = serde_json::json!({
         "name": "single-repo-fanout",

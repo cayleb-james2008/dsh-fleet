@@ -4,12 +4,12 @@ use std::io::{Read, Write};
 use std::process::Command;
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_fleet-rs")
+    env!("CARGO_BIN_EXE_fleet")
 }
 
 #[test]
 fn version_is_answered_in_any_argument_position() {
-    let want = format!("fleet-rs {}", env!("CARGO_PKG_VERSION"));
+    let want = format!("fleet {}", env!("CARGO_PKG_VERSION"));
     // Second position, behind a policies path that does not exist: still the version.
     let out = Command::new(bin()).args(["/no/such/policies.rn", "--version"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
@@ -118,13 +118,16 @@ fn read(path: PathBuf) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-/// A stand-in `xdg-open` (or `open`) on a private PATH folder: it records its arguments.
+/// A stand-in opener (`chromium`, `xdg-open`, or `open`) on a private PATH folder: it records its arguments.
 fn fake_opener(dir: &Path, name: &str) {
     std::fs::create_dir_all(dir).unwrap();
     let script = dir.join(name);
     std::fs::write(&script, format!("#!/bin/sh\necho \"$@\" >> \"{}/called\"\n", dir.display())).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 
 #[test]
@@ -163,11 +166,15 @@ fn a_busy_default_port_moves_to_the_next_free_one_and_the_banner_says_where() {
         eprintln!("8471 is busy on this machine: the fallback test is skipped");
         return;
     };
+    let Some(expected) = (8472u16..=8490).find(|&p| TcpListener::bind(("127.0.0.1", p)).is_ok()) else {
+        eprintln!("8472..=8490 are all busy on this machine: the fallback test is skipped");
+        return;
+    };
     let home = scratch("busy");
     let _kid = start(&home, &[("FLEET_NO_OPEN", "1")], &[], "/usr/bin:/bin");
-    assert!(wait_answering(8472), "{}", read(home.join("err.log")));
+    assert!(wait_answering(expected), "{}", read(home.join("err.log")));
     let out = read(home.join("out.log"));
-    assert!(out.contains("http://127.0.0.1:8472/"), "{out}");
+    assert!(out.contains(&format!("http://127.0.0.1:{expected}/")), "{out}");
     assert!(out.contains("Data:") && out.contains("Updates:"), "{out}");
 }
 
@@ -194,6 +201,7 @@ fn an_explicit_busy_port_still_fails_loudly() {
 fn the_browser_opens_once_at_the_app_url_when_a_display_is_there() {
     let home = scratch("open");
     let bin_dir = home.join("bin");
+    fake_opener(&bin_dir, "chromium");
     fake_opener(&bin_dir, "xdg-open");
     fake_opener(&bin_dir, "open");
     let port = free_port();
@@ -207,6 +215,32 @@ fn the_browser_opens_once_at_the_app_url_when_a_display_is_there() {
     let called = read(bin_dir.join("called"));
     assert_eq!(called.matches("http://127.0.0.1:").count(), 1, "opened once: {called:?}");
     assert!(called.contains(&format!("http://127.0.0.1:{port}/")), "{called:?}");
+    if cfg!(target_os = "linux") {
+        assert!(called.contains(&format!("--app=http://127.0.0.1:{port}/")), "expected chromeless --app window: {called:?}");
+    }
+}
+
+#[test]
+fn app_window_opt_out_falls_back_to_standard_browser_opener() {
+    let home = scratch("open-fallback");
+    let bin_dir = home.join("bin");
+    fake_opener(&bin_dir, "xdg-open");
+    fake_opener(&bin_dir, "open");
+    let port = free_port();
+    let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+    let _kid = start(
+        &home,
+        &[("PORT", &port.to_string()), ("DISPLAY", ":0"), ("FLEET_APP_WINDOW", "0")],
+        &[],
+        &path,
+    );
+    assert!(wait_answering(port));
+    let t = Instant::now();
+    while !bin_dir.join("called").exists() && t.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let called = read(bin_dir.join("called"));
+    assert_eq!(called.trim(), format!("http://127.0.0.1:{port}/"), "{called:?}");
 }
 
 #[test]
@@ -221,6 +255,7 @@ fn the_browser_stays_closed_for_opt_out_service_and_no_display() {
     for (name, env, args) in cases {
         let home = scratch(&format!("noopen-{}", name.replace(' ', "-")));
         let bin_dir = home.join("bin");
+        fake_opener(&bin_dir, "chromium");
         fake_opener(&bin_dir, "xdg-open");
         fake_opener(&bin_dir, "open");
         let port = free_port();

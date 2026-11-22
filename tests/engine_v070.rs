@@ -1,19 +1,19 @@
-//! Integration, real-git, and adversarial security tests for `v0.7.0` DSH-Fleet engines:
+//! Integration, real-git, and adversarial security tests for `v0.7.0` Fleet engines:
 //! - `pr`: PR preview Markdown/stats + confirmation-gated local bare-remote dry-run
 //! - `worktrees`: `git worktree list --porcelain` inspector, orphan/dirty detection, path-escape defense
 //! - `budget`: `BudgetConfig`/`BudgetStatus`/`BudgetTracker` 429 enforcement, UTC rollover & fuzzing
 
-use fleet_rs::autoheal::HealAttempt;
-use fleet_rs::budget::{
+use fleet::autoheal::HealAttempt;
+use fleet::budget::{
     check_dispatch_allowance, evaluate_budget, utc_day_string, BudgetConfig, BudgetStatus,
     BudgetTracker, MAX_ALLOWED_DAILY_SESSIONS, MAX_ALLOWED_HEAL_ATTEMPTS, MAX_ALLOWED_SESSION_MINS,
 };
-use fleet_rs::checks::{CheckStepReceipt, PipelineReceipt, StepStatus};
-use fleet_rs::pr::{
+use fleet::checks::{CheckStepReceipt, PipelineReceipt, StepStatus};
+use fleet::pr::{
     build_pr_preview, create_github_pr, create_github_pr_with_options, PrCreateRequest,
     PrCreateResult, PrPreview, PrSessionInput,
 };
-use fleet_rs::worktrees::{
+use fleet::worktrees::{
     list_repo_worktrees, remove_worktree, remove_worktree_checked, WorktreeEntry,
     WorktreeSessionInput,
 };
