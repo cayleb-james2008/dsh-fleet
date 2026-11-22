@@ -189,8 +189,8 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
 {
   const { ctx, p } = await open(1440, 900, 'light', { acceptDownloads: true })
   let sseHits = 0
-  // v0.6.0 Board Metrics Strip, Auto-Heal Attempt Badges & Timeline, Playbooks Save/Select + Cmd+K, Zero Rune Jargon
-  await p.route('**/api/version', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ name: 'fleet-rs', version: '0.6.0' }) }))
+  // v0.7.0 DAG Graph, PR Preview & Create PR, Worktrees Inspector, Budget Guardrails, Auto-Heal, Playbooks, Zero Rune Jargon
+  await p.route('**/api/version', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ name: 'fleet-rs', version: '0.7.0' }) }))
   await p.route('**/api/metrics', r => r.fulfill({
     status: 200,
     contentType: 'application/json',
@@ -203,11 +203,66 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
       effective_pass_rate_pct: 66.7,
       median_check_ms: 820,
       active_slots: 2,
-      max_parallel: 4,
+      max_slots: 4,
       queued_count: 0,
-      per_repo_breakdown: [{ repo: 'fixture', total: 5, first_pass: 1, auto_healed: 1, needs_you: 1, median_check_ms: 820 }],
+      blocked_count: 0,
+      per_repo_breakdown: [{ repo: '/tmp/fixture', project: 'fixture', total: 5, first_pass_count: 1, auto_healed_count: 1, needs_you_count: 1, median_check_ms: 820 }],
+      budget: {
+        max_session_mins: 30,
+        daily_session_limit: 50,
+        max_heal_attempts: 2,
+        sessions_today: 5,
+        remaining_today: 45,
+        daily_limit_reached: false,
+        usage_pct: 10.0,
+      },
     }),
   }))
+  await p.route('**/api/sessions/*/pr-preview', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      session_id: 's-done',
+      title: 'Add verified export handler with unit tests',
+      body: '## Summary\n\nVerified export handler.\n\n## Verification\n- [x] cargo clippy\n- [x] cargo test',
+      base_branch: 'main',
+      head_branch: 'fleet/s-done-export',
+      commits_ahead: 1,
+      diff_stat: { files_changed: 2, insertions: 42, deletions: 4, files: [] },
+      gh_available: true,
+      ready_to_create: true,
+      warnings: [],
+    }),
+  }))
+  let prCreateConfirmed = false
+  await p.route('**/api/sessions/*/pr', r => {
+    const b = r.request().postDataJSON() || {}
+    prCreateConfirmed = b.confirm === true
+    return r.fulfill({
+      status: 201,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        created: true,
+        dry_run: true,
+        draft: Boolean(b.draft),
+        url: 'https://github.com/example/fixture/pull/42',
+        message: 'Created PR #42 cleanly.',
+      }),
+    })
+  })
+  let mockWorktrees = [
+    { path: '/tmp/fixture', repo: '/tmp/fixture', branch: 'main', is_main: true, is_orphan: false, dirty: false, removable: false },
+    { path: '/tmp/fixture/.worktrees/stale-orphan-99', repo: '/tmp/fixture', branch: 'fleet/stale-orphan-99', is_main: false, is_orphan: true, dirty: false, removable: true },
+  ]
+  await p.route('**/api/repos/worktrees*', r => {
+    if (r.request().method() === 'DELETE') {
+      const urlObj = new URL(r.request().url())
+      const delPath = urlObj.searchParams.get('path') || (r.request().postDataJSON()?.path) || ''
+      mockWorktrees = mockWorktrees.filter(w => w.path !== delPath)
+      return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ removed: true, path: delPath, message: 'Removed orphan worktree.' }) })
+    }
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ worktrees: mockWorktrees }) })
+  })
   const mockTemplates = [
     {
       id: 'tpl-default-1',
@@ -277,11 +332,12 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
     if (Array.isArray(arr) && arr.length > 0) {
       const doneIdx = arr.findIndex(x => x.bucket === 'done')
       if (doneIdx >= 0) {
+        const upstreamId = arr.find((x, idx) => idx !== doneIdx)?.id || 's-base'
         arr[doneIdx] = {
           ...arr[doneIdx],
           transcript: bigLines,
           transcript_total: 55000,
-          depends_on: ['s-base'],
+          depends_on: [upstreamId],
           auto_healed: true,
           auto_steer_budget: 2,
           heal_attempts: [
@@ -337,10 +393,36 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
   ok('Auto-Heal badge & timeline show Healed on attempt 2/2 with attempts',
     healTimelineText.includes('Healed on attempt 2/2') && (await inspector.locator('ol[aria-label="Auto-heal attempts"] > li').count()) === 2)
 
-  // Board Metrics Strip telemetry
+  // Board Metrics Strip telemetry + Daily budget chip
   const metricsText = await p.locator('[data-testid="board-metrics-strip"]').innerText()
-  ok('Board Metrics Strip renders First-pass %, Auto-healed, Median check, and Active/Max slots',
-    metricsText.includes('33%') && metricsText.includes('Auto-healed') && metricsText.includes('820ms') && metricsText.includes('2 / 4'))
+  ok('Board Metrics Strip renders First-pass %, Auto-healed, Median check, Active/Max slots, and Daily budget',
+    metricsText.includes('33%') && metricsText.includes('Auto-healed') && metricsText.includes('820ms') && metricsText.includes('2 / 4') && metricsText.includes('5 / 50'))
+
+  // PR Preview & Confirmation-Gated Create PR modal from Inspector
+  await inspector.locator('[data-testid="open-pr-preview"]').click(); await p.waitForTimeout(300)
+  const prModal = p.locator('[data-testid="pr-preview-modal"]')
+  const prTitleVal = await prModal.locator('#pr-preview-title').inputValue()
+  const prDisabledBeforeConfirm = await prModal.locator('[data-testid="pr-submit-btn"]').isDisabled()
+  await prModal.locator('#pr-confirm-checkbox').check(); await p.waitForTimeout(100)
+  const prEnabledAfterConfirm = await prModal.locator('[data-testid="pr-submit-btn"]').isEnabled()
+  await prModal.locator('[data-testid="pr-submit-btn"]').click(); await p.waitForTimeout(250)
+  const prStatusText = await prModal.locator('[data-testid="pr-create-status"]').innerText()
+  ok('PR Preview modal loads Markdown, enforces confirmation gate, and submits confirm=true',
+    prTitleVal.includes('export handler') && prDisabledBeforeConfirm && prEnabledAfterConfirm && prCreateConfirmed && prStatusText.includes('PR #42'),
+    `disabledBefore=${prDisabledBeforeConfirm} confirmed=${prCreateConfirmed}`)
+  await p.keyboard.press('Escape'); await p.waitForTimeout(250)
+
+  // Board / DAG Graph toggle renders multi-wave dependency graph + SVG edges + click node -> Inspector
+  await p.keyboard.press('Escape'); await p.waitForTimeout(200)
+  await p.locator('[data-testid="view-toggle-dag"]').click(); await p.waitForTimeout(250)
+  const dagNodes = await p.locator('[data-testid="dag-node"]').count()
+  const dagEdges = await p.locator('[data-testid="dag-edge"]').count()
+  await p.locator('[data-testid="dag-node"]').first().click(); await p.waitForTimeout(250)
+  const dagOpensInspector = await p.locator('aside[aria-label="Session inspector"]').isVisible()
+  ok('DAG Graph view renders multi-wave nodes, directed SVG edges, and opens Inspector on click',
+    dagNodes >= 2 && dagEdges >= 1 && dagOpensInspector,
+    `nodes=${dagNodes} edges=${dagEdges}`)
+  await p.locator('[data-testid="view-toggle-board"]').click(); await p.waitForTimeout(200)
 
   // Zero user-facing "Rune" jargon check (#155)
   const visibleBodyText = await p.locator('body').innerText()
@@ -369,8 +451,20 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
   ok('Composer saves custom playbook via POST /api/templates', (await p.locator('section[aria-label="Playbooks"]').innerText()).includes('Custom Nightly Wave'))
   await p.keyboard.press('Escape'); await p.waitForTimeout(250)
 
-  // Live Policy Tester inside #settings Vaul drawer
+  // Live Policy Tester, Budget Guardrails, and Worktrees Inspector inside #settings Vaul drawer
   await p.getByRole('button', { name: 'Engines and settings' }).click(); await p.waitForTimeout(350)
+  const budgetText = await p.locator('[data-testid="budget-guardrails"]').innerText()
+  ok('Budget Guardrails renders daily cap utilization and session limits inside Settings',
+    budgetText.includes('5 / 50') && budgetText.includes('30 min') && budgetText.includes('2 / run'))
+
+  const wtBefore = await p.locator('[data-testid="worktree-row"]').count()
+  await p.locator('[data-testid="worktree-prune-btn"]').first().click(); await p.waitForTimeout(150)
+  await p.locator('[data-testid="worktree-confirm-prune"]').click(); await p.waitForTimeout(300)
+  const wtAfter = await p.locator('[data-testid="worktree-row"]').count()
+  ok('Worktrees Inspector lists repo checkouts and prunes individual non-main orphan via DELETE',
+    wtBefore === 2 && wtAfter === 1,
+    `before=${wtBefore} after=${wtAfter}`)
+
   await p.locator('#settings').getByRole('button', { name: 'Test policy' }).click(); await p.waitForTimeout(250)
   const ptText = await p.locator('[data-testid="policy-test-result"]').innerText()
   ok('Live Policy Tester evaluates POST /api/policies/test inside Settings',

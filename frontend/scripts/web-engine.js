@@ -1,12 +1,31 @@
 (() => {
-  const APP_VERSION = "0.6.0";
-  const DB_NAME = "fleet-worktrees-v3";
+  const APP_VERSION = "0.7.0";
+  const DB_NAME = "fleet-worktrees-v4";
   const STORE_NAME = "state";
   const BYOK_KEY_SS = "fleet-byok-api-key";
   const BYOK_URL_LS = "fleet-byok-url";
   const BYOK_MODEL_LS = "fleet-byok-model";
   const LOCAL_URL_LS = "fleet-local-url";
   const MAX_PARALLEL = 4;
+  const DAILY_SESSION_LIMIT = 50;
+  const MAX_SESSION_MINS = 30;
+  const MAX_HEAL_ATTEMPTS = 2;
+
+  const DEFAULT_ORPHAN_WORKTREES = () => [
+    {
+      repo: "/workspace/rate-limiter",
+      project: "rate-limiter",
+      path: "/workspace/rate-limiter/.worktrees/stale-hotfix-88",
+      branch: "fleet/stale-hotfix-88",
+      head: "a91c4f0",
+      is_main: false,
+      is_orphan: true,
+      dirty: false,
+      session_id: null,
+      session_status: null,
+      session_task: null
+    }
+  ];
 
   const DEFAULT_TEMPLATES = () => [
     {
@@ -1491,13 +1510,145 @@
           if (!Array.isArray(state.templates) || state.templates.length === 0) {
             state.templates = DEFAULT_TEMPLATES();
           }
+          if (!Array.isArray(state.orphanWorktrees)) {
+            state.orphanWorktrees = DEFAULT_ORPHAN_WORKTREES();
+          }
         } else {
-          state = { repos: INITIAL_REPOS(), sessions: [], templates: DEFAULT_TEMPLATES(), seq: 1 };
+          state = {
+            repos: INITIAL_REPOS(),
+            sessions: [],
+            templates: DEFAULT_TEMPLATES(),
+            orphanWorktrees: DEFAULT_ORPHAN_WORKTREES(),
+            seq: 1
+          };
           await seedRealInitialRuns();
         }
       })();
     }
     return readyPromise;
+  }
+
+  function computeBudget() {
+    const used = state.sessions.length;
+    const remaining = Math.max(0, DAILY_SESSION_LIMIT - used);
+    return {
+      max_session_mins: MAX_SESSION_MINS,
+      daily_session_limit: DAILY_SESSION_LIMIT,
+      max_heal_attempts: MAX_HEAL_ATTEMPTS,
+      sessions_today: used,
+      remaining_today: remaining,
+      limit_reached: used >= DAILY_SESSION_LIMIT,
+      daily_limit_reached: used >= DAILY_SESSION_LIMIT,
+      utilization_pct: Math.min(100, Math.round((used / DAILY_SESSION_LIMIT) * 1000) / 10),
+      usage_pct: Math.min(100, Math.round((used / DAILY_SESSION_LIMIT) * 1000) / 10)
+    };
+  }
+
+  function buildPrPreview(s) {
+    const diffLines = String(s.diff || "").split("\n");
+    let files = 0, add = 0, del = 0;
+    for (const l of diffLines) {
+      if (l.startsWith("diff --git")) files++;
+      else if (l.startsWith("+") && !l.startsWith("+++")) add++;
+      else if (l.startsWith("-") && !l.startsWith("---")) del++;
+    }
+    const baseBranch = (state.repos[s.repo] && state.repos[s.repo].branch) || "main";
+    const headBranch = s.branch || "fleet/" + s.id;
+    const title = String(s.task || ("Session " + s.id)).replace(/\s+/g, " ").trim().slice(0, 72);
+    const md = [
+      "## Summary",
+      "",
+      s.task,
+      "",
+      "- **Session:** `" + s.id + "`",
+      "- **Repository:** `" + s.project + "`",
+      "- **Branch:** `" + headBranch + "` -> `" + baseBranch + "`",
+      "- **Diff Stat:** " + files + " file(s), +" + add + " / -" + del,
+      "",
+      "## Verification",
+      ""
+    ];
+    if (Array.isArray(s.check_steps) && s.check_steps.length > 0) {
+      for (const st of s.check_steps) {
+        const mark = st.passed || st.status === "passed" ? "x" : " ";
+        md.push("- [" + mark + "] **" + st.name + "** `" + st.cmd + "` — " + (st.tail_line || st.status) + (typeof st.elapsed_ms === "number" ? " (" + st.elapsed_ms + "ms)" : ""));
+      }
+    } else {
+      md.push("- [" + (s.check_passed ? "x" : " ") + "] `" + (s.check_cmd || "npm test") + "`");
+    }
+    if (Array.isArray(s.heal_attempts) && s.heal_attempts.length > 0) {
+      md.push("", "## Auto-Heal Timeline", "");
+      for (const h of s.heal_attempts) {
+        md.push("- Attempt " + h.attempt + " (`" + h.trigger_step + "`): " + (h.healed ? "healed" : "retry") + " (" + h.elapsed_ms + "ms) — " + (h.stderr_tail || "steered"));
+      }
+    }
+    const warnings = [];
+    if (!(s.check_passed === true && (s.status === "done" || s.status === "merged"))) {
+      warnings.push("Session check has not reached verified done status yet.");
+    }
+    if (files === 0) {
+      warnings.push("No diff changes recorded on this branch.");
+    }
+    return {
+      session_id: s.id,
+      repo: s.repo || s.project,
+      title,
+      body: md.join("\n"),
+      base_branch: baseBranch,
+      head_branch: headBranch,
+      gh_available: false,
+      gh_status: "Browser standalone dry-run preview — copy Markdown or connect local fleet-rs with gh CLI to publish to GitHub.",
+      ready_to_create: true,
+      can_create: true,
+      warnings,
+      diff_stat: { files_changed: files, insertions: add, deletions: del, files: [] },
+      diff_files: files,
+      diff_add: add,
+      diff_del: del
+    };
+  }
+
+  function listWorktrees() {
+    const out = [];
+    for (const r of Object.values(state.repos || {})) {
+      const head = r.commits && r.commits[r.commits.length - 1];
+      out.push({
+        repo: r.path,
+        project: r.name,
+        path: r.path,
+        branch: r.branch || "main",
+        head: head ? head.hash : "0000000",
+        is_main: true,
+        is_orphan: false,
+        dirty: false,
+        removable: false,
+        session_id: null,
+        session_status: null,
+        session_task: null
+      });
+    }
+    for (const s of state.sessions || []) {
+      if (s.status === "archived" || s.status === "merged" || !s._branchFiles) continue;
+      const dirty = Object.keys(s._branchFiles).some((k) => s._branchFiles[k] !== (s._baseFiles || {})[k]);
+      out.push({
+        repo: s.repo,
+        project: s.project,
+        path: (s.repo || "/workspace/repo") + "/.worktrees/" + s.id,
+        branch: s.branch || "fleet/" + s.id,
+        head: s.verified_commit || "working",
+        is_main: false,
+        is_orphan: false,
+        dirty,
+        removable: s.bucket !== "working",
+        session_id: s.id,
+        session_status: s.status,
+        session_task: s.task
+      });
+    }
+    for (const orph of state.orphanWorktrees || []) {
+      out.push({ ...orph, is_main: false, is_orphan: true, removable: true });
+    }
+    return out;
   }
 
   function computeMetrics() {
@@ -1569,7 +1720,8 @@
         needs_you: r.needs_you,
         needs_you_count: r.needs_you,
         median_check_ms: med(r.durs)
-      }))
+      })),
+      budget: computeBudget()
     };
   }
 
@@ -1641,7 +1793,13 @@
       return this.getStatus();
     },
     async resetWorkspace() {
-      state = { repos: INITIAL_REPOS(), sessions: [], templates: DEFAULT_TEMPLATES(), seq: 1 };
+      state = {
+        repos: INITIAL_REPOS(),
+        sessions: [],
+        templates: DEFAULT_TEMPLATES(),
+        orphanWorktrees: DEFAULT_ORPHAN_WORKTREES(),
+        seq: 1
+      };
       await seedRealInitialRuns();
       await persistState();
       emitSse("sessions", { sessions: state.sessions.filter((s) => s.bucket !== "archived").map(publicSession) });
@@ -1697,8 +1855,39 @@
       const list = Object.values(state.repos).map((r) => ({ name: r.name, path: r.path, branch: r.branch }));
       return jsonResp(list);
     }
+    if (method === "GET" && u.pathname === "/api/repos/worktrees") {
+      return jsonResp({ worktrees: listWorktrees() });
+    }
+    if (method === "DELETE" && u.pathname === "/api/repos/worktrees") {
+      const targetPath = String(body.path || u.searchParams.get("path") || "").trim();
+      const targetRepo = String(body.repo || u.searchParams.get("repo") || "").trim();
+      if (!targetPath) return jsonResp({ error: "Worktree path is required." }, 400);
+      if (state.repos[targetPath]) {
+        return jsonResp({ error: "Refusing to delete main repository checkout." }, 400);
+      }
+      const beforeOrphans = (state.orphanWorktrees || []).length;
+      state.orphanWorktrees = (state.orphanWorktrees || []).filter((w) => w.path !== targetPath);
+      let removed = state.orphanWorktrees.length < beforeOrphans;
+      if (!removed) {
+        for (const s of state.sessions || []) {
+          const wtPath = (s.repo || "/workspace/repo") + "/.worktrees/" + s.id;
+          if (wtPath === targetPath && (!targetRepo || s.repo === targetRepo)) {
+            delete s._branchFiles;
+            removed = true;
+            break;
+          }
+        }
+      }
+      if (!removed) return jsonResp({ error: "Worktree not found: " + targetPath }, 404);
+      await persistState();
+      return jsonResp({ ok: true, removed: targetPath, message: "Removed worktree " + targetPath.split("/").pop() + "." });
+    }
     if (method === "POST" && u.pathname === "/api/repos/prune-worktrees") {
       let pruned = 0;
+      if (Array.isArray(state.orphanWorktrees) && state.orphanWorktrees.length > 0) {
+        pruned += state.orphanWorktrees.length;
+        state.orphanWorktrees = [];
+      }
       for (const s of state.sessions) {
         if (s.status === "archived" && s._branchFiles) {
           delete s._branchFiles;
@@ -1706,7 +1895,7 @@
         }
       }
       await persistState();
-      return jsonResp({ pruned, message: pruned === 0 ? "All browser worktrees are clean." : "Pruned " + pruned + " archived worktree(s)." });
+      return jsonResp({ pruned, message: pruned === 0 ? "All browser worktrees are clean." : "Pruned " + pruned + " stale worktree(s)." });
     }
     if (method === "GET" && u.pathname === "/api/policy") {
       const hasByok = Boolean(getByokKey());
@@ -1732,7 +1921,10 @@
           prune_worktrees: true,
           auto_heal: true,
           templates: true,
-          metrics: true
+          metrics: true,
+          pr_preview: true,
+          worktrees: true,
+          budget: true
         }
       });
     }
@@ -1850,6 +2042,33 @@
       });
     }
 
+    const prPrevM = /^\/api\/sessions\/([^/]+)\/pr-preview$/.exec(u.pathname);
+    if (method === "GET" && prPrevM) {
+      const s = state.sessions.find((x) => x.id === prPrevM[1]);
+      return s ? jsonResp(buildPrPreview(s)) : jsonResp({ error: "no such session" }, 404);
+    }
+
+    const prCreateM = /^\/api\/sessions\/([^/]+)\/pr$/.exec(u.pathname);
+    if (method === "POST" && prCreateM) {
+      const s = state.sessions.find((x) => x.id === prCreateM[1]);
+      if (!s) return jsonResp({ error: "no such session" }, 404);
+      if (body.confirm !== true) {
+        return jsonResp({ error: "Explicit confirmation (confirm: true) is required before opening a PR." }, 400);
+      }
+      const prev = buildPrPreview(s);
+      return jsonResp({
+        ok: true,
+        dry_run: true,
+        draft: Boolean(body.draft),
+        message:
+          "Dry-run PR verified for " +
+          prev.head_branch +
+          " -> " +
+          prev.base_branch +
+          " (copy Markdown or connect local fleet-rs with gh CLI to publish to GitHub)."
+      });
+    }
+
     if (method === "GET" && u.pathname.startsWith("/api/sessions/")) {
       const id = u.pathname.slice("/api/sessions/".length);
       const s = state.sessions.find((x) => x.id === id);
@@ -1859,6 +2078,10 @@
     if (method === "POST" && u.pathname === "/api/sessions/batch") {
       const rawItems = Array.isArray(body.tasks) ? body.tasks : Array.isArray(body.sessions) ? body.sessions : [];
       if (rawItems.length === 0) return jsonResp({ error: "Provide at least one task in tasks[]." }, 400);
+      const budget = computeBudget();
+      if (budget.sessions_today + rawItems.length > budget.daily_session_limit) {
+        return jsonResp({ error: "Daily session budget limit reached (" + budget.sessions_today + "/" + budget.daily_session_limit + ")." }, 429);
+      }
       const aliasMap = new Map();
       const pending = [];
 
@@ -1911,6 +2134,10 @@
       const repoPath = String(body.repo || "").trim();
       if (!repoPath) return jsonResp({ error: "Give the repo path: select a browser git repository." }, 400);
       if (!task) return jsonResp({ error: "Write the task: say what the agent should do." }, 400);
+      const budget = computeBudget();
+      if (budget.limit_reached) {
+        return jsonResp({ error: "Daily session budget limit reached (" + budget.sessions_today + "/" + budget.daily_session_limit + ")." }, 429);
+      }
       ensureRepoExists(repoPath);
       const created = createSessionRecord({
         repoPath,

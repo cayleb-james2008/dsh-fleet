@@ -10,8 +10,11 @@ import {
   Cpu,
   FileDiff,
   FolderGit2,
+  Gauge,
   GitBranch,
   GitMerge,
+  LayoutGrid,
+  Network,
   RotateCcw,
   ShieldAlert,
   Square,
@@ -44,6 +47,7 @@ import {
   type Session,
   type StatusFilter,
   type TabId,
+  type ViewMode,
 } from "./api";
 
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
@@ -126,6 +130,23 @@ export function BoardMetricsStrip({ metrics }: { metrics: BoardMetrics }) {
           </span>
           {metrics.queued_count > 0 && <span className="text-ink-3">· {metrics.queued_count} queued</span>}
         </span>
+
+        {metrics.budget && (
+          <span className="inline-flex items-center gap-1.5 text-ink-2" data-testid="metric-budget">
+            <Gauge className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
+            <span className="font-sans text-ink-3">Daily budget</span>
+            <span
+              className={cn(
+                "rounded-chip px-1.5 py-0.5 font-medium",
+                metrics.budget.limit_reached
+                  ? "bg-pill-pro-bg text-destructive-foreground"
+                  : "bg-track text-ink",
+              )}
+            >
+              {metrics.budget.sessions_today} / {metrics.budget.daily_session_limit}
+            </span>
+          </span>
+        )}
       </div>
 
       {metrics.per_repo_breakdown.length > 0 && (
@@ -351,6 +372,7 @@ export function HeroVerifiedReceipt({
 }
 
 export function BoardFilterBulkBar({
+  viewMode,
   statusFilter,
   repoFilter,
   engineFilter,
@@ -361,6 +383,7 @@ export function BoardFilterBulkBar({
   selectedIds,
   visibleSessions,
   bulkBusy,
+  onViewMode,
   onStatusFilter,
   onRepoFilter,
   onEngineFilter,
@@ -372,6 +395,7 @@ export function BoardFilterBulkBar({
   onBulkDismiss,
   onBulkMerge,
 }: {
+  viewMode: ViewMode;
   statusFilter: StatusFilter;
   repoFilter: string;
   engineFilter: string;
@@ -382,6 +406,7 @@ export function BoardFilterBulkBar({
   selectedIds: Set<string>;
   visibleSessions: Session[];
   bulkBusy: boolean;
+  onViewMode: (v: ViewMode) => void;
   onStatusFilter: (s: StatusFilter) => void;
   onRepoFilter: (r: string) => void;
   onEngineFilter: (e: string) => void;
@@ -506,6 +531,29 @@ export function BoardFilterBulkBar({
         )}
 
         <div className="ml-auto flex flex-wrap items-center gap-2">
+          <SegmentedControl aria-label="Workspace view" size="sm">
+            <SegmentedControlItem
+              data-testid="view-toggle-board"
+              aria-pressed={viewMode === "board"}
+              data-checked={viewMode === "board" ? "" : undefined}
+              onClick={() => onViewMode("board")}
+              className="gap-1.5 whitespace-nowrap px-2.5 text-xs max-md:!min-h-11 max-md:!min-w-11"
+            >
+              <LayoutGrid className="size-3.5" strokeWidth={1.5} aria-hidden />
+              <span>Board</span>
+            </SegmentedControlItem>
+            <SegmentedControlItem
+              data-testid="view-toggle-dag"
+              aria-pressed={viewMode === "dag"}
+              data-checked={viewMode === "dag" ? "" : undefined}
+              onClick={() => onViewMode("dag")}
+              className="gap-1.5 whitespace-nowrap px-2.5 text-xs max-md:!min-h-11 max-md:!min-w-11"
+            >
+              <Network className="size-3.5" strokeWidth={1.5} aria-hidden />
+              <span>DAG Graph</span>
+            </SegmentedControlItem>
+          </SegmentedControl>
+
           <Button
             type="button"
             size="sm"
