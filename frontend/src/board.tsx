@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import {
+  Activity,
   Check,
   CheckCircle2,
   CheckSquare,
@@ -15,6 +16,7 @@ import {
   ShieldAlert,
   Square,
   Terminal,
+  Wrench,
   X,
 } from "lucide-react";
 import { BorderTrail } from "@/components/ui/border-trail";
@@ -28,6 +30,8 @@ import { layout } from "@/motion";
 import { cn } from "@/lib/utils";
 import {
   diffStat,
+  formatDurationMs,
+  healBadgeInfo,
   HONEST,
   isActivelyRunning,
   isFailed,
@@ -36,6 +40,7 @@ import {
   isVerified,
   receiptLine,
   statusText,
+  type BoardMetrics,
   type Session,
   type StatusFilter,
   type TabId,
@@ -68,6 +73,89 @@ function projectSkin(project: string): string {
   let h = 0;
   for (let i = 0; i < project.length; i++) h = (h * 31 + project.charCodeAt(i)) >>> 0;
   return TAG_SKINS[h % TAG_SKINS.length];
+}
+
+export function BoardMetricsStrip({ metrics }: { metrics: BoardMetrics }) {
+  const settled = metrics.first_pass_count + metrics.auto_healed_count + metrics.needs_you_count;
+  const firstPassLabel = settled > 0 ? `${Math.round(metrics.first_pass_rate_pct)}%` : "—";
+  const effectiveLabel = settled > 0 ? `${Math.round(metrics.effective_pass_rate_pct)}% effective` : "awaiting runs";
+  const medianLabel = metrics.median_check_ms !== null ? formatDurationMs(metrics.median_check_ms) : "—";
+
+  return (
+    <section
+      aria-label="Board metrics"
+      data-testid="board-metrics-strip"
+      className="flex flex-wrap items-center gap-x-5 gap-y-2 border-b border-hairline bg-canvas/70 px-4 py-2 text-xs md:px-6"
+    >
+      <span className="order-1 inline-flex items-center gap-1.5 font-medium text-ink-2">
+        <Activity className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
+        <span>Telemetry</span>
+      </span>
+
+      <div className="order-3 flex w-full flex-wrap items-center gap-x-4 gap-y-1.5 font-mono tabular-nums md:order-2 md:w-auto">
+        <span className="inline-flex items-center gap-1.5 text-ink-2">
+          <span className="font-sans text-ink-3">First-pass</span>
+          <span className="font-medium text-ink" data-testid="metric-first-pass">{firstPassLabel}</span>
+          {settled > 0 && <span className="text-ink-3">({metrics.first_pass_count}/{settled})</span>}
+        </span>
+
+        <span className="inline-flex items-center gap-1.5 text-ink-2">
+          <Wrench className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
+          <span className="font-sans text-ink-3">Auto-healed</span>
+          <span
+            data-testid="metric-auto-healed"
+            className={cn(
+              "rounded-chip px-1.5 py-0.5 font-medium",
+              metrics.auto_healed_count > 0 ? "bg-pill-active-bg text-pill-active-fg" : "bg-track text-ink",
+            )}
+          >
+            {metrics.auto_healed_count}
+          </span>
+          <span className="hidden text-ink-3 sm:inline">{effectiveLabel}</span>
+        </span>
+
+        <span className="inline-flex items-center gap-1.5 text-ink-2">
+          <span className="font-sans text-ink-3">Median check</span>
+          <span className="font-medium text-ink" data-testid="metric-median-check">{medianLabel}</span>
+        </span>
+
+        <span className="inline-flex items-center gap-1.5 text-ink-2">
+          <span className="font-sans text-ink-3">Active / Max</span>
+          <span className="rounded-chip bg-track px-1.5 py-0.5 font-medium text-ink" data-testid="metric-slots">
+            {metrics.active_slots} / {metrics.max_parallel}
+          </span>
+          {metrics.queued_count > 0 && <span className="text-ink-3">· {metrics.queued_count} queued</span>}
+        </span>
+      </div>
+
+      {metrics.per_repo_breakdown.length > 0 && (
+        <div className="order-2 ml-auto md:order-3">
+          <Popover>
+            <PopoverTrigger className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-control border border-hairline bg-surface px-2.5 text-xs font-medium text-ink-2 outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:bg-raised hover:text-ink focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11 max-md:px-3">
+              <FolderGit2 className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
+              <span>By repo ({metrics.per_repo_breakdown.length})</span>
+            </PopoverTrigger>
+            <PopoverContent
+              align="end"
+              className="z-30 w-80 max-w-[calc(100%-24px)] rounded-card border border-hairline bg-surface p-3 text-ink shadow-lift"
+            >
+              <p className="mb-2 text-xs font-medium text-ink">Per-repository telemetry</p>
+              <ul className="divide-y divide-hairline font-mono text-xs tabular-nums">
+                {metrics.per_repo_breakdown.map((row) => (
+                  <li key={row.repo} className="flex items-center justify-between gap-2 py-1.5">
+                    <span className="min-w-0 truncate text-ink">{row.repo}</span>
+                    <span className="shrink-0 text-ink-2">
+                      {row.first_pass} pass · {row.auto_healed} heal · {row.needs_you} halt
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </PopoverContent>
+          </Popover>
+        </div>
+      )}
+    </section>
+  );
 }
 
 export function HeroVerifiedReceipt({
@@ -140,6 +228,7 @@ export function HeroVerifiedReceipt({
 
   const ds = diffStat(latest.diff);
   const merged = latest.status === "merged";
+  const heroHeal = healBadgeInfo(latest);
   const mergePrompt = latest.merge_target
     ? `Merge ${latest.branch || "this branch"} into ${latest.merge_target}? Fleet refuses if the target is dirty.`
     : `Merge ${latest.branch || "this branch"}? Fleet refuses if the target is dirty.`;
@@ -157,6 +246,12 @@ export function HeroVerifiedReceipt({
             <PillIndicator variant="success" />
             <span>{merged ? "Latest receipt · merged" : "Latest verified receipt"}</span>
           </Pill>
+          {heroHeal && (
+            <span className="inline-flex items-center gap-1 rounded-chip bg-pill-active-bg px-2 py-0.5 font-mono text-xs font-medium text-pill-active-fg">
+              <Wrench className="size-3" strokeWidth={1.5} aria-hidden />
+              <span>{heroHeal.fullLabel}</span>
+            </span>
+          )}
           <span
             className={cn(
               "inline-flex items-center rounded-chip px-2 py-0.5 text-xs font-medium [overflow-wrap:anywhere]",
@@ -602,6 +697,7 @@ function SessionCard({
     s.check_steps && s.check_steps.length > 1
       ? `${s.check_steps.filter((st) => st.status === "passed" || st.passed === true).length}/${s.check_steps.length} steps`
       : null;
+  const healBadge = healBadgeInfo(s);
 
   return (
     <motion.article
@@ -657,6 +753,22 @@ function SessionCard({
           <span className="inline-flex items-center gap-1 rounded-chip bg-track px-1.5 py-0.5 font-mono text-xs text-ink-2">
             <GitBranch className="size-3 text-icon" strokeWidth={1.5} aria-hidden />
             <span>{s.depends_on.length} dep{s.depends_on.length === 1 ? "" : "s"}</span>
+          </span>
+        )}
+        {healBadge && (
+          <span
+            data-testid="card-heal-badge"
+            className={cn(
+              "inline-flex items-center gap-1 rounded-chip px-1.5 py-0.5 font-mono text-xs font-medium",
+              healBadge.tone === "healed"
+                ? "bg-pill-active-bg text-pill-active-fg"
+                : healBadge.tone === "healing"
+                  ? "bg-pill-warn-bg text-pill-warn-fg"
+                  : "bg-pill-pro-bg text-pill-pro-fg",
+            )}
+          >
+            <Wrench className="size-3" strokeWidth={1.5} aria-hidden />
+            <span>{healBadge.shortLabel}</span>
           </span>
         )}
         <Badge variant={badgeVariant} size="sm" className="ml-auto shrink-0">

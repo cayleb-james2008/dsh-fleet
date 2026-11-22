@@ -1,5 +1,6 @@
 // Global Command Palette (Cmd+K / Ctrl+K) powered by House Frontend Command (cmdk + Radix Dialog).
 import {
+  BookMarked,
   CheckSquare,
   Cpu,
   Download,
@@ -29,6 +30,7 @@ import {
   isFailed,
   isVerified,
   statusText,
+  type PlaybookTemplate,
   type RepoInfo,
   type Session,
   type StatusFilter,
@@ -40,6 +42,7 @@ export function CommandPalette({
   onOpenChange,
   sessions,
   selectedSession,
+  playbooks,
   repos,
   engines,
   multiSelect,
@@ -47,6 +50,7 @@ export function CommandPalette({
   onSwitchTab,
   onNewSingle,
   onNewBatch,
+  onApplyPlaybook,
   onOpenSettings,
   onToggleMultiSelect,
   onFocusSearch,
@@ -61,6 +65,7 @@ export function CommandPalette({
   onOpenChange: (o: boolean) => void;
   sessions: Session[];
   selectedSession: Session | null;
+  playbooks: PlaybookTemplate[];
   repos: RepoInfo[];
   engines: string[];
   multiSelect: boolean;
@@ -68,6 +73,7 @@ export function CommandPalette({
   onSwitchTab: (tab: TabId) => void;
   onNewSingle: () => void;
   onNewBatch: () => void;
+  onApplyPlaybook: (tpl: PlaybookTemplate) => void;
   onOpenSettings: () => void;
   onToggleMultiSelect: () => void;
   onFocusSearch: () => void;
@@ -126,6 +132,28 @@ export function CommandPalette({
             <span>Clear all board filters</span>
           </CommandItem>
         </CommandGroup>
+
+        {playbooks.length > 0 && (
+          <>
+            <CommandSeparator />
+            <CommandGroup heading={`Playbooks (${playbooks.length})`}>
+              {playbooks.map((tpl) => {
+                const count = tpl.tasks?.length ?? 1;
+                return (
+                  <CommandItem
+                    key={tpl.id}
+                    value={`playbook template ${tpl.name} ${tpl.description} ${tpl.repo || ""}`}
+                    onSelect={() => act(() => onApplyPlaybook(tpl))}
+                  >
+                    <BookMarked className="text-icon" strokeWidth={1.5} aria-hidden />
+                    <span className="min-w-0 flex-1 truncate">{tpl.name}</span>
+                    <CommandShortcut>{count > 1 ? `${count} tasks` : "Single"}</CommandShortcut>
+                  </CommandItem>
+                );
+              })}
+            </CommandGroup>
+          </>
+        )}
 
         {selectedSession && (
           <>

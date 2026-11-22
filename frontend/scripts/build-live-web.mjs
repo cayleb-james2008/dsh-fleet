@@ -11,7 +11,7 @@ const srcHtml = path.join(root, "assets/index.html");
 const engineJs = path.join(import.meta.dirname, "web-engine.js");
 const outDir =
   process.env.LIVE_WEB_OUT_DIR ||
-  "/home/cayleb/Work/scratch/swarm-v050/shared-live-web/dsh-fleet";
+  "/home/cayleb/Work/scratch/swarm-v060/shared-live-web/dsh-fleet";
 const outFile = path.join(outDir, "index.html");
 
 if (!fs.existsSync(srcHtml)) {

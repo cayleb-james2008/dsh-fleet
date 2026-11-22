@@ -4,6 +4,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   isWebEngineMode,
+  normalizeHealAttempt,
   normalizeSession,
   normalizeSessions,
   type CheckStepReceipt,
@@ -112,6 +113,30 @@ function applyCheckStepUpdate(
   return copy;
 }
 
+function applyHealAttemptUpdate(
+  prev: Session[] | null,
+  sessionId: string,
+  rawAttempt: unknown,
+): Session[] | null {
+  if (!prev) return prev;
+  const idx = prev.findIndex((s) => s.id === sessionId);
+  if (idx === -1) return prev;
+  const cur = prev[idx];
+  const existing = cur.heal_attempts ? cur.heal_attempts.slice() : [];
+  const next = normalizeHealAttempt(rawAttempt, existing.length);
+  if (!next) return prev;
+  const matchIdx = existing.findIndex((a) => a.attempt === next.attempt);
+  if (matchIdx >= 0) existing[matchIdx] = next;
+  else existing.push(next);
+  const copy = prev.slice();
+  copy[idx] = {
+    ...cur,
+    heal_attempts: existing,
+    auto_healed: cur.auto_healed || next.healed || undefined,
+  };
+  return copy;
+}
+
 export function useFleetStream({
   enabled,
   onRefresh,
@@ -216,11 +241,23 @@ export function useFleetStream({
         return;
       }
 
+      if (kind === "auto_heal_attempt" || kind === "heal_attempt") {
+        const sid = String(obj.session_id || obj.id || "").trim();
+        const attemptObj = obj.attempt && typeof obj.attempt === "object" ? obj.attempt : obj;
+        if (sid) {
+          patchRef.current((prev) => applyHealAttemptUpdate(prev, sid, attemptObj));
+          scheduleSync();
+        }
+        return;
+      }
+
       if (
         kind === "queue" ||
         kind === "queue_depth" ||
         kind === "config_updated" ||
         kind === "worktrees_pruned" ||
+        kind === "templates_updated" ||
+        kind === "metrics_updated" ||
         kind === "refresh" ||
         kind === "inbox"
       ) {
@@ -268,11 +305,15 @@ export function useFleetStream({
         "line",
         "check_step",
         "check_progress",
+        "auto_heal_attempt",
+        "heal_attempt",
         "receipt",
         "queue",
         "queue_depth",
         "config_updated",
         "worktrees_pruned",
+        "templates_updated",
+        "metrics_updated",
         "refresh",
       ]) {
         es.addEventListener(name, (ev) => handlePayload((ev as MessageEvent).data, name));
