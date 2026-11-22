@@ -9,6 +9,15 @@
 mod events;
 mod update;
 
+use fleet_rs::checks::{
+    CheckPipeline, CheckStep, CheckStepReceipt, FileScope, PipelineReceipt, ScopeViolation,
+    verify_git_scope,
+};
+use fleet_rs::dag::{BatchSpec, BatchTaskSpec, DagGraph, DagNodeState, TaskNode};
+use fleet_rs::merge_check::{
+    MergeStrategy, PatchFormat, dry_run_merge, execute_merge, export_patch,
+};
+use fleet_rs::policy::{MAX_TIMEOUT_SECS, Policy, test_policy_script};
 use serde::Serialize;
 use std::os::unix::ffi::OsStrExt as _;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -18,32 +27,13 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
-// Rune policy layer
+// Core limits & helpers
 // ---------------------------------------------------------------------------
-
-struct Policy {
-    unit: Arc<rune::Unit>,
-    runtime: Arc<rune::runtime::RuntimeContext>,
-    max_parallel: i64,
-    /// Agent/check execution cap in seconds. Read from the policy's
-    /// optional timeout_secs(); a policy that doesn't define it gets
-    /// DEFAULT_TIMEOUT_SECS — never infinity.
-    timeout_secs: u64,
-    /// The house model route, from the policy's optional
-    /// agent_model() — one config point for which model agent
-    /// sessions run. Passed to the engine that speaks that provider
-    /// namespace (opencode). Absent means the engine's own default.
-    model: Option<String>,
-}
-
-const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
 /// In-memory transcript cap per session (the on-disk log is uncapped).
 const TRANSCRIPT_CAP: usize = 2000;
 /// Stored-transcript byte budget per session (see log()).
 const TRANSCRIPT_BYTES: usize = 512 * 1024;
-/// The largest run timeout a policy may set (one week).
-const MAX_TIMEOUT_SECS: u64 = 604_800;
 /// Stored check output / diff cap, in characters.
 const OUTPUT_CAP: usize = 256_000;
 
@@ -79,92 +69,6 @@ fn truncate_output(text: String) -> String {
         t
     } else {
         text
-    }
-}
-
-impl Policy {
-    fn load(script: &str) -> Result<Policy, String> {
-        let context = rune::Context::with_default_modules().map_err(|e| e.to_string())?;
-        let runtime = Arc::new(context.runtime().map_err(|e| e.to_string())?);
-        let mut sources = rune::Sources::new();
-        sources
-            .insert(rune::Source::memory(script).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-        let mut diagnostics = rune::Diagnostics::new();
-        let unit = rune::prepare(&mut sources)
-            .with_context(&context)
-            .with_diagnostics(&mut diagnostics)
-            .build()
-            .map_err(|e| format!("policy script failed to build: {e}"))?;
-        let unit = Arc::new(unit);
-        let mut policy = Policy {
-            unit,
-            runtime,
-            max_parallel: 1,
-            timeout_secs: DEFAULT_TIMEOUT_SECS,
-            model: None,
-        };
-        // agent_model is optional in the policy file; absent or
-        // unusable means the engine's own default model.
-        if let Ok(m) = policy.call_string("agent_model", ()) {
-            if !m.is_empty() {
-                policy.model = Some(m);
-            }
-        }
-        policy.max_parallel = policy.call_i64("max_parallel", ())?;
-        if policy.max_parallel < 1 {
-            // A cap of zero would queue every session forever with
-            // nothing anywhere saying why. The floor is 1.
-            policy.max_parallel = 1;
-        }
-        // timeout_secs is optional in the policy file; absent or
-        // unusable means the default, never "no timeout".
-        if let Ok(secs) = policy.call_i64("timeout_secs", ()) {
-            if secs > 0 {
-                // Clamped: a policy value near i64::MAX would
-                // overflow Instant + Duration in the runner and
-                // panic the worker, leaving the session working
-                // forever. A week is beyond any real run.
-                policy.timeout_secs = (secs as u64).min(MAX_TIMEOUT_SECS);
-            }
-        }
-        Ok(policy)
-    }
-
-    fn vm(&self) -> rune::Vm {
-        rune::Vm::new(self.runtime.clone(), self.unit.clone())
-    }
-
-    fn call_i64<A>(&self, name: &str, args: A) -> Result<i64, String>
-    where
-        A: rune::runtime::Args + rune::runtime::GuardedArgs,
-    {
-        let value = self
-            .vm()
-            .call([name], args)
-            .map_err(|e| format!("policy call {name} failed: {e}"))?;
-        rune::from_value::<i64>(value).map_err(|e| format!("policy {name} returned non-integer: {e}"))
-    }
-
-    fn call_string<A>(&self, name: &str, args: A) -> Result<String, String>
-    where
-        A: rune::runtime::Args + rune::runtime::GuardedArgs,
-    {
-        let value = self
-            .vm()
-            .call([name], args)
-            .map_err(|e| format!("policy call {name} failed: {e}"))?;
-        rune::from_value::<String>(value)
-            .map_err(|e| format!("policy {name} returned non-string: {e}"))
-    }
-
-    fn default_check(&self, project: &str) -> Result<String, String> {
-        let value = self
-            .vm()
-            .call(["default_check"], (project.to_string(),))
-            .map_err(|e| format!("policy call default_check failed: {e}"))?;
-        rune::from_value::<String>(value)
-            .map_err(|e| format!("policy default_check returned non-string: {e}"))
     }
 }
 
@@ -397,6 +301,7 @@ fn engine_command(
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum Status {
+    Blocked,
     Queued,
     Working,
     Checking,
@@ -409,6 +314,7 @@ enum Status {
 impl Status {
     fn label(self) -> &'static str {
         match self {
+            Status::Blocked => "blocked",
             Status::Queued => "queued",
             Status::Working => "working",
             Status::Checking => "checking",
@@ -421,11 +327,25 @@ impl Status {
     /// The three buckets the sidebar shows: working / needs you / done.
     fn bucket(self) -> &'static str {
         match self {
-            Status::Queued | Status::Working | Status::Checking => "working",
+            Status::Blocked | Status::Queued | Status::Working | Status::Checking => "working",
             Status::NeedsYou => "needs-you",
             Status::Done | Status::Merged => "done",
             Status::Archived => "archived",
         }
+    }
+}
+
+fn session_dag_state(status: &str) -> DagNodeState {
+    match status {
+        "blocked" => DagNodeState::Blocked,
+        "queued" => DagNodeState::Queued,
+        "working" => DagNodeState::Working,
+        "checking" => DagNodeState::Checking,
+        "done" => DagNodeState::Done,
+        "merged" => DagNodeState::Merged,
+        "needs-you" => DagNodeState::NeedsYou,
+        "archived" => DagNodeState::Archived,
+        _ => DagNodeState::NeedsYou,
     }
 }
 
@@ -500,6 +420,28 @@ struct Session {
     /// by a refused merge, cleared by a merge that lands or by a retry.
     #[serde(default)]
     merge_error: Option<MergeRefusal>,
+    /// Upstream session IDs that must finish verified-done (or merged) before
+    /// this session starts. Evaluated by `fleet_rs::dag::DagGraph`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    depends_on: Vec<String>,
+    /// Optional multi-step verification pipeline specs; when empty, runs legacy `check_cmd`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    check_step_specs: Vec<CheckStep>,
+    /// Structured receipt produced by `CheckPipeline` (per-step status, timing, exit, tail).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    check_receipt: Option<PipelineReceipt>,
+    /// Optional repo-relative glob allowlist enforced before marking Done.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allowed_globs: Vec<String>,
+    /// Optional repo-relative glob denylist enforced before marking Done.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    forbidden_globs: Vec<String>,
+    /// Recorded file-scope violations when a session touched out-of-scope files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    scope_violations: Vec<ScopeViolation>,
+    /// Merge strategy used when this session landed (`merge-commit`, `squash`, `fast-forward-only`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    merge_strategy: Option<MergeStrategy>,
     transcript: Vec<String>,
 }
 
@@ -630,6 +572,7 @@ enum RunEnd {
     Stopped,
 }
 
+#[allow(dead_code)]
 struct RunOutcome {
     end: RunEnd,
     /// The exit code, when the process exited with one.
@@ -908,9 +851,12 @@ impl App {
         let sessions = self.sessions.lock().unwrap();
         let active = sessions
             .iter()
-            .filter(|s| s.bucket == "working" && s.status != "queued")
+            .filter(|s| matches!(s.status.as_str(), "working" | "checking"))
             .count();
-        let queued = sessions.iter().filter(|s| s.status == "queued").count();
+        let queued = sessions
+            .iter()
+            .filter(|s| matches!(s.status.as_str(), "queued" | "blocked"))
+            .count();
         let total = sessions.iter().filter(|s| s.bucket != "archived").count();
         (active, queued, total)
     }
@@ -1057,8 +1003,19 @@ impl App {
                 pruned_repos.push(repo);
             }
         }
+        let removed_count = removed_worktrees.len();
+        let message = if removed_count == 0 {
+            "All worktrees are clean.".to_string()
+        } else {
+            format!(
+                "Pruned {removed_count} stale worktree{}.",
+                if removed_count == 1 { "" } else { "s" }
+            )
+        };
         let payload = serde_json::json!({
             "pruned": true,
+            "removed": removed_count,
+            "message": message,
             "removed_worktrees": removed_worktrees,
             "pruned_repos": pruned_repos,
         });
@@ -1259,6 +1216,7 @@ impl App {
         self.mark_dirty(id);
         self.persist();
         let (active, queued, _) = self.queue_counts();
+        let session_obj = self.session_json_single(id);
         self.events.publish(
             "session_status",
             &serde_json::json!({
@@ -1268,6 +1226,7 @@ impl App {
                 "active": active,
                 "queued": queued,
                 "max_parallel": self.effective_max_parallel(),
+                "session": session_obj,
             }),
         );
     }
@@ -1288,6 +1247,7 @@ impl App {
         self.log(id, format!("needs you: {reason}"));
         self.persist();
         let (active, queued, _) = self.queue_counts();
+        let session_obj = self.session_json_single(id);
         self.events.publish(
             "session_status",
             &serde_json::json!({
@@ -1298,8 +1258,51 @@ impl App {
                 "active": active,
                 "queued": queued,
                 "max_parallel": self.effective_max_parallel(),
+                "session": session_obj,
             }),
         );
+    }
+
+    /// Serialize a single session by ID without scanning/serializing all 2,000+ sessions.
+    fn session_json_single(&self, id: &str) -> Option<serde_json::Value> {
+        let (session, queue_pos, dep_statuses) = {
+            let sessions = self.sessions.lock().unwrap();
+            let mut qpos = 0usize;
+            let mut found_qpos = None;
+            let mut found = None;
+            for s in sessions.iter() {
+                if s.status == "queued" {
+                    qpos += 1;
+                    if s.id == id {
+                        found_qpos = Some(qpos);
+                    }
+                }
+                if s.id == id {
+                    found = Some(s.clone());
+                }
+            }
+            let session = found?;
+            let mut dep_map = std::collections::HashMap::with_capacity(session.depends_on.len());
+            if !session.depends_on.is_empty() {
+                for dep in &session.depends_on {
+                    if let Some(ds) = sessions.iter().find(|x| x.id == *dep) {
+                        dep_map.insert(dep.clone(), ds.status.clone());
+                    }
+                }
+            }
+            (session, found_qpos, dep_map)
+        };
+        let targets = if session.repo.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            self.cached_merge_targets(std::slice::from_ref(&session.repo))
+        };
+        let mut v = session_to_api_value(&session, &targets, &dep_statuses);
+        v["queue_position"] = match queue_pos {
+            Some(p) => serde_json::json!(p),
+            None => serde_json::Value::Null,
+        };
+        Some(v)
     }
     fn status_of(&self, id: &str) -> Option<String> {
         self.sessions
@@ -1415,12 +1418,14 @@ impl App {
             .and_then(|v| v.parse::<usize>().ok())
             .map(|l| l.min(2000));
 
-        let (matched, repos, counts) = {
+        let (matched, repos, counts, status_map) = {
             let sessions = self.sessions.lock().unwrap();
             let mut pos = 0usize;
             let mut queue_pos = std::collections::HashMap::<String, usize>::new();
+            let mut status_map = std::collections::HashMap::<String, String>::with_capacity(sessions.len());
             let (mut c_all, mut c_needs, mut c_work, mut c_done) = (0usize, 0usize, 0usize, 0usize);
             for s in sessions.iter() {
+                status_map.insert(s.id.clone(), s.status.clone());
                 if s.status == "queued" {
                     pos += 1;
                     queue_pos.insert(s.id.clone(), pos);
@@ -1495,7 +1500,7 @@ impl App {
                 .collect();
             r.sort();
             r.dedup();
-            (filtered, r, (c_all, c_needs, c_work, c_done))
+            (filtered, r, (c_all, c_needs, c_work, c_done), status_map)
         };
 
         let total = matched.len();
@@ -1509,16 +1514,20 @@ impl App {
         } else {
             &matched[offset..slice_end]
         };
-        let only_sessions: Vec<Session> = slice.iter().map(|(s, _)| s.clone()).collect();
-        let mut arr = sessions_json(&only_sessions, &targets);
-        if let Some(items) = arr.as_array_mut() {
-            for (v, (_, qp)) in items.iter_mut().zip(slice.iter()) {
-                v["queue_position"] = match qp {
-                    Some(p) => serde_json::json!(p),
-                    None => serde_json::Value::Null,
-                };
-            }
-        }
+        let mut arr = serde_json::Value::Array(
+            slice
+                .iter()
+                .map(|(s, qp)| {
+                    let mut v = session_to_api_value(s, &targets, &status_map);
+                    v["queue_position"] = match qp {
+                        Some(p) => serde_json::json!(p),
+                        None => serde_json::Value::Null,
+                    };
+                    v
+                })
+                .collect(),
+        );
+        let _ = &mut arr;
         if paginated {
             serde_json::json!({
                 "sessions": arr,
@@ -1582,7 +1591,7 @@ impl App {
             .get("limit")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(500)
-            .clamp(1, 5000);
+            .clamp(1, 60_000);
 
         let mut filtered_total = 0usize;
         let mut page = Vec::with_capacity(limit.min(500));
@@ -1770,38 +1779,50 @@ impl App {
         }
     }
 
-    /// Start a session's worker thread if a parallel slot is free;
-    /// otherwise it stays queued. Called on creation and whenever a
-    /// session settles.
+    /// Start a session's worker thread if its DAG dependencies are satisfied
+    /// and a parallel slot is free; otherwise it stays queued/blocked.
     fn maybe_start(self: &Arc<Self>, id: &str) {
         let cap = self.effective_max_parallel();
         {
             let mut sessions = self.sessions.lock().unwrap();
             let active = sessions
                 .iter()
-                .filter(|x| x.bucket == "working" && x.status != "queued")
+                .filter(|x| matches!(x.status.as_str(), "working" | "checking"))
                 .count() as i64;
-            let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
+            let Some(idx) = sessions.iter().position(|s| s.id == id) else {
                 return;
             };
-            if s.status != "queued" {
+            if !matches!(sessions[idx].status.as_str(), "queued" | "blocked") {
                 return;
+            }
+            if !sessions[idx].depends_on.is_empty() {
+                let deps_satisfied = sessions[idx].depends_on.iter().all(|dep| {
+                    sessions
+                        .iter()
+                        .find(|x| x.id == *dep)
+                        .is_some_and(|x| matches!(x.status.as_str(), "done" | "merged"))
+                });
+                if !deps_satisfied {
+                    return;
+                }
             }
             if active >= cap {
                 return;
             }
-            s.status = Status::Working.label().to_string();
-            s.bucket = Status::Working.bucket().to_string();
+            sessions[idx].status = Status::Working.label().to_string();
+            sessions[idx].bucket = Status::Working.bucket().to_string();
         }
         self.mark_dirty(id);
         self.persist();
         self.emit_queue_depth();
+        let session_obj = self.session_json_single(id);
         self.events.publish(
             "session_status",
             &serde_json::json!({
                 "id": id,
                 "status": Status::Working.label(),
                 "bucket": Status::Working.bucket(),
+                "session": session_obj,
             }),
         );
         let app = self.clone();
@@ -1810,16 +1831,73 @@ impl App {
     }
 
     fn pump_queue(self: &Arc<Self>) {
-        let queued: Vec<String> = self
-            .sessions
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|s| s.status == "queued")
-            .map(|s| s.id.clone())
-            .collect();
-        for id in queued {
-            self.maybe_start(&id);
+        let (nodes, external_states, has_pending) = {
+            let sessions = self.sessions.lock().unwrap();
+            let pending = sessions
+                .iter()
+                .any(|s| matches!(s.status.as_str(), "queued" | "blocked"));
+            if !pending {
+                return;
+            }
+            let known: std::collections::HashSet<&str> =
+                sessions.iter().map(|s| s.id.as_str()).collect();
+            let mut ext: std::collections::HashMap<String, DagNodeState> =
+                std::collections::HashMap::new();
+            let mut nodes = Vec::with_capacity(sessions.len());
+            for s in sessions.iter() {
+                for dep in &s.depends_on {
+                    if !known.contains(dep.as_str()) {
+                        ext.insert(dep.clone(), DagNodeState::Archived);
+                    }
+                }
+                nodes.push(TaskNode {
+                    id: s.id.clone(),
+                    depends_on: s.depends_on.clone(),
+                    state: session_dag_state(&s.status),
+                });
+            }
+            (nodes, ext, pending)
+        };
+        if !has_pending {
+            return;
+        }
+        let cap = self.effective_max_parallel() as usize;
+        match DagGraph::from_nodes_with_external_deps(nodes, &external_states) {
+            Ok(graph) => {
+                let plan = graph.evaluate(cap);
+                for fail in plan.upstream_failed {
+                    if matches!(self.status_of(&fail.id).as_deref(), Some("queued" | "blocked")) {
+                        self.set_needs_you(&fail.id, &fail.reason);
+                    }
+                }
+                for b in plan.blocked {
+                    if self.status_of(&b.id).as_deref() == Some("queued") {
+                        self.set_status(&b.id, Status::Blocked);
+                    }
+                }
+                for ready_id in plan.ready_waiting_for_slot {
+                    if self.status_of(&ready_id).as_deref() == Some("blocked") {
+                        self.set_status(&ready_id, Status::Queued);
+                    }
+                }
+                for start_id in plan.to_start {
+                    self.maybe_start(&start_id);
+                }
+            }
+            Err(_) => {
+                // Defensive fallback if an externally edited store contains a cycle.
+                let queued: Vec<String> = self
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s.status == "queued" && s.depends_on.is_empty())
+                    .map(|s| s.id.clone())
+                    .collect();
+                for id in queued {
+                    self.maybe_start(&id);
+                }
+            }
         }
     }
 
@@ -2082,7 +2160,11 @@ impl App {
         prompt: &str,
         continuation: bool,
     ) -> AgentRun {
-        let timeout = self.policy.timeout_secs;
+        let timeout = self.policy.timeout_for(
+            &session.repo,
+            &session.task,
+            engine_kind(&session.agent).label(),
+        );
         let app_lines = self.clone();
         let id_lines = id.to_string();
         let mut on_line = move |is_err: bool, line: &str| {
@@ -2345,7 +2427,11 @@ impl App {
                 "check_cmd": session.check_cmd,
             }),
         );
-        let timeout = self.policy.timeout_secs;
+        let timeout = self.policy.timeout_for(
+            &session.repo,
+            &session.task,
+            engine_kind(&session.agent).label(),
+        );
         // The check judges the pinned commit, literally: it runs in
         // a pristine checkout of that commit (a throwaway worktree),
         // never in the session's mutable worktree. A check that
@@ -2376,15 +2462,74 @@ impl App {
         let pristine_failed =
             tip.is_some() && commit_error.is_none() && verify_dir.is_none();
         let check_dir: &Path = verify_dir.as_deref().unwrap_or(wt);
-        let mut sink = |_: bool, _: &str| {};
-        let mut check_cmd_proc = Command::new("sh");
-        check_cmd_proc
-            .arg("-c")
-            .arg(&session.check_cmd)
-            .current_dir(check_dir)
-            .env("PWD", check_dir);
         let flag = self.stop_flag(id);
-        let outcome = run_bounded(check_cmd_proc, timeout, Some(&flag), &mut sink);
+        let (
+            check_ran,
+            check_exit,
+            passed,
+            output,
+            check_timed_out,
+            check_pipes_held,
+            check_stopped,
+            check_receipt,
+            pipeline_reason,
+        ) = if pristine_failed {
+            (
+                false,
+                None,
+                false,
+                "fleet could not create a pristine checkout of the verified commit to run the check in — the check was not run"
+                    .to_string(),
+                false,
+                false,
+                false,
+                None,
+                None,
+            )
+        } else {
+            match CheckPipeline::resolve(&session.check_step_specs, &session.check_cmd, timeout) {
+                Ok(pipeline) => {
+                    let bus = self.events.clone();
+                    let sid = id.to_string();
+                    let mut on_step = |step_idx: usize, step: &CheckStepReceipt| {
+                        bus.publish(
+                            "check_progress",
+                            &serde_json::json!({
+                                "id": sid,
+                                "session_id": sid,
+                                "phase": "step",
+                                "step_index": step_idx,
+                                "step": step,
+                            }),
+                        );
+                    };
+                    let receipt =
+                        pipeline.run_with_callback(check_dir, Some(&flag), &mut on_step);
+                    (
+                        receipt.ran,
+                        receipt.exit_code,
+                        receipt.passed,
+                        receipt.combined_output.clone(),
+                        receipt.timed_out,
+                        receipt.pipes_held,
+                        receipt.stopped,
+                        Some(receipt.clone()),
+                        receipt.summary_reason,
+                    )
+                }
+                Err(e) => (
+                    false,
+                    None,
+                    false,
+                    format!("check could not run: {e}"),
+                    false,
+                    false,
+                    false,
+                    None,
+                    Some(format!("check could not run: {e}")),
+                ),
+            }
+        };
         self.sweep_detached(id, check_dir);
         if let Some(dir) = &verify_dir {
             let _ = Command::new("git")
@@ -2399,53 +2544,6 @@ impl App {
                 .args(["worktree", "prune"])
                 .output();
         }
-        let check_ran = !pristine_failed && !matches!(outcome.end, RunEnd::SpawnFailed(_));
-        let check_exit = outcome.code;
-        let (passed, output, check_timed_out, check_pipes_held, check_stopped) = if pristine_failed {
-            (
-                false,
-                "fleet could not create a pristine checkout of the verified commit to run the check in — the check was not run"
-                    .to_string(),
-                false,
-                false,
-                false,
-            )
-        } else {
-            match outcome.end {
-            RunEnd::SpawnFailed(e) => (false, format!("check could not run: {e}"), false, false, false),
-            RunEnd::Exited(ok) => (ok, outcome.lines.join("\n"), false, false, false),
-            RunEnd::TimedOut => (
-                false,
-                format!(
-                    "{}\n(check timed out after {timeout}s and was killed)",
-                    outcome.lines.join("\n")
-                ),
-                true,
-                false,
-                false,
-            ),
-            RunEnd::PipesHeld => (
-                false,
-                format!(
-                    "{}\n(check's output stayed open past the limit — a detached process held it; the process group was killed)",
-                    outcome.lines.join("\n")
-                ),
-                false,
-                true,
-                false,
-            ),
-            RunEnd::Stopped => (
-                false,
-                format!(
-                    "{}\n(check stopped by you and killed)",
-                    outcome.lines.join("\n")
-                ),
-                false,
-                false,
-                true,
-            ),
-            }
-        };
 
         // 5. The diff the operator reviews before merging must be
         // everything the merge will land: the branch's whole history
@@ -2467,10 +2565,42 @@ impl App {
             .as_deref()
             .map(|t| Self::tree_problems(&session.repo, t))
             .unwrap_or_default();
+        // File-scope guardrails (`allowed_globs` / `forbidden_globs` from
+        // session + Rune policy): verify committed changes stay inside scope
+        // before this session can ever earn "done".
+        let policy_scope = self.policy.file_scope_for(&session.repo, &session.task);
+        let effective_scope = FileScope::new(
+            session.allowed_globs.clone(),
+            session.forbidden_globs.clone(),
+        )
+        .with_defaults(&policy_scope);
+        let (scope_violations, scope_reason) = match (&tip, &commit_error) {
+            (Some(t), None) if !effective_scope.is_unrestricted() => {
+                match verify_git_scope(Path::new(&session.repo), "HEAD", t, &effective_scope) {
+                    Ok(report) if !report.passed => (report.violations, report.needs_you_reason),
+                    Ok(_) => (Vec::new(), None),
+                    Err(e) => (
+                        vec![ScopeViolation {
+                            path: "*".to_string(),
+                            reason: format!("could not verify file scope: {e}"),
+                            matched_rule: None,
+                        }],
+                        Some(format!("File-scope guardrail could not verify changes: {e}")),
+                    ),
+                }
+            }
+            _ => (Vec::new(), None),
+        };
         // The full check output goes to the session's log file before
         // the stored copy is capped — the cap must never lose it.
         self.append_log_text(id, &format!("--- check output ---\n{output}\n--- end check output ---"));
-        let failed_reason = Self::check_failure_reason(&session.check_cmd, check_exit, &output);
+        let failed_reason = if !session.check_step_specs.is_empty() {
+            pipeline_reason
+                .clone()
+                .unwrap_or_else(|| Self::check_failure_reason(&session.check_cmd, check_exit, &output))
+        } else {
+            Self::check_failure_reason(&session.check_cmd, check_exit, &output)
+        };
         {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
@@ -2478,6 +2608,8 @@ impl App {
                 s.check_passed = Some(passed);
                 s.check_ran = check_ran;
                 s.check_exit = check_exit;
+                s.check_receipt = check_receipt;
+                s.scope_violations = scope_violations.clone();
                 s.diff = truncate_output(diff.clone());
                 // Provisional: every needs-you path below clears it.
                 s.verified_commit = tip.clone();
@@ -2488,6 +2620,7 @@ impl App {
             "check_progress",
             &serde_json::json!({
                 "id": id,
+                "session_id": id,
                 "phase": "finished",
                 "check_cmd": session.check_cmd,
                 "check_passed": passed,
@@ -2555,6 +2688,11 @@ impl App {
                     ),
                 );
             }
+        } else if !scope_violations.is_empty() {
+            let reason = scope_reason
+                .unwrap_or_else(|| "File-scope guardrail blocked out-of-scope changes".to_string());
+            self.log(id, reason.clone());
+            self.set_needs_you(id, &reason);
         } else if passed && diff.trim().is_empty() {
             // The check passed on state the session did not change —
             // there is no work to verify or merge, and calling it
@@ -2826,7 +2964,7 @@ fn retry_prompt_text(
         }
     }
 
-/// Hand a needs-you session back to its agent: the check state is
+    /// Hand a needs-you session back to its agent: the check state is
     /// cleared and the session re-queues; its worktree (with the agent's
     /// earlier work in it) is reused by run_session.
     fn retry(self: &Arc<Self>, id: &str) -> Result<(), String> {
@@ -2836,7 +2974,7 @@ fn retry_prompt_text(
                 .iter_mut()
                 .find(|s| s.id == id)
                 .ok_or("no such session")?;
-            if matches!(s.status.as_str(), "queued" | "working" | "checking") {
+            if matches!(s.status.as_str(), "queued" | "blocked" | "working" | "checking") {
                 return Err(format!(
                     "this session is already running ({}) — there is nothing to retry",
                     s.status
@@ -2871,17 +3009,24 @@ fn retry_prompt_text(
             s.check_passed = None;
             s.check_ran = false;
             s.check_exit = None;
+            s.check_receipt = None;
+            s.scope_violations.clear();
             s.reason = None;
             s.diff = String::new();
             s.verified_commit = None;
-            s.status = Status::Queued.label().to_string();
-            s.bucket = Status::Queued.bucket().to_string();
+            let initial = if s.depends_on.is_empty() {
+                Status::Queued
+            } else {
+                Status::Blocked
+            };
+            s.status = initial.label().to_string();
+            s.bucket = initial.bucket().to_string();
         }
         self.mark_dirty(id);
         self.log(id, "retry: handed back to the agent".to_string());
         self.persist();
         self.emit_queue_depth();
-        self.maybe_start(id);
+        self.pump_queue();
         Ok(())
     }
 
@@ -2907,17 +3052,24 @@ fn retry_prompt_text(
                 s.check_passed = None;
                 s.check_ran = false;
                 s.check_exit = None;
+                s.check_receipt = None;
+                s.scope_violations.clear();
                 s.reason = None;
                 s.diff = String::new();
                 s.verified_commit = None;
-                s.status = Status::Queued.label().to_string();
-                s.bucket = Status::Queued.bucket().to_string();
+                let initial = if s.depends_on.is_empty() {
+                    Status::Queued
+                } else {
+                    Status::Blocked
+                };
+                s.status = initial.label().to_string();
+                s.bucket = initial.bucket().to_string();
             }
         }
         self.mark_dirty(id);
         self.persist();
         self.emit_queue_depth();
-        self.maybe_start(id);
+        self.pump_queue();
     }
 
     /// Hand out the next item of a finished session's successor
@@ -2983,6 +3135,13 @@ fn retry_prompt_text(
                 check_ran: false,
                 check_exit: None,
                 merge_error: None,
+                depends_on: Vec::new(),
+                check_step_specs: parent.check_step_specs.clone(),
+                check_receipt: None,
+                allowed_globs: parent.allowed_globs.clone(),
+                forbidden_globs: parent.forbidden_globs.clone(),
+                scope_violations: Vec::new(),
+                merge_strategy: None,
                 transcript: Vec::new(),
             };
             sessions.push(child);
@@ -3075,7 +3234,7 @@ fn retry_prompt_text(
     /// Clear a needs-you session the operator has decided not to
     /// pursue. It leaves the board and the inbox; its record and log
     /// stay on disk. Only a needs-you session can be dismissed.
-    fn dismiss(&self, id: &str) -> Result<(), String> {
+    fn dismiss(self: &Arc<Self>, id: &str) -> Result<(), String> {
         {
             let mut sessions = self.sessions.lock().unwrap();
             let s = sessions
@@ -3095,19 +3254,20 @@ fn retry_prompt_text(
         self.mark_dirty(id);
         self.persist();
         self.emit_queue_depth();
+        self.pump_queue();
         Ok(())
     }
 
     /// Stop a session at the operator's word. A live run (agent or
     /// check) is killed through its stop flag — the bounded runner
     /// kills the whole process group and lands the session in
-    /// needs-you with "stopped by you" as the reason. A queued
-    /// session is cancelled before it ever starts. A settled session
-    /// cannot be stopped; the refusal names its status.
+    /// needs-you with "stopped by you" as the reason. A queued or
+    /// blocked session is cancelled before it ever starts. A settled
+    /// session cannot be stopped; the refusal names its status.
     fn stop(self: &Arc<Self>, id: &str) -> Result<(), String> {
         let status = self.status_of(id).ok_or("no such session")?;
         match status.as_str() {
-            "queued" => {
+            "queued" | "blocked" => {
                 self.log(id, "stopped by you while queued — it never started".to_string());
                 self.set_needs_you(id, "cancelled by you before it started");
                 self.pump_queue();
@@ -3120,18 +3280,24 @@ fn retry_prompt_text(
                 Ok(())
             }
             other => Err(format!(
-                "session is '{other}' — only a queued, working or checking session can be stopped"
+                "session is '{other}' — only a queued, blocked, working or checking session can be stopped"
             )),
         }
     }
 
-    fn merge(&self, id: &str) -> Result<(String, String), MergeError> {
+    fn merge_with_strategy(
+        &self,
+        id: &str,
+        strategy: MergeStrategy,
+    ) -> Result<(String, String, String, MergeStrategy), MergeError> {
         let mut detail = String::new();
-        let result = self.merge_landing(id, &mut detail).map_err(|message| MergeError {
-            status: if message == "no such session" { 404 } else { 409 },
-            message,
-            detail: (!detail.is_empty()).then_some(detail),
-        });
+        let result = self
+            .merge_landing(id, strategy, &mut detail)
+            .map_err(|message| MergeError {
+                status: if message == "no such session" { 404 } else { 409 },
+                message,
+                detail: (!detail.is_empty()).then_some(detail),
+            });
         // The last refusal stays on the session until a merge lands.
         let refusal = result.as_ref().err().map(|e| MergeRefusal {
             message: e.message.clone(),
@@ -3157,13 +3323,19 @@ fn retry_prompt_text(
             }
         };
         if found {
+            self.mark_dirty(id);
             self.persist();
         }
     }
 
     /// The merge itself. A refusal carries a plain sentence; git's own
     /// text for a refusal git made is left in `detail`.
-    fn merge_landing(&self, id: &str, detail: &mut String) -> Result<(String, String), String> {
+    fn merge_landing(
+        &self,
+        id: &str,
+        strategy: MergeStrategy,
+        detail: &mut String,
+    ) -> Result<(String, String, String, MergeStrategy), String> {
         let session = {
             let sessions = self.sessions.lock().unwrap();
             sessions
@@ -3200,120 +3372,31 @@ fn retry_prompt_text(
                     .to_string(),
             );
         }
-        // Merge safety: the operator's own state in that repo is not
-        // ours to entangle. A merge already in progress, or uncommitted
-        // changes to tracked files, stops the merge before it starts.
-        let repo_path = Path::new(&session.repo);
-        if repo_path.join(".git").join("MERGE_HEAD").exists() {
-            return Err(
-                "repo already has a merge in progress — resolve or abort it before merging a session"
-                    .to_string(),
-            );
-        }
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(&session.repo)
-            .args(["status", "--porcelain"])
-            .output()
-            .map_err(|e| e.to_string())?;
-        let dirty = String::from_utf8_lossy(&status.stdout)
-            .lines()
-            .any(|l| !l.starts_with("??"));
-        if dirty {
-            return Err(
-                "repo has uncommitted changes — commit or stash them before merging a session"
-                    .to_string(),
-            );
-        }
-        // A detached HEAD advances no branch: the merge would
-        // "succeed" into limbo and be orphaned at the next checkout.
-        let on_branch = Command::new("git")
-            .arg("-C")
-            .arg(&session.repo)
-            .args(["symbolic-ref", "-q", "HEAD"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !on_branch {
-            return Err(
-                "repo is on a detached HEAD — check out a branch before merging a session, or the work lands on no branch"
-                    .to_string(),
-            );
-        }
-        let target_branch = Command::new("git")
-            .arg("-C")
-            .arg(&session.repo)
-            .args(["symbolic-ref", "--short", "-q", "HEAD"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&session.repo)
-            .args(["merge", "--no-ff", "-m", &format!("merge fleet session {id}")])
-            .arg(&pin)
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            // Never leave the operator's repo mid-merge on our account.
-            let _ = Command::new("git")
-                .arg("-C")
-                .arg(&session.repo)
-                .args(["merge", "--abort"])
-                .output();
-            // Name the failure for what it is, with enough of git's
-            // message to act on: a content conflict is a conflict; an
-            // untracked-file collision (or any other refusal) is a
-            // refusal, and the filename lives past the first line.
-            // Git writes conflict markers to stdout and refusals to
-            // stderr — read both.
-            let raw = format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            *detail = raw.trim().to_string();
-            if let Some(plain) = plain_merge_refusal(&raw) {
-                return Err(plain);
+        let outcome = match execute_merge(Path::new(&session.repo), &pin, id, strategy) {
+            Ok(o) => o,
+            Err(e) => {
+                if let Some(d) = e.detail {
+                    *detail = d;
+                }
+                return Err(e.message);
             }
-            let lines: Vec<&str> = raw
-                .lines()
-                .map(|l| l.trim())
-                .filter(|l| !l.is_empty())
-                .take(3)
-                .collect();
-            let summary = if lines.is_empty() {
-                "merge failed".to_string()
-            } else {
-                lines.join(" — ")
-            };
-            return Err(format!(
-                "merge refused: {summary} — nothing was merged"
-            ));
-        }
-        // Verify the landing, don't trust the merge's exit code alone:
-        // the session's branch tip must now be part of the repo's
-        // history, or nothing was actually merged.
-        let landed = Command::new("git")
-            .arg("-C")
-            .arg(&session.repo)
-            .args(["merge-base", "--is-ancestor", &pin, "HEAD"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !landed {
-            return Err(
-                "merge ran but the session's commit is not in the repo's history — nothing was landed"
-                    .to_string(),
-            );
+        };
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
+                s.merge_strategy = Some(strategy);
+            }
         }
         self.set_status(id, Status::Merged);
         self.invalidate_merge_target_cache(&session.repo);
         self.log(
             id,
-            format!("merged into {target_branch} at {pin}"),
+            format!(
+                "merged into {} at {} ({})",
+                outcome.target_branch,
+                pin,
+                strategy.label()
+            ),
         );
         // Clean up the session's isolated worktree once its verified commit
         // has landed on the target branch (strictly inside Fleet's worktrees dir).
@@ -3341,7 +3424,16 @@ fn retry_prompt_text(
                 );
             }
         }
-        Ok((pin, target_branch))
+        let reported_commit = match strategy {
+            MergeStrategy::Squash => outcome.landed_commit.clone(),
+            _ => pin,
+        };
+        Ok((
+            reported_commit,
+            outcome.target_branch,
+            outcome.landed_commit,
+            strategy,
+        ))
     }
 }
 
@@ -3825,7 +3917,7 @@ fn update_route(app: &Arc<App>, method: &str, route: &str, body: &str, host: &st
 }
 
 /// Starts the staged build. Refused when nothing is staged, and while any
-/// session is queued, working or checking: a restart would send those to Needs
+/// session is queued, blocked, working or checking: a restart would send those to Needs
 /// you. The new process starts after this answer has been written.
 fn restart_response(app: &Arc<App>) -> String {
     if app.updater.snapshot()["staged"].is_null() {
@@ -3836,7 +3928,7 @@ fn restart_response(app: &Arc<App>) -> String {
             .lock()
             .unwrap()
             .iter()
-            .filter(|s| matches!(s.status.as_str(), "queued" | "working" | "checking"))
+            .filter(|s| matches!(s.status.as_str(), "queued" | "blocked" | "working" | "checking"))
             .count()
     };
     let running = busy(app);
@@ -3863,6 +3955,100 @@ fn restart_response(app: &Arc<App>) -> String {
     json_response(200, &serde_json::json!({"restarting": true}).to_string())
 }
 
+/// Convert one `Session` to its public API JSON object, enriching derived
+/// fields (`engine`, `test_mode`, `merge_target`, `blocked_by`, `check_steps`,
+/// `guardrail_violations`, `elapsed_ms`, `transcript_total`).
+fn session_to_api_value(
+    s: &Session,
+    targets: &std::collections::HashMap<String, Option<String>>,
+    status_map: &std::collections::HashMap<String, String>,
+) -> serde_json::Value {
+    let mut v = serde_json::to_value(s).unwrap();
+    // The engine kind is derived from the agent string, never
+    // stored — it cannot desync from what actually ran. A
+    // custom command (any executable path) is test mode, and
+    // the API says so on every session it labels.
+    let kind = engine_kind(&s.agent);
+    v["engine"] = serde_json::json!(kind.label());
+    v["test_mode"] = serde_json::json!(kind == EngineKind::Custom);
+    // The receipt facts are always present: null until a check ran.
+    v["check_output"] = serde_json::json!(s.check_output.clone().unwrap_or_default());
+    v["check_passed"] = serde_json::json!(s.check_passed);
+    v["check_ran"] = serde_json::json!(s.check_ran);
+    v["check_exit"] = serde_json::json!(s.check_exit);
+    v["transcript_total"] = serde_json::json!(s.transcript.len());
+    // Surface structured per-step check receipts for the Receipt tab.
+    if let Some(ref receipt) = s.check_receipt {
+        v["elapsed_ms"] = serde_json::json!(receipt.total_elapsed_ms);
+        if !receipt.steps.is_empty() {
+            v["check_steps"] = serde_json::json!(&receipt.steps);
+        }
+    } else if !s.check_step_specs.is_empty() {
+        let pending_steps: Vec<serde_json::Value> = s
+            .check_step_specs
+            .iter()
+            .enumerate()
+            .map(|(idx, spec)| {
+                serde_json::json!({
+                    "name": spec.effective_name(idx),
+                    "cmd": spec.cmd,
+                    "status": "pending",
+                    "passed": serde_json::Value::Null,
+                    "exit_code": serde_json::Value::Null,
+                    "elapsed_ms": serde_json::Value::Null,
+                    "tail_line": "",
+                    "output": "",
+                })
+            })
+            .collect();
+        v["check_steps"] = serde_json::json!(pending_steps);
+    }
+    // Surface active unmet dependencies (`blocked_by`) alongside `depends_on`.
+    if !s.depends_on.is_empty() {
+        let blocked_by: Vec<&String> = s
+            .depends_on
+            .iter()
+            .filter(|dep| {
+                !matches!(
+                    status_map.get(*dep).map(String::as_str),
+                    Some("done" | "merged")
+                )
+            })
+            .collect();
+        if !blocked_by.is_empty() {
+            v["blocked_by"] = serde_json::json!(blocked_by);
+        }
+    }
+    // Human-readable guardrail violations alongside structured `scope_violations`.
+    if !s.scope_violations.is_empty() {
+        let readable: Vec<String> = s
+            .scope_violations
+            .iter()
+            .map(|sv| format!("{} ({})", sv.path, sv.reason))
+            .collect();
+        v["guardrail_violations"] = serde_json::json!(readable);
+    }
+    // Where Merge will land: the repo's checked-out branch, null
+    // when the repo is unknown or its HEAD is detached.
+    let target = if s.repo.is_empty() {
+        None
+    } else {
+        targets.get(&s.repo).cloned().flatten()
+    };
+    v["merge_target"] = serde_json::json!(target);
+    // A needs-you session whose steering is still waiting says
+    // so in its reason: the message is not silently pending.
+    if s.status == "needs-you" && !s.steer.is_empty() {
+        let msg = &s.steer[0];
+        let shown: String = msg.chars().take(120).collect();
+        let cut = if msg.chars().count() > 120 { "…" } else { "" };
+        let note = format!("Your message is still waiting: \"{shown}{cut}\".");
+        let base = s.reason.clone().unwrap_or_default();
+        v["reason"] = serde_json::json!(format!("{base} {note}").trim_start());
+    }
+    v
+}
+
 /// Serialize sessions for the API with queue positions computed in:
 /// a queued session's position is its place among the queued, in
 /// hand-out order. Non-queued sessions carry null.
@@ -3870,41 +4056,15 @@ fn sessions_json(
     sessions: &[Session],
     targets: &std::collections::HashMap<String, Option<String>>,
 ) -> serde_json::Value {
+    let status_map: std::collections::HashMap<String, String> = sessions
+        .iter()
+        .map(|s| (s.id.clone(), s.status.clone()))
+        .collect();
     let mut pos = 0usize;
     let arr: Vec<serde_json::Value> = sessions
         .iter()
         .map(|s| {
-            let mut v = serde_json::to_value(s).unwrap();
-            // The engine kind is derived from the agent string, never
-            // stored — it cannot desync from what actually ran. A
-            // custom command (any executable path) is test mode, and
-            // the API says so on every session it labels.
-            let kind = engine_kind(&s.agent);
-            v["engine"] = serde_json::json!(kind.label());
-            v["test_mode"] = serde_json::json!(kind == EngineKind::Custom);
-            // The receipt facts are always present: null until a check ran.
-            v["check_output"] = serde_json::json!(s.check_output.clone().unwrap_or_default());
-            v["check_passed"] = serde_json::json!(s.check_passed);
-            v["check_ran"] = serde_json::json!(s.check_ran);
-            v["check_exit"] = serde_json::json!(s.check_exit);
-            // Where Merge will land: the repo's checked-out branch, null
-            // when the repo is unknown or its HEAD is detached.
-            let target = if s.repo.is_empty() {
-                None
-            } else {
-                targets.get(&s.repo).cloned().flatten()
-            };
-            v["merge_target"] = serde_json::json!(target);
-            // A needs-you session whose steering is still waiting says
-            // so in its reason: the message is not silently pending.
-            if s.status == "needs-you" && !s.steer.is_empty() {
-                let msg = &s.steer[0];
-                let shown: String = msg.chars().take(120).collect();
-                let cut = if msg.chars().count() > 120 { "…" } else { "" };
-                let note = format!("Your message is still waiting: \"{shown}{cut}\".");
-                let base = s.reason.clone().unwrap_or_default();
-                v["reason"] = serde_json::json!(format!("{base} {note}").trim_start());
-            }
+            let mut v = session_to_api_value(s, targets, &status_map);
             if s.status == "queued" {
                 pos += 1;
                 v["queue_position"] = serde_json::json!(pos);
@@ -3921,6 +4081,592 @@ fn error_response(status: u16, message: &str) -> String {
     json_response(
         status,
         &serde_json::json!({ "error": message }).to_string(),
+    )
+}
+
+fn patch_response(filename: &str, body: &str) -> String {
+    let safe_name: String = filename
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect();
+    let name = if safe_name.is_empty() {
+        "session.patch".to_string()
+    } else {
+        safe_name
+    };
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/x-patch; charset=utf-8\r\nContent-Disposition: attachment; filename=\"{name}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn parse_string_list_field(
+    val: &serde_json::Value,
+    field: &str,
+) -> Result<Vec<String>, String> {
+    match val {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(s) = item.as_str() else {
+                    return Err(format!("{field} must be an array of strings"));
+                };
+                let trimmed = s.trim();
+                if !trimmed.is_empty() && !out.iter().any(|x| x == trimmed) {
+                    out.push(trimmed.to_string());
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(format!("{field} must be an array of strings")),
+    }
+}
+
+fn parse_check_steps_field(val: &serde_json::Value) -> Result<Vec<CheckStep>, String> {
+    match val {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (idx, item) in items.iter().enumerate() {
+                let step = match item {
+                    serde_json::Value::String(cmd) => CheckStep::new(format!("step-{}", idx + 1), cmd),
+                    serde_json::Value::Object(obj) => {
+                        let cmd = obj
+                            .get("cmd")
+                            .or_else(|| obj.get("command"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let name = obj
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("step-{}", idx + 1));
+                        let timeout_secs = obj
+                            .get("timeout_secs")
+                            .and_then(serde_json::Value::as_u64);
+                        CheckStep {
+                            name,
+                            cmd,
+                            timeout_secs,
+                        }
+                    }
+                    _ => return Err("check_steps entries must be objects or strings".to_string()),
+                };
+                step.validate()?;
+                out.push(step);
+            }
+            Ok(out)
+        }
+        _ => Err("check_steps must be an array".to_string()),
+    }
+}
+
+fn validate_git_repo(repo: &str) -> Result<(), String> {
+    if !Path::new(repo).is_dir() {
+        return Err(format!("There is no folder at {repo}."));
+    }
+    let repo_ok = Path::new(repo).join(".git").exists()
+        && Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+    if !repo_ok {
+        return Err(format!(
+            "That folder is not a git repository: {repo}. Give the path of a folder that contains a .git folder, for example the one you run git in."
+        ));
+    }
+    Ok(())
+}
+
+fn handle_policy_test(app: &Arc<App>, body: &str) -> String {
+    let req: serde_json::Value = if body.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_str(body) {
+            Ok(v) => v,
+            Err(e) => return error_response(400, &format!("bad json: {e}")),
+        }
+    };
+    let repo_raw = req
+        .get("repo")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let project_raw = req
+        .get("project")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let repo_arg = if repo_raw.trim().is_empty() && !project_raw.trim().is_empty() {
+        project_raw
+    } else {
+        repo_raw
+    };
+    let task_arg = req
+        .get("task")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let engine_arg = req
+        .get("engine")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let script_arg = req
+        .get("script")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty());
+
+    let decision = if let Some(script) = script_arg {
+        if script.len() > 65_536 {
+            return error_response(400, "policy script exceeds 64 KiB limit");
+        }
+        match test_policy_script(script, repo_arg, task_arg, engine_arg) {
+            Ok(d) => d,
+            Err(e) => return error_response(400, &e),
+        }
+    } else {
+        let mut d = app.policy.test_policy(repo_arg, task_arg, engine_arg);
+        d.max_parallel = app.effective_max_parallel();
+        d
+    };
+    let matched_rule = decision
+        .trace
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("{} -> {}", app.policy_source, decision.project));
+    let mut out = serde_json::to_value(&decision).unwrap_or_else(|_| serde_json::json!({}));
+    out["matched_rule"] = serde_json::json!(matched_rule);
+    json_response(200, &out.to_string())
+}
+
+fn handle_batch_sessions(app: &Arc<App>, body: &str) -> String {
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return error_response(400, &format!("bad json: {e}")),
+    };
+    let Some(obj) = req.as_object() else {
+        return error_response(400, "batch payload must be a JSON object");
+    };
+    let dry_run = obj
+        .get("dry_run")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let raw_tasks = obj
+        .get("tasks")
+        .or_else(|| obj.get("sessions"))
+        .and_then(serde_json::Value::as_array);
+    let Some(raw_tasks) = raw_tasks else {
+        return error_response(400, "batch payload requires a 'tasks' array");
+    };
+    if raw_tasks.is_empty() {
+        return error_response(400, "batch must contain at least one task");
+    }
+    if raw_tasks.len() > 2000 {
+        return error_response(400, "batch cannot exceed 2000 tasks");
+    }
+
+    let mut parsed_tasks: Vec<BatchTaskSpec> = Vec::with_capacity(raw_tasks.len());
+    let mut explicit_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for item in raw_tasks {
+        if let Some(k) = item
+            .get("key")
+            .or_else(|| item.get("alias"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            explicit_keys.insert(k.to_string());
+        }
+    }
+
+    for (idx, item) in raw_tasks.iter().enumerate() {
+        let Some(t_obj) = item.as_object() else {
+            return error_response(400, &format!("task #{idx} must be a JSON object"));
+        };
+        let key = t_obj
+            .get("key")
+            .or_else(|| t_obj.get("alias"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let synth = format!("#{}", idx + 1);
+                (!explicit_keys.contains(&synth)).then_some(synth)
+            });
+        let task = t_obj
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let repo = t_obj
+            .get("repo")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let project = t_obj
+            .get("project")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let agent = t_obj
+            .get("agent")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let model = t_obj
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let check_cmd = t_obj
+            .get("check_cmd")
+            .or_else(|| t_obj.get("check"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let check_steps = match parse_check_steps_field(
+            t_obj.get("check_steps").unwrap_or(&serde_json::Value::Null),
+        ) {
+            Ok(s) => s,
+            Err(e) => return error_response(400, &format!("task #{idx}: {e}")),
+        };
+        let depends_on = match parse_string_list_field(
+            t_obj.get("depends_on").unwrap_or(&serde_json::Value::Null),
+            "depends_on",
+        ) {
+            Ok(v) => v,
+            Err(e) => return error_response(400, &format!("task #{idx}: {e}")),
+        };
+        let allowed_globs = match parse_string_list_field(
+            t_obj.get("allowed_globs").unwrap_or(&serde_json::Value::Null),
+            "allowed_globs",
+        ) {
+            Ok(v) => v,
+            Err(e) => return error_response(400, &format!("task #{idx}: {e}")),
+        };
+        let forbidden_globs = match parse_string_list_field(
+            t_obj
+                .get("forbidden_globs")
+                .unwrap_or(&serde_json::Value::Null),
+            "forbidden_globs",
+        ) {
+            Ok(v) => v,
+            Err(e) => return error_response(400, &format!("task #{idx}: {e}")),
+        };
+        parsed_tasks.push(BatchTaskSpec {
+            key,
+            task,
+            repo,
+            project,
+            agent,
+            model,
+            check_cmd,
+            check_steps,
+            depends_on,
+            allowed_globs,
+            forbidden_globs,
+        });
+    }
+
+    let repos = match parse_string_list_field(
+        obj.get("repos").unwrap_or(&serde_json::Value::Null),
+        "repos",
+    ) {
+        Ok(v) => v,
+        Err(e) => return error_response(400, &e),
+    };
+    let batch_allowed = match parse_string_list_field(
+        obj.get("allowed_globs").unwrap_or(&serde_json::Value::Null),
+        "allowed_globs",
+    ) {
+        Ok(v) => v,
+        Err(e) => return error_response(400, &e),
+    };
+    let batch_forbidden = match parse_string_list_field(
+        obj.get("forbidden_globs")
+            .unwrap_or(&serde_json::Value::Null),
+        "forbidden_globs",
+    ) {
+        Ok(v) => v,
+        Err(e) => return error_response(400, &e),
+    };
+
+    let spec = BatchSpec {
+        name: obj
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        repo: obj
+            .get("repo")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        repos,
+        tasks: parsed_tasks,
+        max_parallel: obj
+            .get("max_parallel")
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| n as usize),
+        default_check: obj
+            .get("default_check")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        default_agent: obj
+            .get("default_agent")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        allowed_globs: batch_allowed,
+        forbidden_globs: batch_forbidden,
+    };
+
+    let existing_states: std::collections::HashMap<String, DagNodeState> = {
+        let sessions = app.sessions.lock().unwrap();
+        sessions
+            .iter()
+            .map(|s| (s.id.clone(), session_dag_state(&s.status)))
+            .collect()
+    };
+    let base_counter = *app.counter.lock().unwrap();
+    let mut preview_seq = base_counter;
+    let expanded = match spec.expand(
+        &existing_states,
+        app.effective_max_parallel() as usize,
+        || {
+            preview_seq += 1;
+            format!("s{}-{preview_seq}", app.run_tag)
+        },
+    ) {
+        Ok(e) => e,
+        Err(e) => return error_response(400, &e.to_string()),
+    };
+
+    if dry_run {
+        return json_response(
+            200,
+            &serde_json::json!({
+                "valid": true,
+                "count": expanded.sessions.len(),
+                "effective_max_parallel": expanded.effective_max_parallel,
+                "topological_order": expanded.topological_order,
+                "immediate_ready": expanded.immediate_ready,
+            })
+            .to_string(),
+        );
+    }
+
+    // Deduplicate expensive git/agent/policy validations across large batches (e.g., 1,000 nodes).
+    let mut validated_repos: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut resolved_agents: std::collections::HashMap<Option<String>, String> =
+        std::collections::HashMap::new();
+    let mut default_checks: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    struct ReadySpec {
+        planned: fleet_rs::dag::PlannedSession,
+        agent: String,
+        model: Option<String>,
+        check_cmd: String,
+    }
+    let mut ready_specs: Vec<ReadySpec> = Vec::with_capacity(expanded.sessions.len());
+
+    for planned in expanded.sessions {
+        if planned.task.contains('\0') {
+            return error_response(
+                400,
+                "a task contains a NUL byte, which an agent cannot receive — remove it",
+            );
+        }
+        if planned.task.len() > MAX_TASK_BYTES {
+            return error_response(
+                400,
+                &format!("a task is over {MAX_TASK_BYTES} bytes — split it into smaller tasks"),
+            );
+        }
+        if !validated_repos.contains(&planned.repo) {
+            if let Err(e) = validate_git_repo(&planned.repo) {
+                return error_response(400, &e);
+            }
+            validated_repos.insert(planned.repo.clone());
+        }
+        let agent = if let Some(cached) = resolved_agents.get(&planned.agent) {
+            cached.clone()
+        } else {
+            match resolve_agent(app, planned.agent.as_deref()) {
+                Ok(a) => {
+                    resolved_agents.insert(planned.agent.clone(), a.clone());
+                    a
+                }
+                Err(e) => return error_response(400, &e),
+            }
+        };
+        let model = match planned.model.as_deref() {
+            Some(raw) => match validate_model_field(raw) {
+                Ok(m) => m,
+                Err(e) => return error_response(400, &e),
+            },
+            None => None,
+        };
+        let check_cmd = if let Some(c) = planned.check_cmd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            c.to_string()
+        } else if !planned.check_steps.is_empty() {
+            planned
+                .check_steps
+                .iter()
+                .map(|st| st.cmd.as_str())
+                .collect::<Vec<_>>()
+                .join(" && ")
+        } else if let Some(cached) = default_checks.get(&planned.project) {
+            cached.clone()
+        } else {
+            match app.policy.default_check(&planned.project) {
+                Ok(c) => {
+                    default_checks.insert(planned.project.clone(), c.clone());
+                    c
+                }
+                Err(e) => return error_response(500, &e),
+            }
+        };
+        ready_specs.push(ReadySpec {
+            planned,
+            agent,
+            model,
+            check_cmd,
+        });
+    }
+
+    // Atomically commit counter + sessions under lock.
+    let mut created_ids: Vec<String> = Vec::with_capacity(ready_specs.len());
+    let mut created_sessions: Vec<Session> = Vec::with_capacity(ready_specs.len());
+    {
+        let mut counter = app.counter.lock().unwrap();
+        let mut sessions = app.sessions.lock().unwrap();
+        // If another request advanced the counter concurrently, remap IDs consistently.
+        let id_shift = *counter != base_counter;
+        let mut id_remap: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if id_shift {
+            for rs in &ready_specs {
+                *counter += 1;
+                let fresh = format!("s{}-{}", app.run_tag, *counter);
+                id_remap.insert(rs.planned.id.clone(), fresh);
+            }
+        } else {
+            *counter = preview_seq;
+        }
+        for rs in ready_specs {
+            let id = id_remap
+                .get(&rs.planned.id)
+                .cloned()
+                .unwrap_or(rs.planned.id);
+            let deps: Vec<String> = rs
+                .planned
+                .depends_on
+                .into_iter()
+                .map(|d| id_remap.get(&d).cloned().unwrap_or(d))
+                .collect();
+            let initial_status = if deps.is_empty() {
+                Status::Queued
+            } else {
+                Status::Blocked
+            };
+            let s = Session {
+                id: id.clone(),
+                task: rs.planned.task,
+                project: rs.planned.project,
+                repo: rs.planned.repo,
+                branch: format!("fleet/{id}"),
+                worktree: app
+                    .data_dir
+                    .join("worktrees")
+                    .join(&id)
+                    .to_string_lossy()
+                    .to_string(),
+                status: initial_status.label().to_string(),
+                bucket: initial_status.bucket().to_string(),
+                agent: rs.agent,
+                model: rs.model,
+                check_cmd: rs.check_cmd,
+                check_output: None,
+                check_passed: None,
+                diff: String::new(),
+                reason: None,
+                verified_commit: None,
+                steer: Vec::new(),
+                next_queue: Vec::new(),
+                spawned_from: None,
+                successor: None,
+                retry_prompt: None,
+                check_ran: false,
+                check_exit: None,
+                merge_error: None,
+                depends_on: deps,
+                check_step_specs: rs.planned.check_steps,
+                check_receipt: None,
+                allowed_globs: rs.planned.allowed_globs,
+                forbidden_globs: rs.planned.forbidden_globs,
+                scope_violations: Vec::new(),
+                merge_strategy: None,
+                transcript: Vec::new(),
+            };
+            created_ids.push(id);
+            created_sessions.push(s.clone());
+            sessions.push(s);
+        }
+    }
+    for id in &created_ids {
+        app.mark_dirty(id);
+    }
+    app.persist();
+    app.emit_queue_depth();
+    app.pump_queue();
+
+    let created_json: Vec<serde_json::Value> = created_ids
+        .iter()
+        .filter_map(|id| app.session_json_single(id))
+        .collect();
+    for s_val in &created_json {
+        if let Some(id) = s_val["id"].as_str() {
+            app.events.publish(
+                "session_created",
+                &serde_json::json!({
+                    "id": id,
+                    "status": s_val["status"],
+                    "bucket": s_val["bucket"],
+                    "session": s_val,
+                }),
+            );
+        }
+    }
+    json_response(
+        201,
+        &serde_json::json!({
+            "sessions": created_json,
+            "created": created_json,
+            "topological_order": expanded.topological_order,
+            "effective_max_parallel": expanded.effective_max_parallel,
+            "count": created_ids.len(),
+        })
+        .to_string(),
     )
 }
 
@@ -3960,12 +4706,22 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                         "codex": codex_model,
                     },
                     "timeout_secs": app.policy.timeout_secs,
+                    "auto_retry_budget": app.policy.default_auto_retry_budget,
+                    "auto_steer_budget": app.policy.default_auto_steer_budget,
+                    "features": {
+                        "sse": true,
+                        "batch": true,
+                        "merge_check": true,
+                        "policy_test": true,
+                        "prune_worktrees": true,
+                    },
                     "source": app.policy_source,
                     "version": env!("CARGO_PKG_VERSION")
                 })
                 .to_string(),
             )
         }
+        ("POST", "/api/policies/test") => handle_policy_test(app, body),
         ("GET", "/api/sessions") => {
             if params.is_empty() {
                 json_response(200, &app.sessions_view_cached())
@@ -3973,6 +4729,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 json_response(200, &app.sessions_query(&params).to_string())
             }
         }
+        ("POST", "/api/sessions/batch") => handle_batch_sessions(app, body),
         ("POST", "/api/sessions") => {
             let req: serde_json::Value = match serde_json::from_str(body) {
                 Ok(v) => v,
@@ -4024,33 +4781,58 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                     )
                 }
             };
-            let repo_ok = Path::new(&repo).join(".git").exists()
-                && Command::new("git")
-                    .arg("-C")
-                    .arg(&repo)
-                    .args(["rev-parse", "--git-dir"])
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false);
-            if !Path::new(&repo).is_dir() {
-                return error_response(400, &format!("There is no folder at {repo}."));
+            if let Err(e) = validate_git_repo(&repo) {
+                return error_response(400, &e);
             }
-            if !repo_ok {
-                return error_response(
-                    400,
-                    &format!(
-                        "That folder is not a git repository: {repo}. Give the path of a folder that contains a .git folder, for example the one you run git in."
-                    ),
-                );
-            }
-            // A blank explicit check is no check: the policy default applies.
+            let check_step_specs = match parse_check_steps_field(&req["check_steps"]) {
+                Ok(s) => s,
+                Err(e) => return error_response(400, &e),
+            };
+            // A blank explicit check is no check: check_steps or policy default applies.
             let check_cmd = match req["check"].as_str().map(str::trim) {
                 Some(c) if !c.is_empty() => c.to_string(),
+                _ if !check_step_specs.is_empty() => check_step_specs
+                    .iter()
+                    .map(|st| st.cmd.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" && "),
                 _ => match app.policy.default_check(&project) {
                     Ok(c) => c,
                     Err(e) => return error_response(500, &e),
                 },
             };
+            let depends_on = match parse_string_list_field(&req["depends_on"], "depends_on") {
+                Ok(v) => v,
+                Err(e) => return error_response(400, &e),
+            };
+            let allowed_globs =
+                match parse_string_list_field(&req["allowed_globs"], "allowed_globs") {
+                    Ok(v) => v,
+                    Err(e) => return error_response(400, &e),
+                };
+            let forbidden_globs =
+                match parse_string_list_field(&req["forbidden_globs"], "forbidden_globs") {
+                    Ok(v) => v,
+                    Err(e) => return error_response(400, &e),
+                };
+            // Validate every `depends_on` target exists before creating the session.
+            if !depends_on.is_empty() {
+                let known: std::collections::HashSet<String> = app
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.id.clone())
+                    .collect();
+                for dep in &depends_on {
+                    if !known.contains(dep) {
+                        return error_response(
+                            400,
+                            &format!("unknown dependency '{dep}' — no session with that id exists"),
+                        );
+                    }
+                }
+            }
             // Successor work named with the order: a single task
             // string, or an array for a chain. Each item must be a
             // non-empty string; anything else is refused up front.
@@ -4088,6 +4870,11 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 *counter
             };
             let id = format!("s{}-{n}", app.run_tag);
+            let initial_status = if depends_on.is_empty() {
+                Status::Queued
+            } else {
+                Status::Blocked
+            };
             let session = Session {
                 id: id.clone(),
                 task,
@@ -4100,8 +4887,8 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                     .join(&id)
                     .to_string_lossy()
                     .to_string(),
-                status: Status::Queued.label().to_string(),
-                bucket: Status::Queued.bucket().to_string(),
+                status: initial_status.label().to_string(),
+                bucket: initial_status.bucket().to_string(),
                 agent,
                 model: explicit_model,
                 check_cmd,
@@ -4118,11 +4905,21 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 check_ran: false,
                 check_exit: None,
                 merge_error: None,
+                depends_on,
+                check_step_specs,
+                check_receipt: None,
+                allowed_globs,
+                forbidden_globs,
+                scope_violations: Vec::new(),
+                merge_strategy: None,
                 transcript: Vec::new(),
             };
             app.sessions.lock().unwrap().push(session.clone());
             app.mark_dirty(&id);
             app.persist();
+            let created_obj = app
+                .session_json_single(&id)
+                .unwrap_or_else(|| serde_json::to_value(&session).unwrap());
             app.events.publish(
                 "session_created",
                 &serde_json::json!({
@@ -4133,18 +4930,13 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                     "branch": session.branch,
                     "status": session.status,
                     "bucket": session.bucket,
+                    "session": created_obj,
                 }),
             );
             app.emit_queue_depth();
-            app.maybe_start(&id);
-            let all = app.sessions_view();
-            let mine = all
-                .as_array()
-                .and_then(|a| {
-                    a.iter()
-                        .find(|v| v["id"].as_str() == Some(id.as_str()))
-                        .cloned()
-                })
+            app.pump_queue();
+            let mine = app
+                .session_json_single(&id)
                 .unwrap_or_else(|| serde_json::to_value(&session).unwrap());
             json_response(201, &mine.to_string())
         }
@@ -4155,26 +4947,105 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 None => error_response(404, "no such session"),
             }
         }
+        ("GET", route) if route.starts_with("/api/sessions/") && route.ends_with("/merge-check") => {
+            let id = &route["/api/sessions/".len()..route.len() - "/merge-check".len()];
+            let session = {
+                let sessions = app.sessions.lock().unwrap();
+                sessions.iter().find(|s| s.id == id).cloned()
+            };
+            let Some(s) = session else {
+                return error_response(404, "no such session");
+            };
+            if s.repo.is_empty() {
+                return error_response(409, "session has no repository path");
+            }
+            let target = params
+                .get("target")
+                .map(String::as_str)
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or("HEAD");
+            let source = s.verified_commit.as_deref().unwrap_or(&s.branch);
+            match dry_run_merge(Path::new(&s.repo), target, source) {
+                Ok(res) => json_response(200, &serde_json::to_string(&res).unwrap()),
+                Err(e) => error_response(409, &e),
+            }
+        }
+        ("GET", route) if route.starts_with("/api/sessions/") && route.ends_with("/patch") => {
+            let id = &route["/api/sessions/".len()..route.len() - "/patch".len()];
+            let session = {
+                let sessions = app.sessions.lock().unwrap();
+                sessions.iter().find(|s| s.id == id).cloned()
+            };
+            let Some(s) = session else {
+                return error_response(404, "no such session");
+            };
+            if s.repo.is_empty() {
+                return error_response(409, "session has no repository path");
+            }
+            let fmt_raw = params
+                .get("format")
+                .map(String::as_str)
+                .unwrap_or("format-patch");
+            let format = match PatchFormat::parse(fmt_raw) {
+                Ok(f) => f,
+                Err(e) => return error_response(400, &e),
+            };
+            let base = params
+                .get("base")
+                .map(String::as_str)
+                .filter(|b| !b.trim().is_empty())
+                .unwrap_or("HEAD");
+            let source = s.verified_commit.as_deref().unwrap_or(&s.branch);
+            let want_json = matches!(
+                params.get("json").map(String::as_str),
+                Some("1" | "true" | "yes")
+            );
+            match export_patch(Path::new(&s.repo), base, source, id, format) {
+                Ok(mut exported) => {
+                    if exported.content.trim().is_empty() && !s.diff.trim().is_empty() {
+                        exported.content = s.diff.clone();
+                    }
+                    if want_json {
+                        json_response(200, &serde_json::to_string(&exported).unwrap())
+                    } else {
+                        patch_response(&exported.filename, &exported.content)
+                    }
+                }
+                Err(e) => error_response(409, &e),
+            }
+        }
         ("GET", route) if route.starts_with("/api/sessions/") => {
             let id = &route["/api/sessions/".len()..];
-            let all = app.sessions_view();
-            match all
-                .as_array()
-                .and_then(|a| a.iter().find(|v| v["id"].as_str() == Some(id)).cloned())
-            {
+            match app.session_json_single(id) {
                 Some(v) => json_response(200, &v.to_string()),
                 None => error_response(404, "no such session"),
             }
         }
         ("POST", route) if route.starts_with("/api/sessions/") && route.ends_with("/merge") => {
             let id = &route["/api/sessions/".len()..route.len() - "/merge".len()];
-            match app.merge(id) {
-                Ok((commit, branch)) => json_response(
+            let strategy = if body.trim().is_empty() {
+                MergeStrategy::MergeCommit
+            } else {
+                match serde_json::from_str::<serde_json::Value>(body) {
+                    Ok(v) => match v.get("strategy").and_then(serde_json::Value::as_str) {
+                        Some(raw) => match MergeStrategy::parse(raw) {
+                            Ok(st) => st,
+                            Err(e) => return error_response(400, &e),
+                        },
+                        None => MergeStrategy::MergeCommit,
+                    },
+                    Err(e) => return error_response(400, &format!("bad json: {e}")),
+                }
+            };
+            match app.merge_with_strategy(id, strategy) {
+                Ok((commit, branch, landed_commit, strat)) => json_response(
                     200,
                     &serde_json::json!({
                         "merged": true,
                         "commit": commit,
-                        "branch": branch
+                        "landed_commit": landed_commit,
+                        "branch": branch,
+                        "strategy": strat.label(),
                     })
                     .to_string(),
                 ),
@@ -4230,15 +5101,9 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
             }
         }
         ("GET", "/api/inbox") => {
-            let all = app.sessions_view();
-            let inbox: Vec<serde_json::Value> = all
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|v| v["status"].as_str() == Some("needs-you"))
-                .collect();
-            json_response(200, &serde_json::Value::Array(inbox).to_string())
+            let mut inbox_params = std::collections::HashMap::new();
+            inbox_params.insert("status".to_string(), "needs-you".to_string());
+            json_response(200, &app.sessions_query(&inbox_params).to_string())
         }
         _ => error_response(404, "not found"),
     }
@@ -4398,6 +5263,13 @@ fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
             check_ran: false,
             check_exit: None,
             merge_error: None,
+            depends_on: Vec::new(),
+            check_step_specs: Vec::new(),
+            check_receipt: None,
+            allowed_globs: Vec::new(),
+            forbidden_globs: Vec::new(),
+            scope_violations: Vec::new(),
+            merge_strategy: None,
             transcript: cap_transcript(lines),
         });
     }
@@ -4754,33 +5626,11 @@ fn main() {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Git's refusal text for a merge, in plain words, for the two cases
-/// the operator can act on: a missing committer identity and a content
-/// conflict. Anything else is described by the caller from git's own lines.
-fn plain_merge_refusal(raw: &str) -> Option<String> {
-    if raw.contains("identity unknown")
-        || raw.contains("Please tell me who you are")
-        || raw.contains("auto-detection is disabled")
-    {
-        return Some("Git has no name and email for the merge commit. Set them with git config user.name and git config user.email in this repo, then merge again. Nothing was merged.".to_string());
-    }
-    if raw.contains("CONFLICT") {
-        let files: Vec<&str> = raw
-            .lines()
-            .filter_map(|l| l.split_once("Merge conflict in ").map(|(_, f)| f.trim()))
-            .collect();
-        return Some(if files.is_empty() {
-            "Merge conflict. Nothing was merged.".to_string()
-        } else {
-            format!("Merge conflict in {}. Nothing was merged.", files.join(", "))
-        });
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fleet_rs::merge_check::plain_merge_refusal;
+    use fleet_rs::policy::DEFAULT_TIMEOUT_SECS;
 
     const SCRIPT: &str = include_str!("../policies.rn");
 
@@ -4958,6 +5808,13 @@ mod tests {
             check_ran: false,
             check_exit: None,
             merge_error: None,
+            depends_on: Vec::new(),
+            check_step_specs: Vec::new(),
+            check_receipt: None,
+            allowed_globs: Vec::new(),
+            forbidden_globs: Vec::new(),
+            scope_violations: Vec::new(),
+            merge_strategy: None,
             transcript: Vec::new(),
         };
         app.sessions.lock().unwrap().push(session);
@@ -5031,6 +5888,13 @@ mod tests {
             check_ran: false,
             check_exit: None,
             merge_error: None,
+            depends_on: Vec::new(),
+            check_step_specs: Vec::new(),
+            check_receipt: None,
+            allowed_globs: Vec::new(),
+            forbidden_globs: Vec::new(),
+            scope_violations: Vec::new(),
+            merge_strategy: None,
             transcript: Vec::new(),
         }
     }
@@ -6149,6 +7013,383 @@ mod tests {
         let tr_err = response_body(&handle(&app, "GET", "/api/sessions/s-0000/transcript?errors_only=1&limit=10", ""));
         assert_eq!(tr_err["filtered_total"], 1);
         assert_eq!(tr_err["lines"][0]["index"], 32_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[test]
+    fn v050_batch_dag_execution_cycle_rejection_and_upstream_cascade() {
+        let dir = std::env::temp_dir().join(format!("fleet-v050-dag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir);
+        let ok_agent = write_script(
+            &dir,
+            "ok.sh",
+            "#!/bin/sh\necho \"$1\" > output.txt\necho ok\n",
+        );
+        let bad_agent = write_script(&dir, "bad.sh", "#!/bin/sh\necho fail\nexit 1\n");
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let app = test_app(data.clone(), Vec::new());
+
+        // 1. Atomic cycle rejection: zero sessions created.
+        let cycle_body = serde_json::json!({
+            "repo": repo.to_string_lossy(),
+            "tasks": [
+                { "key": "a", "task": "step a", "depends_on": ["b"], "agent": ok_agent.to_string_lossy() },
+                { "key": "b", "task": "step b", "depends_on": ["a"], "agent": ok_agent.to_string_lossy() }
+            ]
+        });
+        let cyc = handle(&app, "POST", "/api/sessions/batch", &cycle_body.to_string());
+        assert!(cyc.starts_with("HTTP/1.1 400"), "expected 400 on cycle: {cyc}");
+        assert!(app.sessions.lock().unwrap().is_empty());
+
+        // 2. 1,000-node DAG dry-run validation & 1,000-node cycle rejection <200ms.
+        let mut big_tasks = Vec::with_capacity(1000);
+        for i in 0..1000usize {
+            let deps = if i == 0 {
+                Vec::new()
+            } else {
+                vec![format!("n{}", i - 1)]
+            };
+            big_tasks.push(serde_json::json!({
+                "key": format!("n{i}"),
+                "task": format!("task {i}"),
+                "depends_on": deps,
+            }));
+        }
+        let t0 = std::time::Instant::now();
+        let dry = handle(
+            &app,
+            "POST",
+            "/api/sessions/batch",
+            &serde_json::json!({
+                "dry_run": true,
+                "repo": repo.to_string_lossy(),
+                "tasks": big_tasks,
+            })
+            .to_string(),
+        );
+        let dry_ms = t0.elapsed().as_millis();
+        assert!(dry.starts_with("HTTP/1.1 200"), "dry run failed: {dry}");
+        assert_eq!(response_body(&dry)["count"], 1000);
+        assert!(dry_ms < 200, "1000-node DAG dry_run took {dry_ms}ms");
+
+        // Inject cycle edge n0 -> n999 and ensure fast 400 rejection.
+        big_tasks[0]["depends_on"] = serde_json::json!(["n999"]);
+        let t1 = std::time::Instant::now();
+        let big_cyc = handle(
+            &app,
+            "POST",
+            "/api/sessions/batch",
+            &serde_json::json!({
+                "repo": repo.to_string_lossy(),
+                "tasks": big_tasks,
+            })
+            .to_string(),
+        );
+        let cyc_ms = t1.elapsed().as_millis();
+        assert!(big_cyc.starts_with("HTTP/1.1 400"));
+        assert!(cyc_ms < 200, "1000-node cycle rejection took {cyc_ms}ms");
+
+        // 3. Real execution: A -> B (#1 -> #2) completes in order.
+        let chain_body = serde_json::json!({
+            "repo": repo.to_string_lossy(),
+            "tasks": [
+                {
+                    "alias": "#1",
+                    "task": "upstream task",
+                    "agent": ok_agent.to_string_lossy(),
+                    "check": "test -s output.txt"
+                },
+                {
+                    "alias": "#2",
+                    "task": "downstream task",
+                    "agent": ok_agent.to_string_lossy(),
+                    "check": "test -s output.txt",
+                    "depends_on": ["#1"]
+                }
+            ]
+        });
+        let created = handle(&app, "POST", "/api/sessions/batch", &chain_body.to_string());
+        assert!(created.starts_with("HTTP/1.1 201"), "batch failed: {created}");
+        let body = response_body(&created);
+        let id_a = body["sessions"][0]["id"].as_str().unwrap().to_string();
+        let id_b = body["sessions"][1]["id"].as_str().unwrap().to_string();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            if app.status_of(&id_a).as_deref() == Some("done")
+                && app.status_of(&id_b).as_deref() == Some("done")
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(app.status_of(&id_a).as_deref(), Some("done"));
+        assert_eq!(app.status_of(&id_b).as_deref(), Some("done"));
+
+        // 4. Upstream failure cascade: X fails -> Y automatically lands in needs-you.
+        let fail_chain = serde_json::json!({
+            "repo": repo.to_string_lossy(),
+            "tasks": [
+                {
+                    "key": "x",
+                    "task": "failing upstream",
+                    "agent": bad_agent.to_string_lossy(),
+                    "check": "test -s output.txt"
+                },
+                {
+                    "key": "y",
+                    "task": "blocked downstream",
+                    "agent": ok_agent.to_string_lossy(),
+                    "check": "test -s output.txt",
+                    "depends_on": ["x"]
+                }
+            ]
+        });
+        let fc = handle(&app, "POST", "/api/sessions/batch", &fail_chain.to_string());
+        assert!(fc.starts_with("HTTP/1.1 201"));
+        let fc_body = response_body(&fc);
+        let id_y = fc_body["sessions"][1]["id"].as_str().unwrap().to_string();
+
+        let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline2 {
+            if app.status_of(&id_y).as_deref() == Some("needs-you") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(app.status_of(&id_y).as_deref(), Some("needs-you"));
+        let y_view = response_body(&handle(&app, "GET", &format!("/api/sessions/{id_y}"), ""));
+        assert!(
+            y_view["reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("upstream failed"),
+            "expected upstream failed reason, got: {y_view}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v050_file_scope_guardrail_and_multistep_check_receipt() {
+        let dir = std::env::temp_dir().join(format!("fleet-v050-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir);
+        let oos_agent = write_script(
+            &dir,
+            "oos.sh",
+            "#!/bin/sh\necho touched >> README.md\nmkdir -p src\necho ok > src/ok.rs\n",
+        );
+        let ok_agent = write_script(
+            &dir,
+            "ok.sh",
+            "#!/bin/sh\nmkdir -p src\necho ok > src/ok.rs\n",
+        );
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let app = test_app(data.clone(), Vec::new());
+
+        // 1. Out-of-scope edit blocked cleanly in needs-you even when check passes!
+        let r1 = handle(
+            &app,
+            "POST",
+            "/api/sessions",
+            &serde_json::json!({
+                "repo": repo.to_string_lossy(),
+                "task": "only touch src",
+                "agent": oos_agent.to_string_lossy(),
+                "check": "test -s src/ok.rs",
+                "allowed_globs": ["src/**"]
+            })
+            .to_string(),
+        );
+        assert!(r1.starts_with("HTTP/1.1 201"));
+        let id1 = response_body(&r1)["id"].as_str().unwrap().to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            if app.status_of(&id1).as_deref() == Some("needs-you") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let s1 = response_body(&handle(&app, "GET", &format!("/api/sessions/{id1}"), ""));
+        assert_eq!(s1["status"], "needs-you");
+        assert!(s1["verified_commit"].is_null());
+        assert!(s1["reason"].as_str().unwrap_or("").contains("README.md"));
+        assert!(!s1["guardrail_violations"].as_array().unwrap().is_empty());
+
+        // 2. Multi-step check pipeline runs steps in order and populates receipt!
+        let r2 = handle(
+            &app,
+            "POST",
+            "/api/sessions",
+            &serde_json::json!({
+                "repo": repo.to_string_lossy(),
+                "task": "in-scope edit",
+                "agent": ok_agent.to_string_lossy(),
+                "allowed_globs": ["src/**"],
+                "check_steps": [
+                    { "name": "exists", "cmd": "test -s src/ok.rs && echo exists ok" },
+                    { "name": "verify", "cmd": "grep -q ok src/ok.rs && echo 2 passed" }
+                ]
+            })
+            .to_string(),
+        );
+        assert!(r2.starts_with("HTTP/1.1 201"));
+        let id2 = response_body(&r2)["id"].as_str().unwrap().to_string();
+        let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline2 {
+            if app.status_of(&id2).as_deref() == Some("done") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let s2 = response_body(&handle(&app, "GET", &format!("/api/sessions/{id2}"), ""));
+        assert_eq!(s2["status"], "done");
+        assert_eq!(s2["check_passed"], true);
+        let steps = s2["check_steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0]["name"], "exists");
+        assert_eq!(steps[0]["passed"], true);
+        assert_eq!(steps[1]["name"], "verify");
+        assert_eq!(steps[1]["tail_line"], "2 passed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v050_merge_check_patch_export_and_squash_merge() {
+        let dir = std::env::temp_dir().join(format!("fleet-v050-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir);
+        git_run(&repo, &["config", "user.email", "fleet@test"]);
+        git_run(&repo, &["config", "user.name", "fleet"]);
+        let ok_agent = write_script(
+            &dir,
+            "ok.sh",
+            "#!/bin/sh\necho feature > feature.txt\n",
+        );
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let app = test_app(data.clone(), Vec::new());
+
+        let r = handle(
+            &app,
+            "POST",
+            "/api/sessions",
+            &serde_json::json!({
+                "repo": repo.to_string_lossy(),
+                "task": "add feature file",
+                "agent": ok_agent.to_string_lossy(),
+                "check": "test -s feature.txt"
+            })
+            .to_string(),
+        );
+        assert!(r.starts_with("HTTP/1.1 201"));
+        let id = response_body(&r)["id"].as_str().unwrap().to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            if app.status_of(&id).as_deref() == Some("done") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(app.status_of(&id).as_deref(), Some("done"));
+
+        // 1. Dry-run merge-check clean
+        let mc = handle(&app, "GET", &format!("/api/sessions/{id}/merge-check"), "");
+        assert!(mc.starts_with("HTTP/1.1 200"), "merge-check failed: {mc}");
+        let mc_body = response_body(&mc);
+        assert_eq!(mc_body["clean"], true);
+        assert_eq!(mc_body["commits_ahead"], 1);
+        assert!(mc_body["conflicting_files"].as_array().unwrap().is_empty());
+
+        // 2. Patch export (raw text/x-patch + JSON)
+        let raw_patch = handle(&app, "GET", &format!("/api/sessions/{id}/patch"), "");
+        assert!(raw_patch.starts_with("HTTP/1.1 200 OK"));
+        assert!(raw_patch.contains("Content-Type: text/x-patch"));
+        assert!(raw_patch.contains("Content-Disposition: attachment"));
+        assert!(raw_patch.contains("feature.txt"));
+        let json_patch = response_body(&handle(
+            &app,
+            "GET",
+            &format!("/api/sessions/{id}/patch?json=1"),
+            "",
+        ));
+        assert_eq!(json_patch["files_changed"], 1);
+        assert_eq!(json_patch["insertions"], 1);
+
+        // 3. Squash merge lands cleanly on main
+        let merged = handle(
+            &app,
+            "POST",
+            &format!("/api/sessions/{id}/merge"),
+            r#"{"strategy":"squash"}"#,
+        );
+        assert!(merged.starts_with("HTTP/1.1 200"), "squash merge failed: {merged}");
+        let m_body = response_body(&merged);
+        assert_eq!(m_body["merged"], true);
+        assert_eq!(m_body["strategy"], "squash");
+        assert!(repo.join("feature.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v050_policy_test_endpoint_and_fuzz_resilience() {
+        let dir = std::env::temp_dir().join(format!("fleet-v050-poltest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = test_app(dir.clone(), Vec::new());
+
+        let ok = handle(
+            &app,
+            "POST",
+            "/api/policies/test",
+            r#"{"repo":"/home/dev/security-api","task":"security audit of jwt","engine":"auto"}"#,
+        );
+        assert!(ok.starts_with("HTTP/1.1 200"));
+        let b = response_body(&ok);
+        assert_eq!(b["engine"], "claude");
+        assert_eq!(b["model"], "claude-sonnet-4-5");
+        assert!(b["matched_rule"].is_string());
+
+        // Fuzz payloads: zero panics, zero 500s.
+        let big = "a".repeat(40_000);
+        let fuzz_cases = vec![
+            "".to_string(),
+            "{}".to_string(),
+            "not json at all {{{".to_string(),
+            "[]".to_string(),
+            r#"{"repo":123,"task":null,"engine":true}"#.to_string(),
+            format!(r#"{{"repo":"{big}","task":"{big}\u0000evil","engine":"unknown"}}"#),
+            r#"{"script":"pub fn broken( {","repo":"/tmp/x","task":"y"}"#.to_string(),
+            r#"{"script":"pub fn max_parallel() { 2 } pub fn default_check(p) { \"echo ok\" }","repo":"/tmp/x","task":"y"}"#.to_string(),
+        ];
+        for payload in fuzz_cases {
+            let resp = handle(&app, "POST", "/api/policies/test", &payload);
+            assert!(
+                resp.starts_with("HTTP/1.1 200") || resp.starts_with("HTTP/1.1 400"),
+                "unexpected status on fuzz payload: {}",
+                resp.lines().next().unwrap_or("")
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
