@@ -4,6 +4,38 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running app shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.3.0 - 2026-11-21
+
+- Parallel Coding-Agent Mission Control Board built on the House Frontend system
+  (Square UI hairline surfaces, warm light default + full dark parity, self-hosted
+  Geist and Geist Mono fonts, and full coverage across all eight House libraries
+  documented in `JOB.md`, `ROLE-COVERAGE.md`, and `ALIVE.md`).
+- Top Command Bar: `Fleet` wordmark and version chip, `/` search filter with `Kbd`
+  hint across tasks/projects/branches, `Needs you` Inbox popover with live count
+  and 1-click session jump/Retry, `New session` `MorphingDialog` (`Cmd/Ctrl+Enter`
+  dispatch), `Engines and Rune policy` Vaul right sheet, and Light/Dark
+  `SegmentedControl` (`id="themeBtn"`).
+- Scan Strip & Latest Verified Receipt hero: four `SlidingNumber` counters
+  (`Sessions`, `Needs you`, `Working`, `Verified`), Kibo UI running `AvatarStack`,
+  Tremor 32-session outcome `Tracker`, and a measured Latest Verified Receipt hero
+  card (`+added` / `-removed` diff stats in Geist Mono, `verified by: <check>`,
+  and 1-click `Inspect receipt`, `View diff`, and `Merge`).
+- Three-Lane Board (`Needs you` · `Working` · `Done`) & Split-Pane Session
+  Inspector: Motion `layoutId` transitions between lanes, `BorderTrail` and
+  `TextShimmer` strictly on running sessions with live streaming transcript tails,
+  Cult UI `Expandable` disclosures for check and merge diagnostics (zero native
+  `<details>`), roving `ArrowLeft`/`ArrowRight`/`Home`/`End` tabs across
+  `Transcript` · `Diff` (syntax-tinted `+/-` lines in Geist Mono) · `Receipt`,
+  focus restoration on open/close, and live per-session `Steer` composer.
+- Desktop launch UX and Update strip hardening: platform data-folder default
+  (`XDG_DATA_HOME`/macOS Application Support), automatic port fallback when the
+  default port is busy, loopback-only `Update now` and manual update checks,
+  plain-language update error mapping, and deterministic focus handoff across
+  `Update now`, `Restart now`, `Dismiss`, and `Show update`.
+- Release workflow (`release.yml`): targets Unix platforms (`x86_64-unknown-linux-gnu`,
+  `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`) matching Fleet's Unix
+  process-group supervision model.
+
 ## 0.2.0 - 2026-11-19
 
 - Board redesign: Needs you, Working and Done groups; a detail panel with

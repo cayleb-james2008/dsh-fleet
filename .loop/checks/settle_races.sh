@@ -17,7 +17,7 @@ PIDS=""
 cleanup() { for p in $PIDS; do kill -9 $p 2>/dev/null; done; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-[ -x ./target/debug/fleet-rs ] || cargo build >/dev/null 2>&1
+[ -x "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" ] || cargo build >/dev/null 2>&1
 
 git init -q -b main "$WORK/repo"
 echo "seed" > "$WORK/repo/README.md"
@@ -79,7 +79,7 @@ pub fn timeout_secs() { 60 }
 pub fn default_check(project) { "test -s output.txt" }
 RN
 PORT=8517
-FLEET_DATA="$WORK/dataA" PORT=$PORT ./target/debug/fleet-rs "$WORK/pol2.rn" > "$WORK/serverA.log" 2>&1 &
+FLEET_DATA="$WORK/dataA" PORT=$PORT "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" "$WORK/pol2.rn" > "$WORK/serverA.log" 2>&1 &
 PIDS="$PIDS $!"
 wait_up $PORT
 A=$(post $PORT /api/sessions "{\"repo\":\"$WORK/repo\",\"project\":\"fixture\",\"task\":\"parent A\",\"agent\":\"$WORK/medium.sh\",\"next\":[\"child of A\"]}" | jq -r '.id')
@@ -108,7 +108,7 @@ echo "F1 OK: the freed slot went to the earlier-queued session; the successor wa
 
 # ================= F2: steering survives a mid-delivery kill =======
 PORT=8519
-FLEET_DATA="$WORK/dataB" PORT=$PORT ./target/debug/fleet-rs policies.rn > "$WORK/serverB.log" 2>&1 &
+FLEET_DATA="$WORK/dataB" PORT=$PORT "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" policies.rn > "$WORK/serverB.log" 2>&1 &
 SRV=$!
 PIDS="$PIDS $SRV"
 wait_up $PORT
@@ -125,7 +125,7 @@ done
 [ "$n" -ge 2 ] || { echo "FAIL [F2]: continuation run never started (calls=$n)"; exit 1; }
 kill -9 $SRV
 sleep 1
-FLEET_DATA="$WORK/dataB" PORT=$PORT ./target/debug/fleet-rs policies.rn > "$WORK/serverB2.log" 2>&1 &
+FLEET_DATA="$WORK/dataB" PORT=$PORT "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" policies.rn > "$WORK/serverB2.log" 2>&1 &
 PIDS="$PIDS $!"
 wait_up $PORT
 st=$(status_of $PORT "$S")
@@ -140,7 +140,7 @@ echo "F2 OK: the steering message survived a kill -9 mid-delivery and was delive
 
 # ================= N1: a stalled chain fires at startup ============
 PORT=8521
-FLEET_DATA="$WORK/dataC" PORT=$PORT ./target/debug/fleet-rs policies.rn > "$WORK/serverC.log" 2>&1 &
+FLEET_DATA="$WORK/dataC" PORT=$PORT "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" policies.rn > "$WORK/serverC.log" 2>&1 &
 SRV=$!
 PIDS="$PIDS $SRV"
 wait_up $PORT
@@ -159,7 +159,7 @@ jq --arg p "$P" --arg ch "$CH" '
   .sessions |= map(if .id == $p then .next_queue = ["revived job"] | .successor = null else . end)
   | .sessions |= map(select(.id != $ch))' "$WORK/dataC/sessions.json" > "$WORK/dataC/sessions.json.new"
 mv "$WORK/dataC/sessions.json.new" "$WORK/dataC/sessions.json"
-FLEET_DATA="$WORK/dataC" PORT=$PORT ./target/debug/fleet-rs policies.rn > "$WORK/serverC2.log" 2>&1 &
+FLEET_DATA="$WORK/dataC" PORT=$PORT "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" policies.rn > "$WORK/serverC2.log" 2>&1 &
 PIDS="$PIDS $!"
 wait_up $PORT
 for i in $(seq 1 40); do

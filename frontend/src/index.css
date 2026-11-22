@@ -1,29 +1,25 @@
 /* Scan only the app and the copied parts: Tailwind's automatic scan would read the Markdown notes (LOCAL-EDITS.md, DESIGN.md) as class names. */
 @import "tailwindcss" source(none);
 @source "../src";
-/* Tokens: the house roles (tokens.css), then this app's Hallmark theme values (theme.css), then its fonts. */
+/* Tokens: the house roles (tokens.css), then this app's theme values (theme.css), then its self-hosted fonts. */
 @import "./tokens.css";
 @import "./theme.css";
 @import "./fonts.css";
 @source "../../rune/used/**/*.tsx";
 
-/* Hallmark floor: no sideways scroll on the page; heads wrap evenly. */
-html, body { overflow-x: clip; }
+/* Hallmark floor: no sideways scroll on the page; no synthetic bold/italic; heads wrap evenly. */
+html, body { overflow-x: clip; font-synthesis: none; }
 /* Focus offsets sit on the canvas, not on Tailwind's literal white. */
 *, ::before, ::after, ::backdrop { --tw-ring-offset-color: var(--canvas); }
-/* Tailwind's core `transition` utility includes box-shadow, so a focus ring would fade in (Hallmark 15). This
-   redefines the same utility without it; the two other properties Tailwind lists are kept. */
+/* Tailwind's core `transition` utility includes box-shadow, so a focus ring would fade in (Hallmark 15). */
 @utility transition {
   transition-property: color, background-color, border-color, outline-color, text-decoration-color, fill, stroke, opacity, transform, translate, scale, rotate, filter, backdrop-filter, display, pointer-events;
   transition-timing-function: var(--tw-ease, var(--default-transition-timing-function));
   transition-duration: var(--tw-duration, var(--default-transition-duration));
 }
-/* The focus-ring offset defaults to a literal white in Tailwind's property registry; it sits on the canvas instead. */
 @property --tw-ring-offset-color { syntax: "*"; inherits: false; initial-value: transparent; }
 h1, h2, h3 { text-wrap: balance; }
 
-/* Tremor Raw animation block (documented install step: paste its @theme into globals.css).
-   Only the hover-card/tooltip entries that Tracker uses are kept. */
 @theme {
   --animate-slide-down-and-fade: slideDownAndFade 150ms cubic-bezier(0.16, 1, 0.3, 1);
   --animate-slide-up-and-fade: slideUpAndFade 150ms cubic-bezier(0.16, 1, 0.3, 1);
@@ -48,10 +44,7 @@ h1, h2, h3 { text-wrap: balance; }
   }
 }
 
-/* Vaul ignores prefers-reduced-motion: its sheet and overlay travel with CSS *animations* (slideFromBottom,
-   slideToBottom, fadeIn, fadeOut) and a transform transition. The earlier override here (until 2026-11-10)
-   matched [vaul-drawer], an attribute vaul 1.x does not set (it sets data-vaul-drawer), and cut only the
-   transition, so the 500 ms slide kept running. Both durations are cut on the real attributes. */
+/* Vaul ignores prefers-reduced-motion: cut both animation and transition durations on its real attributes. */
 @media (prefers-reduced-motion: reduce) {
   [data-vaul-drawer], [data-vaul-overlay] { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }

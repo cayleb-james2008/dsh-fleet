@@ -36,7 +36,7 @@ agent a_link "ln -s /etc/hostname output.txt"
 agent a_none "echo just talking"
 agent a_hook "printf 'agent version\\n' > output.txt"
 
-FLEET_DATA="$WORK/data" PORT=$PORT ./target/debug/fleet-rs policies.rn > "$WORK/server.log" 2>&1 &
+FLEET_DATA="$WORK/data" PORT=$PORT "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" policies.rn > "$WORK/server.log" 2>&1 &
 PIDS="$PIDS $!"
 api() { curl -s "http://127.0.0.1:$PORT$1"; }
 post() { curl -s -X POST "http://127.0.0.1:$PORT$1" -H 'Content-Type: application/json' -d "$2"; }

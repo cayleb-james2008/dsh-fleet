@@ -25,7 +25,7 @@ EOF
 chmod +x "$WORK/agent.sh"
 
 FLEET_AGENT="$WORK/agent.sh" FLEET_DATA="$WORK/data" PORT=$PORT \
-  ./target/debug/fleet-rs policies.rn > "$WORK/server.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" policies.rn > "$WORK/server.log" 2>&1 &
 PIDS="$PIDS $!"
 api() { curl -s "http://127.0.0.1:$PORT$1"; }
 for i in $(seq 1 20); do api /api/sessions >/dev/null 2>&1 && break; sleep 0.5; done
@@ -122,7 +122,7 @@ pub fn max_parallel() { 0 }
 pub fn default_check(project) { "test -s output.txt" }
 EOF
 FLEET_AGENT="$WORK/agent.sh" FLEET_DATA="$WORK/data0" PORT=8504 \
-  ./target/debug/fleet-rs "$WORK/policy0.rn" > "$WORK/server0.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" "$WORK/policy0.rn" > "$WORK/server0.log" 2>&1 &
 PIDS="$PIDS $!"
 for i in $(seq 1 20); do curl -s http://127.0.0.1:8504/api/sessions >/dev/null 2>&1 && break; sleep 0.5; done
 curl -s -X POST http://127.0.0.1:8504/api/sessions -H 'Content-Type: application/json' \

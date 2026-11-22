@@ -40,7 +40,7 @@ function TextShimmerComponent({
     <MotionComponent
       className={cn(
         'relative inline-block bg-[length:250%_100%,auto] bg-clip-text',
-        'text-transparent [--base-color:var(--ink-2)] [--base-gradient-color:var(--ink)]',
+        'text-ink-2 [-webkit-text-fill-color:transparent] [--base-color:var(--ink-2)] [--base-gradient-color:var(--ink)]',
         '[background-repeat:no-repeat,padding-box] [--bg:linear-gradient(90deg,transparent_calc(50%-var(--spread)),var(--base-gradient-color),transparent_calc(50%+var(--spread)))]',
         className
       )}

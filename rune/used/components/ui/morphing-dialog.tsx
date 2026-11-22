@@ -106,7 +106,8 @@ function MorphingDialogTrigger({
   blocked,
   thing,
 }: MorphingDialogTriggerProps) {
-  const { setIsOpen, isOpen, uniqueId } = useMorphingDialog();
+  const { setIsOpen, isOpen, uniqueId, triggerRef: ctxTriggerRef } = useMorphingDialog();
+  const resolvedRef = triggerRef ?? ctxTriggerRef;
 
   const handleClick = useCallback(() => {
     if (blocked) return;
@@ -126,7 +127,7 @@ function MorphingDialogTrigger({
 
   return (
     <motion.button
-      ref={triggerRef}
+      ref={resolvedRef}
       layoutId={`dialog-${uniqueId}`}
       className={cn('relative cursor-pointer', className)}
       onClick={handleClick}
@@ -205,7 +206,7 @@ function MorphingDialogContent({
       }
     } else {
       document.body.classList.remove('overflow-hidden');
-      triggerRef.current?.focus();
+      requestAnimationFrame(() => triggerRef.current?.focus());
     }
   }, [isOpen, triggerRef]);
 
