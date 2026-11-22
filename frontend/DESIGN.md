@@ -1,6 +1,16 @@
-# Fleet front end: design (v0.4.0 Mission Control Board)
+# Fleet front end: design (v0.5.0 Mission Control Board)
 
-Status: v0.4.0 complete. Built on the House Frontend system (`JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md`), self-hosted **Geist** and **Geist Mono** (`frontend/src/fonts/*.woff2`), light default + full dark parity (`frontend/src/theme.css`).
+Status: v0.5.0 complete. Built on the House Frontend system (`JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md`), self-hosted **Geist** and **Geist Mono** (`frontend/src/fonts/*.woff2`), light default + full dark parity (`frontend/src/theme.css`).
+
+## What v0.5.0 adds
+
+- Live SSE stream (`EventSource('/api/events/stream')`) with automatic backoff polling fallback and header status indicator.
+- Virtualized searchable transcript viewer (`frontend/src/transcript.tsx`) smoothly handling 50,000+ lines (<150 mounted DOM rows), match navigation, and 1-click **Jump to first error**.
+- Unified & Side-by-Side Split Diff viewer (`frontend/src/diff.tsx`) with non-destructive pre-merge dry-run conflict badge (`GET /api/sessions/:id/merge-check`), merge strategy selector (`Merge commit` · `Squash` · `Fast-forward`), and **Download `.patch`** (`GET /api/sessions/:id/patch`).
+- Ordered multi-step timed receipt timeline (`check_steps`) and file-scope guardrail badges (`allowed_globs` / `forbidden_globs` / `guardrail_violations`).
+- Single, Batch, and Multi-Repo Matrix DAG Composer (`frontend/src/composer.tsx`) with `depends_on`, multi-step checks, and file-scope rules.
+- Multi-select bulk controls on the board (Bulk Retry, Bulk Merge, Bulk Stop/Dismiss), live concurrency slot capacity display, and global `Cmd+K` / `Ctrl+K` Command Palette (`frontend/src/palette.tsx`).
+- Policy Tester (`POST /api/policies/test`), concurrency cap slider (`max_parallel_agents`), and **Prune stale worktrees** inside the `Engines and settings` Vaul drawer (`#settings`), keeping Light/Dark Appearance strictly inside Settings.
 
 ## The job
 
@@ -15,7 +25,7 @@ Questions the first screen answers (`data-answers` / `data-answers-via` in the D
 ## Region map
 
 - **Top Command Bar** (sticky): `Fleet` wordmark, version chip (`v0.4.0`), desktop `Check for updates` icon button (loopback-only), `Show update` button when an available update is dismissed, `/` search field (`InputGroup` + `Kbd` `/`) filtering by task/project/branch, `Needs you` Inbox `Popover` (live `/api/inbox` count, `View session`, `Retry`, `Go to Needs you`), `New session` `MorphingDialog` (`GET /api/repos` repository picker, auto-derived project basename, `Cmd/Ctrl+Enter` dispatch), and `Engines and settings` Vaul right-sheet trigger (`#settings-open`).
-- **Engines and Settings Sheet (`#settings`)**: Light/Dark `SegmentedControl` (`id="themeBtn"`, `aria-label="Light"` / `"Dark"`) under **Appearance** (kept out of the top bar), Rune policy summary, detected CLI engines on PATH, live default-engine and per-engine model routing (`GET/POST /api/config`), and updates controls (plus Browser Worktree Engine / Local `fleet-rs` / optional `sessionStorage` BYOK controls in the standalone web bundle).
+- **Engines and Settings Sheet (`#settings`)**: Light/Dark `SegmentedControl` (`id="themeBtn"`, `aria-label="Light"` / `"Dark"`) under **Appearance** (kept out of the top bar), policy rules summary, detected CLI engines on PATH, live default-engine and per-engine model routing (`GET/POST /api/config`), and updates controls (plus Browser Worktree Engine / Local `fleet-rs` / optional `sessionStorage` BYOK controls in the standalone web bundle).
 - **Update Strip** (shown when an update is available, staged, or a manual check fails): loopback-only `Update now` with `"Update now downloads it, checks it, and replaces this app. Restart to start using it."`, developer-copy / non-loopback plain explanation, Cult UI `Expandable` release notes and raw failure diagnostics (zero native `<details>`), and deterministic focus transitions (`busy` -> status line, `staged` -> `Restart now`, `Dismiss` -> `Show update`).
 - **Scan Strip**: four `SlidingNumber` counters (`Sessions`, `Needs you`, `Working`, `Verified` — skeleton placeholders before initial fetch so unreachable never flashes fake zeros), Kibo UI `AvatarStack` for concurrent running agents, and Tremor 32-session outcome `Tracker`.
 - **Latest Verified Receipt Hero**: Fleet's defining signature object — measured corner ticks, sage `Latest verified receipt` `Pill`, project & branch chips, task headline in Geist 500, check output receipt line, Geist Mono diff stats (`files`, `+added`, `−removed`), `verified by: <check command>`, and 1-click `Inspect receipt`, `View diff`, and `Merge` (with inline safety confirmation).

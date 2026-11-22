@@ -572,7 +572,7 @@ function Composer({
             <Field
               id="project"
               label="Project"
-              hint="Derived automatically from the repository folder name. Edit if your Rune policy matches a custom project key."
+              hint="Derived automatically from the repository folder name. Edit if your routing rules match a custom project key."
             >
               <InputGroup>
                 <InputGroupInput

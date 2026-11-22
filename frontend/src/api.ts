@@ -331,7 +331,13 @@ export function normalizeSession(raw: unknown, idx = 0): Session | null {
 
   const rawStrategy = asStr(r.merge_strategy, "").toLowerCase();
   const mergeStrategy: MergeStrategy | null =
-    rawStrategy === "squash" ? "squash" : rawStrategy === "ff" || rawStrategy === "fast-forward" ? "ff" : rawStrategy === "merge" ? "merge" : null;
+    rawStrategy === "squash"
+      ? "squash"
+      : rawStrategy === "ff" || rawStrategy === "ff-only" || rawStrategy === "fast-forward" || rawStrategy === "fast-forward-only"
+        ? "ff"
+        : rawStrategy === "merge" || rawStrategy === "merge-commit"
+          ? "merge"
+          : null;
 
   return {
     id,
@@ -807,7 +813,10 @@ export async function pruneStaleWorktrees(useServer: boolean): Promise<{ ok: boo
     if (!r.ok) {
       return { ok: false, message: asStr(raw.error, "Worktree prune failed.") };
     }
-    const pruned = asNum(raw.pruned ?? raw.removed) ?? 0;
+    const pruned =
+      asNum(raw.removed) ??
+      asNum(raw.pruned) ??
+      (Array.isArray(raw.removed_worktrees) ? raw.removed_worktrees.length : 0);
     return {
       ok: true,
       pruned,

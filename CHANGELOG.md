@@ -4,6 +4,53 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running app shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.5.0 - 2026-11-22
+
+- Real-time Server-Sent Events stream (`GET /api/events/stream`, `src/events.rs`):
+  lock-minimal bounded subscriber bus with 64-frame `Last-Event-ID` / `?since=`
+  replay, 15s keepalive heartbeats, and live `session_created`, `session_status`,
+  `transcript_line`, `check_progress`, `queue_depth`, `config_updated`, and
+  `worktrees_pruned` events, wired into the frontend `EventSource` stream with
+  graceful 2s polling fallback.
+- DAG Dependency Scheduler & Batch / Multi-Repo Matrix Dispatch (`src/dag.rs`,
+  `POST /api/sessions/batch`, `depends_on` on `POST /api/sessions`): iterative
+  Kahn's topological sort + 3-color cycle detection tested to 2,000+ nodes,
+  atomic cycle/unknown-dependency rejection, `blocked` session state with
+  `blocked_by` tracking, automatic downstream launch on upstream `done`/`merged`,
+  and transitive `Needs you: upstream failed (...)` cascading on upstream failure
+  or dismissal.
+- Multi-Step Check Pipelines & File-Scope Guardrails (`src/checks.rs`): ordered
+  `check_steps` execution in pristine checkouts with live per-step SSE receipts,
+  per-step timing/exit/tail output, and polynomial-time glob guardrails
+  (`allowed_globs` / `forbidden_globs` merged with `policies.rn` defaults) that
+  block out-of-scope or forbidden-file edits cleanly in `Needs you` before any
+  session can reach `done`.
+- Non-Destructive Pre-Merge Dry-Run, `.patch` Export & Merge Strategies
+  (`src/merge_check.rs`): `GET /api/sessions/:id/merge-check` via `git merge-tree`
+  (zero mutation to working tree, index, or `HEAD`), `GET /api/sessions/:id/patch`
+  (`format-patch` or `unified-diff`), and `POST /api/sessions/:id/merge` strategy
+  support (`merge-commit`, `squash`, `fast-forward-only`) preserving every merge
+  safety guarantee.
+- Policy Rules Engine & Live Dry-Run Tester (`src/policy.rs`, `policies.rn`,
+  `POST /api/policies/test`): repo/task engine routing (`route_engine`), model
+  routing (`route_model`), per-task timeouts (`timeout_for`), retry/steer budgets
+  (`auto_retry_budget`, `auto_steer_budget`), default globs & check steps, and
+  fuzz-hardened live dry-run evaluation with full decision traces.
+- Scale & Operational Controls: configurable live concurrency cap
+  (`max_parallel_agents`, `FLEET_MAX_PARALLEL`, `1..=64`), graceful
+  `SIGTERM -> SIGKILL` process-group cancellation on stop/timeout, loopback-only
+  `POST /api/repos/prune-worktrees`, dirty-tracked `.record.json` persistence,
+  5s TTL merge-target & `state_rev`-keyed session caches, and fast indexed/paginated
+  `GET /api/sessions` & `GET /api/sessions/:id/transcript` tested to 2,000 sessions
+  and 50,000+ transcript lines (<200ms).
+- Mission Control UI v0.5.0: virtualized searchable 50,000+ line transcript viewer
+  with Jump to first error, Unified & Side-by-Side Split Diff viewer with pre-merge
+  conflict badge and `.patch` export, per-step timed receipt timeline, Batch &
+  Matrix DAG composer with guardrail inputs, multi-select bulk actions, global
+  `Cmd+K` command palette, Policy Tester & concurrency slider inside
+  `Engines and settings` (Light/Dark switch exclusively in Settings), and upgraded
+  standalone v0.5.0 Browser Worktree Engine (`shared-live-web/dsh-fleet/index.html`).
+
 ## 0.4.0 - 2026-11-21
 
 - Real repository discovery (`GET /api/repos`, loopback-only): discovers local

@@ -962,7 +962,7 @@ export function App() {
                 <Drawer.Description className="text-sm leading-relaxed text-ink-2">
                   {policy
                     ? `Up to ${policy.max_parallel} sessions run in parallel. Any agent or check exceeding ${policy.timeout_secs}s returns to Needs you. Policy source: ${policy.source}.${policy.model ? ` OpenCode model: ${policy.model}.` : ""} ${policy.default_agent ? `Default agent: ${policy.default_agent_engine === "custom" ? "custom script" : policy.default_agent}.` : "No default agent is set."}`
-                    : "Loading Rune policy..."}
+                    : "Loading policy rules..."}
                 </Drawer.Description>
 
                 <section>

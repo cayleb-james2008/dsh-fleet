@@ -442,6 +442,9 @@ struct Session {
     /// Merge strategy used when this session landed (`merge-commit`, `squash`, `fast-forward-only`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     merge_strategy: Option<MergeStrategy>,
+    /// Total transcript lines logged to disk (may exceed in-memory `TRANSCRIPT_CAP`).
+    #[serde(default)]
+    transcript_total: usize,
     transcript: Vec<String>,
 }
 
@@ -1700,6 +1703,7 @@ impl App {
             let mut sessions = self.sessions.lock().unwrap();
             match sessions.iter_mut().find(|s| s.id == id) {
                 Some(s) => {
+                    s.transcript_total = s.transcript_total.max(s.transcript.len()) + 1;
                     s.transcript.push(line.clone());
                     // Cap the in-memory transcript: a flooding agent
                     // must not grow memory, the snapshot file, or every
@@ -3142,6 +3146,7 @@ fn retry_prompt_text(
                 forbidden_globs: parent.forbidden_globs.clone(),
                 scope_violations: Vec::new(),
                 merge_strategy: None,
+                transcript_total: 0,
                 transcript: Vec::new(),
             };
             sessions.push(child);
@@ -3976,7 +3981,7 @@ fn session_to_api_value(
     v["check_passed"] = serde_json::json!(s.check_passed);
     v["check_ran"] = serde_json::json!(s.check_ran);
     v["check_exit"] = serde_json::json!(s.check_exit);
-    v["transcript_total"] = serde_json::json!(s.transcript.len());
+    v["transcript_total"] = serde_json::json!(s.transcript_total.max(s.transcript.len()));
     // Surface structured per-step check receipts for the Receipt tab.
     if let Some(ref receipt) = s.check_receipt {
         v["elapsed_ms"] = serde_json::json!(receipt.total_elapsed_ms);
@@ -4626,6 +4631,7 @@ fn handle_batch_sessions(app: &Arc<App>, body: &str) -> String {
                 forbidden_globs: rs.planned.forbidden_globs,
                 scope_violations: Vec::new(),
                 merge_strategy: None,
+                transcript_total: 0,
                 transcript: Vec::new(),
             };
             created_ids.push(id);
@@ -4912,6 +4918,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 forbidden_globs,
                 scope_violations: Vec::new(),
                 merge_strategy: None,
+                transcript_total: 0,
                 transcript: Vec::new(),
             };
             app.sessions.lock().unwrap().push(session.clone());
@@ -5219,6 +5226,7 @@ fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
             // operator says it in its reason too. Status is unchanged.
             let mut lines = lines;
             lines.push(RESTORED_LINE.to_string());
+            s.transcript_total = lines.len();
             s.transcript = cap_transcript(lines);
             if s.status == "needs-you" && !s.reason.as_deref().unwrap_or("").contains(RESTORED_REASON) {
                 let base = s.reason.clone().unwrap_or_else(|| "needs you".to_string());
@@ -5270,6 +5278,7 @@ fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
             forbidden_globs: Vec::new(),
             scope_violations: Vec::new(),
             merge_strategy: None,
+            transcript_total: lines.len(),
             transcript: cap_transcript(lines),
         });
     }
@@ -5295,6 +5304,7 @@ fn load_persisted(data_dir: &Path) -> (Vec<Session>, u64) {
             let log_path = data_dir.join("logs").join(format!("{}.log", s.id));
             if let Ok(text) = std::fs::read_to_string(&log_path) {
                 let lines = transcript_lines_from_log(&text);
+                s.transcript_total = s.transcript_total.max(lines.len());
                 if lines.len() > s.transcript.len() {
                     s.transcript = cap_transcript(lines);
                 }
@@ -5815,6 +5825,7 @@ mod tests {
             forbidden_globs: Vec::new(),
             scope_violations: Vec::new(),
             merge_strategy: None,
+            transcript_total: 0,
             transcript: Vec::new(),
         };
         app.sessions.lock().unwrap().push(session);
@@ -5895,6 +5906,7 @@ mod tests {
             forbidden_globs: Vec::new(),
             scope_violations: Vec::new(),
             merge_strategy: None,
+            transcript_total: 0,
             transcript: Vec::new(),
         }
     }

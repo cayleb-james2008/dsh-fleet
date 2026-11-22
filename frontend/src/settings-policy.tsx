@@ -72,12 +72,12 @@ export function PolicyTesterSection({
         <div className="flex items-center justify-between gap-2">
           <h3 className="flex items-center gap-1.5 text-sm font-medium text-ink">
             <FlaskConical className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
-            <span>Live Rune policy tester</span>
+            <span>Policy tester</span>
           </h3>
           {result && (
             <Pill variant={result.warnings.length ? "secondary" : "success"} className="px-2 py-0.5 font-mono text-xs">
               <PillIndicator variant={result.warnings.length ? "warning" : "success"} />
-              <span>{result.source === "server" ? "live Rune" : "policy preview"}</span>
+              <span>{result.source === "server" ? "live rules" : "policy preview"}</span>
             </Pill>
           )}
         </div>

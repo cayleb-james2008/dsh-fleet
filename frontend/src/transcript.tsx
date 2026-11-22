@@ -90,7 +90,15 @@ export function VirtualizedTranscript({
             ? ((raw as Record<string, unknown>).lines as unknown[])
             : null;
         if (arr) {
-          setFullLines(arr.map((x) => (typeof x === "string" ? x : String(x ?? ""))));
+          setFullLines(
+            arr.map((x) => {
+              if (typeof x === "string") return x;
+              if (x && typeof x === "object" && "text" in x) {
+                return String((x as { text?: unknown }).text ?? "");
+              }
+              return String(x ?? "");
+            }),
+          );
         }
       }
     } catch {
