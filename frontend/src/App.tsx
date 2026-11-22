@@ -1,4 +1,4 @@
-// Fleet v0.5.0: Parallel Coding-Agent War Room & Mission Control Board.
+// Fleet v0.8.0: Parallel Coding-Agent War Room & Mission Control Board.
 // Top Command Bar (Cmd+K, Search, Needs-you Inbox, New/Batch Session, Settings — NO top-bar theme toggle)
 // -> Update Strip -> Scan Strip (Concurrency active/max_parallel + Live SSE status + Tremor Tracker)
 // -> Hero Verified Receipt -> Filter & Multi-Select Bulk Strip -> Three-Lane Board + Split-Pane Inspector.
@@ -56,6 +56,7 @@ import {
   supportsV050,
   supportsV060,
   supportsV070,
+  VERSION_URL,
   type BoardMetrics,
   type PlaybookTemplate,
   type Policy,
@@ -622,7 +623,7 @@ export function App() {
             <h1 className="font-heading text-[20px] font-medium tracking-[-0.025em] text-ink">Fleet</h1>
             {upd.version && (
               <a
-                href={`https://github.com/cayleb-james2008/dsh-fleet/releases/tag/v${upd.version}`}
+                href={`${VERSION_URL}${upd.version}`}
                 target="_blank"
                 rel="noopener"
                 className="hidden min-h-8 items-center rounded-chip bg-track px-2 font-mono text-xs text-ink-2 outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-ring md:inline-flex"
@@ -1448,11 +1449,11 @@ function WebEngineSettingsSection({ onChanged }: { onChanged: () => void }) {
     setConnBusy(false);
     setStatus(handle.getStatus());
     if (res.ok) {
-      toast.success(enable ? "Connected to local fleet-rs." : "Switched to Browser Worktree Engine.");
+      toast.success(enable ? "Connected to local Fleet." : "Switched to Browser Worktree Engine.");
       onChanged();
     } else {
-      setConnMsg(res.error || "Could not reach local fleet-rs.");
-      toast.error(res.error || "Could not reach local fleet-rs.");
+      setConnMsg(res.error || "Could not reach local Fleet.");
+      toast.error(res.error || "Could not reach local Fleet.");
     }
   };
 
@@ -1489,7 +1490,7 @@ function WebEngineSettingsSection({ onChanged }: { onChanged: () => void }) {
         <div className="flex items-center justify-between gap-2">
           <h3 className="flex items-center gap-1.5 text-sm font-medium text-ink">
             <Plug className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
-            <span>Connect to local fleet-rs</span>
+            <span>Connect to local Fleet</span>
           </h3>
           <Pill variant={status.mode === "local" ? "success" : "secondary"} className="px-2 py-0.5 text-xs">
             <PillIndicator variant={status.mode === "local" ? "success" : "info"} />
@@ -1497,7 +1498,7 @@ function WebEngineSettingsSection({ onChanged }: { onChanged: () => void }) {
           </Pill>
         </div>
         <p className="text-xs leading-relaxed text-ink-3">
-          Run real CLI agents on your machine with <span className="font-mono text-ink-2">fleet-rs</span>, or keep running real git worktrees, DAG dependencies, and Blob Web Worker check pipelines directly in this browser.
+          Run real CLI agents on your machine with <span className="font-mono text-ink-2">fleet</span>, or keep running real git worktrees, DAG dependencies, and Blob Web Worker check pipelines directly in this browser.
         </p>
         <div className="space-y-1.5">
           <label htmlFor="local-fleet-url" className="block text-xs font-medium text-ink-2">
@@ -1520,7 +1521,7 @@ function WebEngineSettingsSection({ onChanged }: { onChanged: () => void }) {
             </Button>
           ) : (
             <Button size="sm" variant="outline" disabled={connBusy} onClick={() => void connectLocal(true)} className="max-md:min-h-11 max-md:px-4">
-              {connBusy ? "Connecting..." : "Connect to local fleet-rs"}
+              {connBusy ? "Connecting..." : "Connect to local Fleet"}
             </Button>
           )}
           <a

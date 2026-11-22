@@ -311,7 +311,7 @@ export type UpdateState = {
   checked_at?: number | null;
 };
 
-export const VERSION_URL = "https://github.com/cayleb-james2008/dsh-fleet/releases/tag/v";
+export const VERSION_URL = "https://github.com/cayleb-james2008/fleet/releases/tag/v";
 const LOCAL_PLAYBOOKS_KEY = "fleet-playbooks-v1";
 
 export const DEFAULT_PLAYBOOKS: PlaybookTemplate[] = [
@@ -1540,7 +1540,7 @@ export function buildLocalPrPreview(s: Session): PrPreview {
     head_branch: headBranch,
     gh_available: false,
     gh_status: isWebEngineMode()
-      ? "Standalone browser preview — copy Markdown or connect local fleet-rs with gh CLI to publish."
+      ? "Standalone browser preview — copy Markdown or connect local Fleet with gh CLI to publish."
       : "PR preview generated locally (upgrade to Fleet v0.7.0+ for live gh CLI creation).",
     can_create: isWebEngineMode(),
     warnings,

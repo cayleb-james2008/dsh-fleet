@@ -1,20 +1,24 @@
-# Fleet front end: design (v0.7.0 Mission Control Board)
+# Fleet front end: design (v0.8.0 Mission Control Board)
 
-Status: v0.7.0 complete. Built on the House Frontend system (`JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md`), self-hosted **Geist** and **Geist Mono** (`frontend/src/fonts/*.woff2`), light default + full dark parity (`frontend/src/theme.css`).
+Status: v0.8.0 complete. Built on the House Frontend system (`JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md`), self-hosted **Geist** and **Geist Mono** (`frontend/src/fonts/*.woff2`), light default + full dark parity (`frontend/src/theme.css`).
 
-## What v0.7.0 adds
+## What v0.8.0 adds
+
+- **Full `Fleet` Rebrand**: clean `Fleet` branding across all UI headers, modals, release URLs (`cayleb-james2008/fleet`), local Fleet connector copy, and standalone live web bundle (`shared-live-web/fleet/index.html`), with zero legacy names or internal jargon (`#155`, `#67` Settings-only Light/Dark preserved).
+
+## What v0.7.0 added
 
 - **Interactive Multi-Wave DAG Dependency Visualizer** (`frontend/src/dag-graph.tsx`): `Board` / `DAG Graph` `SegmentedControl` toggle (+ `g` shortcut & `Cmd+K` command), topological wave columns, status rails, SVG directed cubic Bezier dependency arrows, and click-node -> Session Inspector navigation.
 - **PR Preview & Confirmation-Gated Create PR Modal** (`frontend/src/pr-modal.tsx`): structured PR title & copyable Markdown body (`GET /api/sessions/:id/pr-preview`), draft toggle, explicit confirmation checkbox gating `POST /api/sessions/:id/pr` (`confirm: true`), mounted outside Vaul `<Drawer.Content>` for reliable `390x844` mobile taps.
 - **Worktrees Inspector & Budget Guardrails** (`frontend/src/settings-policy.tsx`, `frontend/src/board.tsx`): live `Daily budget` chip in `BoardMetricsStrip`, `Budget guardrails` panel with GPU-composited `scaleX` progress bar inside Settings, and per-worktree `Worktrees inspector` (`GET/DELETE /api/repos/worktrees`) showing main/active/orphan/dirty status with inline-confirmed targeted pruning.
-- **Standalone Browser Bundle v0.7.0** (`shared-live-web/dsh-fleet/index.html`): full browser-only parity for DAG Graph, PR Preview + dry-run confirmation, Worktrees Inspector with orphan prune, and Budget Guardrails with zero external requests.
+- **Standalone Browser Bundle** (`shared-live-web/fleet/index.html`): full browser-only parity for DAG Graph, PR Preview + dry-run confirmation, Worktrees Inspector with orphan prune, and Budget Guardrails with zero external requests.
 
 ## What v0.6.0 added
 
 - **Board Telemetry Strip** (`GET /api/metrics`): compact live strip showing First-pass %, Auto-healed count + effective pass rate, Median check duration, Active/Max parallel slots (+ queued/blocked), and an interactive `By repo (N)` popover breakdown.
 - **Autonomous Auto-Heal Badges & Timeline** (`auto_heal_attempt` SSE): live `Healed N/M` / `Auto-healing N/M` badges across session cards, hero verified receipt, and inspector header, plus an expandable `Auto-heal timeline` inside the Receipt tab showing each attempt's failing step, stderr tail, elapsed time, and diagnostic steer prompt (zero native `<details>`).
 - **Reusable Playbooks & Auto-Heal Budget** (`GET/POST/DELETE /api/templates`): Playbook selector bar with inline `Save as playbook` and custom delete inside the Composer, `auto_steer_budget` input, and a `Playbooks` section in the `Cmd+K` Command Palette.
-- **Standalone Browser Bundle v0.6.0** (`shared-live-web/dsh-fleet/index.html`): full browser-only parity including in-browser autonomous Auto-Heal loop with identical-error guard, live metrics, and IndexedDB-backed Playbook Templates CRUD.
+- **Standalone Browser Bundle v0.6.0** (`shared-live-web/fleet/index.html`): full browser-only parity including in-browser autonomous Auto-Heal loop with identical-error guard, live metrics, and IndexedDB-backed Playbook Templates CRUD.
 
 ## What v0.5.0 added
 
@@ -38,8 +42,8 @@ Questions the first screen answers (`data-answers` / `data-answers-via` in the D
 
 ## Region map
 
-- **Top Command Bar** (sticky): `Fleet` wordmark, version chip (`v0.6.0`), desktop `Check for updates` icon button (loopback-only), `Show update` button when an available update is dismissed, `/` search field (`InputGroup` + `Kbd` `/`) filtering by task/project/branch, `Needs you` Inbox `Popover` (live `/api/inbox` count, `View session`, `Retry`, `Go to Needs you`), `New session` `MorphingDialog` (`GET /api/repos` repository picker, Playbooks bar, auto-derived project basename, `Cmd/Ctrl+Enter` dispatch), and `Engines and settings` Vaul right-sheet trigger (`#settings-open`).
-- **Engines and Settings Sheet (`#settings`)**: Light/Dark `SegmentedControl` (`id="themeBtn"`, `aria-label="Light"` / `"Dark"`) under **Appearance** (kept out of the top bar), policy rules summary, detected CLI engines on PATH, live default-engine and per-engine model routing (`GET/POST /api/config`), and updates controls (plus Browser Worktree Engine / Local `fleet-rs` / optional `sessionStorage` BYOK controls in the standalone web bundle).
+- **Top Command Bar** (sticky): `Fleet` wordmark, version chip (`v0.8.0`), desktop `Check for updates` icon button (loopback-only), `Show update` button when an available update is dismissed, `/` search field (`InputGroup` + `Kbd` `/`) filtering by task/project/branch, `Needs you` Inbox `Popover` (live `/api/inbox` count, `View session`, `Retry`, `Go to Needs you`), `New session` `MorphingDialog` (`GET /api/repos` repository picker, Playbooks bar, auto-derived project basename, `Cmd/Ctrl+Enter` dispatch), and `Engines and settings` Vaul right-sheet trigger (`#settings-open`).
+- **Engines and Settings Sheet (`#settings`)**: Light/Dark `SegmentedControl` (`id="themeBtn"`, `aria-label="Light"` / `"Dark"`) under **Appearance** (kept out of the top bar), policy rules summary, detected CLI engines on PATH, live default-engine and per-engine model routing (`GET/POST /api/config`), and updates controls (plus Browser Worktree Engine / Local `Fleet` / optional `sessionStorage` BYOK controls in the standalone web bundle).
 - **Update Strip** (shown when an update is available, staged, or a manual check fails): loopback-only `Update now` with `"Update now downloads it, checks it, and replaces this app. Restart to start using it."`, developer-copy / non-loopback plain explanation, Cult UI `Expandable` release notes and raw failure diagnostics (zero native `<details>`), and deterministic focus transitions (`busy` -> status line, `staged` -> `Restart now`, `Dismiss` -> `Show update`).
 - **Scan Strip**: four `SlidingNumber` counters (`Sessions`, `Needs you`, `Working`, `Verified` — skeleton placeholders before initial fetch so unreachable never flashes fake zeros), Kibo UI `AvatarStack` for concurrent running agents, and Tremor 32-session outcome `Tracker`.
 - **Latest Verified Receipt Hero**: Fleet's defining signature object — measured corner ticks, sage `Latest verified receipt` `Pill`, project & branch chips, task headline in Geist 500, check output receipt line, Geist Mono diff stats (`files`, `+added`, `−removed`), `verified by: <check command>`, and 1-click `Inspect receipt`, `View diff`, and `Merge` (with inline safety confirmation).

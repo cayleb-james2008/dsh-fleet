@@ -1,6 +1,6 @@
 # Role Coverage — House Frontend Libraries in Fleet
 
-Every one of the eight House Frontend libraries serves its intended role on the Fleet v0.7.0 Mission Control Board (`0` "no need here" rows).
+Every one of the eight House Frontend libraries serves its intended role on the Fleet v0.8.0 Mission Control Board (`0` "no need here" rows).
 
 | Library | Need of this product | Part used and its file | If "no need here": why |
 | --- | --- | --- | --- |

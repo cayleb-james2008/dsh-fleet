@@ -14,7 +14,18 @@ export const E2E = path.dirname(fileURLToPath(import.meta.url)), ROOT = path.res
 export const OUT = path.join(E2E, '.out'), RUN = path.join(OUT, 'run')
 const STATE = path.join(RUN, 'ports.json'), FIX = path.join(E2E, 'fixtures')
 const AGENT = path.join(RUN, 'agent.sh')
-const BIN = path.join(process.env.CARGO_TARGET_DIR || path.join(ROOT, 'target'), 'debug/fleet-rs')
+function resolveBin() {
+  const targetDir = process.env.CARGO_TARGET_DIR || path.join(ROOT, 'target')
+  const cargoToml = fs.existsSync(path.join(ROOT, 'Cargo.toml')) ? fs.readFileSync(path.join(ROOT, 'Cargo.toml'), 'utf8') : ''
+  const preferFleet = /name\s*=\s*"fleet"/.test(cargoToml)
+  const fleetBin = path.join(targetDir, 'debug/fleet')
+  const legacyBin = path.join(targetDir, 'debug/fleet-rs')
+  if (preferFleet && fs.existsSync(fleetBin)) return fleetBin
+  if (fs.existsSync(legacyBin)) return legacyBin
+  if (fs.existsSync(fleetBin)) return fleetBin
+  return preferFleet ? fleetBin : legacyBin
+}
+const BIN = () => resolveBin()
 // Playwright comes from the frontend's own devDependencies; the browser is the installed Chrome for Testing build.
 export const CHROME = process.env.E2E_CHROME || path.join(os.homedir(), '.cache/ms-playwright/chromium-1234/chrome-linux64/chrome')
 export const launch = (opts = {}) => chromium.launch({ headless: true, executablePath: CHROME, ...opts })
@@ -79,7 +90,7 @@ export async function start({ fresh = false } = {}) {
   fs.mkdirSync(RUN, { recursive: true })
   if (!st) { st = { app: await pickPort([]) }; fs.writeFileSync(STATE, JSON.stringify(st)) }
   BASE = `http://127.0.0.1:${st.app}/`
-  await kill('app', BIN); await killAgents()
+  await kill('app', BIN()); await killAgents()
   for (let i = 0; i < 20 && await listening(st.app); i++) await sleep(200)
   if (await listening(st.app)) throw new Error(`port ${st.app} is still held`)
   if (fresh || !fs.existsSync(path.join(RUN, 'data'))) {
@@ -93,7 +104,7 @@ export async function start({ fresh = false } = {}) {
   for (const d of ['home', 'tmp', 'agents']) fs.mkdirSync(path.join(RUN, d), { recursive: true })
   fs.copyFileSync(path.join(FIX, 'agent.sh'), AGENT); fs.chmodSync(AGENT, 0o755)
   const env = { PATH: '/usr/bin:/bin', HOME: path.join(RUN, 'home'), TMPDIR: path.join(RUN, 'tmp'), TZ: 'UTC', LANG: 'C.UTF-8' }
-  launchProc('app', BIN, ['policies.rn'], { ...env, FLEET_AGENT: AGENT, FLEET_DATA: path.join(RUN, 'data'), PORT: String(st.app), FLEET_UPDATE_MODE: 'off', FLEET_NO_OPEN: '1' })
+  launchProc('app', BIN(), ['policies.rn'], { ...env, FLEET_AGENT: AGENT, FLEET_DATA: path.join(RUN, 'data'), PORT: String(st.app), FLEET_UPDATE_MODE: 'off', FLEET_NO_OPEN: '1' })
   for (let i = 0; i < 50; i++) {
     if (await fetch(BASE + 'api/policy').then(r => r.ok, () => false)) return BASE
     await sleep(300)
@@ -125,7 +136,7 @@ async function killAgents() {
 }
 
 export async function stop() {
-  await kill('app', BIN); await killAgents()
+  await kill('app', BIN()); await killAgents()
   fs.rmSync(STATE, { force: true }); st = null; BASE = null
 }
 

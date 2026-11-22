@@ -189,8 +189,8 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
 {
   const { ctx, p } = await open(1440, 900, 'light', { acceptDownloads: true })
   let sseHits = 0
-  // v0.7.0 DAG Graph, PR Preview & Create PR, Worktrees Inspector, Budget Guardrails, Auto-Heal, Playbooks, Zero Rune Jargon
-  await p.route('**/api/version', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ name: 'fleet-rs', version: '0.7.0' }) }))
+  // v0.8.0 Fleet Rebrand + DAG Graph, PR Preview & Create PR, Worktrees Inspector, Budget Guardrails, Auto-Heal, Playbooks
+  await p.route('**/api/version', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ name: 'fleet', version: '0.8.0' }) }))
   await p.route('**/api/metrics', r => r.fulfill({
     status: 200,
     contentType: 'application/json',
@@ -424,9 +424,15 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
     `nodes=${dagNodes} edges=${dagEdges}`)
   await p.locator('[data-testid="view-toggle-board"]').click(); await p.waitForTimeout(200)
 
-  // Zero user-facing "Rune" jargon check (#155)
+  // Zero user-facing "Rune" jargon and zero legacy DSH-Fleet / DeepSeek Harness branding check
   const visibleBodyText = await p.locator('body').innerText()
+  const pageTitle = await p.title()
+  const versionHref = (await p.locator('header a[href*="/releases/tag/"]').first().getAttribute('href')) || ''
   ok('Zero user-facing Rune jargon rendered on board or inspector', !/\brune\b/i.test(visibleBodyText))
+  ok('Fleet rebrand clean: zero DSH-Fleet, DeepSeek Harness, or fleet-rs strings on board/title/release URL',
+    !/\bdsh[-_ ]?fleet\b|deepseek\s+harness|\bfleet-rs\b/i.test(`${pageTitle}\n${visibleBodyText}\n${versionHref}`) &&
+      versionHref.includes('cayleb-james2008/fleet/releases/tag/v0.8.0'),
+    `href=${versionHref}`)
 
   // Multi-select bulk bar + status filter
   await p.keyboard.press('Escape'); await p.waitForTimeout(250)

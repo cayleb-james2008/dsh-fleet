@@ -1,11 +1,12 @@
-// test-live-web.mjs: Comprehensive end-to-end verification of the standalone v0.7.0 browser-only
-// live web bundle (shared-live-web/dsh-fleet/index.html) across desktop 1440x900 and mobile 390x844
-// in both Light and Dark themes. Verifies Board/DAG Graph toggle + directed SVG arrows + node click,
-// PR Preview & confirmation-gated Create PR modal, Worktrees Inspector (GET/DELETE orphan prune),
-// Budget Guardrails, Board Metrics Strip, real Auto-Heal attempt recovery & timeline, Playbooks,
-// Batch fan-out, multi-step Blob Web Worker checks, Unified + Split Diff (zero cross-column bleed),
-// .patch download, keyboard nav, Policy Tester, IndexedDB persistence, Settings-only Light/Dark
-// mobile tap, ZERO fixture pills, ZERO user-facing Rune jargon, ZERO external network requests.
+// test-live-web.mjs: Comprehensive end-to-end verification of the standalone v0.8.0 browser-only
+// live web bundle (shared-live-web/fleet/index.html) across desktop 1440x900 and mobile 390x844
+// in both Light and Dark themes. Verifies Fleet rebrand (0 dsh-fleet / DeepSeek Harness / fleet-rs
+// / Rune jargon), Board/DAG Graph toggle + directed SVG arrows + node click, PR Preview &
+// confirmation-gated Create PR modal, Worktrees Inspector (GET/DELETE orphan prune), Budget
+// Guardrails, Board Metrics Strip, real Auto-Heal recovery & timeline, Playbooks, Batch fan-out,
+// multi-step Blob Web Worker checks, Unified + Split Diff (zero cross-column bleed), .patch
+// download, keyboard nav, Policy Tester, IndexedDB persistence, Settings-only Light/Dark mobile
+// tap, ZERO fixture pills, ZERO external network requests.
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
@@ -14,7 +15,7 @@ import { chromium } from "playwright-core";
 
 const BUNDLE =
   process.env.LIVE_WEB_FILE ||
-  "/home/cayleb/Work/scratch/swarm-v080/shared-live-web/dsh-fleet/index.html";
+  "/home/cayleb/Work/scratch/swarm-v080/shared-live-web/fleet/index.html";
 const SHOT_DIR =
   process.env.SHOT_DIR ||
   "/home/cayleb/.gemini/antigravity/brain/4d606d0e-862d-43e1-b40f-5f32ac566aa0";
@@ -72,6 +73,8 @@ try {
   await p.waitForTimeout(1600);
 
   const bodyText = await p.locator("body").innerText();
+  const docTitle = await p.title();
+  const verHref = (await p.locator('header a[href*="/releases/tag/"]').first().getAttribute("href")) || "";
   ok(
     "zero fixture pills or placeholder labels on live web bundle",
     !/\bfixture\b|example fixture|recorded read-only replay/i.test(bodyText),
@@ -81,6 +84,12 @@ try {
     "zero user-facing Rune jargon on live web bundle (#155)",
     !/\brune\b/i.test(bodyText),
     bodyText.match(/\brune\b/i)?.[0] || "clean",
+  );
+  ok(
+    "Fleet v0.8.0 rebrand clean: zero dsh-fleet, DeepSeek Harness, or fleet-rs strings on board/title/release URL",
+    !/\bdsh[-_ ]?fleet\b|deepseek\s+harness|\bfleet-rs\b/i.test(`${docTitle}\n${bodyText}\n${verHref}`) &&
+      verHref.includes("cayleb-james2008/fleet/releases/tag/v0.8.0"),
+    `title=${docTitle} href=${verHref}`,
   );
   ok(
     "initial 4 real browser worktree sessions settle with concurrency slots indicator",
@@ -106,7 +115,7 @@ try {
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
   );
   ok("1440 desktop has 0px horizontal overflow", overflow1440 <= 0, `overflow=${overflow1440}`);
-  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v070-live-1440-light.png") });
+  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v080-live-1440-light.png") });
 
   // Switch to interactive Multi-Wave DAG Graph view -> verify SVG edges + waves + click node -> Inspector
   await p.locator('[data-testid="view-toggle-dag"]').click();
@@ -116,7 +125,7 @@ try {
   const dagOverflow = await p.evaluate(
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
   );
-  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v070-dag-graph-1440-light.png") });
+  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v080-dag-graph-1440-light.png") });
   await p.locator('[data-testid="dag-node"][data-session-id="s-002"]').click();
   await p.waitForTimeout(350);
   const inspector = p.locator('aside[aria-label="Session inspector"]');
@@ -151,7 +160,7 @@ try {
       prStatusText.includes("Dry-run PR verified"),
     `disabledBefore=${prDisabledBefore}`,
   );
-  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v070-pr-preview-1440-light.png") });
+  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v080-pr-preview-1440-light.png") });
   await p.keyboard.press("Escape");
   await p.waitForTimeout(250);
 
@@ -260,7 +269,10 @@ try {
   await p.waitForTimeout(400);
   const settings = p.locator("#settings");
   const settingsText = await settings.innerText();
-  ok("Settings sheet has zero Rune jargon (#155)", !/\brune\b/i.test(settingsText));
+  ok(
+    "Settings sheet has zero Rune jargon and zero legacy DSH-Fleet / fleet-rs branding",
+    !/\brune\b|\bdsh[-_ ]?fleet\b|deepseek\s+harness|\bfleet-rs\b/i.test(settingsText),
+  );
 
   const budgetText = await settings.locator('[data-testid="budget-guardrails"]').innerText();
   ok(
@@ -281,7 +293,7 @@ try {
   );
   await settings.locator('[data-testid="budget-guardrails"]').scrollIntoViewIfNeeded();
   await p.waitForTimeout(150);
-  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v070-settings-worktrees-budget-1440-light.png") });
+  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v080-settings-worktrees-budget-1440-light.png") });
 
   await settings.getByRole("button", { name: "Test policy" }).click();
   await p.waitForTimeout(250);
@@ -299,7 +311,7 @@ try {
   await p.waitForTimeout(300);
   const darkAttr = await p.evaluate(() => document.documentElement.dataset.theme);
   ok("Dark theme activates from Settings drawer", darkAttr === "dark");
-  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v070-live-1440-dark.png") });
+  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v080-live-1440-dark.png") });
   await ctx.close();
 
   // 2. Real Mobile 390x844 Settings Tap Test + DAG Graph mobile scroll check + Light & Dark screenshots
@@ -322,7 +334,7 @@ try {
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
   );
   ok("390x844 mobile has 0px horizontal overflow", mOverflow <= 0, `overflow=${mOverflow}`);
-  await mp.screenshot({ path: path.join(SHOT_DIR, "fleet-v070-live-390-light.png") });
+  await mp.screenshot({ path: path.join(SHOT_DIR, "fleet-v080-live-390-light.png") });
 
   const bgLum = () =>
     mp.evaluate(() => {
@@ -341,7 +353,7 @@ try {
   const lumDark = await bgLum();
   await mp.locator('#settings button[aria-label="Close settings"]').tap();
   await mp.waitForTimeout(350);
-  await mp.screenshot({ path: path.join(SHOT_DIR, "fleet-v070-live-390-dark.png") });
+  await mp.screenshot({ path: path.join(SHOT_DIR, "fleet-v080-live-390-dark.png") });
   ok(
     "390x844 real mobile Settings tap toggles Dark theme cleanly",
     mThemeDark === "dark" && lumDark < lumLight,
