@@ -62,7 +62,7 @@ impl Mode {
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Executable name, for example `fleet-rs`; asset names start with it.
+    /// Executable name, for example `fleet`; asset names start with it.
     pub bin: &'static str,
     /// Version of the running build (`CARGO_PKG_VERSION`).
     pub current: &'static str,
@@ -694,33 +694,33 @@ mod tests {
 
     #[test]
     fn sums_parse_and_hashes_are_sha256() {
-        let sums = format!("{}  other\n{}  *fleet-rs-x\n", "a".repeat(64), "B".repeat(64));
-        assert_eq!(hash_from_sums(&sums, "fleet-rs-x").unwrap(), "b".repeat(64));
+        let sums = format!("{}  other\n{}  *fleet-x\n", "a".repeat(64), "B".repeat(64));
+        assert_eq!(hash_from_sums(&sums, "fleet-x").unwrap(), "b".repeat(64));
         assert!(hash_from_sums(&sums, "missing").is_none());
-        assert!(hash_from_sums("short  fleet-rs-x", "fleet-rs-x").is_none());
+        assert!(hash_from_sums("short  fleet-x", "fleet-x").is_none());
         assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     }
 
     #[test]
     fn release_json_needs_a_platform_asset_and_ignores_prereleases() {
-        let name = asset_name("fleet-rs");
+        let name = asset_name("fleet");
         let ok = json!({"tag_name": "v0.3.0", "body": "notes", "html_url": "u", "assets": [
             {"name": name, "browser_download_url": "https://x/a", "size": 3, "digest": "sha256:ABCDEF"},
             {"name": "SHA256SUMS", "browser_download_url": "https://x/s"}]});
-        let r = parse_release(&ok, "fleet-rs").unwrap();
+        let r = parse_release(&ok, "fleet").unwrap();
         assert_eq!((r.version.as_str(), r.asset_size, r.digest.as_deref()), ("0.3.0", Some(3), Some("abcdef")));
         assert!(r.sums_url.is_some());
-        assert!(parse_release(&json!({"tag_name": "v0.3.0", "prerelease": true, "assets": []}), "fleet-rs").is_err());
-        assert!(parse_release(&json!({"tag_name": "v0.3.0", "assets": [{"name": "other"}]}), "fleet-rs").unwrap_err().contains("no build for this platform"));
-        assert!(parse_release(&json!({"tag_name": "weekly", "assets": []}), "fleet-rs").is_err());
+        assert!(parse_release(&json!({"tag_name": "v0.3.0", "prerelease": true, "assets": []}), "fleet").is_err());
+        assert!(parse_release(&json!({"tag_name": "v0.3.0", "assets": [{"name": "other"}]}), "fleet").unwrap_err().contains("no build for this platform"));
+        assert!(parse_release(&json!({"tag_name": "weekly", "assets": []}), "fleet").is_err());
     }
 
     #[test]
     fn the_release_page_link_is_only_ever_an_http_or_https_url() {
-        let name = asset_name("fleet-rs");
+        let name = asset_name("fleet");
         let with = |u: Value| {
             let v = json!({"tag_name": "v0.3.0", "html_url": u, "assets": [{"name": name, "browser_download_url": "https://x/a"}]});
-            parse_release(&v, "fleet-rs").unwrap().url
+            parse_release(&v, "fleet").unwrap().url
         };
         assert_eq!(with(json!("https://github.com/o/r/releases/tag/v0.3.0")), "https://github.com/o/r/releases/tag/v0.3.0");
         for bad in ["javascript:alert(1)", "JaVaScRiPt:alert(1)", "data:text/html,<b>x</b>", "file:///etc/passwd", "//evil.example/x", " https://x", "u"] {
@@ -738,7 +738,7 @@ mod tests {
     fn mock(version: &str, asset: Vec<u8>, sums_hash: Option<String>, declared_size: Option<usize>) -> Mock {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let name = asset_name("fleet-rs");
+        let name = asset_name("fleet");
         let sums = sums_hash.map(|h| format!("{h}  {name}\n"));
         let version = version.to_string();
         std::thread::spawn(move || {
@@ -787,8 +787,8 @@ mod tests {
     }
 
     fn fake_exe(dir: &Path, version: &str) -> PathBuf {
-        let p = dir.join("fleet-rs");
-        std::fs::write(&p, format!("#!/bin/sh\necho 'fleet-rs {version}'\n")).unwrap();
+        let p = dir.join("fleet");
+        std::fs::write(&p, format!("#!/bin/sh\necho 'fleet {version}'\n")).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -799,7 +799,7 @@ mod tests {
 
     fn updater(m: &Mock, exe: &Path, mode: Mode, may_apply: bool) -> Updater {
         Updater::new(Config {
-            bin: "fleet-rs",
+            bin: "fleet",
             current: "0.2.0",
             repo: "o/r".to_string(),
             api: format!("http://127.0.0.1:{}", m.port),
@@ -811,7 +811,7 @@ mod tests {
     }
 
     fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fleet-rs-upd-{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("fleet-upd-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -837,7 +837,7 @@ mod tests {
     fn a_newer_release_is_reported_downloaded_verified_and_swapped_in() {
         let dir = tmp("ok");
         let exe = fake_exe(&dir, "0.2.0");
-        let new = b"#!/bin/sh\necho 'fleet-rs 0.3.0'\n".to_vec();
+        let new = b"#!/bin/sh\necho 'fleet 0.3.0'\n".to_vec();
         let m = mock("0.3.0", new.clone(), Some(sha256_hex(&new)), None);
         let u = updater(&m, &exe, Mode::Notify, true);
         let snap = u.check_now();
@@ -845,7 +845,7 @@ mod tests {
         assert_eq!(snap["notes"], json!("What is new"));
         assert_eq!(u.apply().unwrap(), "0.3.0");
         assert_eq!(std::fs::read(&exe).unwrap(), new, "the installed file is now the release");
-        assert!(!dir.join("fleet-rs.new").exists(), "no staging file is left behind");
+        assert!(!dir.join("fleet.new").exists(), "no staging file is left behind");
         assert_eq!(u.snapshot()["staged"], json!("0.3.0"));
         assert_eq!(u.snapshot()["can_apply"], json!(false), "already staged");
     }
@@ -856,14 +856,14 @@ mod tests {
         let dir = tmp("badsum");
         let exe = fake_exe(&dir, "0.2.0");
         let before = std::fs::read(&exe).unwrap();
-        let new = b"#!/bin/sh\necho 'fleet-rs 0.3.0'\n".to_vec();
+        let new = b"#!/bin/sh\necho 'fleet 0.3.0'\n".to_vec();
         let m = mock("0.3.0", new, Some(sha256_hex(b"something else")), None);
         let u = updater(&m, &exe, Mode::Notify, true);
         u.check_now();
         let e = u.apply().unwrap_err();
         assert!(e.contains("checksum"), "{e}");
         assert_eq!(std::fs::read(&exe).unwrap(), before);
-        assert!(!dir.join("fleet-rs.new").exists());
+        assert!(!dir.join("fleet.new").exists());
     }
 
     #[cfg(unix)]
@@ -872,7 +872,7 @@ mod tests {
         let dir = tmp("wrongver");
         let exe = fake_exe(&dir, "0.2.0");
         let before = std::fs::read(&exe).unwrap();
-        let new = b"#!/bin/sh\necho 'fleet-rs 9.9.9'\n".to_vec();
+        let new = b"#!/bin/sh\necho 'fleet 9.9.9'\n".to_vec();
         let m = mock("0.3.0", new.clone(), Some(sha256_hex(&new)), None);
         let u = updater(&m, &exe, Mode::Notify, true);
         u.check_now();
@@ -886,7 +886,7 @@ mod tests {
     fn a_release_without_checksums_a_size_mismatch_and_old_releases_are_refused() {
         let dir = tmp("refuse");
         let exe = fake_exe(&dir, "0.2.0");
-        let new = b"#!/bin/sh\necho 'fleet-rs 0.3.0'\n".to_vec();
+        let new = b"#!/bin/sh\necho 'fleet 0.3.0'\n".to_vec();
         let no_sums = mock("0.3.0", new.clone(), None, None);
         let u = updater(&no_sums, &exe, Mode::Notify, true);
         u.check_now();
@@ -906,14 +906,14 @@ mod tests {
         let dir = tmp("modes");
         let exe = fake_exe(&dir, "0.2.0");
         // No server at all: any network call would error, and off mode records nothing.
-        let off = Updater::new(Config { bin: "fleet-rs", current: "0.2.0", repo: "o/r".into(), api: "http://127.0.0.1:1".into(), mode: Mode::Off, exe: exe.clone(), allow_dev: false, may_apply: true });
+        let off = Updater::new(Config { bin: "fleet", current: "0.2.0", repo: "o/r".into(), api: "http://127.0.0.1:1".into(), mode: Mode::Off, exe: exe.clone(), allow_dev: false, may_apply: true });
         let snap = off.check_now();
         assert_eq!((snap["checked_at"].clone(), snap["error"].clone()), (Value::Null, Value::Null));
         assert!(off.apply().unwrap_err().contains("turned off"));
         let shared = Updater::new(Config { may_apply: false, mode: Mode::Notify, ..off.cfg.clone() });
         assert!(shared.apply().unwrap_err().contains("operator"));
         assert!(shared.restart().unwrap_err().contains("operator"));
-        let dev = Updater::new(Config { exe: dir.join("target").join("debug").join("fleet-rs"), mode: Mode::Notify, ..off.cfg.clone() });
+        let dev = Updater::new(Config { exe: dir.join("target").join("debug").join("fleet"), mode: Mode::Notify, ..off.cfg.clone() });
         assert_eq!(dev.snapshot()["dev_build"], json!(true));
         assert!(dev.apply().unwrap_err().contains("cargo-built"));
     }
@@ -922,7 +922,7 @@ mod tests {
     fn an_unreachable_or_insecure_api_reports_an_error_and_changes_nothing() {
         let dir = tmp("neterr");
         let exe = fake_exe(&dir, "0.2.0");
-        let down = Updater::new(Config { bin: "fleet-rs", current: "0.2.0", repo: "o/r".into(), api: "http://127.0.0.1:1".into(), mode: Mode::Notify, exe: exe.clone(), allow_dev: false, may_apply: true });
+        let down = Updater::new(Config { bin: "fleet", current: "0.2.0", repo: "o/r".into(), api: "http://127.0.0.1:1".into(), mode: Mode::Notify, exe: exe.clone(), allow_dev: false, may_apply: true });
         let snap = down.check_now();
         assert!(snap["error"].as_str().unwrap().contains("could not reach"), "{snap}");
         assert_eq!(snap["available"], json!(false));
@@ -973,7 +973,7 @@ mod tests {
         let exe = fake_exe(&dir, "0.2.0");
         let before = std::fs::read(&exe).unwrap();
         let cfg = Config {
-            bin: "fleet-rs",
+            bin: "fleet",
             current: "0.2.0",
             repo: "o/r".to_string(),
             api: DEFAULT_API.to_string(),
@@ -986,7 +986,7 @@ mod tests {
             version: "0.3.0".into(),
             url: String::new(),
             notes: String::new(),
-            asset_name: asset_name("fleet-rs"),
+            asset_name: asset_name("fleet"),
             asset_url: "http://127.0.0.1:1/dl/a".into(),
             asset_size: None,
             sums_url: Some("http://127.0.0.1:1/dl/SHA256SUMS".into()),
@@ -1002,7 +1002,7 @@ mod tests {
     fn two_simultaneous_applies_install_once_and_both_succeed() {
         let dir = tmp("race");
         let exe = fake_exe(&dir, "0.2.0");
-        let new = b"#!/bin/sh\necho 'fleet-rs 0.3.0'\n".to_vec();
+        let new = b"#!/bin/sh\necho 'fleet 0.3.0'\n".to_vec();
         let m = mock("0.3.0", new.clone(), Some(sha256_hex(&new)), None);
         let u = Arc::new(updater(&m, &exe, Mode::Notify, true));
         u.check_now();
@@ -1011,7 +1011,7 @@ mod tests {
         assert_eq!(a.join().unwrap().unwrap(), "0.3.0");
         assert_eq!(b.join().unwrap().unwrap(), "0.3.0");
         assert_eq!(std::fs::read(&exe).unwrap(), new);
-        assert!(!dir.join("fleet-rs.new").exists());
+        assert!(!dir.join("fleet.new").exists());
     }
 
     #[cfg(unix)]
@@ -1023,13 +1023,13 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         let exe = fake_exe(&sub, "0.2.0");
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let new = b"#!/bin/sh\necho 'fleet-rs 0.3.0'\n".to_vec();
+        let new = b"#!/bin/sh\necho 'fleet 0.3.0'\n".to_vec();
         let m = mock("0.3.0", new.clone(), Some(sha256_hex(&new)), None);
         let u = updater(&m, &exe, Mode::Notify, true);
         u.check_now();
         let e = u.apply().unwrap_err();
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(e.contains("cannot write fleet-rs.new"), "{e}");
+        assert!(e.contains("cannot write fleet.new"), "{e}");
         assert!(!e.contains("locked") && !e.contains("/tmp") && !e.contains("fleet-upd"), "{e}");
 
         // A build that echoes a long line reports only its first 60 characters.

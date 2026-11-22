@@ -17,7 +17,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Default per-step check timeout in seconds (matches `fleet-rs` default).
+/// Default per-step check timeout in seconds (matches `fleet` default).
 pub const DEFAULT_CHECK_TIMEOUT_SECS: u64 = 1800;
 /// Hard ceiling on per-step timeout (one week) to prevent `Instant` overflow.
 pub const MAX_CHECK_TIMEOUT_SECS: u64 = 604_800;
@@ -504,7 +504,17 @@ fn kill_group(pid: u32) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn kill_group(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+}
+
+#[cfg(not(any(unix, windows)))]
 fn kill_group(_pid: u32) {}
 
 enum ProcEnd {
@@ -534,10 +544,16 @@ fn run_shell_bounded(
             lines: Vec::new(),
         };
     }
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(cmd_str)
-        .current_dir(workdir)
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", cmd_str]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(cmd_str);
+        c
+    };
+    cmd.current_dir(workdir)
         .env("PWD", workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -895,7 +911,11 @@ pub fn changed_files_between(
             "-c",
             "core.fsmonitor=false",
             "-c",
-            "core.hooksPath=/dev/null",
+            if cfg!(windows) {
+                "core.hooksPath=NUL"
+            } else {
+                "core.hooksPath=/dev/null"
+            },
             "diff",
             "--no-ext-diff",
             "--no-textconv",
@@ -947,7 +967,11 @@ pub fn verify_worktree_scope(
             "-c",
             "core.fsmonitor=false",
             "-c",
-            "core.hooksPath=/dev/null",
+            if cfg!(windows) {
+                "core.hooksPath=NUL"
+            } else {
+                "core.hooksPath=/dev/null"
+            },
             "diff",
             "--no-ext-diff",
             "--no-textconv",
@@ -972,7 +996,11 @@ pub fn verify_worktree_scope(
             "-c",
             "core.fsmonitor=false",
             "-c",
-            "core.hooksPath=/dev/null",
+            if cfg!(windows) {
+                "core.hooksPath=NUL"
+            } else {
+                "core.hooksPath=/dev/null"
+            },
             "ls-files",
             "--others",
             "--exclude-standard",

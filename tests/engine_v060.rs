@@ -1,18 +1,18 @@
-//! Integration, edge-case, and scale tests for `v0.6.0` DSH-Fleet engines:
+//! Integration, edge-case, and scale tests for `v0.6.0` Fleet engines:
 //! - `autoheal`: autonomous repair loop, diagnostic prompts, budget & identical-error loop guard
 //! - `templates`: reusable engineering playbooks, atomic persistence, corrupt-store recovery, DAG expansion
 //! - `metrics`: live board telemetry, pass-rate lift math, median latency, 2,000-session benchmark
 
-use fleet_rs::autoheal::{
+use fleet::autoheal::{
     build_heal_prompt, error_fingerprint, evaluate_auto_heal, heal_badge_label, should_auto_heal,
     strip_ansi_codes, FailedCheckContext, HealAttempt, HealDecision, HealSessionContext,
     HealStopReason,
 };
-use fleet_rs::checks::{CheckPipeline, CheckStep, StepStatus};
-use fleet_rs::metrics::{
+use fleet::checks::{CheckPipeline, CheckStep, StepStatus};
+use fleet::metrics::{
     compute_metrics, compute_metrics_with_capacity, BoardMetrics, RepoMetrics, SessionMetricInput,
 };
-use fleet_rs::templates::{default_templates, PlaybookInput, PlaybookTemplate, TemplateStore};
+use fleet::templates::{default_templates, PlaybookInput, PlaybookTemplate, TemplateStore};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

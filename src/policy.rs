@@ -1,4 +1,4 @@
-//! Rich Rune Policy Evaluator for `fleet-rs`.
+//! Rich Policy Rules Evaluator for `fleet`.
 //!
 //! Executes `policies.rn` inside the Rune VM to drive:
 //! - Parallel concurrency caps (`max_parallel`)

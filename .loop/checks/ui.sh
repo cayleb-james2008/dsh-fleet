@@ -11,7 +11,7 @@ cleanup() { for p in $PIDS; do kill -9 $p 2>/dev/null; done; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 export PATH="$HOME/.rust/bin:$PATH"
-BIN="${CARGO_TARGET_DIR:-./target}/debug/fleet-rs"
+BIN="${CARGO_TARGET_DIR:-./target}/debug/fleet"
 [ -x "$BIN" ] || cargo build >/dev/null 2>&1 || { echo "FAIL: cargo build"; exit 1; }
 FLEET_NO_OPEN=1 FLEET_DATA="$WORK/data" PORT=$PORT "$BIN" policies.rn > "$WORK/server.log" 2>&1 &
 PIDS="$PIDS $!"
