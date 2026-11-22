@@ -3789,7 +3789,10 @@ fn respond(
         // reach a handler: requiring JSON is what makes a drive-by POST from
         // another site impossible.
         error_response(415, "POST requires Content-Type: application/json")
-    } else if method == "POST" && !origin.is_empty() && !origin_is_local(origin) {
+    } else if matches!(method, "POST" | "DELETE" | "PUT" | "PATCH")
+        && !origin.is_empty()
+        && !origin_is_local(origin)
+    {
         error_response(403, "cross-origin requests are refused")
     } else {
         let route = path.split('?').next().unwrap_or("");
