@@ -1,8 +1,15 @@
-# Fleet front end: design (v0.5.0 Mission Control Board)
+# Fleet front end: design (v0.6.0 Mission Control Board)
 
-Status: v0.5.0 complete. Built on the House Frontend system (`JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md`), self-hosted **Geist** and **Geist Mono** (`frontend/src/fonts/*.woff2`), light default + full dark parity (`frontend/src/theme.css`).
+Status: v0.6.0 complete. Built on the House Frontend system (`JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md`), self-hosted **Geist** and **Geist Mono** (`frontend/src/fonts/*.woff2`), light default + full dark parity (`frontend/src/theme.css`).
 
-## What v0.5.0 adds
+## What v0.6.0 adds
+
+- **Board Telemetry Strip** (`GET /api/metrics`): compact live strip showing First-pass %, Auto-healed count + effective pass rate, Median check duration, Active/Max parallel slots (+ queued/blocked), and an interactive `By repo (N)` popover breakdown.
+- **Autonomous Auto-Heal Badges & Timeline** (`auto_heal_attempt` SSE): live `Healed N/M` / `Auto-healing N/M` badges across session cards, hero verified receipt, and inspector header, plus an expandable `Auto-heal timeline` inside the Receipt tab showing each attempt's failing step, stderr tail, elapsed time, and diagnostic steer prompt (zero native `<details>`).
+- **Reusable Playbooks & Auto-Heal Budget** (`GET/POST/DELETE /api/templates`): Playbook selector bar with inline `Save as playbook` and custom delete inside the Composer, `auto_steer_budget` input, and a `Playbooks` section in the `Cmd+K` Command Palette.
+- **Standalone Browser Bundle v0.6.0** (`shared-live-web/dsh-fleet/index.html`): full browser-only parity including in-browser autonomous Auto-Heal loop with identical-error guard, live metrics, and IndexedDB-backed Playbook Templates CRUD.
+
+## What v0.5.0 added
 
 - Live SSE stream (`EventSource('/api/events/stream')`) with automatic backoff polling fallback and header status indicator.
 - Virtualized searchable transcript viewer (`frontend/src/transcript.tsx`) smoothly handling 50,000+ lines (<150 mounted DOM rows), match navigation, and 1-click **Jump to first error**.
@@ -24,7 +31,7 @@ Questions the first screen answers (`data-answers` / `data-answers-via` in the D
 
 ## Region map
 
-- **Top Command Bar** (sticky): `Fleet` wordmark, version chip (`v0.4.0`), desktop `Check for updates` icon button (loopback-only), `Show update` button when an available update is dismissed, `/` search field (`InputGroup` + `Kbd` `/`) filtering by task/project/branch, `Needs you` Inbox `Popover` (live `/api/inbox` count, `View session`, `Retry`, `Go to Needs you`), `New session` `MorphingDialog` (`GET /api/repos` repository picker, auto-derived project basename, `Cmd/Ctrl+Enter` dispatch), and `Engines and settings` Vaul right-sheet trigger (`#settings-open`).
+- **Top Command Bar** (sticky): `Fleet` wordmark, version chip (`v0.6.0`), desktop `Check for updates` icon button (loopback-only), `Show update` button when an available update is dismissed, `/` search field (`InputGroup` + `Kbd` `/`) filtering by task/project/branch, `Needs you` Inbox `Popover` (live `/api/inbox` count, `View session`, `Retry`, `Go to Needs you`), `New session` `MorphingDialog` (`GET /api/repos` repository picker, Playbooks bar, auto-derived project basename, `Cmd/Ctrl+Enter` dispatch), and `Engines and settings` Vaul right-sheet trigger (`#settings-open`).
 - **Engines and Settings Sheet (`#settings`)**: Light/Dark `SegmentedControl` (`id="themeBtn"`, `aria-label="Light"` / `"Dark"`) under **Appearance** (kept out of the top bar), policy rules summary, detected CLI engines on PATH, live default-engine and per-engine model routing (`GET/POST /api/config`), and updates controls (plus Browser Worktree Engine / Local `fleet-rs` / optional `sessionStorage` BYOK controls in the standalone web bundle).
 - **Update Strip** (shown when an update is available, staged, or a manual check fails): loopback-only `Update now` with `"Update now downloads it, checks it, and replaces this app. Restart to start using it."`, developer-copy / non-loopback plain explanation, Cult UI `Expandable` release notes and raw failure diagnostics (zero native `<details>`), and deterministic focus transitions (`busy` -> status line, `staged` -> `Restart now`, `Dismiss` -> `Show update`).
 - **Scan Strip**: four `SlidingNumber` counters (`Sessions`, `Needs you`, `Working`, `Verified` — skeleton placeholders before initial fetch so unreachable never flashes fake zeros), Kibo UI `AvatarStack` for concurrent running agents, and Tremor 32-session outcome `Tracker`.
@@ -51,10 +58,8 @@ Full mapping in `../ROLE-COVERAGE.md` and motion preset table in `../ALIVE.md`:
 ## Verification gates
 
 - `cargo clippy --all-targets -- -D warnings`: 0 warnings
-- `cargo test`: 54 passed (45 unit + 9 CLI)
+- `cargo test`: 102 passed (18 lib + 60 bin + 9 CLI + 11 v0.5.0 engine + 4 v0.6.0 engine)
 - `bash .loop/verify`: 23/23 passed (including `verify2.sh`, `engines.sh`, `ui.sh`, `theme.sh`, `inbox.sh`, `proof.sh`)
-- `cd frontend && npm run check:ui`: `gate` 37/37, `replay` 6/6 (including Settings-only Light/Dark switch verification and repo picker)
-- `hallmark/scripts/sloplint.mjs --scope app --render`: 0 FAIL
-- `ultra-design/kit/replay.mjs`: PASS across malformed 200 + unreachable sweep + worst-case scenarios at `1440` and `390`
-- Real live-agent E2E (real `opencode` CLI, zero `FLEET_AGENT` shim): worktree edit, real check pass, real diff, real merge + worktree cleanup, and real failing check caught in `Needs you` -> `Steer` continuation -> verified `done`
-- Standalone functional web bundle (`shared-live-web/dsh-fleet/index.html`): real Web Worker check failures & passes, in-inspector branch file editing, real unified diff, real merge into `main`, IndexedDB persistence across reload, zero `fixture demo` pills
+- `cd frontend && npm run check:ui -- --lints`: `gate` 52/52, `replay` 6/6, Hallmark `sloplint` 0 FAIL / 0 REFLEX
+- `cd frontend && node e2e/test-live-web.mjs`: 24/24 passed (Auto-Heal timeline, Board Telemetry Strip, Playbooks CRUD, Batch DAG, 0 external requests, 0 console errors)
+- Real live-agent 3-repo multi-wave campaign (real `opencode` CLI, zero `FLEET_AGENT` shim): parallel Wave 1 across `py-ledger-api`, `node-cli-tools`, and `sh-ops-kit`, real autonomous Auto-Heal fixing a failing CI contract check into verified `done`, Wave 2 `depends_on` auto-launch, file-scope guardrail refusal, non-destructive conflict check, and real squash merges + worktree cleanup
