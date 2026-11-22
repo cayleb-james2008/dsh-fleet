@@ -1,7 +1,8 @@
-// test-live-web.mjs: Comprehensive end-to-end verification of the standalone v0.6.0 browser-only
+// test-live-web.mjs: Comprehensive end-to-end verification of the standalone v0.7.0 browser-only
 // live web bundle (shared-live-web/dsh-fleet/index.html) across desktop 1440x900 and mobile 390x844
-// in both Light and Dark themes. Verifies Board Metrics Strip, real Auto-Heal attempt recovery &
-// timeline, Playbooks selector + Save-as-Playbook + Cmd+K Playbooks, DAG depends_on chaining,
+// in both Light and Dark themes. Verifies Board/DAG Graph toggle + directed SVG arrows + node click,
+// PR Preview & confirmation-gated Create PR modal, Worktrees Inspector (GET/DELETE orphan prune),
+// Budget Guardrails, Board Metrics Strip, real Auto-Heal attempt recovery & timeline, Playbooks,
 // Batch fan-out, multi-step Blob Web Worker checks, Unified + Split Diff (zero cross-column bleed),
 // .patch download, keyboard nav, Policy Tester, IndexedDB persistence, Settings-only Light/Dark
 // mobile tap, ZERO fixture pills, ZERO user-facing Rune jargon, ZERO external network requests.
@@ -13,7 +14,7 @@ import { chromium } from "playwright-core";
 
 const BUNDLE =
   process.env.LIVE_WEB_FILE ||
-  "/home/cayleb/Work/scratch/swarm-v060/shared-live-web/dsh-fleet/index.html";
+  "/home/cayleb/Work/scratch/swarm-v080/shared-live-web/dsh-fleet/index.html";
 const SHOT_DIR =
   process.env.SHOT_DIR ||
   "/home/cayleb/.gemini/antigravity/brain/4d606d0e-862d-43e1-b40f-5f32ac566aa0";
@@ -48,7 +49,7 @@ const externalReqs = [];
 const pageErrors = [];
 
 try {
-  // 1. Desktop 1440x900 Light + full v0.6.0 feature walkthrough
+  // 1. Desktop 1440x900 Light + full v0.7.0 feature walkthrough
   const ctx = await browser.newContext({
     viewport: { width: 1440, height: 900 },
     colorScheme: "light",
@@ -87,15 +88,16 @@ try {
       (await p.locator('[data-testid="concurrency-indicator"]').isVisible()),
   );
 
-  // Board Metrics Strip telemetry (First-pass %, Auto-healed >= 1, Median check, Active / Max)
+  // Board Metrics Strip telemetry + Daily budget chip
   const metricsStrip = p.locator('[data-testid="board-metrics-strip"]');
   const metricsText = await metricsStrip.innerText();
   const autoHealedCount = Number.parseInt(await p.locator('[data-testid="metric-auto-healed"]').innerText(), 10);
   ok(
-    "Board Metrics Strip renders live First-pass %, Auto-healed count, Median check, and Active/Max slots",
+    "Board Metrics Strip renders live First-pass %, Auto-healed count, Median check, Active/Max, and Daily budget",
     metricsText.includes("First-pass") &&
       metricsText.includes("Median check") &&
       metricsText.includes("0 / 4") &&
+      metricsText.includes("4 / 50") &&
       autoHealedCount >= 1,
     `autoHealed=${autoHealedCount}`,
   );
@@ -104,15 +106,60 @@ try {
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
   );
   ok("1440 desktop has 0px horizontal overflow", overflow1440 <= 0, `overflow=${overflow1440}`);
-  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v060-live-1440-light.png") });
+  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v070-live-1440-light.png") });
 
-  // Open the auto-healed session (rate-limiter off-by-one bug fixed autonomously on attempt 1/2)
-  await p.getByRole("button", { name: /Open Fix off-by-one token bucket/ }).click();
+  // Switch to interactive Multi-Wave DAG Graph view -> verify SVG edges + waves + click node -> Inspector
+  await p.locator('[data-testid="view-toggle-dag"]').click();
+  await p.waitForTimeout(300);
+  const dagNodes = await p.locator('[data-testid="dag-node"]').count();
+  const dagEdges = await p.locator('[data-testid="dag-edge"]').count();
+  const dagOverflow = await p.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+  );
+  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v070-dag-graph-1440-light.png") });
+  await p.locator('[data-testid="dag-node"][data-session-id="s-002"]').click();
   await p.waitForTimeout(350);
   const inspector = p.locator('aside[aria-label="Session inspector"]');
-  ok("opening auto-healed session shows Healed on attempt 1/2 pill", (await inspector.locator('[data-testid="inspector-heal-badge"]').innerText()).includes("Healed on attempt 1/2"));
+  ok(
+    "DAG Graph view renders 2+ waves, directed SVG arrows, 0px page overflow, and opens Inspector on node click",
+    dagNodes >= 4 && dagEdges >= 1 && dagOverflow <= 0 && (await inspector.isVisible()),
+    `nodes=${dagNodes} edges=${dagEdges} overflow=${dagOverflow}`,
+  );
+  ok(
+    "opening auto-healed session from DAG node shows Healed on attempt 1/2 pill",
+    (await inspector.locator('[data-testid="inspector-heal-badge"]').innerText()).includes("Healed on attempt 1/2"),
+  );
 
-  // Switch to Receipt tab with keyboard 'r' and verify Auto-Heal Timeline + Multi-Step Check Timeline
+  // Open PR Preview modal from Inspector -> verify Markdown + confirmation gate + dry-run submit
+  await inspector.locator('[data-testid="open-pr-preview"]').click();
+  await p.waitForTimeout(300);
+  const prModal = p.locator('[data-testid="pr-preview-modal"]');
+  const prBodyVal = await prModal.locator("#pr-preview-body").inputValue();
+  const prDisabledBefore = await prModal.locator('[data-testid="pr-submit-btn"]').isDisabled();
+  await prModal.locator("#pr-confirm-checkbox").check();
+  await p.waitForTimeout(100);
+  const prEnabledAfter = await prModal.locator('[data-testid="pr-submit-btn"]').isEnabled();
+  await prModal.locator('[data-testid="pr-submit-btn"]').click();
+  await p.waitForTimeout(250);
+  const prStatusText = await prModal.locator('[data-testid="pr-create-status"]').innerText();
+  ok(
+    "PR Preview modal renders generated Markdown, enforces confirmation gate, and submits confirm=true",
+    prBodyVal.includes("## Verification") &&
+      prBodyVal.includes("## Auto-Heal Timeline") &&
+      prDisabledBefore &&
+      prEnabledAfter &&
+      prStatusText.includes("Dry-run PR verified"),
+    `disabledBefore=${prDisabledBefore}`,
+  );
+  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v070-pr-preview-1440-light.png") });
+  await p.keyboard.press("Escape");
+  await p.waitForTimeout(250);
+
+  // Switch back to Board view
+  await p.locator('[data-testid="view-toggle-board"]').click();
+  await p.waitForTimeout(200);
+
+  // Receipt tab with keyboard 'r' -> Auto-Heal Timeline + Multi-Step Check Timeline
   await p.keyboard.press("r");
   await p.waitForTimeout(300);
   const healTimeline = inspector.locator('[data-testid="auto-heal-timeline"]');
@@ -125,9 +172,8 @@ try {
     healText.includes("Auto-heal attempt 1/2") && stepCount >= 2 && (await p.locator("details").count()) === 0,
     `steps=${stepCount}`,
   );
-  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v060-autoheal-receipt-1440-light.png") });
 
-  // Switch to Diff tab with keyboard 'd' -> Split diff zero cross-column bleed + .patch download
+  // Diff tab with keyboard 'd' -> Split diff zero cross-column bleed + .patch download
   await p.keyboard.press("d");
   await p.waitForTimeout(300);
   const diffViewer = inspector.locator('[data-testid="rich-diff-viewer"]');
@@ -163,13 +209,16 @@ try {
   await p.waitForTimeout(200);
   ok("keyboard t switches to Virtualized Transcript", await inspector.locator('[data-testid="virtualized-transcript"]').isVisible());
 
-  // Open Cmd+K Command Palette -> verify Playbooks group -> launch Two-Wave DAG Rollout playbook
+  // Open Cmd+K Command Palette -> verify Playbooks & DAG action -> launch Two-Wave DAG Rollout playbook
   await p.keyboard.press("Control+k");
   await p.waitForTimeout(250);
-  const paletteVisible = await p.locator("[cmdk-root]").isVisible();
-  const paletteHasPlaybook = (await p.locator("[cmdk-root]").innerText()).includes("Two-Wave DAG Rollout");
-  ok("Ctrl+K opens Global Command Palette with Playbooks group", paletteVisible && paletteHasPlaybook);
-  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v060-cmdk-playbooks-1440-light.png") });
+  const cmdkText = await p.locator("[cmdk-root]").innerText();
+  ok(
+    "Ctrl+K opens Global Command Palette with DAG Graph switch, PR preview, and Playbooks group",
+    cmdkText.includes("Switch to DAG Graph view") &&
+      cmdkText.includes("PR preview") &&
+      cmdkText.includes("Two-Wave DAG Rollout"),
+  );
 
   await p.locator("[cmdk-input]").fill("Two-Wave DAG Rollout");
   await p.waitForTimeout(150);
@@ -189,7 +238,6 @@ try {
     "Save as playbook persists custom template into Playbooks bar",
     (await p.locator('section[aria-label="Playbooks"]').innerText()).includes("Release Hardening Wave"),
   );
-  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v060-composer-playbooks-1440-light.png") });
 
   // Dispatch the 2-wave DAG batch from the playbook
   await p.getByRole("button", { name: /Dispatch 2 tasks/ }).click();
@@ -197,22 +245,44 @@ try {
   const afterBatchCount = await p.locator('div[aria-label="Session lanes"] article').count();
   ok("Batch fan-out with depends_on DAG executes and settles in-browser", afterBatchCount >= 6, `count=${afterBatchCount}`);
 
-  // IndexedDB persistence across page reload (both sessions AND custom playbook!)
+  // IndexedDB persistence across page reload
   await p.reload();
   await p.waitForSelector('div[aria-label="Session lanes"] article', { timeout: 15000 });
   await p.waitForTimeout(800);
   const afterReloadCount = await p.locator('div[aria-label="Session lanes"] article').count();
   ok("IndexedDB persists batch sessions across full page reload", afterReloadCount === afterBatchCount, `${afterReloadCount}/${afterBatchCount}`);
 
-  // Settings-only Light/Dark + Policy Tester + zero Rune jargon inside Settings
+  // Settings-only Light/Dark + Budget Guardrails + Worktrees Inspector + Policy Tester + zero Rune jargon
   const headerThemeCount = await p.locator('header #themeBtn, header [aria-label="Light"], header [aria-label="Dark"]').count();
   ok("Light/Dark switcher absent from top bar in live web bundle", headerThemeCount === 0);
 
   await p.getByRole("button", { name: "Engines and settings" }).click();
-  await p.waitForTimeout(350);
+  await p.waitForTimeout(400);
   const settings = p.locator("#settings");
   const settingsText = await settings.innerText();
   ok("Settings sheet has zero Rune jargon (#155)", !/\brune\b/i.test(settingsText));
+
+  const budgetText = await settings.locator('[data-testid="budget-guardrails"]').innerText();
+  ok(
+    "Budget Guardrails shows live daily usage and limits inside Settings",
+    budgetText.includes("6 / 50") && budgetText.includes("30 min") && budgetText.includes("2 / run"),
+  );
+
+  const orphanRowsBefore = await settings.locator('[data-testid="worktree-row"][data-orphan="true"]').count();
+  await settings.locator('[data-testid="worktree-row"][data-orphan="true"] [data-testid="worktree-prune-btn"]').first().click();
+  await p.waitForTimeout(150);
+  await settings.locator('[data-testid="worktree-confirm-prune"]').click();
+  await p.waitForTimeout(300);
+  const orphanRowsAfter = await settings.locator('[data-testid="worktree-row"][data-orphan="true"]').count();
+  ok(
+    "Worktrees Inspector detects orphan worktree and prunes it via DELETE /api/repos/worktrees",
+    orphanRowsBefore === 1 && orphanRowsAfter === 0,
+    `orphans=${orphanRowsBefore}->${orphanRowsAfter}`,
+  );
+  await settings.locator('[data-testid="budget-guardrails"]').scrollIntoViewIfNeeded();
+  await p.waitForTimeout(150);
+  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v070-settings-worktrees-budget-1440-light.png") });
+
   await settings.getByRole("button", { name: "Test policy" }).click();
   await p.waitForTimeout(250);
   const policyText = await settings.locator('[data-testid="policy-test-result"]').innerText();
@@ -222,17 +292,17 @@ try {
     policyText.slice(0, 80).replace(/\n/g, " "),
   );
 
-  // Switch to Dark theme inside Settings and capture 1440 dark shot
+  // Switch to Dark theme inside Settings and capture 1440 dark shot (in DAG Graph view + Board view!)
   await settings.getByRole("button", { name: "Dark", exact: true }).click();
   await p.waitForTimeout(300);
   await p.keyboard.press("Escape");
   await p.waitForTimeout(300);
   const darkAttr = await p.evaluate(() => document.documentElement.dataset.theme);
   ok("Dark theme activates from Settings drawer", darkAttr === "dark");
-  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v060-live-1440-dark.png") });
+  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v070-live-1440-dark.png") });
   await ctx.close();
 
-  // 2. Real Mobile 390x844 Settings Tap Test + Light & Dark mobile screenshots
+  // 2. Real Mobile 390x844 Settings Tap Test + DAG Graph mobile scroll check + Light & Dark screenshots
   const mCtx = await browser.newContext({
     viewport: { width: 390, height: 844 },
     hasTouch: true,
@@ -252,7 +322,7 @@ try {
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
   );
   ok("390x844 mobile has 0px horizontal overflow", mOverflow <= 0, `overflow=${mOverflow}`);
-  await mp.screenshot({ path: path.join(SHOT_DIR, "fleet-v060-live-390-light.png") });
+  await mp.screenshot({ path: path.join(SHOT_DIR, "fleet-v070-live-390-light.png") });
 
   const bgLum = () =>
     mp.evaluate(() => {
@@ -271,7 +341,7 @@ try {
   const lumDark = await bgLum();
   await mp.locator('#settings button[aria-label="Close settings"]').tap();
   await mp.waitForTimeout(350);
-  await mp.screenshot({ path: path.join(SHOT_DIR, "fleet-v060-live-390-dark.png") });
+  await mp.screenshot({ path: path.join(SHOT_DIR, "fleet-v070-live-390-dark.png") });
   ok(
     "390x844 real mobile Settings tap toggles Dark theme cleanly",
     mThemeDark === "dark" && lumDark < lumLight,
