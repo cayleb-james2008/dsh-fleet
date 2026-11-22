@@ -1,5 +1,5 @@
-//! Modular orchestration, policy, verification, auto-heal, playbook, telemetry, and merge-check
-//! engines for `fleet-rs`.
+//! Modular orchestration, policy, verification, auto-heal, playbook, telemetry, PR,
+//! worktree, budget, and merge-check engines for `fleet-rs`.
 //!
 //! - [`dag`]: Task dependency DAG scheduler with cycle detection, topological readiness,
 //!   upstream-failure propagation, and multi-repo batch/matrix dispatch.
@@ -14,11 +14,17 @@
 //! - [`templates`]: Reusable engineering playbook templates with atomic persistence.
 //! - [`metrics`]: Live board telemetry (first-pass rate, auto-heal lift, median check
 //!   latency, slot utilization, and per-repo breakdown).
+//! - [`pr`]: Structured PR preview builder and confirmation-gated GitHub PR creator.
+//! - [`worktrees`]: Git worktree inspector and strictly allowlisted non-main removal.
+//! - [`budget`]: Per-session runtime, heal-attempt, and daily dispatch budget guardrails.
 
 pub mod autoheal;
+pub mod budget;
 pub mod checks;
 pub mod dag;
 pub mod merge_check;
 pub mod metrics;
 pub mod policy;
+pub mod pr;
 pub mod templates;
+pub mod worktrees;
