@@ -256,8 +256,8 @@ fn validate_agent(app: &App, agent: &str) -> Result<String, String> {
 fn resolve_agent(app: &App, requested: Option<&str>) -> Result<String, String> {
     match requested {
         Some(a) if !a.is_empty() => validate_agent(app, a),
-        _ => match &app.default_agent {
-            Some(d) => validate_agent(app, d)
+        _ => match app.effective_default_agent() {
+            Some(d) => validate_agent(app, &d)
                 .map_err(|e| format!("the configured default agent is unusable: {e}")),
             None => Err(
                 "no agent available: none of opencode, claude, codex is installed and FLEET_AGENT is not set"
@@ -329,6 +329,7 @@ fn engine_command(
     prompt: &str,
     continuation: bool,
 ) -> (String, Vec<String>) {
+    let model = model.map(str::trim).filter(|m| !m.is_empty());
     let args: Vec<String> = match engine_kind(agent) {
         EngineKind::Opencode => {
             let mut a = vec!["run".to_string()];
@@ -344,6 +345,13 @@ fn engine_command(
         }
         EngineKind::Claude => {
             let mut a = vec!["-p".to_string()];
+            if let Some(m) = model {
+                // OpenCode provider-namespaced ids (e.g. opencode/...) are not spoken by claude.
+                if !m.starts_with("opencode") {
+                    a.push("--model".to_string());
+                    a.push(m.to_string());
+                }
+            }
             if continuation {
                 a.push("--continue".to_string());
             }
@@ -359,14 +367,21 @@ fn engine_command(
                     prompt.to_string(),
                 ]
             } else {
-                vec![
+                let mut a = vec![
                     "exec".to_string(),
                     "--sandbox".to_string(),
                     "workspace-write".to_string(),
                     "--color".to_string(),
                     "never".to_string(),
-                    prompt.to_string(),
-                ]
+                ];
+                if let Some(m) = model {
+                    if !m.starts_with("opencode") {
+                        a.push("--model".to_string());
+                        a.push(m.to_string());
+                    }
+                }
+                a.push(prompt.to_string());
+                a
             }
         }
         EngineKind::Custom => vec![prompt.to_string()],
@@ -428,6 +443,9 @@ struct Session {
     /// say exactly what ran.
     #[serde(default)]
     agent: String,
+    /// Optional explicit model override recorded on this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
     check_cmd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     check_output: Option<String>,
@@ -508,6 +526,35 @@ struct MergeRefusal {
     ts: u64,
 }
 
+/// Runtime engine and model configuration persisted to data_dir/config.json.
+#[derive(Clone, Default, Serialize, serde::Deserialize)]
+struct RuntimeConfig {
+    #[serde(default)]
+    default_agent: Option<String>,
+    #[serde(default)]
+    opencode_model: Option<String>,
+    #[serde(default)]
+    claude_model: Option<String>,
+    #[serde(default)]
+    codex_model: Option<String>,
+}
+
+fn load_config(data_dir: &Path) -> RuntimeConfig {
+    let path = data_dir.join("config.json");
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<RuntimeConfig>(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Discovered local git repository returned by GET /api/repos.
+#[derive(Clone, Serialize)]
+struct RepoInfo {
+    name: String,
+    path: String,
+    branch: Option<String>,
+}
+
 struct App {
     policy: Policy,
     /// The policy file actually loaded (argv), reported by /api/policy
@@ -515,6 +562,10 @@ struct App {
     policy_source: String,
     agents: Vec<AgentInfo>,
     default_agent: Option<String>,
+    config: Mutex<RuntimeConfig>,
+    env_model: Option<String>,
+    env_claude_model: Option<String>,
+    env_codex_model: Option<String>,
     data_dir: PathBuf,
     /// Tag unique to this server run, baked into session ids and branch
     /// names so a restarted server can never collide with worktrees or
@@ -769,6 +820,207 @@ fn run_bounded(
 }
 
 impl App {
+    fn save_config(&self) {
+        let text = {
+            let cfg = self.config.lock().unwrap();
+            serde_json::to_string_pretty(&*cfg).unwrap_or_else(|_| "{}".to_string())
+        };
+        let _ = std::fs::create_dir_all(&self.data_dir);
+        let tmp = self
+            .data_dir
+            .join(format!("config.json.tmp.{}", std::process::id()));
+        let dst = self.data_dir.join("config.json");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &dst);
+        }
+    }
+
+    fn effective_default_agent(&self) -> Option<String> {
+        let cfg = self.config.lock().unwrap();
+        cfg.default_agent
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.default_agent.clone())
+    }
+
+    fn effective_model_for(&self, agent: &str) -> Option<String> {
+        let cfg = self.config.lock().unwrap();
+        match engine_kind(agent) {
+            EngineKind::Opencode => cfg
+                .opencode_model
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| self.env_model.clone())
+                .or_else(|| self.policy.model.clone()),
+            EngineKind::Claude => cfg
+                .claude_model
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| self.env_claude_model.clone()),
+            EngineKind::Codex => cfg
+                .codex_model
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| self.env_codex_model.clone()),
+            EngineKind::Custom => None,
+        }
+    }
+
+    fn config_json(&self) -> serde_json::Value {
+        let default_agent = self.effective_default_agent();
+        let default_agent_engine = default_agent
+            .as_deref()
+            .map(|a| engine_kind(a).label().to_string());
+        let eff_opencode = self.effective_model_for("opencode");
+        let eff_claude = self.effective_model_for("claude");
+        let eff_codex = self.effective_model_for("codex");
+        let cfg = self.config.lock().unwrap();
+        serde_json::json!({
+            "default_agent": default_agent,
+            "default_agent_engine": default_agent_engine,
+            "opencode_model": cfg.opencode_model,
+            "claude_model": cfg.claude_model,
+            "codex_model": cfg.codex_model,
+            "effective_models": {
+                "opencode": eff_opencode,
+                "claude": eff_claude,
+                "codex": eff_codex,
+            },
+            "policy_model": self.policy.model,
+            "env_model": self.env_model,
+        })
+    }
+
+    fn discover_repos(&self) -> Vec<RepoInfo> {
+        let mut seen = std::collections::HashSet::<PathBuf>::new();
+        let mut repos = Vec::<RepoInfo>::new();
+        const MAX_REPOS: usize = 60;
+
+        let mut try_add = |p: &Path| -> bool {
+            if repos.len() >= MAX_REPOS {
+                return false;
+            }
+            if !p.is_dir() || !p.join(".git").exists() {
+                return true;
+            }
+            let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            if !seen.insert(canon.clone()) {
+                return true;
+            }
+            let path_str = canon.to_string_lossy().to_string();
+            let name = canon
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("repo")
+                .to_string();
+            let branch = merge_target(&path_str);
+            repos.push(RepoInfo {
+                name,
+                path: path_str,
+                branch,
+            });
+            repos.len() < MAX_REPOS
+        };
+
+        let session_repos: Vec<String> = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions
+                .iter()
+                .filter(|s| !s.repo.is_empty())
+                .map(|s| s.repo.clone())
+                .collect()
+        };
+        for r in session_repos {
+            if !try_add(Path::new(&r)) {
+                break;
+            }
+        }
+
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Ok(env_dirs) = std::env::var("FLEET_REPOS_DIR") {
+            for part in env_dirs.split(':').filter(|s| !s.trim().is_empty()) {
+                roots.push(PathBuf::from(part.trim()));
+            }
+        } else {
+            if let Some(home) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
+                let h = PathBuf::from(home);
+                roots.push(h.join("Work/projects"));
+                roots.push(h.join("projects"));
+                roots.push(h.join("Code"));
+            }
+            if let Ok(cwd) = std::env::current_dir() {
+                roots.push(cwd);
+            }
+        }
+
+        let skip_dir = |name: &str| {
+            name.starts_with('.')
+                || matches!(
+                    name,
+                    "node_modules"
+                        | "target"
+                        | "vendor"
+                        | "dist"
+                        | "build"
+                        | "__pycache__"
+                        | "venv"
+                )
+        };
+
+        'roots: for root in roots {
+            if !root.is_dir() {
+                continue;
+            }
+            if root.join(".git").exists() {
+                if !try_add(&root) {
+                    break 'roots;
+                }
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if skip_dir(&name) {
+                    continue;
+                }
+                if p.join(".git").exists() {
+                    if !try_add(&p) {
+                        break 'roots;
+                    }
+                } else if let Ok(sub) = std::fs::read_dir(&p) {
+                    for se in sub.flatten() {
+                        let sp = se.path();
+                        if !sp.is_dir() {
+                            continue;
+                        }
+                        let sname = se.file_name().to_string_lossy().to_string();
+                        if skip_dir(&sname) {
+                            continue;
+                        }
+                        if sp.join(".git").exists() && !try_add(&sp) {
+                            break 'roots;
+                        }
+                    }
+                }
+            }
+        }
+
+        repos.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then(a.path.cmp(&b.path))
+        });
+        repos
+    }
+
     /// Snapshot all session state to disk (atomic rename), so a server
     /// restart loses nothing. The per-session log files are the durable
     /// transcript record; this file is the state snapshot.
@@ -1335,14 +1587,19 @@ impl App {
                 app_lines.log(&id_lines, line.to_string());
             }
         };
+        let resolved_model = session
+            .model
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+            .or_else(|| self.effective_model_for(&session.agent));
         let (prog, args) = engine_command(
             &session.agent,
-            self.policy.model.as_deref(),
+            resolved_model.as_deref(),
             prompt,
             continuation,
         );
         let mut agent_cmd = Command::new(&prog);
-        agent_cmd.args(&args).current_dir(wt);
+        agent_cmd.args(&args).current_dir(wt).env("PWD", wt);
         // The stop flag is NOT cleared at run start: a stop can be
         // pressed in the windows where no run is polling it
         // (worktree creation, between runs, during the settle), and
@@ -1611,7 +1868,8 @@ impl App {
         check_cmd_proc
             .arg("-c")
             .arg(&session.check_cmd)
-            .current_dir(check_dir);
+            .current_dir(check_dir)
+            .env("PWD", check_dir);
         let flag = self.stop_flag(id);
         let outcome = run_bounded(check_cmd_proc, timeout, Some(&flag), &mut sink);
         self.sweep_detached(id, check_dir);
@@ -2181,6 +2439,7 @@ fn retry_prompt_text(
                 status: Status::Queued.label().to_string(),
                 bucket: Status::Queued.bucket().to_string(),
                 agent: parent.agent.clone(),
+                model: parent.model.clone(),
                 check_cmd: parent.check_cmd.clone(),
                 check_output: None,
                 check_passed: None,
@@ -2521,6 +2780,32 @@ fn retry_prompt_text(
             id,
             format!("merged into {target_branch} at {pin}"),
         );
+        // Clean up the session's isolated worktree once its verified commit
+        // has landed on the target branch (strictly inside Fleet's worktrees dir).
+        if !session.worktree.is_empty() {
+            let wt_path = Path::new(&session.worktree);
+            let wt_root = self.data_dir.join("worktrees");
+            if wt_path.starts_with(&wt_root) && wt_path.exists() {
+                let _ = Command::new("git")
+                    .arg("-C")
+                    .arg(&session.repo)
+                    .args(["worktree", "remove", "--force"])
+                    .arg(wt_path)
+                    .output();
+                if wt_path.exists() {
+                    let _ = std::fs::remove_dir_all(wt_path);
+                }
+                let _ = Command::new("git")
+                    .arg("-C")
+                    .arg(&session.repo)
+                    .args(["worktree", "prune"])
+                    .output();
+                self.log(
+                    id,
+                    format!("removed merged worktree {}", wt_path.display()),
+                );
+            }
+        }
         Ok((pin, target_branch))
     }
 }
@@ -2740,19 +3025,108 @@ fn respond(
         error_response(403, "cross-origin requests are refused")
     } else {
         let route = path.split('?').next().unwrap_or("");
-        update_route(app, method, route, host).unwrap_or_else(|| handle(app, method, path, body))
+        update_route(app, method, route, body, host).unwrap_or_else(|| handle(app, method, path, body))
     }
 }
 
-/// The version and self-update routes. Replacing the program, or starting the
-/// new one, is for whoever sits at this machine: a name from FLEET_ALLOWED_HOSTS
-/// does not count, only loopback does.
-fn update_route(app: &Arc<App>, method: &str, route: &str, host: &str) -> Option<String> {
+/// Validate a model identifier submitted via config or session hand-out.
+fn validate_model_field(raw: &str) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > 200 || trimmed.contains('\0') || trimmed.contains('\n') || trimmed.contains('\r') {
+        return Err("model name must be a single line of at most 200 characters".to_string());
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// Loopback-guarded routes: version, self-update, local repo discovery, and
+/// live engine/model configuration. A name from FLEET_ALLOWED_HOSTS does not
+/// count for machine-local mutation or filesystem discovery — only loopback does.
+fn update_route(app: &Arc<App>, method: &str, route: &str, body: &str, host: &str) -> Option<String> {
     Some(match (method, route) {
         ("GET", "/api/version") => json_response(
             200,
             &serde_json::json!({"name": "fleet-rs", "version": env!("CARGO_PKG_VERSION")}).to_string(),
         ),
+        ("GET", "/api/repos") => {
+            if !host_allowed(host, "") {
+                return Some(error_response(
+                    403,
+                    "repo discovery is only allowed from this machine, not through a shared address",
+                ));
+            }
+            let repos = app.discover_repos();
+            json_response(200, &serde_json::json!(repos).to_string())
+        }
+        ("GET", "/api/config") => {
+            if !host_allowed(host, "") {
+                return Some(error_response(
+                    403,
+                    "reading engine config is only allowed from this machine, not through a shared address",
+                ));
+            }
+            json_response(200, &app.config_json().to_string())
+        }
+        ("POST", "/api/config") => {
+            if !host_allowed(host, "") {
+                return Some(error_response(
+                    403,
+                    "changing engine config is only allowed from this machine, not through a shared address",
+                ));
+            }
+            let req: serde_json::Value = match serde_json::from_str(body) {
+                Ok(v) => v,
+                Err(e) => return Some(error_response(400, &format!("bad json: {e}"))),
+            };
+            let Some(obj) = req.as_object() else {
+                return Some(error_response(400, "config payload must be a JSON object"));
+            };
+            let mut next_cfg = app.config.lock().unwrap().clone();
+            if let Some(val) = obj.get("default_agent") {
+                match val {
+                    serde_json::Value::Null => next_cfg.default_agent = None,
+                    serde_json::Value::String(s) if s.trim().is_empty() => next_cfg.default_agent = None,
+                    serde_json::Value::String(s) => match validate_agent(app, s.trim()) {
+                        Ok(valid) => next_cfg.default_agent = Some(valid),
+                        Err(e) => return Some(error_response(400, &e)),
+                    },
+                    _ => return Some(error_response(400, "default_agent must be a string or null")),
+                }
+            }
+            for (key, slot) in [
+                ("opencode_model", &mut next_cfg.opencode_model),
+                ("claude_model", &mut next_cfg.claude_model),
+                ("codex_model", &mut next_cfg.codex_model),
+            ] {
+                if let Some(val) = obj.get(key) {
+                    match val {
+                        serde_json::Value::Null => *slot = None,
+                        serde_json::Value::String(s) => match validate_model_field(s) {
+                            Ok(v) => *slot = v,
+                            Err(e) => return Some(error_response(400, &e)),
+                        },
+                        _ => return Some(error_response(400, &format!("{key} must be a string or null"))),
+                    }
+                }
+            }
+            if let Some(val) = obj.get("model") {
+                if !obj.contains_key("opencode_model") {
+                    match val {
+                        serde_json::Value::Null => next_cfg.opencode_model = None,
+                        serde_json::Value::String(s) => match validate_model_field(s) {
+                            Ok(v) => next_cfg.opencode_model = v,
+                            Err(e) => return Some(error_response(400, &e)),
+                        },
+                        _ => return Some(error_response(400, "model must be a string or null")),
+                    }
+                }
+            }
+            *app.config.lock().unwrap() = next_cfg;
+            app.save_config();
+            json_response(200, &app.config_json().to_string())
+        }
         ("GET", "/api/update") => json_response(200, &app.updater.snapshot().to_string()),
         ("POST", "/api/update/check") => json_response(200, &app.updater.check_now().to_string()),
         ("POST", "/api/update/apply") | ("POST", "/api/update/restart") => {
@@ -2887,24 +3261,34 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
     let _ = query;
     match (method, route) {
         ("GET", "/") => html_response(include_str!("../assets/index.html")),
-        ("GET", "/api/policy") => json_response(
-            200,
-            &serde_json::json!({
-                "max_parallel": app.policy.max_parallel,
-                "agents": app.agents,
-                "default_agent": app.default_agent,
-                "default_agent_engine": app
-                    .default_agent
-                    .as_deref()
-                    .map(|a| engine_kind(a).label()),
-                "model": app.policy.model,
-                "model_engine": "opencode",
-                "timeout_secs": app.policy.timeout_secs,
-                "source": app.policy_source,
-                "version": env!("CARGO_PKG_VERSION")
-            })
-            .to_string(),
-        ),
+        ("GET", "/api/policy") => {
+            let default_agent = app.effective_default_agent();
+            let opencode_model = app.effective_model_for("opencode");
+            let claude_model = app.effective_model_for("claude");
+            let codex_model = app.effective_model_for("codex");
+            json_response(
+                200,
+                &serde_json::json!({
+                    "max_parallel": app.policy.max_parallel,
+                    "agents": app.agents,
+                    "default_agent": default_agent,
+                    "default_agent_engine": default_agent
+                        .as_deref()
+                        .map(|a| engine_kind(a).label()),
+                    "model": opencode_model,
+                    "model_engine": "opencode",
+                    "models": {
+                        "opencode": opencode_model,
+                        "claude": claude_model,
+                        "codex": codex_model,
+                    },
+                    "timeout_secs": app.policy.timeout_secs,
+                    "source": app.policy_source,
+                    "version": env!("CARGO_PKG_VERSION")
+                })
+                .to_string(),
+            )
+        }
         ("GET", "/api/sessions") => {
             json_response(200, &app.sessions_view().to_string())
         }
@@ -2915,7 +3299,26 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
             };
             let task = req["task"].as_str().unwrap_or("").trim().to_string();
             let repo = req["repo"].as_str().unwrap_or("").trim().to_string();
-            let project = req["project"].as_str().unwrap_or("default").to_string();
+            let project = req["project"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    Path::new(&repo)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("default")
+                        .to_string()
+                });
+            let explicit_model = match req["model"].as_str() {
+                Some(raw) => match validate_model_field(raw) {
+                    Ok(m) => m,
+                    Err(e) => return error_response(400, &e),
+                },
+                None => None,
+            };
             if task.is_empty() || repo.is_empty() {
                 return error_response(400, "task and repo are required");
             }
@@ -3019,6 +3422,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 status: Status::Queued.label().to_string(),
                 bucket: Status::Queued.bucket().to_string(),
                 agent,
+                model: explicit_model,
                 check_cmd,
                 check_output: None,
                 check_passed: None,
@@ -3271,6 +3675,7 @@ fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
             status: Status::NeedsYou.label().to_string(),
             bucket: Status::NeedsYou.bucket().to_string(),
             agent: String::new(),
+            model: None,
             check_cmd: String::new(),
             check_output: None,
             check_passed: None,
@@ -3409,15 +3814,27 @@ fn main() {
         std::process::exit(1);
     });
     let agents = detect_agents();
-    let default_agent = std::env::var("FLEET_AGENT")
+    let env_agent = std::env::var("FLEET_AGENT")
         .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            agents
-                .iter()
-                .find(|a| a.found)
-                .map(|a| a.name.clone())
-        });
+        .filter(|s| !s.is_empty());
+    let default_agent = env_agent.clone().or_else(|| {
+        agents
+            .iter()
+            .find(|a| a.found)
+            .map(|a| a.name.clone())
+    });
+    let env_model = std::env::var("FLEET_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let env_claude_model = std::env::var("FLEET_CLAUDE_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let env_codex_model = std::env::var("FLEET_CODEX_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let policy_path = args
         .get(1)
         .cloned()
@@ -3442,6 +3859,11 @@ fn main() {
     let data_dir_label = data_dir.display().to_string();
     let _ = std::fs::create_dir_all(data_dir.join("worktrees"));
     let _ = std::fs::create_dir_all(data_dir.join("logs"));
+    let mut runtime_config = load_config(&data_dir);
+    if env_agent.is_some() {
+        // Explicit FLEET_AGENT env var wins on startup over persisted default_agent.
+        runtime_config.default_agent = None;
+    }
 
     let run_tag = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3453,6 +3875,10 @@ fn main() {
         policy_source: policy_path.clone(),
         agents,
         default_agent,
+        config: Mutex::new(runtime_config),
+        env_model,
+        env_claude_model,
+        env_codex_model,
         data_dir,
         run_tag,
         sessions: Mutex::new(restored),
@@ -3560,7 +3986,7 @@ fn main() {
     println!(
         "fleet-rs listening on http://127.0.0.1:{port}/ (agents: {}; default: {}; max_parallel: {})",
         detected.join(", "),
-        app.default_agent.as_deref().unwrap_or("none"),
+        app.effective_default_agent().as_deref().unwrap_or("none"),
         app.policy.max_parallel
     );
     println!("  Data:    {data_dir_label}");
@@ -3635,7 +4061,7 @@ mod tests {
         // The model route is read from the policy, not hardcoded.
         assert_eq!(
             policy.model.as_deref(),
-            Some("opencode-go/deepseek-v4.1-flash")
+            Some("opencode/deepseek-v4.1-flash-free")
         );
     }
 
@@ -3648,32 +4074,40 @@ mod tests {
 
     #[test]
     fn engine_commands_drive_real_clis_noninteractively() {
-        let model = Some("opencode-go/deepseek-v4.1-flash");
+        let model = Some("opencode/deepseek-v4.1-flash-free");
         // opencode: `run`, the house model, the prompt last.
         let (prog, args) = engine_command("opencode", model, "do it", false);
         assert_eq!(prog, "opencode");
         assert_eq!(
             args,
-            vec!["run", "--model", "opencode-go/deepseek-v4.1-flash", "do it"]
+            vec!["run", "--model", "opencode/deepseek-v4.1-flash-free", "do it"]
         );
         // Steering continues the same conversation.
         let (_, args) = engine_command("opencode", model, "also this", true);
         assert_eq!(
             args,
-            vec!["run", "--model", "opencode-go/deepseek-v4.1-flash", "--continue", "also this"]
+            vec!["run", "--model", "opencode/deepseek-v4.1-flash-free", "--continue", "also this"]
         );
-        // claude: print mode; the OpenCode Go model id is NOT passed —
+        // claude: print mode; the OpenCode model id is NOT passed —
         // it names a provider claude does not speak.
         let (_, args) = engine_command("claude", model, "do it", false);
         assert_eq!(args, vec!["-p", "do it"]);
         let (_, args) = engine_command("claude", model, "also this", true);
         assert_eq!(args, vec!["-p", "--continue", "also this"]);
+        // An explicit Claude model IS passed to claude.
+        let (_, args) = engine_command("claude", Some("claude-sonnet-4-5"), "do it", false);
+        assert_eq!(args, vec!["-p", "--model", "claude-sonnet-4-5", "do it"]);
         // codex: exec with a workspace-write sandbox; resume --last
         // continues (and keeps the first run's sandbox).
         let (_, args) = engine_command("codex", model, "do it", false);
         assert_eq!(
             args,
             vec!["exec", "--sandbox", "workspace-write", "--color", "never", "do it"]
+        );
+        let (_, args) = engine_command("codex", Some("o4-mini"), "do it", false);
+        assert_eq!(
+            args,
+            vec!["exec", "--sandbox", "workspace-write", "--color", "never", "--model", "o4-mini", "do it"]
         );
         let (_, args) = engine_command("codex", model, "also this", true);
         assert_eq!(args, vec!["exec", "resume", "--last", "also this"]);
@@ -3737,6 +4171,10 @@ mod tests {
             policy_source: "policies.rn".to_string(),
             agents: Vec::new(),
             default_agent: Some(agent.to_string_lossy().to_string()),
+            config: Mutex::new(RuntimeConfig::default()),
+            env_model: None,
+            env_claude_model: None,
+            env_codex_model: None,
             data_dir: dir.join("data"),
             run_tag: "test".to_string(),
             sessions: Mutex::new(Vec::new()),
@@ -3766,6 +4204,7 @@ mod tests {
             status: Status::Queued.label().to_string(),
             bucket: Status::Queued.bucket().to_string(),
             agent: agent.to_string_lossy().to_string(),
+            model: None,
             check_cmd: "test -s output.txt".to_string(),
             check_output: None,
             check_passed: None,
@@ -3797,6 +4236,10 @@ mod tests {
             policy_source: "policies.rn".to_string(),
             agents: Vec::new(),
             default_agent: None,
+            config: Mutex::new(RuntimeConfig::default()),
+            env_model: None,
+            env_claude_model: None,
+            env_codex_model: None,
             data_dir,
             run_tag: "test".to_string(),
             sessions: Mutex::new(sessions),
@@ -3828,6 +4271,7 @@ mod tests {
             status: status.label().to_string(),
             bucket: status.bucket().to_string(),
             agent: "/bin/true".to_string(),
+            model: None,
             check_cmd: "test -s output.txt".to_string(),
             check_output: Some("1 passed".to_string()),
             check_passed: Some(true),
@@ -4579,6 +5023,146 @@ mod tests {
         assert!(msg.contains("1 session(s) are still queued, working or checking"), "{msg}");
         // Nothing was restarted: the session is still working.
         assert_eq!(app.status_of("s1").as_deref(), Some("working"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_and_repos_routes_are_loopback_only_and_persist() {
+        let dir = std::env::temp_dir().join(format!("fleet-v040-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let repo = git_repo(&dir.join("alpha-proj"));
+        let mut s = test_session("s1", Status::Done, &dir);
+        s.repo = repo.to_string_lossy().to_string();
+        let app = Arc::new(App {
+            policy: Policy::load(SCRIPT).unwrap(),
+            policy_source: "policies.rn".to_string(),
+            agents: vec![
+                AgentInfo { name: "opencode".to_string(), found: true, path: Some("/usr/bin/opencode".to_string()) },
+                AgentInfo { name: "claude".to_string(), found: true, path: Some("/usr/bin/claude".to_string()) },
+                AgentInfo { name: "codex".to_string(), found: false, path: None },
+            ],
+            default_agent: Some("opencode".to_string()),
+            config: Mutex::new(RuntimeConfig::default()),
+            env_model: None,
+            env_claude_model: None,
+            env_codex_model: None,
+            data_dir: data.clone(),
+            run_tag: "test".to_string(),
+            sessions: Mutex::new(vec![s]),
+            lines_since_persist: std::sync::atomic::AtomicU64::new(0),
+            counter: Mutex::new(0),
+            stops: Mutex::new(std::collections::HashMap::new()),
+            updater: update::Updater::new(update::Config {
+                bin: "fleet-rs",
+                current: env!("CARGO_PKG_VERSION"),
+                repo: "o/r".to_string(),
+                api: "http://127.0.0.1:1".to_string(),
+                mode: update::Mode::Notify,
+                exe: std::env::temp_dir().join("fleet-rs-test-no-such-binary"),
+                allow_dev: false,
+                may_apply: true,
+            })
+            .into(),
+        });
+
+        // Shared LAN host cannot read repos or mutate config.
+        let r = respond(&app, "lan.local", "GET", "/api/repos", "", "", "", "lan.local:8471");
+        assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+        let r = respond(&app, "lan.local", "POST", "/api/config", "{}", "application/json", "", "lan.local:8471");
+        assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+
+        // Loopback discovers the session's git repo with its branch.
+        let r = respond(&app, "", "GET", "/api/repos", "", "", "", "127.0.0.1:8471");
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        let repos = response_body(&r);
+        let canon = std::fs::canonicalize(&repo).unwrap().to_string_lossy().to_string();
+        assert!(
+            repos.as_array().unwrap().iter().any(|v| v["path"] == canon && v["branch"] == "main"),
+            "expected {canon} in {repos}"
+        );
+
+        // Updating config validates agent, persists to disk, and reflects in /api/policy.
+        let bad = respond(
+            &app,
+            "",
+            "POST",
+            "/api/config",
+            r#"{"default_agent":"codex"}"#,
+            "application/json",
+            "",
+            "127.0.0.1:8471",
+        );
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+
+        let ok_resp = respond(
+            &app,
+            "",
+            "POST",
+            "/api/config",
+            r#"{"default_agent":"claude","opencode_model":"opencode/custom-free","claude_model":"claude-sonnet-4-5"}"#,
+            "application/json",
+            "",
+            "127.0.0.1:8471",
+        );
+        assert!(ok_resp.starts_with("HTTP/1.1 200"), "{ok_resp}");
+        let cfg_body = response_body(&ok_resp);
+        assert_eq!(cfg_body["default_agent"], "claude");
+        assert_eq!(cfg_body["effective_models"]["opencode"], "opencode/custom-free");
+        assert_eq!(cfg_body["effective_models"]["claude"], "claude-sonnet-4-5");
+
+        let pol = response_body(&respond(&app, "", "GET", "/api/policy", "", "", "", "127.0.0.1:8471"));
+        assert_eq!(pol["default_agent"], "claude");
+        assert_eq!(pol["model"], "opencode/custom-free");
+
+        let reloaded = load_config(&data);
+        assert_eq!(reloaded.default_agent.as_deref(), Some("claude"));
+        assert_eq!(reloaded.opencode_model.as_deref(), Some("opencode/custom-free"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn post_session_derives_project_from_repo_basename_and_merge_cleans_worktree() {
+        let dir = std::env::temp_dir().join(format!("fleet-v040-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = dir.join("my-real-app");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_run(&repo, &["init", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "seed\n").unwrap();
+        git_run(&repo, &["add", "-A"]);
+        git_run(&repo, &["commit", "-m", "init"]);
+
+        let agent = script_agent(&dir, "ok.sh", "printf 'hello\\n' > output.txt");
+        let data = dir.join("data");
+        std::fs::create_dir_all(data.join("worktrees")).unwrap();
+        std::fs::create_dir_all(data.join("logs")).unwrap();
+        let app = test_app(data.clone(), Vec::new());
+
+        // Omit project -> derived from repo folder basename ("my-real-app").
+        let body = serde_json::json!({
+            "task": "write hello",
+            "repo": repo.to_string_lossy(),
+            "check": "test -s output.txt",
+            "agent": agent.to_string_lossy(),
+        });
+        let resp = handle(&app, "POST", "/api/sessions", &body.to_string());
+        assert!(resp.starts_with("HTTP/1.1 201"), "{resp}");
+        let created = response_body(&resp);
+        assert_eq!(created["project"], "my-real-app", "{created}");
+        let id = created["id"].as_str().unwrap().to_string();
+        let wt = PathBuf::from(created["worktree"].as_str().unwrap());
+
+        settle(&app, &id);
+        assert_eq!(app.status_of(&id).as_deref(), Some("done"));
+        assert!(wt.exists(), "worktree should exist before merge");
+
+        let merge_resp = handle(&app, "POST", &format!("/api/sessions/{id}/merge"), "{}");
+        assert!(merge_resp.starts_with("HTTP/1.1 200"), "{merge_resp}");
+        assert!(repo.join("output.txt").exists(), "merged output must land on main");
+        assert!(!wt.exists(), "merged worktree should be cleaned up automatically");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

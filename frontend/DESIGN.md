@@ -1,6 +1,6 @@
-# Fleet front end: design (v0.3.0 Mission Control Board)
+# Fleet front end: design (v0.4.0 Mission Control Board)
 
-Status: v0.3.0 complete. Built on the House Frontend system (`JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md`), self-hosted **Geist** and **Geist Mono** (`frontend/src/fonts/*.woff2`), light default + full dark parity (`frontend/src/theme.css`).
+Status: v0.4.0 complete. Built on the House Frontend system (`JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md`), self-hosted **Geist** and **Geist Mono** (`frontend/src/fonts/*.woff2`), light default + full dark parity (`frontend/src/theme.css`).
 
 ## The job
 
@@ -14,7 +14,8 @@ Questions the first screen answers (`data-answers` / `data-answers-via` in the D
 
 ## Region map
 
-- **Top Command Bar** (sticky): `Fleet` wordmark, version chip (`v0.3.0`), desktop `Check for updates` icon button (loopback-only), `fixture demo` / `fixture · test mode` honesty badge, `Show update` button when an available update is dismissed, `/` search field (`InputGroup` + `Kbd` `/`) filtering by task/project/branch, `Needs you` Inbox `Popover` (live `/api/inbox` count, `View session`, `Retry`, `Go to Needs you`), `New session` `MorphingDialog` (`Cmd/Ctrl+Enter` dispatch), `Engines and settings` Vaul right-sheet trigger, and Light/Dark `SegmentedControl` (`id="themeBtn"`, `aria-label="Light"` / `"Dark"`).
+- **Top Command Bar** (sticky): `Fleet` wordmark, version chip (`v0.4.0`), desktop `Check for updates` icon button (loopback-only), `Show update` button when an available update is dismissed, `/` search field (`InputGroup` + `Kbd` `/`) filtering by task/project/branch, `Needs you` Inbox `Popover` (live `/api/inbox` count, `View session`, `Retry`, `Go to Needs you`), `New session` `MorphingDialog` (`GET /api/repos` repository picker, auto-derived project basename, `Cmd/Ctrl+Enter` dispatch), and `Engines and settings` Vaul right-sheet trigger (`#settings-open`).
+- **Engines and Settings Sheet (`#settings`)**: Light/Dark `SegmentedControl` (`id="themeBtn"`, `aria-label="Light"` / `"Dark"`) under **Appearance** (kept out of the top bar), Rune policy summary, detected CLI engines on PATH, live default-engine and per-engine model routing (`GET/POST /api/config`), and updates controls (plus Browser Worktree Engine / Local `fleet-rs` / optional `sessionStorage` BYOK controls in the standalone web bundle).
 - **Update Strip** (shown when an update is available, staged, or a manual check fails): loopback-only `Update now` with `"Update now downloads it, checks it, and replaces this app. Restart to start using it."`, developer-copy / non-loopback plain explanation, Cult UI `Expandable` release notes and raw failure diagnostics (zero native `<details>`), and deterministic focus transitions (`busy` -> status line, `staged` -> `Restart now`, `Dismiss` -> `Show update`).
 - **Scan Strip**: four `SlidingNumber` counters (`Sessions`, `Needs you`, `Working`, `Verified` — skeleton placeholders before initial fetch so unreachable never flashes fake zeros), Kibo UI `AvatarStack` for concurrent running agents, and Tremor 32-session outcome `Tracker`.
 - **Latest Verified Receipt Hero**: Fleet's defining signature object — measured corner ticks, sage `Latest verified receipt` `Pill`, project & branch chips, task headline in Geist 500, check output receipt line, Geist Mono diff stats (`files`, `+added`, `−removed`), `verified by: <check command>`, and 1-click `Inspect receipt`, `View diff`, and `Merge` (with inline safety confirmation).
@@ -40,9 +41,10 @@ Full mapping in `../ROLE-COVERAGE.md` and motion preset table in `../ALIVE.md`:
 ## Verification gates
 
 - `cargo clippy --all-targets -- -D warnings`: 0 warnings
-- `cargo test`: 52 passed (43 unit + 9 CLI)
-- `bash .loop/verify`: 23/23 passed (including `verify2.sh`, `ui.sh`, `theme.sh`, `inbox.sh`, `proof.sh`)
-- `cd frontend && npm run check:ui`: `gate` 34/34, `replay` 6/6
-- `hallmark/scripts/sloplint.mjs --scope app --render`: 0 FAIL, 0 REFLEX
-- `ultra-design/kit/probe.mjs`: PASS across `1440, 1100, 900, 768` Light & Dark
-- `ultra-design/kit/replay.mjs`: PASS across malformed 200 + unreachable sweep + 6 worst-case scenarios at `1440` and `390`
+- `cargo test`: 54 passed (45 unit + 9 CLI)
+- `bash .loop/verify`: 23/23 passed (including `verify2.sh`, `engines.sh`, `ui.sh`, `theme.sh`, `inbox.sh`, `proof.sh`)
+- `cd frontend && npm run check:ui`: `gate` 37/37, `replay` 6/6 (including Settings-only Light/Dark switch verification and repo picker)
+- `hallmark/scripts/sloplint.mjs --scope app --render`: 0 FAIL
+- `ultra-design/kit/replay.mjs`: PASS across malformed 200 + unreachable sweep + worst-case scenarios at `1440` and `390`
+- Real live-agent E2E (real `opencode` CLI, zero `FLEET_AGENT` shim): worktree edit, real check pass, real diff, real merge + worktree cleanup, and real failing check caught in `Needs you` -> `Steer` continuation -> verified `done`
+- Standalone functional web bundle (`shared-live-web/dsh-fleet/index.html`): real Web Worker check failures & passes, in-inspector branch file editing, real unified diff, real merge into `main`, IndexedDB persistence across reload, zero `fixture demo` pills

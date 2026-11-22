@@ -3,7 +3,7 @@
 // Cult UI Expandable disclosures (zero <details>), roving ArrowLeft/ArrowRight/Home/End tabs across Transcript · Diff · Receipt,
 // syntax-tinted +/- diff lines in Geist Mono, focus management on open/close, and per-session Steer composer.
 import { useEffect, useRef, useState } from "react";
-import { X, Send, RotateCcw, GitMerge, Square } from "lucide-react";
+import { X, Send, RotateCcw, GitMerge, Square, FileCode2, Play } from "lucide-react";
 import { AnimatedBackground } from "@/components/ui/animated-background";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -13,6 +13,7 @@ import { glide } from "@/motion";
 import { cn } from "@/lib/utils";
 import {
   diffStat,
+  getWebEngine,
   HONEST,
   isFailed,
   isHonest,
@@ -67,6 +68,94 @@ function DiffViewer({ diff }: { diff?: string }) {
         ))}
       </div>
     </div>
+  );
+}
+
+function BranchFileEditor({ sessionId, onSaved }: { sessionId: string; onSaved: () => void }) {
+  const engine = getWebEngine();
+  const files = engine?.getSessionFiles(sessionId) ?? null;
+  const names = files ? Object.keys(files).sort() : [];
+  const [activeFile, setActiveFile] = useState<string>(() => names[0] || "");
+  const [draft, setDraft] = useState<string>(() => (files && names[0] ? files[names[0]] : ""));
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    const f = getWebEngine()?.getSessionFiles(sessionId) ?? null;
+    const keys = f ? Object.keys(f).sort() : [];
+    const next = keys.includes(activeFile) ? activeFile : keys[0] || "";
+    setActiveFile(next);
+    setDraft(f && next ? f[next] : "");
+  }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (!engine || !files || names.length === 0) return null;
+
+  const selectFile = (name: string) => {
+    setActiveFile(name);
+    setDraft(files[name] ?? "");
+  };
+
+  const saveAndCheck = async () => {
+    if (!activeFile || saving) return;
+    setSaving(true);
+    const res = await engine.updateSessionFile(sessionId, activeFile, draft);
+    setSaving(false);
+    if (res.ok) {
+      toast.success(`Saved ${activeFile} and re-ran Web Worker check.`);
+      onSaved();
+    } else {
+      toast.error(res.error || "Could not update branch file.");
+    }
+  };
+
+  return (
+    <Expandable expandDirection="vertical" expandBehavior="push" className="mt-4 rounded-card border border-hairline bg-surface p-3">
+      {({ isExpanded }) => (
+        <>
+          <ExpandableTrigger
+            aria-label="Edit branch worktree files"
+            className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-control text-left text-sm font-medium text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11"
+          >
+            <span className="inline-flex items-center gap-1.5">
+              <FileCode2 className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
+              <span>Edit branch worktree files ({names.length})</span>
+            </span>
+            <span className="text-xs font-normal text-ink-3">{isExpanded ? "Hide editor" : "Open editor"}</span>
+          </ExpandableTrigger>
+          <ExpandableContent preset="fade">
+            <div className="mt-3 space-y-2.5 border-t border-hairline pt-3">
+              <div className="flex flex-wrap gap-1.5">
+                {names.map((name) => (
+                  <Button
+                    key={name}
+                    type="button"
+                    size="sm"
+                    variant={activeFile === name ? "default" : "outline"}
+                    onClick={() => selectFile(name)}
+                    className="h-7 px-2 font-mono text-xs max-md:min-h-11"
+                  >
+                    {name}
+                  </Button>
+                ))}
+              </div>
+              <Textarea
+                aria-label={`Source code of ${activeFile}`}
+                rows={10}
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                className="font-mono text-xs leading-relaxed"
+              />
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs text-ink-3">Edits apply only to this session’s branch and re-run the Web Worker check.</p>
+                <Button type="button" size="sm" disabled={saving} onClick={saveAndCheck} className="max-md:min-h-11 max-md:px-4">
+                  <Play className="size-3.5" strokeWidth={1.5} aria-hidden />
+                  {saving ? "Running check..." : "Save and re-run check"}
+                </Button>
+              </div>
+            </div>
+          </ExpandableContent>
+        </>
+      )}
+    </Expandable>
   );
 }
 
@@ -219,6 +308,7 @@ export function DetailBody({
         <dl className="mt-3 flex flex-wrap gap-x-5 gap-y-1.5 text-sm text-ink-2 tabular-nums">
           <div className="flex min-w-0 gap-2"><dt className="text-ink-3">Project</dt><dd className="min-w-0 [overflow-wrap:anywhere] text-ink">{s.project}</dd></div>
           <div className="flex gap-2"><dt className="text-ink-3">Agent</dt><dd className="text-ink">{agent}</dd></div>
+          {s.model && <div className="flex min-w-0 gap-2"><dt className="text-ink-3">Model</dt><dd className="min-w-0 break-all font-mono text-xs text-ink">{s.model}</dd></div>}
           <div className="flex min-w-0 gap-2"><dt className="text-ink-3">Branch</dt><dd className="min-w-0 break-all font-mono text-xs text-ink">{s.branch || "—"}</dd></div>
           {s.queue_position ? <div className="flex gap-2"><dt className="text-ink-3">Queue</dt><dd className="font-mono text-ink">#{s.queue_position}</dd></div> : null}
         </dl>
@@ -381,6 +471,7 @@ export function DetailBody({
                 <span>lines against base branch.</span>
               </p>
               <DiffViewer diff={s.diff} />
+              {s.status !== "merged" && <BranchFileEditor sessionId={s.id} onSaved={onChanged} />}
             </>
           )}
 

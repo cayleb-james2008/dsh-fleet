@@ -55,7 +55,7 @@ for i in $(seq 1 20); do api /api/sessions >/dev/null 2>&1 && break; sleep 0.5; 
 
 # (a) policy carries the model from policies.rn.
 model=$(api /api/policy | jq -r '.model')
-[ "$model" = "opencode-go/deepseek-v4.1-flash" ] \
+[ "$model" = "opencode/deepseek-v4.1-flash-free" ] \
   || { echo "FAIL: /api/policy model is '$model', expected the policies.rn agent_model()"; exit 1; }
 meng=$(api /api/policy | jq -r '.model_engine')
 [ "$meng" = "opencode" ] || { echo "FAIL: model_engine is '$meng'"; exit 1; }
@@ -71,8 +71,8 @@ for i in $(seq 1 60); do
   sleep 0.5
 done
 [ "$st" = "done" ] || { echo "FAIL: opencode session reached '$st', expected done"; api "/api/sessions/$ID" | jq '{status, reason, transcript}'; exit 1; }
-grep -qx "run --model opencode-go/deepseek-v4.1-flash alpha job" "$OPENCODE_ARGV_LOG" \
-  || { echo "FAIL: adapter did not invoke opencode as 'run --model opencode-go/deepseek-v4.1-flash alpha job'; recorded:"; cat "$OPENCODE_ARGV_LOG"; exit 1; }
+grep -qx "run --model opencode/deepseek-v4.1-flash-free alpha job" "$OPENCODE_ARGV_LOG" \
+  || { echo "FAIL: adapter did not invoke opencode as 'run --model opencode/deepseek-v4.1-flash-free alpha job'; recorded:"; cat "$OPENCODE_ARGV_LOG"; exit 1; }
 eng=$(api "/api/sessions/$ID" | jq -r '.engine')
 [ "$eng" = "opencode" ] || { echo "FAIL: session engine is '$eng', expected opencode"; exit 1; }
 tm=$(api "/api/sessions/$ID" | jq -r '.test_mode')
@@ -89,7 +89,7 @@ for i in $(seq 1 60); do
   sleep 0.5
 done
 [ "$st" = "done" ] || { echo "FAIL: steered session reached '$st', expected done again"; exit 1; }
-grep -qx "run --model opencode-go/deepseek-v4.1-flash --continue polish it" "$OPENCODE_ARGV_LOG" \
+grep -qx "run --model opencode/deepseek-v4.1-flash-free --continue polish it" "$OPENCODE_ARGV_LOG" \
   || { echo "FAIL: continuation invocation not recorded; argv log:"; cat "$OPENCODE_ARGV_LOG"; exit 1; }
 
 # (d) a path agent is labelled custom + test mode.

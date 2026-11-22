@@ -256,7 +256,7 @@ function SessionCard({
         aria-current={selected ? "true" : undefined}
         aria-label={`Open ${s.task}`}
         onClick={() => onOpen("tr")}
-        className="h-auto min-h-11 w-full justify-start whitespace-normal px-1.5 py-1 text-left font-heading text-[15px] font-medium leading-snug text-ink hover:bg-board [overflow-wrap:anywhere]"
+        className="h-auto sm:h-auto min-h-11 w-full justify-start whitespace-normal px-1.5 py-1.5 text-left font-heading text-[15px] font-medium leading-snug text-ink hover:bg-board [overflow-wrap:anywhere]"
       >
         <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{s.task}</span>
       </Button>
@@ -328,7 +328,7 @@ function SessionCard({
       )}
 
       <div className="mt-auto flex min-w-0 items-center gap-2 border-t border-hairline pt-2 font-mono text-xs text-ink-3">
-        <span className="shrink-0 text-ink-2">{s.test_mode ? "fixture" : s.engine || s.agent || "agent"}</span>
+        <span className="shrink-0 text-ink-2">{s.test_mode ? "custom" : s.engine || s.agent || "agent"}</span>
         <span className="ml-auto min-w-0 truncate">{s.branch || s.id}</span>
       </div>
     </motion.article>

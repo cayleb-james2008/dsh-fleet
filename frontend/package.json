@@ -1,12 +1,12 @@
 {
   "name": "fleet-frontend",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "build:demo": "npm run build && node scripts/build-demo.mjs",
+    "build:live-web": "npm run build && node scripts/build-live-web.mjs",
     "sync-used": "node scripts/sync-used.mjs",
     "check:ui": "node e2e/check.mjs"
   },

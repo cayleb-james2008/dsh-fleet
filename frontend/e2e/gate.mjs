@@ -152,11 +152,33 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
   const newTrigger = p.getByRole('button', { name: /New session/ }).first()
   await newTrigger.click(); await p.waitForTimeout(400)
   ok('New session MorphingDialog opens', await p.locator('[role=dialog]').count() >= 1)
+  const repoPickerVisible = await p.locator('[aria-label="Discovered repositories"]').isVisible().catch(() => false)
+  const initialProjectVal = await p.locator('#project').inputValue()
+  ok('New session discovers git repos and never defaults project to fixture', repoPickerVisible && initialProjectVal !== 'fixture', `picker=${repoPickerVisible} project=${initialProjectVal}`)
   await p.keyboard.press('Escape'); await p.waitForTimeout(350)
   ok('New session dialog returns focus on Escape', (await p.evaluate(() => document.activeElement?.textContent || '')).includes('New session'))
 
+  // Owner ruling (#67): Light/Dark theme switch lives inside Settings ONLY, not on top bar
+  const headerThemeBtns = await p.locator('header #themeBtn, header [aria-label="Light"], header [aria-label="Dark"]').count()
+  ok('Light/Dark switch is absent from top bar', headerThemeBtns === 0, `headerThemeBtns=${headerThemeBtns}`)
   await p.getByRole('button', { name: 'Engines and settings' }).click(); await p.waitForTimeout(400)
-  ok('Engines and Rune policy sheet opens', await p.locator('#settings').isVisible())
+  ok('Engines and settings sheet opens', await p.locator('#settings').isVisible())
+  const lum = (rgb) => 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+  const bgRgb = () => p.evaluate(() => {
+    const cx = document.createElement('canvas').getContext('2d')
+    cx.fillStyle = getComputedStyle(document.body).backgroundColor
+    cx.fillRect(0, 0, 1, 1)
+    return [...cx.getImageData(0, 0, 1, 1).data]
+  })
+  const lightBg = await bgRgb()
+  await p.locator('#settings').getByRole('button', { name: 'Dark', exact: true }).click(); await p.waitForTimeout(300)
+  const darkThemeAttr = await p.evaluate(() => document.documentElement.dataset.theme)
+  const darkBg = await bgRgb()
+  await p.locator('#settings').getByRole('button', { name: 'Light', exact: true }).click(); await p.waitForTimeout(300)
+  const lightThemeAttr = await p.evaluate(() => document.documentElement.dataset.theme)
+  ok('Light/Dark toggles cleanly inside Settings and darkens background',
+    darkThemeAttr === 'dark' && lightThemeAttr === 'light' && lum(darkBg) < lum(lightBg),
+    `dark=${darkThemeAttr}(${lum(darkBg).toFixed(0)}) light=${lightThemeAttr}(${lum(lightBg).toFixed(0)})`)
   await p.keyboard.press('Escape'); await p.waitForTimeout(350)
   await ctx.close()
 }
@@ -167,12 +189,12 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
   await p.route('**/api/update', r => r.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ current: '0.3.0', latest: '0.4.0', available: true, can_apply: true, mode: 'notify', notes: 'Faster worktree diffs\nExtra detail line' }),
+    body: JSON.stringify({ current: '0.4.0', latest: '0.5.0', available: true, can_apply: true, mode: 'notify', notes: 'Faster worktree diffs\nExtra detail line' }),
   }))
   await p.route('**/api/update/check', r => r.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ current: '0.3.0', latest: '0.4.0', available: true, can_apply: true, mode: 'notify', checked_at: Math.floor(Date.now() / 1000) }),
+    body: JSON.stringify({ current: '0.4.0', latest: '0.5.0', available: true, can_apply: true, mode: 'notify', checked_at: Math.floor(Date.now() / 1000) }),
   }))
   await p.goto(BASE); await ready(p); await p.waitForTimeout(500)
   const strip = p.locator('section[aria-label="Fleet update"]')
