@@ -211,7 +211,8 @@ fn the_browser_opens_once_at_the_app_url_when_a_display_is_there() {
 
 #[test]
 fn the_browser_stays_closed_for_opt_out_service_and_no_display() {
-    let cases: [(&str, Vec<(&str, &str)>, Vec<&str>); 4] = [
+    type NoOpenCase<'a> = (&'a str, Vec<(&'a str, &'a str)>, Vec<&'a str>);
+    let cases: [NoOpenCase<'_>; 4] = [
         ("opt-out env", vec![("DISPLAY", ":0"), ("FLEET_NO_OPEN", "1")], vec![]),
         ("opt-out flag", vec![("DISPLAY", ":0")], vec!["--no-open"]),
         ("service", vec![("DISPLAY", ":0"), ("INVOCATION_ID", "abc")], vec![]),

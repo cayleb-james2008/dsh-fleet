@@ -980,7 +980,7 @@ impl App {
                         } else {
                             0
                         };
-                        let mut idx = start;
+                        let idx = start;
                         while over > 0 && s.transcript.len() > idx + 1 {
                             over = over.saturating_sub(s.transcript[idx].len() + 1);
                             s.transcript.remove(idx);
@@ -1018,14 +1018,6 @@ impl App {
                 .store(0, std::sync::atomic::Ordering::Relaxed);
             self.persist();
         }
-    }
-    fn active_count(&self) -> i64 {
-        self.sessions
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|s| s.bucket == "working" && s.status != "queued")
-            .count() as i64
     }
 
     /// Start a session's worker thread if a parallel slot is free;
@@ -3201,7 +3193,7 @@ fn cap_transcript(lines: Vec<String>) -> Vec<String> {
         } else {
             0
         };
-        let mut idx = start;
+        let idx = start;
         while over > 0 && kept.len() > idx + 1 {
             over = over.saturating_sub(kept[idx].len() + 1);
             kept.remove(idx);
@@ -3571,7 +3563,7 @@ fn main() {
         app.default_agent.as_deref().unwrap_or("none"),
         app.policy.max_parallel
     );
-    println!("  Data:    {}", data_dir_label);
+    println!("  Data:    {data_dir_label}");
     println!(
         "  Updates: {}",
         std::env::var("FLEET_UPDATE_MODE").unwrap_or_else(|_| "notify".to_string())

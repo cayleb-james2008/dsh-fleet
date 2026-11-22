@@ -9,7 +9,7 @@ PIDS=""
 cleanup() { for p in $PIDS; do kill -9 $p 2>/dev/null; done; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-[ -x ./target/debug/fleet-rs ] || cargo build >/dev/null 2>&1
+[ -x "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" ] || cargo build >/dev/null 2>&1
 
 for r in a b; do
   git init -q -b main "$WORK/repo$r"
@@ -43,7 +43,7 @@ pub fn default_check(project) { "sleep 60" }
 EOF
 
 start() { # port policy agent datadir
-  FLEET_AGENT="$3" FLEET_DATA="$4" PORT=$1 ./target/debug/fleet-rs "$2" > "$WORK/server-$1.log" 2>&1 &
+  FLEET_AGENT="$3" FLEET_DATA="$4" PORT=$1 "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" "$2" > "$WORK/server-$1.log" 2>&1 &
   PIDS="$PIDS $!"
   for i in $(seq 1 20); do curl -s "http://127.0.0.1:$1/api/sessions" >/dev/null 2>&1 && break; sleep 0.5; done
 }

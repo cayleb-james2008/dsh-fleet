@@ -44,7 +44,12 @@ export function build() {
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 const listening = port => new Promise(res => { const s = net.connect(port, '127.0.0.1'); s.once('connect', () => { s.destroy(); res(true) }); s.once('error', () => res(false)) })
 const freePort = () => new Promise((res, rej) => { const s = net.createServer().once('error', rej).listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => res(port)) }) })
-async function pickPort(taken) { for (;;) { const p = await freePort(); if (p !== 9230 && !taken.includes(p)) return p } }
+async function pickPort(taken) {
+  for (let p = 18470; p <= 18479; p++) {
+    if (!taken.includes(p) && !(await listening(p))) return p
+  }
+  for (;;) { const p = await freePort(); if (p !== 9230 && !taken.includes(p)) return p }
+}
 
 // Only ever signal a pid this fixture wrote, and only while its command line is still the one it started.
 function alive(name, mark) {
@@ -97,13 +102,13 @@ export async function start({ fresh = false } = {}) {
 }
 export const reset = () => start({ fresh: true })
 
-// Five fixture sessions: two pass, one fails its check, two stream for ten minutes.
+// Five fixture sessions: two pass with check receipts, one fails test -s output.txt, two stream for ten minutes.
 export async function seed() {
   const repo = path.join(RUN, 'repo'), origin = new URL(BASE).origin
   for (const s of [
-    { task: 'Add the export button to the reports page and cover it with a test' },
-    { task: 'Write the changelog entry for 0.4' },
-    { task: 'Fix the sign-in redirect loop on the staging host', check: 'false' },
+    { task: 'Add the export button to the reports page and cover it with a test', check: 'test -s output.txt && echo "reports_export: 6 passed in 0.38s"' },
+    { task: 'Write the changelog entry for 0.3.0', check: 'test -s output.txt && echo "changelog_lint: 3 checks passed"' },
+    { task: 'Fix the sign-in redirect loop without writing output artifact', check: 'test -s output.txt' },
     { task: 'slow: Migrate the billing tables to the new schema' },
     { task: 'slow: Profile the search endpoint and cut p95 under 200 ms' },
   ]) {

@@ -20,7 +20,7 @@ PIDS=""
 cleanup() { for p in $PIDS; do kill -9 $p 2>/dev/null; done; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-[ -x ./target/debug/fleet-rs ] || cargo build >/dev/null 2>&1
+[ -x "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" ] || cargo build >/dev/null 2>&1
 
 git init -q -b main "$WORK/repo"
 echo "seed" > "$WORK/repo/README.md"
@@ -47,7 +47,7 @@ chmod +x "$WORK/agent.sh"
 
 export OPENCODE_ARGV_LOG="$WORK/argv.log"
 PATH="$WORK/bin:$PATH" FLEET_DATA="$WORK/data" PORT=$PORT \
-  ./target/debug/fleet-rs policies.rn > "$WORK/server.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" policies.rn > "$WORK/server.log" 2>&1 &
 PIDS="$PIDS $!"
 api() { curl -s "http://127.0.0.1:$PORT$1"; }
 post() { curl -s -w "\n%{http_code}" -X POST "http://127.0.0.1:$PORT$1" -H 'Content-Type: application/json' -d "$2"; }

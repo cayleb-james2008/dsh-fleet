@@ -228,26 +228,27 @@ binary (one under a `target` folder) unless `FLEET_UPDATE_DEV=1`.
 
 ## Tests and checks
 
-`cargo test` runs the Rust tests: 22 at this commit, all passing. They cover
-the session store and recovery, the runner's settle path, check reasons, the
-engine invocation shapes, merge refusals, retry after a lost worktree, the
-concurrent retry, task and repo validation, the Host and header limits, and the
-steering and dismiss routes.
+`cargo test` runs the Rust unit and CLI integration tests: 52 tests (43 unit +
+9 CLI), all passing. They cover the session store and recovery, the runner's
+settle path, check reasons, the engine invocation shapes, merge refusals, retry
+after a lost worktree, concurrent retry protection, task and repo validation,
+Host and header limits, desktop launch data-dir/port-fallback/browser rules,
+self-update verification, and the steering and dismiss routes.
 
-`bash .loop/verify` builds the binary, runs the Rust tests, and runs the shell
-checks in `.loop/checks/`. The shell checks run the real binary over HTTP.
-One is known to be out of date: `.loop/checks/inbox.sh` matches the old reason
-text `check failed`, which the current reason (`Check failed (exit N): …`)
-does not contain. Until that check is updated, `bash .loop/verify` reports it
-as a failure.
+`bash .loop/verify` builds the binary, runs `cargo test`, runs all 20 hermetic
+HTTP/process checks in `.loop/checks/`, and runs `proof.sh` (23/23 checks
+passing). `cd frontend && npm run check:ui` runs the Playwright E2E gate and
+worst-case data replay across desktop and mobile viewports in both themes.
 
 ## Layout
 
-- `src/main.rs` — the whole server: sessions, the runner, the checker, the
-  merger, persistence, the HTTP API, and the tests.
-- `assets/index.html` — the board: the three groups, the session detail with
-  its Transcript, Diff and Receipt tabs, the Needs-you inbox, and Settings.
-  Light and dark themes, dark by default, the switch in the settings footer;
-  icons are drawn symbols, never letters.
-- `policies.rn` — the Rune policies file: per-project check command, default
-  agent, and run timeout.
+- `src/main.rs` & `src/update.rs` — the single-binary Rust server: sessions,
+  worktree runner, pristine-checkout verifier, defensive merger, persistence,
+  Rune policy evaluation, self-updater, HTTP API, and unit tests.
+- `frontend/` & `rune/used/` — the React + Tailwind 4 + House Frontend Mission
+  Control Board (`JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md`), compiled into a
+  single self-contained `assets/index.html` with self-hosted Geist and Geist
+  Mono fonts embedded directly into the Rust binary. Light default + full dark
+  theme parity.
+- `policies.rn` — the Rune policies file: parallel session cap, per-project
+  check command, default agent model, and execution timeout.

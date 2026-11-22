@@ -1,11 +1,12 @@
 {
   "name": "fleet-frontend",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "build:demo": "npm run build && node scripts/build-demo.mjs",
     "sync-used": "node scripts/sync-used.mjs",
     "check:ui": "node e2e/check.mjs"
   },
@@ -41,7 +42,7 @@
     "tailwind-variants": "^4.0.2",
     "tunnel-rat": "^0.1.2",
     "vaul": "^1.1.2"
-},
+  },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.5",
     "@types/lodash.throttle": "^4.1.9",
@@ -53,5 +54,5 @@
     "tailwindcss": "^4.3.5",
     "typescript": "^7.0.2",
     "vite": "^8.3.7"
-}
+  }
 }

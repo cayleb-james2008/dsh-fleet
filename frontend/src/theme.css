@@ -1,7 +1,6 @@
-/* Fleet colour scheme: the shared Anthropic / owner palette (_fe/palette-claude.css), set by hand in this file.
-   Colour roles only: fonts, radii, the heading recipe and the Vantage signature are unchanged below.
-   Roles: --blue is the ONE clay accent (primary key, current selection, focus); green, red, amber are state only.
-   Needs you = clay, failed check = red, verified = sage. Decisions and measured contrast: frontend/DESIGN.md "Colour scheme". */
+/* Layout concept: Parallel coding-agent mission control — scan strip + measured verified-receipt hero over a hairline three-lane board (Needs you · Working · Done) with a split-pane session inspector.
+   Fleet colour scheme: House Frontend + owner warm palette, light default + full dark parity.
+   Roles: --blue is the ONE clay accent (primary key, current selection, focus); green, red, amber are state only. */
 :root[data-theme="light"] {
   color-scheme: light;
   --canvas: #f5f4ee;       /* page */
@@ -26,6 +25,8 @@
   --dot-clay: #d97757;   /* needs you */
   --dot-amber: #c99a3e;  --warning-foreground: #7a5a14;   /* queued, honest-but-needs-you */
   --dot-online: #788c5d;
+  --diff-add-bg: #eaf3df; --diff-add-fg: #34471d;
+  --diff-del-bg: #fbe7e4; --diff-del-fg: #822319;
   --tag-plan-bg: #ffe3d7; --tag-plan-fg: #67260c;
   --tag-ops-bg: #d8eeff; --tag-ops-fg: #023f6f;
   --tag-design-bg: #ffe1e5; --tag-design-fg: #672131;
@@ -68,6 +69,8 @@
   --dot-clay: #d97757;
   --dot-amber: #d9a84a;  --warning-foreground: #e7c277;
   --dot-online: #8fa86d;
+  --diff-add-bg: #1d2715; --diff-add-fg: #b9d49b;
+  --diff-del-bg: #2f1917; --diff-del-fg: #f4a89f;
   --tag-plan-bg: #3e2015; --tag-plan-fg: #ffb294;
   --tag-ops-bg: #142a41; --tag-ops-fg: #92d0ff;
   --tag-design-bg: #3e1e23; --tag-design-fg: #ffacba;
@@ -87,23 +90,28 @@
   --elev-shell: none; --elev-card: none; --elev-raised: none; --elev-lift: 0 10px 24px rgba(0, 0, 0, 0.55); --elev-primary: none;
 }
 :root {
-  /* Vantage: type voice, radii and the heading recipe (Hallmark theme values) */
-  --font-sans: "Geologica", ui-sans-serif, system-ui, sans-serif;
-  --font-heading: "Geologica", ui-sans-serif, system-ui, sans-serif;
+  /* House Frontend type voice and nested radii (inner strictly smaller than outer) */
+  --font-sans: "Geist", ui-sans-serif, system-ui, sans-serif;
+  --font-heading: "Geist", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Geist Mono", ui-monospace, monospace;
-  --radius-shell: 10px; --radius-panel: 6px; --radius-dialog: 8px; --radius-card: 4px;
-  --radius-segment: 999px; --radius-chip: 999px; --radius-menu: 8px; --radius: 8px;
-  --display-weight: 300; --tracking-display: -0.035em;
+  --radius-shell: 24px; --radius-panel: 16px; --radius-dialog: 16px; --radius-card: 10px;
+  --radius-segment: 7px; --radius-chip: 6px; --radius-menu: 12px; --radius: 9px;
+  --display-weight: 500; --tracking-display: -0.025em;
+  --ease-out: cubic-bezier(.23,1,.32,1); --ease-in-out: cubic-bezier(.77,0,.175,1); --ease-soft: cubic-bezier(.33,1,.68,1);
+  --t-press: 150ms; --t-hover: 180ms; --t-ui: 240ms;
 }
 h1, h2, h3, .font-heading { font-family: var(--font-heading); font-weight: var(--display-weight); letter-spacing: var(--tracking-display); }
-.num, .mono, [data-measured] { font-family: var(--font-mono); font-variant-numeric: tabular-nums ; }
+.num, .mono, [data-measured] { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 ::selection { background: color-mix(in oklab, var(--blue) 28%, transparent); }
 
-/* Round 2: an input edge that reads at 3:1 (WCAG non-text), and the two literal colours Tailwind ships (white, black) on tokens. */
 @theme inline {
   --color-edge: var(--edge);
   --color-white: var(--surface);
   --color-black: var(--ink);
+  --color-diff-add-bg: var(--diff-add-bg);
+  --color-diff-add-fg: var(--diff-add-fg);
+  --color-diff-del-bg: var(--diff-del-bg);
+  --color-diff-del-fg: var(--diff-del-fg);
   --shadow-xs: var(--elev-card);
   --shadow: var(--elev-raised);
   --shadow-md: var(--elev-lift);

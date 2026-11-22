@@ -26,7 +26,7 @@ EOF
 chmod +x "$WORK/agent.sh"
 
 FLEET_AGENT="$WORK/agent.sh" FLEET_DATA="$WORK/data" PORT=$PORT \
-  ./target/debug/fleet-rs policies.rn > "$WORK/server.log" 2>&1 &
+  "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" policies.rn > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 1
 
