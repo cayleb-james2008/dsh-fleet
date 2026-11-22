@@ -6533,11 +6533,12 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 /// - Windows: `msedge.exe --app=<url>` (or Chrome), falling back to `cmd /C start "" <url>`.
 /// - macOS: `open <url>`.
 ///
-/// Setting `FLEET_APP_WINDOW=0` opts into the standard browser tab opener.
-fn desktop_launch_command(url: &str) -> (String, Vec<String>) {
-    let app_window = std::env::var("FLEET_APP_WINDOW")
-        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
-        .unwrap_or(true);
+/// Setting `FLEET_APP_WINDOW=0` opts into the standard browser tab opener unless `--app` is explicitly passed.
+fn desktop_launch_command(url: &str, force_app: bool) -> (String, Vec<String>) {
+    let app_window = force_app
+        || std::env::var("FLEET_APP_WINDOW")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+            .unwrap_or(true);
 
     #[cfg(target_os = "windows")]
     {
@@ -6612,12 +6613,14 @@ fn desktop_launch_command(url: &str) -> (String, Vec<String>) {
 /// Open Fleet once in a chromeless desktop app window (with browser fallback).
 /// Suppressed when there is no display on Linux (a headless service), when the
 /// operator opts out (`FLEET_NO_OPEN` or `--no-open`), or when running under
-/// systemd (`INVOCATION_ID` set). Failures are silent: the board stays reachable
-/// at the URL on the banner.
+/// systemd (`INVOCATION_ID` set) unless `--app` is explicitly passed (for `.desktop`
+/// launchers under systemd/UWSM sessions). Failures are silent: the board stays
+/// reachable at the URL on the banner.
 fn open_in_browser(url: &str) {
+    let force_app = std::env::args().any(|a| a == "--app");
     let opted_out = std::env::var_os("FLEET_NO_OPEN").is_some()
-        || std::env::var_os("INVOCATION_ID").is_some()
-        || std::env::args().any(|a| a == "--no-open");
+        || std::env::args().any(|a| a == "--no-open")
+        || (!force_app && std::env::var_os("INVOCATION_ID").is_some());
     let has_display = if cfg!(any(target_os = "windows", target_os = "macos")) {
         true
     } else {
@@ -6626,7 +6629,7 @@ fn open_in_browser(url: &str) {
     if opted_out || !has_display {
         return;
     }
-    let (prog, args) = desktop_launch_command(url);
+    let (prog, args) = desktop_launch_command(url, force_app);
     let _ = std::process::Command::new(prog)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -6634,6 +6637,8 @@ fn open_in_browser(url: &str) {
         .stderr(std::process::Stdio::null())
         .spawn();
 }
+
+const DEFAULT_POLICIES_SCRIPT: &str = include_str!("../policies.rn");
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -6673,16 +6678,48 @@ fn main() {
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .map(|v| v.clamp(1, 64));
-    let policy_path = args
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| "policies.rn".to_string());
-    let script = match std::fs::read_to_string(&policy_path) {
-        Ok(text) => text,
-        Err(e) => {
-            eprintln!("fleet: cannot read the policies file {policy_path}: {e}");
-            std::process::exit(1);
-        }
+    let explicit_policy_path = args
+        .iter()
+        .skip(1)
+        .find(|a| !matches!(a.as_str(), "--app" | "--no-open"))
+        .cloned();
+    let (policy_path, script) = if let Some(path) = explicit_policy_path {
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("fleet: cannot read the policies file {path}: {e}");
+                std::process::exit(1);
+            }
+        };
+        (path, text)
+    } else if Path::new("policies.rn").is_file() {
+        let text = match std::fs::read_to_string("policies.rn") {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("fleet: cannot read the policies file policies.rn: {e}");
+                std::process::exit(1);
+            }
+        };
+        ("policies.rn".to_string(), text)
+    } else if let Some(sibling) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("policies.rn")))
+        .filter(|p| p.is_file())
+    {
+        let label = sibling.display().to_string();
+        let text = match std::fs::read_to_string(&sibling) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("fleet: cannot read the policies file {label}: {e}");
+                std::process::exit(1);
+            }
+        };
+        (label, text)
+    } else {
+        (
+            "built-in policies.rn".to_string(),
+            DEFAULT_POLICIES_SCRIPT.to_string(),
+        )
     };
     let policy = match Policy::load(&script) {
         Ok(p) => p,

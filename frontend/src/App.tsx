@@ -243,7 +243,6 @@ export function App() {
         if (next) {
           setInbox(next.filter((s) => s.bucket === "needs-you"));
           setLastGood(new Date());
-          setUnreachable(false);
         }
         return next;
       });

@@ -338,7 +338,7 @@ export function useFleetStream({
     if (enabled) connect();
     else setStreamState(webEngine ? "browser" : "polling");
 
-    // Polling loop: 2s when SSE is not connected, 6s safety reconcile when SSE is live
+    // Polling loop: 2s when SSE is not connected, 4s safety reconcile when SSE is live
     const poll = setInterval(() => {
       if (!alive) return;
       if (!sseOpen) {
@@ -351,7 +351,7 @@ export function useFleetStream({
       if (sseOpen) {
         refreshRef.current();
       }
-    }, 6000);
+    }, 4000);
 
     return () => {
       alive = false;

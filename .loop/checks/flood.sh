@@ -27,7 +27,8 @@ chmod +x "$WORK/agent.sh"
 
 FLEET_AGENT="$WORK/agent.sh" FLEET_DATA="$WORK/data" PORT=$PORT \
   "${CARGO_TARGET_DIR:-./target}/debug/fleet" policies.rn > "$WORK/server.log" 2>&1 &
-PIDS="$PIDS $!"
+S1=$!
+PIDS="$PIDS $S1"
 api() { curl -s "http://127.0.0.1:$PORT$1"; }
 for i in $(seq 1 20); do api /api/sessions >/dev/null 2>&1 && break; sleep 0.5; done
 
@@ -52,11 +53,12 @@ lines=$(wc -l < "$WORK/data/logs/$ID.log")
 # The restore used to replace the capped transcript with the whole
 # log file; the cap must survive the restart, and the check-output
 # block stored in the same file must not pollute the transcript.
-kill -9 $(ps aux | grep "[f]leet-rs policies.rn" | awk '{print $2}') 2>/dev/null
+kill -9 "$S1" 2>/dev/null
 sleep 1
 FLEET_AGENT="$WORK/agent.sh" FLEET_DATA="$WORK/data" PORT=$PORT \
   "${CARGO_TARGET_DIR:-./target}/debug/fleet" policies.rn > "$WORK/server2.log" 2>&1 &
-PIDS="$PIDS $!"
+S2=$!
+PIDS="$PIDS $S2"
 for i in $(seq 1 20); do api /api/sessions >/dev/null 2>&1 && break; sleep 0.5; done
 n2=$(api /api/sessions | jq '.[0].transcript | length')
 [ "$n2" -le 2100 ] || { echo "FAIL: after restart the transcript holds $n2 lines — the cap was undone by the restore"; exit 1; }
@@ -88,12 +90,13 @@ snapsize=$(wc -c < "$WORK/data/sessions.json")
 
 # --- B18 phase 4: lose sessions.json entirely — the sessions are
 # recovered from their logs as needs-you, never silently vanished.
-kill -9 $(ps aux | grep "[f]leet-rs policies.rn" | awk '{print $2}') 2>/dev/null
+kill -9 "$S2" 2>/dev/null
 sleep 1
 rm "$WORK/data/sessions.json"
 FLEET_AGENT="$WORK/agent.sh" FLEET_DATA="$WORK/data" PORT=$PORT \
   "${CARGO_TARGET_DIR:-./target}/debug/fleet" policies.rn > "$WORK/server3.log" 2>&1 &
-PIDS="$PIDS $!"
+S3=$!
+PIDS="$PIDS $S3"
 for i in $(seq 1 20); do api /api/sessions >/dev/null 2>&1 && break; sleep 0.5; done
 api /api/sessions | jq -e 'length >= 2' >/dev/null \
   || { echo "FAIL: sessions vanished with sessions.json — no recovery from logs"; api /api/sessions; exit 1; }
