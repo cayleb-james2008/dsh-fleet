@@ -4,6 +4,37 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running app shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.4.0 - 2026-11-21
+
+- Real repository discovery (`GET /api/repos`, loopback-only): discovers local
+  git repositories under `FLEET_REPOS_DIR`, `$HOME/Work/projects`, `$HOME/projects`,
+  `$HOME/Code`, cwd, and active sessions, wired into a live repo picker in the
+  `New session` dialog. Default project name is derived automatically from the
+  selected repository folder basename instead of `"fixture"`.
+- Live engine and model routing (`GET /api/config`, `POST /api/config`, loopback-only,
+  persisted in `data_dir/config.json`) plus `FLEET_MODEL` / `FLEET_CLAUDE_MODEL` /
+  `FLEET_CODEX_MODEL` environment overrides. Default `policies.rn` OpenCode model
+  updated to `opencode/deepseek-v4.1-flash-free`, with per-engine model routing
+  in `Engines and settings`.
+- Worktree isolation & cleanup fixes: sets `PWD` to the isolated worktree/check
+  directory on spawned agents and checks so CLIs reading `$PWD` (such as
+  `opencode`) never write outside the worktree; automatically removes and prunes
+  a session's worktree directory under `data_dir/worktrees` once its verified
+  commit merges onto the target branch.
+- Settings-only Appearance switch: moved the Light/Dark `SegmentedControl`
+  (`id="themeBtn"`) out of the top command bar and into the `Engines and settings`
+  Vaul right sheet while preserving `Light`/`Dark` accessible labels and
+  `localStorage('fleet-theme')` persistence.
+- Board polish & real-time reliability: optimistic session insertion on
+  `New session` dispatch so the Split-Pane Inspector opens immediately without a
+  poll race, `sm:h-auto` fix preventing multi-line task buttons from clipping at
+  desktop widths, and zero fixture/demo pills in live operation.
+- Standalone functional browser bundle (`frontend/scripts/build-live-web.mjs` +
+  `frontend/scripts/web-engine.js`): in-browser git worktree store persisted in
+  IndexedDB, real LCS unified diff generator, real sandboxed Web Worker check
+  evaluator, in-inspector branch file editor, optional BYOK OpenAI-compatible
+  agent (`sessionStorage` only), and local `fleet-rs` connector.
+
 ## 0.3.0 - 2026-11-21
 
 - Parallel Coding-Agent Mission Control Board built on the House Frontend system

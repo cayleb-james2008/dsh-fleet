@@ -65,7 +65,8 @@ that lands in Needs you fires nothing.
   `git config user.email`. Git's own text is kept in the response's `detail`.
   The refusal is also kept on the session as `merge_error`, until a merge
   lands or the session is retried. A merge is only reported once the
-  session's branch is verifiably an ancestor of the target.
+  session's branch is verifiably an ancestor of the target, and Fleet then
+  removes and prunes the merged session's isolated worktree cleanly.
 - **Nothing is silently dropped.** If an agent writes files your repo's
   gitignore excludes, they can never be committed — so the session goes to
   Needs you, naming the files, instead of reporting a "done" whose work is
@@ -128,7 +129,13 @@ the task, status, bucket and transcript, each carries:
   `archived`). Actions on a session in the wrong state answer 409 with a plain
   sentence; an unknown session answers 404.
 - `GET /api/inbox` lists the needs-you sessions. `GET /api/policy` shows the
-  parallel cap, detected agents, default agent, model and `version`.
+  parallel cap, detected agents, default agent, active per-engine models, and
+  `version`.
+- `GET /api/repos` (loopback-only) discovers local git repositories and their
+  checked-out branches for the `New session` repository picker.
+- `GET /api/config` and `POST /api/config` (loopback-only) read and persist
+  live default-engine and per-engine model settings in `config.json` inside the
+  data folder without restarting Fleet.
 - `GET /api/version`, `GET /api/update`, `POST /api/update/check`,
   `POST /api/update/apply`, `POST /api/update/restart` — see "Versions and
   updates".
@@ -154,23 +161,19 @@ A bare name gets the engine's non-interactive form:
 
 - **opencode** — `opencode run --model <model> <task>`; a continuation adds
   `--continue`.
-- **claude** — `claude -p <task>`; a continuation adds `--continue`. The
-  OpenCode Go model is not passed to claude.
-- **codex** — `codex exec --sandbox workspace-write --color never <task>`; a
-  continuation is `codex exec resume --last <task>`, which keeps the first
+- **claude** — `claude -p [--model <model>] <task>`; a continuation adds
+  `--continue`. OpenCode-namespaced model IDs are never passed to claude.
+- **codex** — `codex exec --sandbox workspace-write --color never [--model <model>] <task>`;
+  a continuation is `codex exec resume --last <task>`, which keeps the first
   run's sandbox.
 
-The model comes from one config point: the policies file's `agent_model()` —
-set to `opencode-go/deepseek-v4.1-flash` — and `/api/policy` shows the model in
-force. Any other executable named as the agent (a script, a fixture, a full
-path) runs in **test mode**, labelled as such on the board, and receives the
-prompt as its single argument.
-
-The honest limit: on the machine this was built on, no engine CLI is installed
-or signed in, so the adapter is proven by its exact invocation shape (a
-recording stand-in receives precisely the commands above) and, for the one CLI
-present, up to its sign-in wall. A live model run needs a host where the engine
-is signed in.
+The default OpenCode model comes from `policies.rn` (`agent_model()`, set to
+`opencode/deepseek-v4.1-flash-free`), overridable via `FLEET_MODEL` (plus
+`FLEET_CLAUDE_MODEL` / `FLEET_CODEX_MODEL`) or live from the **Engines and
+settings** sheet (`POST /api/config`, persisted in `config.json`). Every agent
+and check process is spawned with both `cwd` and `PWD` set to the isolated
+worktree path. Any executable path named as the agent runs as a custom script
+and receives the prompt as its single argument.
 
 ## Running it
 
@@ -182,9 +185,12 @@ Environment: `PORT` (default 8471; a busy default falls back to the next free
 port and the banner says which), `FLEET_DATA` (default the platform data folder
 — `$XDG_DATA_HOME/fleet`, else `~/.local/share/fleet` on Linux,
 `~/Library/Application Support/fleet` on macOS), `FLEET_AGENT` (the default
-agent, otherwise the first detected one), `FLEET_ALLOWED_HOSTS` (extra Host
-names, see HTTP), `FLEET_NO_OPEN` (do not open the browser on launch), and the
-`FLEET_UPDATE_*` variables under "Versions and updates".
+agent, otherwise the first detected one), `FLEET_MODEL` / `FLEET_CLAUDE_MODEL` /
+`FLEET_CODEX_MODEL` (startup model overrides), `FLEET_REPOS_DIR` (optional
+colon-separated git repo discovery roots for `GET /api/repos`),
+`FLEET_ALLOWED_HOSTS` (extra Host names, see HTTP), `FLEET_NO_OPEN` (do not
+open the browser on launch), and the `FLEET_UPDATE_*` variables under
+"Versions and updates".
 
 The board opens in the operator's browser on launch, unless there is no display
 (a headless service), `FLEET_NO_OPEN` is set, `--no-open` is passed, or
@@ -228,12 +234,14 @@ binary (one under a `target` folder) unless `FLEET_UPDATE_DEV=1`.
 
 ## Tests and checks
 
-`cargo test` runs the Rust unit and CLI integration tests: 52 tests (43 unit +
+`cargo test` runs the Rust unit and CLI integration tests: 54 tests (45 unit +
 9 CLI), all passing. They cover the session store and recovery, the runner's
-settle path, check reasons, the engine invocation shapes, merge refusals, retry
-after a lost worktree, concurrent retry protection, task and repo validation,
-Host and header limits, desktop launch data-dir/port-fallback/browser rules,
-self-update verification, and the steering and dismiss routes.
+settle path, check reasons, the engine invocation shapes, per-engine model and
+repo-discovery routes (`GET /api/repos`, `GET/POST /api/config`), merge refusals
+and automatic worktree cleanup, retry after a lost worktree, concurrent retry
+protection, task and repo validation, Host and header limits, desktop launch
+data-dir/port-fallback/browser rules, self-update verification, and the steering
+and dismiss routes.
 
 `bash .loop/verify` builds the binary, runs `cargo test`, runs all 20 hermetic
 HTTP/process checks in `.loop/checks/`, and runs `proof.sh` (23/23 checks

@@ -1,9 +1,9 @@
-// Fleet v0.3.0: Parallel Coding-Agent Mission Control Board.
+// Fleet v0.4.0: Parallel Coding-Agent Mission Control Board.
 // Top Command Bar -> Update Strip -> Scan Strip & Hero Verified Receipt -> Three-Lane Board + Split-Pane Session Inspector.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Toaster, toast } from "sonner";
 import { Drawer } from "vaul";
-import { Search, Plus, Sun, Moon, Cpu, ScanLine, RefreshCw, X } from "lucide-react";
+import { Search, Plus, Sun, Moon, Cpu, ScanLine, RefreshCw, X, FolderGit2, Plug, KeyRound, RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
@@ -26,17 +26,24 @@ import { glide } from "@/motion";
 import { cn } from "@/lib/utils";
 import {
   getJson,
-  isDemoMode,
+  getWebEngine,
   isFailed,
   isVerified,
+  isWebEngineMode,
+  normalizeConfig,
   normalizePolicy,
+  normalizeRepos,
   normalizeSessions,
   postJson,
+  repoBasename,
   statusText,
   type Agent,
   type Policy,
+  type RepoInfo,
+  type RuntimeConfig,
   type Session,
   type TabId,
+  type WebEngineStatus,
 } from "./api";
 import { HeroVerifiedReceipt, ThreeLaneBoard } from "./board";
 import { DetailBody } from "./detail";
@@ -44,7 +51,7 @@ import { onThisMachine, resultLine as resultLineOf, UpdateStrip, useUpdate } fro
 
 type Theme = "dark" | "light";
 const THEME_KEY = "fleet-theme";
-const TEST_NOTE = "Example fixture / test mode: a stand-in script runs in place of a live coding model.";
+const TEST_NOTE = "Custom script mode: an executable path runs in place of a detected coding CLI.";
 
 const AVATAR_SKINS = [
   "bg-av-sky-bg text-av-sky-fg",
@@ -81,6 +88,7 @@ export function App() {
   const [inboxOpenMobile, setInboxOpenMobile] = useState(false);
   const [inbox, setInbox] = useState<Session[]>([]);
   const [inboxErr, setInboxErr] = useState<Record<string, string>>({});
+  const [config, setConfig] = useState<RuntimeConfig | null>(null);
 
   const wide = useMediaQuery("(min-width: 1100px)");
   const md = useMediaQuery("(min-width: 768px)");
@@ -91,7 +99,7 @@ export function App() {
   }, []);
   const upd = useUpdate(closeOverlaysForUpdate);
   const searchRef = useRef<HTMLInputElement>(null);
-  const demo = isDemoMode();
+  const webEngine = isWebEngineMode();
   const localHost = onThisMachine();
 
   useEffect(() => {
@@ -119,11 +127,22 @@ export function App() {
     }
   }, []);
 
+  const refreshConfig = useCallback(async () => {
+    const cfgRaw = await getJson<unknown>("/api/config");
+    const cfg = normalizeConfig(cfgRaw);
+    if (cfg) setConfig(cfg);
+  }, []);
+
   useEffect(() => {
     refresh();
+    refreshConfig();
     const t = setInterval(refresh, 2000);
     return () => clearInterval(t);
-  }, [refresh]);
+  }, [refresh, refreshConfig]);
+
+  useEffect(() => {
+    if (settingsOpen) refreshConfig();
+  }, [settingsOpen, refreshConfig]);
 
   const closeDetail = useCallback(() => {
     const id = selected;
@@ -167,7 +186,7 @@ export function App() {
   const workingAll = all.filter((s) => s.bucket === "working" && s.status !== "queued");
   const needsCount = needsAll.length;
   const workingCount = all.filter((s) => s.bucket === "working").length;
-  const testMode = !demo && (policy?.default_agent_engine === "custom" || all.some((s) => s.test_mode));
+  const testMode = !webEngine && (policy?.default_agent_engine === "custom" || all.some((s) => s.test_mode));
 
   const openSession = (id: string, tab: TabId = "tr") => {
     setSelected(id);
@@ -247,7 +266,7 @@ export function App() {
                 v{upd.version}
               </a>
             )}
-            {localHost && upd.snap?.mode !== "off" && !demo && (
+            {localHost && upd.snap?.mode !== "off" && !webEngine && (
               <Tooltip>
                 <TooltipTrigger
                   render={
@@ -266,15 +285,9 @@ export function App() {
                 <TooltipPopup>Check for updates</TooltipPopup>
               </Tooltip>
             )}
-            {demo && (
-              <Pill variant="info" className="px-2.5 py-0.5 font-mono text-xs font-medium" title="Interactive static fixture demo with in-browser /api/* mock state.">
-                <PillIndicator variant="info" />
-                <span>fixture demo</span>
-              </Pill>
-            )}
             {testMode && (
               <Badge variant="warning" size="sm" title={TEST_NOTE} className="shrink-0">
-                fixture · test mode
+                custom script
               </Badge>
             )}
             {upd.hidden && upd.snap?.available && upd.dismissed && (
@@ -290,7 +303,7 @@ export function App() {
               ref={searchRef}
               type="search"
               aria-label="Search sessions"
-              placeholder="Search tasks, projects, branches"
+              placeholder="Search sessions"
               className="max-md:[&_input]:!h-11 max-md:!h-11"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
@@ -311,7 +324,14 @@ export function App() {
               className="hidden md:inline-flex"
             />
             <span data-answers-via="4" className="hidden md:inline-flex">
-              <NewSession policy={policy} onHanded={(id) => { openSession(id, "tr"); refresh(); }} />
+              <NewSession
+                policy={policy}
+                onHanded={(s) => {
+                  setSessions((prev) => (prev ? [s, ...prev.filter((x) => x.id !== s.id)] : [s]));
+                  openSession(s.id, "tr");
+                  refresh();
+                }}
+              />
             </span>
             <Tooltip>
               <TooltipTrigger
@@ -334,20 +354,6 @@ export function App() {
               </TooltipTrigger>
               <TooltipPopup>Engines and settings</TooltipPopup>
             </Tooltip>
-            <SegmentedControl aria-label="Theme" size="sm" id="themeBtn">
-              {(["light", "dark"] as const).map((t) => (
-                <SegmentedControlItem
-                  key={t}
-                  aria-pressed={theme === t}
-                  data-checked={theme === t ? "" : undefined}
-                  onClick={() => setTheme(t)}
-                  aria-label={t === "light" ? "Light" : "Dark"}
-                  className="max-md:!h-11 max-md:!min-w-11"
-                >
-                  {t === "light" ? <Sun className="size-4" strokeWidth={1.5} aria-hidden /> : <Moon className="size-4" strokeWidth={1.5} aria-hidden />}
-                </SegmentedControlItem>
-              ))}
-            </SegmentedControl>
           </div>
         </header>
 
@@ -372,7 +378,7 @@ export function App() {
                   </AvatarStack>
                   <span className="min-w-0 truncate text-xs text-ink-2">
                     {workingAll.length === 1
-                      ? `running ${workingAll[0].test_mode ? "fixture" : workingAll[0].engine || workingAll[0].agent || "agent"}`
+                      ? `running ${workingAll[0].test_mode ? "custom script" : workingAll[0].engine || workingAll[0].agent || "agent"}`
                       : `${workingAll.length} running`}
                   </span>
                 </>
@@ -479,9 +485,9 @@ export function App() {
         <Drawer.Root direction="right" open={settingsOpen} onOpenChange={setSettingsOpen}>
           <Drawer.Portal>
             <Drawer.Overlay className="fixed inset-0 z-40 bg-canvas/60" />
-            <Drawer.Content id="settings" className="fixed inset-y-0 right-0 z-50 flex w-full max-w-[420px] flex-col border-l border-hairline bg-surface text-ink outline-none">
+            <Drawer.Content id="settings" className="fixed inset-y-0 right-0 z-50 flex w-full max-w-[440px] flex-col border-l border-hairline bg-surface text-ink outline-none">
               <div className="flex items-center justify-between border-b border-hairline px-5 py-4">
-                <Drawer.Title className="font-heading text-xl font-medium text-ink">Engines and Rune policy</Drawer.Title>
+                <Drawer.Title className="font-heading text-xl font-medium text-ink">Engines and settings</Drawer.Title>
                 <Drawer.Close asChild>
                   <Button variant="ghost" size="icon" className="max-md:size-11" aria-label="Close settings">
                     <X className="size-4" strokeWidth={1.5} aria-hidden />
@@ -489,36 +495,85 @@ export function App() {
                 </Drawer.Close>
               </div>
               <div className="flex-1 space-y-6 overflow-y-auto p-5">
+                <section className="border-b border-hairline pb-5">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <h3 className="text-sm font-medium text-ink">Appearance</h3>
+                      <p className="text-xs text-ink-3">Light or dark theme, saved in this browser.</p>
+                    </div>
+                    <SegmentedControl aria-label="Theme" size="sm" id="themeBtn">
+                      {(["light", "dark"] as const).map((t) => (
+                        <SegmentedControlItem
+                          key={t}
+                          aria-pressed={theme === t}
+                          data-checked={theme === t ? "" : undefined}
+                          onClick={() => setTheme(t)}
+                          aria-label={t === "light" ? "Light" : "Dark"}
+                          className="gap-1.5 px-2.5 max-md:!h-11 max-md:!min-w-11"
+                        >
+                          {t === "light" ? <Sun className="size-4" strokeWidth={1.5} aria-hidden /> : <Moon className="size-4" strokeWidth={1.5} aria-hidden />}
+                          <span>{t === "light" ? "Light" : "Dark"}</span>
+                        </SegmentedControlItem>
+                      ))}
+                    </SegmentedControl>
+                  </div>
+                </section>
+
                 <Drawer.Description className="text-sm leading-relaxed text-ink-2">
                   {policy
-                    ? `Up to ${policy.max_parallel} sessions run in parallel. Any agent or check exceeding ${policy.timeout_secs}s returns to Needs you. Policy source: ${policy.source}.${policy.model ? ` Model route: ${policy.model}.` : ""} ${policy.default_agent ? `Default agent: ${policy.default_agent_engine === "custom" ? "custom command (test mode)" : policy.default_agent}.` : "No default agent is set."}`
+                    ? `Up to ${policy.max_parallel} sessions run in parallel. Any agent or check exceeding ${policy.timeout_secs}s returns to Needs you. Policy source: ${policy.source}.${policy.model ? ` OpenCode model: ${policy.model}.` : ""} ${policy.default_agent ? `Default agent: ${policy.default_agent_engine === "custom" ? "custom script" : policy.default_agent}.` : "No default agent is set."}`
                     : "Loading Rune policy..."}
                 </Drawer.Description>
 
                 <section>
-                  <h3 className="mb-2 text-sm font-medium text-ink">CLI engines detected on PATH</h3>
+                  <h3 className="mb-2 text-sm font-medium text-ink">
+                    {webEngine ? "Browser Worktree Engine" : "CLI engines detected on PATH"}
+                  </h3>
                   <ul className="divide-y divide-hairline rounded-card border border-hairline bg-canvas">
                     {(policy?.agents ?? []).length === 0 && (
-                      <li className="p-3 text-sm text-ink-2">No CLI agents configured. Test mode runs the custom script from the policy file.</li>
+                      <li className="p-3 text-sm text-ink-2">No CLI agents detected on PATH.</li>
                     )}
                     {(policy?.agents ?? []).map((a) => (
                       <li key={a.name} className="flex items-center justify-between gap-3 px-3 py-2.5 text-sm">
-                        <span className="min-w-0 truncate font-mono text-ink">{a.name}</span>
-                        <Pill variant={a.found ? "success" : "secondary"} className="px-2.5 py-0.5 text-xs">
+                        <div className="min-w-0">
+                          <span className="block truncate font-mono text-ink">{a.name}</span>
+                          {a.path && <span className="block truncate font-mono text-xs text-ink-3">{a.path}</span>}
+                        </div>
+                        <Pill variant={a.found ? "success" : "secondary"} className="shrink-0 px-2.5 py-0.5 text-xs">
                           <PillIndicator variant={a.found ? "success" : "warning"} />
-                          <span>{a.found ? "found on this machine" : "not installed"}</span>
+                          <span>{a.found ? (webEngine ? "active" : "found on this machine") : "not installed"}</span>
                         </Pill>
                       </li>
                     ))}
                   </ul>
-                  {(testMode || demo) && <p className="mt-2 text-xs text-ink-3">{TEST_NOTE}</p>}
+                  {testMode && <p className="mt-2 text-xs text-ink-3">{TEST_NOTE}</p>}
                 </section>
+
+                {localHost && !webEngine && (
+                  <EngineConfigSection
+                    policy={policy}
+                    config={config}
+                    onSaved={() => {
+                      refreshConfig();
+                      refresh();
+                    }}
+                  />
+                )}
+
+                {webEngine && (
+                  <WebEngineSettingsSection
+                    onChanged={() => {
+                      refreshConfig();
+                      refresh();
+                    }}
+                  />
+                )}
 
                 <section className="border-t border-hairline pt-5">
                   <h3 className="mb-2 text-sm font-medium text-ink">Version and updates</h3>
                   <div className="flex flex-wrap items-center gap-3 text-sm text-ink-2">
                     {upd.version && <span className="font-mono text-ink">Fleet {upd.version}</span>}
-                    {localHost ? (
+                    {localHost && !webEngine ? (
                       <Button
                         variant="outline"
                         size="sm"
@@ -528,13 +583,17 @@ export function App() {
                       >
                         {upd.checking ? "Checking..." : "Check for updates"}
                       </Button>
+                    ) : webEngine ? (
+                      <span className="text-xs text-ink-2">Running in-browser git worktree and Web Worker check engine.</span>
                     ) : (
                       <span className="text-xs text-ink-2">To update, open Fleet on the computer it runs on.</span>
                     )}
                   </div>
-                  <p className="mt-2 text-sm text-ink-2 [overflow-wrap:anywhere]" role="status">
-                    {upd.snap && !upd.live ? resultLineOf(upd.snap) : upd.live}
-                  </p>
+                  {!webEngine && (
+                    <p className="mt-2 text-sm text-ink-2 [overflow-wrap:anywhere]" role="status">
+                      {upd.snap && !upd.live ? resultLineOf(upd.snap) : upd.live}
+                    </p>
+                  )}
                 </section>
               </div>
             </Drawer.Content>
@@ -558,7 +617,15 @@ export function App() {
             className="h-11 flex-1 justify-center"
           />
           <span data-answers-via="4" className="flex flex-1">
-            <NewSession policy={policy} onHanded={(id) => { openSession(id, "tr"); refresh(); }} className="h-11 flex-1 justify-center" />
+            <NewSession
+              policy={policy}
+              onHanded={(s) => {
+                setSessions((prev) => (prev ? [s, ...prev.filter((x) => x.id !== s.id)] : [s]));
+                openSession(s.id, "tr");
+                refresh();
+              }}
+              className="h-11 flex-1 justify-center"
+            />
           </span>
         </nav>
 
@@ -619,7 +686,7 @@ function Reading({
   );
 }
 
-function NewSession({ policy, onHanded, className }: { policy: Policy | null; onHanded: (id: string) => void; className?: string }) {
+function NewSession({ policy, onHanded, className }: { policy: Policy | null; onHanded: (s: Session) => void; className?: string }) {
   const wrap = useRef<HTMLSpanElement>(null);
   const returnFocus = () => wrap.current?.querySelector<HTMLElement>("button")?.focus();
   return (
@@ -690,11 +757,13 @@ function AgentPicker({ agents, value, onChange, testDefault }: { agents: Agent[]
   );
 }
 
-function Composer({ policy, onHanded, onClosed }: { policy: Policy | null; onHanded: (id: string) => void; onClosed: () => void }) {
+function Composer({ policy, onHanded, onClosed }: { policy: Policy | null; onHanded: (s: Session) => void; onClosed: () => void }) {
   useEffect(() => () => onClosed(), []); // eslint-disable-line react-hooks/exhaustive-deps
-  const demo = isDemoMode();
-  const [repo, setRepo] = useState(demo ? "/workspace/dsh-fleet" : "");
-  const [project, setProject] = useState(demo ? "dsh-fleet" : "fixture");
+  const webEngine = isWebEngineMode();
+  const [repos, setRepos] = useState<RepoInfo[]>([]);
+  const [repo, setRepo] = useState("");
+  const [project, setProject] = useState("");
+  const [projectTouched, setProjectTouched] = useState(false);
   const [agent, setAgent] = useState("");
   const [task, setTask] = useState("");
   const [check, setCheck] = useState("");
@@ -707,8 +776,61 @@ function Composer({ policy, onHanded, onClosed }: { policy: Policy | null; onHan
   const testDefault = policy?.default_agent_engine === "custom";
 
   useEffect(() => {
-    (demo ? taskRef.current : repoRef.current)?.focus();
-  }, [demo]);
+    let alive = true;
+    getJson<unknown>("/api/repos").then((raw) => {
+      if (!alive) return;
+      const list = normalizeRepos(raw);
+      setRepos(list);
+      if (webEngine && list.length > 0) {
+        setRepo((cur) => {
+          if (cur) return cur;
+          const first = list[0];
+          setProject((p) => (p ? p : first.name));
+          return first.path;
+        });
+      }
+    });
+    return () => { alive = false; };
+  }, [webEngine]);
+
+  useEffect(() => {
+    (webEngine ? taskRef.current : repoRef.current)?.focus();
+  }, [webEngine]);
+
+  const filteredRepos = useMemo(() => {
+    const q = repo.trim().toLowerCase();
+    if (!q) return repos.slice(0, 8);
+    return repos
+      .filter((r) => r.name.toLowerCase().includes(q) || r.path.toLowerCase().includes(q))
+      .slice(0, 8);
+  }, [repos, repo]);
+
+  const pickRepo = (r: RepoInfo) => {
+    setRepo(r.path);
+    setRepoErr("");
+    if (!projectTouched) {
+      setProject(r.name || repoBasename(r.path));
+    }
+    taskRef.current?.focus();
+  };
+
+  const onRepoChange = (val: string) => {
+    setRepo(val);
+    if (!projectTouched) {
+      setProject(repoBasename(val));
+    }
+  };
+
+  const derivedProject = project.trim() || repoBasename(repo) || "default";
+  const activeEngine = agent || policy?.default_agent_engine || policy?.default_agent || "default";
+  const activeModel =
+    activeEngine === "opencode"
+      ? policy?.models?.opencode ?? policy?.model ?? null
+      : activeEngine === "claude"
+        ? policy?.models?.claude ?? null
+        : activeEngine === "codex"
+          ? policy?.models?.codex ?? null
+          : null;
 
   const submit = async () => {
     if (busy) return;
@@ -722,7 +844,7 @@ function Composer({ policy, onHanded, onClosed }: { policy: Policy | null; onHan
       (repo.trim() ? taskRef.current : repoRef.current)?.focus();
       return;
     }
-    const body: Record<string, string> = { repo: repo.trim(), project, task: task.trim(), check };
+    const body: Record<string, string> = { repo: repo.trim(), project: derivedProject, task: task.trim(), check };
     if (next.trim()) body.next = next.trim();
     if (agent) body.agent = agent;
     setBusy(true);
@@ -746,10 +868,11 @@ function Composer({ policy, onHanded, onClosed }: { policy: Policy | null; onHan
       }
       return;
     }
-    const s = (await r.json()) as Session;
-    toast.success(`Handed out: ${s.task}`);
+    const raw = await r.json();
+    const norm = normalizeSessions([raw])?.[0] ?? (raw as Session);
+    toast.success(`Handed out: ${norm.task}`);
     document.querySelector<HTMLButtonElement>(".new-cancel")?.click();
-    onHanded(s.id);
+    onHanded(norm);
   };
 
   return (
@@ -760,17 +883,74 @@ function Composer({ policy, onHanded, onClosed }: { policy: Policy | null; onHan
           Fleet runs the agent in its own git worktree of this repo. When the agent stops, Fleet runs your check. The session is done only when that check passes.
         </MorphingDialogDescription>
 
-        <Field id="repo" label="Repo path" hint="The folder of a git repository, for example /home/you/projects/app." err={repoErr}>
+        <Field
+          id="repo"
+          label="Repository"
+          hint={repos.length > 0 ? "Pick a discovered git repository below or enter any local repo path." : "The folder of a git repository, for example /home/you/projects/app."}
+          err={repoErr}
+        >
           <InputGroup>
-            <InputGroupInput ref={repoRef} id="repo" value={repo} onChange={(e) => setRepo(e.target.value)} autoComplete="off" aria-invalid={repoErr ? true : undefined} />
+            <InputGroupInput
+              ref={repoRef}
+              id="repo"
+              value={repo}
+              onChange={(e) => onRepoChange(e.target.value)}
+              placeholder={repos[0]?.path || "/home/you/projects/app"}
+              autoComplete="off"
+              aria-invalid={repoErr ? true : undefined}
+            />
+          </InputGroup>
+          {filteredRepos.length > 0 && (
+            <div aria-label="Discovered repositories" className="mt-2 max-h-40 space-y-1 overflow-y-auto rounded-card border border-hairline bg-canvas p-1.5">
+              {filteredRepos.map((r) => {
+                const active = repo.trim() === r.path;
+                return (
+                  <button
+                    key={r.path}
+                    type="button"
+                    onClick={() => pickRepo(r)}
+                    className={cn(
+                      "flex w-full cursor-pointer items-center gap-2 rounded-control px-2.5 py-2 text-left text-sm transition-colors duration-(--dur-press) ease-(--ease-house) outline-none focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11",
+                      active ? "bg-raised text-ink font-medium" : "text-ink-2 hover:bg-surface hover:text-ink",
+                    )}
+                  >
+                    <FolderGit2 className="size-4 shrink-0 text-icon" strokeWidth={1.5} aria-hidden />
+                    <span className="min-w-0 flex-1 truncate font-medium text-ink">{r.name}</span>
+                    {r.branch && (
+                      <span className="shrink-0 rounded-chip bg-track px-1.5 py-0.5 font-mono text-xs text-ink-2">{r.branch}</span>
+                    )}
+                    <span className="hidden max-w-[42%] truncate font-mono text-xs text-ink-3 sm:inline">{r.path}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </Field>
+        <Field id="project" label="Project" hint="Derived automatically from the repository folder name. Edit if your Rune policy matches a custom project key.">
+          <InputGroup>
+            <InputGroupInput
+              id="project"
+              value={project}
+              placeholder={repoBasename(repo) || "default"}
+              onChange={(e) => {
+                setProjectTouched(true);
+                setProject(e.target.value);
+              }}
+              autoComplete="off"
+            />
           </InputGroup>
         </Field>
-        <Field id="project" label="Project" hint="The policy file names this project and its check. Leave it as it is unless your policy names another.">
-          <InputGroup>
-            <InputGroupInput id="project" value={project} onChange={(e) => setProject(e.target.value)} autoComplete="off" />
-          </InputGroup>
-        </Field>
-        <Field id="agent" label="Agent" hint={testDefault ? "Default agent: a test script (no real model). Engines lists what is installed." : "Only agents found on this machine are listed. Engines shows what is installed."}>
+        <Field
+          id="agent"
+          label="Agent"
+          hint={
+            testDefault
+              ? "Default agent: custom script path. Open Engines and settings to configure CLI engines."
+              : activeModel
+                ? `Active model route for ${activeEngine}: ${activeModel}. Configure models in Engines and settings.`
+                : "Only agents available here are listed. Open Engines and settings to change default engine or model."
+          }
+        >
           <AgentPicker agents={policy?.agents ?? []} value={agent} onChange={setAgent} testDefault={testDefault} />
         </Field>
         <Field id="task" label="Task" hint="Say what the agent should change, in one or two sentences. Ctrl+Enter or Cmd+Enter hands it out.">
@@ -784,11 +964,25 @@ function Composer({ policy, onHanded, onClosed }: { policy: Policy | null; onHan
             aria-invalid={!task.trim() && Boolean(formErr) ? true : undefined}
           />
         </Field>
-        <Field id="check" label="Check command (optional)" hint="Leave it empty to use the project’s check from the policy file. Its output becomes the receipt.">
+        <Field
+          id="check"
+          label="Check command (optional)"
+          hint={
+            webEngine
+              ? "Executed inside an isolated Web Worker against the branch's real files (e.g. npm test, or a JS assertion over files['src/ledger.js'])."
+              : "Leave it empty to use the project’s check from the policy file. Its output becomes the receipt."
+          }
+        >
           <InputGroup>
-            <InputGroupInput id="check" value={check} onChange={(e) => setCheck(e.target.value)} autoComplete="off" placeholder="cargo test" />
+            <InputGroupInput
+              id="check"
+              value={check}
+              onChange={(e) => setCheck(e.target.value)}
+              autoComplete="off"
+              placeholder={webEngine ? "npm test" : "cargo test"}
+            />
           </InputGroup>
-          <p className="text-xs text-ink-3">Example: <Kbd>cargo test</Kbd></p>
+          <p className="text-xs text-ink-3">Example: <Kbd>{webEngine ? "npm test" : "cargo test"}</Kbd></p>
         </Field>
         <Field id="next" label="Then (optional)" hint="Starts on its own only when this session is verified done.">
           <InputGroup>
@@ -808,6 +1002,295 @@ function Composer({ policy, onHanded, onClosed }: { policy: Policy | null; onHan
         </div>
       </div>
     </form>
+  );
+}
+
+function EngineConfigSection({
+  policy,
+  config,
+  onSaved,
+}: {
+  policy: Policy | null;
+  config: RuntimeConfig | null;
+  onSaved: () => void;
+}) {
+  const [defaultAgent, setDefaultAgent] = useState("");
+  const [opencodeModel, setOpencodeModel] = useState("");
+  const [claudeModel, setClaudeModel] = useState("");
+  const [codexModel, setCodexModel] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    if (!config) return;
+    setDefaultAgent(config.default_agent && !config.default_agent.includes("/") ? config.default_agent : "");
+    setOpencodeModel(config.opencode_model ?? "");
+    setClaudeModel(config.claude_model ?? "");
+    setCodexModel(config.codex_model ?? "");
+  }, [config]);
+
+  const foundAgents = (policy?.agents ?? []).filter((a) => a.found).map((a) => a.name);
+
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
+    setErr("");
+    const payload: Record<string, string | null> = {
+      opencode_model: opencodeModel.trim() || null,
+      claude_model: claudeModel.trim() || null,
+      codex_model: codexModel.trim() || null,
+    };
+    if (defaultAgent) payload.default_agent = defaultAgent;
+    const error = await postJson("/api/config", payload);
+    setSaving(false);
+    if (error) {
+      setErr(error);
+      toast.error(error);
+    } else {
+      toast.success("Engine settings saved.");
+      onSaved();
+    }
+  };
+
+  return (
+    <section className="border-t border-hairline pt-5">
+      <h3 className="mb-1 text-sm font-medium text-ink">Engine and model routing</h3>
+      <p className="mb-3 text-xs leading-relaxed text-ink-3">
+        Saved to Fleet’s data folder and applied immediately to new runs. Leave a model blank to inherit FLEET_MODEL or policies.rn.
+      </p>
+      <form onSubmit={save} className="space-y-3">
+        {foundAgents.length > 0 && (
+          <div className="space-y-1.5">
+            <p className="text-xs font-medium text-ink-2">Default engine</p>
+            <SegmentedControl aria-label="Default engine" size="sm">
+              {foundAgents.map((name) => (
+                <SegmentedControlItem
+                  key={name}
+                  aria-pressed={defaultAgent === name}
+                  data-checked={defaultAgent === name ? "" : undefined}
+                  onClick={() => setDefaultAgent(name)}
+                  className="max-md:!min-h-11"
+                >
+                  {name}
+                </SegmentedControlItem>
+              ))}
+            </SegmentedControl>
+          </div>
+        )}
+        <div className="space-y-1.5">
+          <label htmlFor="cfg-opencode-model" className="block text-xs font-medium text-ink-2">OpenCode model</label>
+          <InputGroup>
+            <InputGroupInput
+              id="cfg-opencode-model"
+              value={opencodeModel}
+              onChange={(e) => setOpencodeModel(e.target.value)}
+              placeholder={config?.effective_models?.opencode || policy?.model || "opencode/deepseek-v4.1-flash-free"}
+              autoComplete="off"
+              className="font-mono text-xs"
+            />
+          </InputGroup>
+        </div>
+        <div className="space-y-1.5">
+          <label htmlFor="cfg-claude-model" className="block text-xs font-medium text-ink-2">Claude model (optional)</label>
+          <InputGroup>
+            <InputGroupInput
+              id="cfg-claude-model"
+              value={claudeModel}
+              onChange={(e) => setClaudeModel(e.target.value)}
+              placeholder={config?.effective_models?.claude || "engine default"}
+              autoComplete="off"
+              className="font-mono text-xs"
+            />
+          </InputGroup>
+        </div>
+        <div className="space-y-1.5">
+          <label htmlFor="cfg-codex-model" className="block text-xs font-medium text-ink-2">Codex model (optional)</label>
+          <InputGroup>
+            <InputGroupInput
+              id="cfg-codex-model"
+              value={codexModel}
+              onChange={(e) => setCodexModel(e.target.value)}
+              placeholder={config?.effective_models?.codex || "engine default"}
+              autoComplete="off"
+              className="font-mono text-xs"
+            />
+          </InputGroup>
+        </div>
+        {err && <p role="alert" className="text-xs text-destructive-foreground">{err}</p>}
+        <Button type="submit" size="sm" variant="outline" disabled={saving} className="max-md:min-h-11 max-md:px-4">
+          {saving ? "Saving..." : "Save engine settings"}
+        </Button>
+      </form>
+    </section>
+  );
+}
+
+function WebEngineSettingsSection({ onChanged }: { onChanged: () => void }) {
+  const handle = getWebEngine();
+  const [status, setStatus] = useState<WebEngineStatus | null>(() => handle?.getStatus() ?? null);
+  const [localUrl, setLocalUrl] = useState(status?.localUrl || "http://127.0.0.1:8471");
+  const [byokUrl, setByokUrl] = useState(status?.byokBaseUrl || "https://api.openai.com/v1");
+  const [byokModel, setByokModel] = useState(status?.byokModel || "gpt-4.1-mini");
+  const [byokKey, setByokKey] = useState("");
+  const [connBusy, setConnBusy] = useState(false);
+  const [connMsg, setConnMsg] = useState("");
+
+  if (!handle || !status) return null;
+
+  const connectLocal = async (enable: boolean) => {
+    setConnBusy(true);
+    setConnMsg("");
+    const res = await handle.setLocalConnection(localUrl.trim() || "http://127.0.0.1:8471", enable);
+    setConnBusy(false);
+    setStatus(handle.getStatus());
+    if (res.ok) {
+      toast.success(enable ? "Connected to local fleet-rs." : "Switched to Browser Worktree Engine.");
+      onChanged();
+    } else {
+      setConnMsg(res.error || "Could not reach local fleet-rs.");
+      toast.error(res.error || "Could not reach local fleet-rs.");
+    }
+  };
+
+  const saveByok = (e: React.FormEvent) => {
+    e.preventDefault();
+    const next = handle.setByok({
+      baseUrl: byokUrl.trim() || "https://api.openai.com/v1",
+      model: byokModel.trim() || "gpt-4.1-mini",
+      apiKey: byokKey.trim() || undefined,
+    });
+    setStatus(next);
+    setByokKey("");
+    toast.success(next.byokConfigured ? "BYOK agent saved in sessionStorage for this tab." : "BYOK endpoint settings updated.");
+    onChanged();
+  };
+
+  const clearByok = () => {
+    const next = handle.setByok({ baseUrl: byokUrl, model: byokModel, clearKey: true });
+    setStatus(next);
+    setByokKey("");
+    toast.success("API key cleared from sessionStorage.");
+    onChanged();
+  };
+
+  const resetRepo = async () => {
+    await handle.resetWorkspace();
+    toast.success("Browser git worktrees reset to clean main commits.");
+    onChanged();
+  };
+
+  return (
+    <>
+      <section className="space-y-3 border-t border-hairline pt-5">
+        <div className="flex items-center justify-between gap-2">
+          <h3 className="flex items-center gap-1.5 text-sm font-medium text-ink">
+            <Plug className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
+            <span>Connect to local fleet-rs</span>
+          </h3>
+          <Pill variant={status.mode === "local" ? "success" : "secondary"} className="px-2 py-0.5 text-xs">
+            <PillIndicator variant={status.mode === "local" ? "success" : "info"} />
+            <span>{status.mode === "local" ? "local binary" : "browser engine"}</span>
+          </Pill>
+        </div>
+        <p className="text-xs leading-relaxed text-ink-3">
+          Run real CLI agents on your machine with <span className="font-mono text-ink-2">fleet-rs</span>, or keep running real git worktrees and Web Worker checks directly in this browser.
+        </p>
+        <div className="space-y-1.5">
+          <label htmlFor="local-fleet-url" className="block text-xs font-medium text-ink-2">Local Fleet address</label>
+          <InputGroup>
+            <InputGroupInput
+              id="local-fleet-url"
+              value={localUrl}
+              onChange={(e) => setLocalUrl(e.target.value)}
+              placeholder="http://127.0.0.1:8471"
+              className="font-mono text-xs"
+            />
+          </InputGroup>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {status.mode === "local" ? (
+            <Button size="sm" variant="outline" disabled={connBusy} onClick={() => connectLocal(false)} className="max-md:min-h-11 max-md:px-4">
+              Use browser engine
+            </Button>
+          ) : (
+            <Button size="sm" variant="outline" disabled={connBusy} onClick={() => connectLocal(true)} className="max-md:min-h-11 max-md:px-4">
+              {connBusy ? "Connecting..." : "Connect to local fleet-rs"}
+            </Button>
+          )}
+          <a
+            href={localUrl.trim() || "http://127.0.0.1:8471"}
+            target="_blank"
+            rel="noopener"
+            className="inline-flex h-8 items-center rounded-control border border-hairline px-3 text-xs font-medium text-ink-2 hover:bg-raised hover:text-ink max-md:min-h-11"
+          >
+            Open local UI
+          </a>
+        </div>
+        {connMsg && <p role="status" className="text-xs leading-relaxed text-destructive-foreground [overflow-wrap:anywhere]">{connMsg}</p>}
+      </section>
+
+      <section className="space-y-3 border-t border-hairline pt-5">
+        <div className="flex items-center justify-between gap-2">
+          <h3 className="flex items-center gap-1.5 text-sm font-medium text-ink">
+            <KeyRound className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
+            <span>BYOK coding agent (optional)</span>
+          </h3>
+          <Pill variant={status.byokConfigured ? "success" : "secondary"} className="px-2 py-0.5 text-xs">
+            <PillIndicator variant={status.byokConfigured ? "success" : "info"} />
+            <span>{status.byokConfigured ? "key in session" : "built-in patcher"}</span>
+          </Pill>
+        </div>
+        <p className="text-xs leading-relaxed text-ink-3">
+          Optionally connect any OpenAI-compatible API so dispatched tasks generate real file patches via your model. Keys stay strictly in sessionStorage and clear when you close this tab.
+        </p>
+        <form onSubmit={saveByok} className="space-y-2.5">
+          <div className="space-y-1">
+            <label htmlFor="byok-url" className="block text-xs font-medium text-ink-2">API base URL</label>
+            <InputGroup>
+              <InputGroupInput id="byok-url" value={byokUrl} onChange={(e) => setByokUrl(e.target.value)} className="font-mono text-xs" />
+            </InputGroup>
+          </div>
+          <div className="space-y-1">
+            <label htmlFor="byok-model" className="block text-xs font-medium text-ink-2">Model</label>
+            <InputGroup>
+              <InputGroupInput id="byok-model" value={byokModel} onChange={(e) => setByokModel(e.target.value)} className="font-mono text-xs" />
+            </InputGroup>
+          </div>
+          <div className="space-y-1">
+            <label htmlFor="byok-key" className="block text-xs font-medium text-ink-2">API key (sessionStorage only)</label>
+            <InputGroup>
+              <InputGroupInput
+                id="byok-key"
+                type="password"
+                value={byokKey}
+                onChange={(e) => setByokKey(e.target.value)}
+                placeholder={status.byokConfigured ? "Key stored for this tab (enter new to replace)" : "sk-..."}
+                autoComplete="off"
+                className="font-mono text-xs"
+              />
+            </InputGroup>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button type="submit" size="sm" variant="outline" className="max-md:min-h-11 max-md:px-4">Save BYOK settings</Button>
+            {status.byokConfigured && (
+              <Button type="button" size="sm" variant="ghost" onClick={clearByok} className="max-md:min-h-11 max-md:px-4">Clear key</Button>
+            )}
+          </div>
+        </form>
+      </section>
+
+      <section className="border-t border-hairline pt-5">
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <h3 className="text-sm font-medium text-ink">Browser git workspace</h3>
+            <p className="text-xs text-ink-3">Stored locally in IndexedDB across reloads.</p>
+          </div>
+          <Button size="sm" variant="outline" onClick={resetRepo} className="shrink-0 max-md:min-h-11 max-md:px-4">
+            <RotateCcw className="size-3.5" strokeWidth={1.5} aria-hidden />Reset
+          </Button>
+        </div>
+      </section>
+    </>
   );
 }
 

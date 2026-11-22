@@ -7,11 +7,13 @@ export type Session = {
   id: string;
   task: string;
   project: string;
+  repo?: string;
   status: string;
   bucket: Bucket;
   branch?: string;
   engine?: string;
   agent?: string;
+  model?: string | null;
   test_mode?: boolean;
   reason?: string | null;
   check_cmd?: string;
@@ -30,7 +32,12 @@ export type Session = {
   merge_error?: { message?: string; detail?: string } | null;
 };
 
-export type Agent = { name: string; found: boolean };
+export type Agent = { name: string; found: boolean; path?: string };
+export type EngineModels = {
+  opencode?: string | null;
+  claude?: string | null;
+  codex?: string | null;
+};
 export type Policy = {
   agents: Agent[];
   max_parallel: number;
@@ -39,6 +46,41 @@ export type Policy = {
   default_agent?: string | null;
   default_agent_engine?: string;
   model?: string | null;
+  models?: EngineModels;
+};
+
+export type RuntimeConfig = {
+  default_agent?: string | null;
+  default_agent_engine?: string | null;
+  opencode_model?: string | null;
+  claude_model?: string | null;
+  codex_model?: string | null;
+  effective_models?: EngineModels;
+  policy_model?: string | null;
+  env_model?: string | null;
+};
+
+export type RepoInfo = {
+  name: string;
+  path: string;
+  branch?: string | null;
+};
+
+export type WebEngineStatus = {
+  mode: "browser" | "local";
+  localUrl: string;
+  byokBaseUrl: string;
+  byokModel: string;
+  byokConfigured: boolean;
+};
+
+export type WebEngineHandle = {
+  getStatus: () => WebEngineStatus;
+  setLocalConnection: (url: string, enable: boolean) => Promise<{ ok: boolean; error?: string }>;
+  setByok: (cfg: { baseUrl: string; model: string; apiKey?: string; clearKey?: boolean }) => WebEngineStatus;
+  resetWorkspace: () => Promise<void>;
+  getSessionFiles: (sessionId: string) => Record<string, string> | null;
+  updateSessionFile: (sessionId: string, filePath: string, content: string) => Promise<{ ok: boolean; error?: string }>;
 };
 
 export type UpdateState = {
@@ -58,8 +100,18 @@ export type UpdateState = {
 
 export const VERSION_URL = "https://github.com/cayleb-james2008/dsh-fleet/releases/tag/v";
 
-export function isDemoMode(): boolean {
-  return typeof window !== "undefined" && Boolean((window as { __FLEET_DEMO__?: boolean }).__FLEET_DEMO__);
+export function getWebEngine(): WebEngineHandle | null {
+  if (typeof window === "undefined") return null;
+  return (window as { __FLEET_WEB_ENGINE__?: WebEngineHandle }).__FLEET_WEB_ENGINE__ ?? null;
+}
+
+export function isWebEngineMode(): boolean {
+  return getWebEngine() !== null;
+}
+
+export function repoBasename(repoPath: string): string {
+  const parts = (repoPath || "").trim().replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || "";
 }
 
 function asStr(v: unknown, fallback = ""): string {
@@ -107,11 +159,13 @@ export function normalizeSession(raw: unknown, idx = 0): Session | null {
     id,
     task,
     project,
+    repo: asStr(r.repo, ""),
     status: rawStatus,
     bucket,
     branch: asStr(r.branch, ""),
     engine: asStr(r.engine, ""),
     agent: asStr(r.agent, ""),
+    model: r.model ? asStr(r.model) : null,
     test_mode: Boolean(r.test_mode),
     reason: r.reason === null || r.reason === undefined ? null : asStr(r.reason),
     check_cmd: asStr(r.check_cmd, ""),
@@ -148,8 +202,13 @@ export function normalizePolicy(raw: unknown): Policy | null {
     .filter((a) => a && typeof a === "object")
     .map((a, idx) => {
       const o = a as Record<string, unknown>;
-      return { name: asStr(o.name, "").trim() || `agent-${idx + 1}`, found: Boolean(o.found) };
+      return {
+        name: asStr(o.name, "").trim() || `agent-${idx + 1}`,
+        found: Boolean(o.found),
+        path: o.path ? asStr(o.path) : undefined,
+      };
     });
+  const mRaw = r.models && typeof r.models === "object" ? (r.models as Record<string, unknown>) : null;
   return {
     agents,
     max_parallel: typeof r.max_parallel === "number" && Number.isFinite(r.max_parallel) ? r.max_parallel : 1,
@@ -158,7 +217,53 @@ export function normalizePolicy(raw: unknown): Policy | null {
     default_agent: r.default_agent ? asStr(r.default_agent) : null,
     default_agent_engine: r.default_agent_engine ? asStr(r.default_agent_engine) : undefined,
     model: r.model ? asStr(r.model) : null,
+    models: mRaw
+      ? {
+          opencode: mRaw.opencode ? asStr(mRaw.opencode) : null,
+          claude: mRaw.claude ? asStr(mRaw.claude) : null,
+          codex: mRaw.codex ? asStr(mRaw.codex) : null,
+        }
+      : undefined,
   };
+}
+
+export function normalizeConfig(raw: unknown): RuntimeConfig | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const effRaw =
+    r.effective_models && typeof r.effective_models === "object"
+      ? (r.effective_models as Record<string, unknown>)
+      : null;
+  return {
+    default_agent: r.default_agent ? asStr(r.default_agent) : null,
+    default_agent_engine: r.default_agent_engine ? asStr(r.default_agent_engine) : null,
+    opencode_model: r.opencode_model ? asStr(r.opencode_model) : null,
+    claude_model: r.claude_model ? asStr(r.claude_model) : null,
+    codex_model: r.codex_model ? asStr(r.codex_model) : null,
+    effective_models: effRaw
+      ? {
+          opencode: effRaw.opencode ? asStr(effRaw.opencode) : null,
+          claude: effRaw.claude ? asStr(effRaw.claude) : null,
+          codex: effRaw.codex ? asStr(effRaw.codex) : null,
+        }
+      : undefined,
+    policy_model: r.policy_model ? asStr(r.policy_model) : null,
+    env_model: r.env_model ? asStr(r.env_model) : null,
+  };
+}
+
+export function normalizeRepos(raw: unknown): RepoInfo[] {
+  if (!Array.isArray(raw)) return [];
+  const out: RepoInfo[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    const p = asStr(o.path, "").trim();
+    if (!p) continue;
+    const name = asStr(o.name, "").trim() || repoBasename(p) || p;
+    out.push({ name, path: p, branch: o.branch ? asStr(o.branch) : null });
+  }
+  return out;
 }
 
 export async function getJson<T>(url: string): Promise<T | null> {

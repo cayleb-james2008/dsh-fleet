@@ -29,6 +29,7 @@ need('[data-theme=light]' in html or '[data-theme="light"]' in html, "no light t
 need('[data-theme=dark]' in html or '[data-theme="dark"]' in html, "no dark theme variable set")
 need('fleet-theme' in html, "theme choice is not stored under fleet-theme")
 need('themeBtn' in html, "no theme toggle")
+need('Appearance' in html, "Appearance section inside Settings missing")
 need('Engines and settings' in html, "no engines and settings control")
 need('font-family:Geist' in html or 'font-family:"Geist"' in html or 'font-family: "Geist"' in html, "Geist font-face missing")
 need('Geist Mono' in html, "Geist Mono font-face missing")
