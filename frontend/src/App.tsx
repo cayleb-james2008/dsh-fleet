@@ -33,8 +33,12 @@ import { Pill, PillIndicator } from "@/components/kibo-ui/pill";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import { cn } from "@/lib/utils";
 import {
+  computeLocalMetrics,
+  DEFAULT_PLAYBOOKS,
   downloadSessionPatch,
+  fetchBoardMetrics,
   fetchMergeCheck,
+  fetchPlaybooks,
   getJson,
   getWebEngine,
   isActivelyRunning,
@@ -49,6 +53,9 @@ import {
   postJson,
   statusText,
   supportsV050,
+  supportsV060,
+  type BoardMetrics,
+  type PlaybookTemplate,
   type Policy,
   type RepoInfo,
   type RuntimeConfig,
@@ -57,7 +64,7 @@ import {
   type TabId,
   type WebEngineStatus,
 } from "./api";
-import { BoardFilterBulkBar, HeroVerifiedReceipt, ThreeLaneBoard } from "./board";
+import { BoardFilterBulkBar, BoardMetricsStrip, HeroVerifiedReceipt, ThreeLaneBoard } from "./board";
 import { DetailBody } from "./detail";
 import { NewSession, type ComposerMode } from "./composer";
 import { CommandPalette } from "./palette";
@@ -117,6 +124,8 @@ export function App() {
   const [inbox, setInbox] = useState<Session[]>([]);
   const [inboxErr, setInboxErr] = useState<Record<string, string>>({});
   const [config, setConfig] = useState<RuntimeConfig | null>(null);
+  const [playbooks, setPlaybooks] = useState<PlaybookTemplate[]>(DEFAULT_PLAYBOOKS);
+  const [serverMetrics, setServerMetrics] = useState<BoardMetrics | null>(null);
 
   const wide = useMediaQuery("(min-width: 1100px)");
   const md = useMediaQuery("(min-width: 768px)");
@@ -129,10 +138,15 @@ export function App() {
   const upd = useUpdate(closeOverlaysForUpdate);
   const searchRef = useRef<HTMLInputElement>(null);
   const composerModeRef = useRef<ComposerMode>("single");
+  const composerPlaybookRef = useRef<PlaybookTemplate | null>(null);
   const webEngine = isWebEngineMode();
   const localHost = onThisMachine();
   const hasServerV050 = useMemo(
     () => supportsV050(upd.version, policy),
+    [upd.version, policy],
+  );
+  const hasServerV060 = useMemo(
+    () => supportsV060(upd.version, policy),
     [upd.version, policy],
   );
 
@@ -176,10 +190,31 @@ export function App() {
     if (repoList.length) setRepos(repoList);
   }, []);
 
+  const refreshPlaybooks = useCallback(async () => {
+    const list = await fetchPlaybooks(hasServerV060);
+    setPlaybooks(list);
+  }, [hasServerV060]);
+
   useEffect(() => {
     void refresh();
     void refreshConfig();
   }, [refresh, refreshConfig]);
+
+  useEffect(() => {
+    void refreshPlaybooks();
+  }, [refreshPlaybooks]);
+
+  useEffect(() => {
+    if (!sessions || !hasServerV060) return;
+    let alive = true;
+    const mp = policy?.max_parallel ?? config?.max_parallel ?? 4;
+    void fetchBoardMetrics(sessions, mp, true).then((m) => {
+      if (alive) setServerMetrics(m);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [sessions, hasServerV060, policy?.max_parallel, config?.max_parallel]);
 
   useEffect(() => {
     if (settingsOpen) void refreshConfig();
@@ -278,8 +313,9 @@ export function App() {
     });
   }, [selected]);
 
-  const triggerComposer = useCallback((mode: ComposerMode) => {
+  const triggerComposer = useCallback((mode: ComposerMode, playbook: PlaybookTemplate | null = null) => {
     composerModeRef.current = mode;
+    composerPlaybookRef.current = playbook;
     const desktopBtn = document.querySelector<HTMLButtonElement>('[data-thing="new-session-desktop"]');
     const mobileBtn = document.querySelector<HTMLButtonElement>('[data-thing="new-session-mobile"]');
     const btn = desktopBtn && desktopBtn.offsetParent !== null ? desktopBtn : mobileBtn ?? desktopBtn;
@@ -364,6 +400,13 @@ export function App() {
   const needsCount = needsAll.length;
   const workingCount = all.filter((s) => s.bucket === "working").length;
   const maxParallel = policy?.max_parallel ?? config?.max_parallel ?? 4;
+  const liveMetrics = useMemo(() => {
+    const local = computeLocalMetrics(all, maxParallel);
+    if (serverMetrics && hasServerV060) {
+      return serverMetrics;
+    }
+    return local;
+  }, [all, maxParallel, serverMetrics, hasServerV060]);
   const testMode = !webEngine && (policy?.default_agent_engine === "custom" || all.some((s) => s.test_mode));
   const hasActiveFilters = Boolean(query.trim() || statusFilter !== "all" || repoFilter || engineFilter);
 
@@ -638,9 +681,13 @@ export function App() {
               <NewSession
                 policy={policy}
                 sessions={all}
+                playbooks={playbooks}
                 supportsServerV050={hasServerV050}
+                supportsServerV060={hasServerV060}
                 initialModeRef={composerModeRef}
+                initialPlaybookRef={composerPlaybookRef}
                 thing="new-session-desktop"
+                onPlaybooksChanged={() => void refreshPlaybooks()}
                 onHanded={(s) => {
                   setSessions((prev) => (prev ? [s, ...prev.filter((x) => x.id !== s.id)] : [s]));
                   openSession(s.id, "tr");
@@ -784,6 +831,8 @@ export function App() {
           </div>
         </section>
 
+        {sessions !== null && <BoardMetricsStrip metrics={liveMetrics} />}
+
         {unreachable && (
           <p role="status" className="border-b border-hairline bg-pill-pro-bg px-4 py-2 text-sm text-destructive-foreground md:px-6">
             {lastGood
@@ -884,6 +933,7 @@ export function App() {
           onOpenChange={setPaletteOpen}
           sessions={all}
           selectedSession={current}
+          playbooks={playbooks}
           repos={repos}
           engines={distinctEngines}
           multiSelect={multiSelect}
@@ -892,8 +942,11 @@ export function App() {
             setRequestedTab(t);
             if (!selected && navOrdered[0]) openSession(navOrdered[0].id, t);
           }}
-          onNewSingle={() => triggerComposer("single")}
-          onNewBatch={() => triggerComposer("batch")}
+          onNewSingle={() => triggerComposer("single", null)}
+          onNewBatch={() => triggerComposer("batch", null)}
+          onApplyPlaybook={(tpl) =>
+            triggerComposer((tpl.tasks?.length ?? 1) > 1 ? "batch" : "single", tpl)
+          }
           onOpenSettings={() => setSettingsOpen(true)}
           onToggleMultiSelect={() => {
             setMultiSelect((prev) => {
@@ -1074,9 +1127,13 @@ export function App() {
             <NewSession
               policy={policy}
               sessions={all}
+              playbooks={playbooks}
               supportsServerV050={hasServerV050}
+              supportsServerV060={hasServerV060}
               initialModeRef={composerModeRef}
+              initialPlaybookRef={composerPlaybookRef}
               thing="new-session-mobile"
+              onPlaybooksChanged={() => void refreshPlaybooks()}
               onHanded={(s) => {
                 setSessions((prev) => (prev ? [s, ...prev.filter((x) => x.id !== s.id)] : [s]));
                 openSession(s.id, "tr");
