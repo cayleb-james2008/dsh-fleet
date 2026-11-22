@@ -467,7 +467,9 @@ export function DetailBody({
             <span>
               {mergeCheck.clean
                 ? "Clean merge"
-                : `${mergeCheck.conflicting_files.length || 1} conflicts`}
+                : (mergeCheck.conflicting_files.length || 1) === 1
+                  ? "1 conflict"
+                  : `${mergeCheck.conflicting_files.length} conflicts`}
             </span>
           </Pill>
         )}

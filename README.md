@@ -49,8 +49,8 @@ that lands in Needs you fires nothing.
 
 ## What "verified" means here
 
-- **The check is the product's own command**, named per project in a policies
-  file (`policies.rn`, Rune) — the same command a developer would run. A
+- **The check is the product's own command**, named per project in a policy
+  rules file (`policies.rn`) — the same command a developer would run. A
   check given with a hand-out replaces the default; a blank one counts as no
   check given. Whoever grades the work, it is never the agent.
 - **A failed check says what it printed.** Its reason reads
@@ -123,19 +123,39 @@ the task, status, bucket and transcript, each carries:
 
 ## HTTP
 
-- `POST /api/sessions` — hand out (201). Other session routes are
-  `/api/sessions/<id>/merge`, `/retry`, `/steer` (`{"message": ...}`),
-  `/stop`, and `/dismiss` (only for a needs-you session; it becomes
-  `archived`). Actions on a session in the wrong state answer 409 with a plain
-  sentence; an unknown session answers 404.
+- `POST /api/sessions` — hand out (201), accepting optional `depends_on`,
+  `check_steps`, `allowed_globs`, `forbidden_globs`, `model`, and `next`.
+- `POST /api/sessions/batch` — atomic multi-task / multi-repo DAG batch dispatch
+  (201; supports symbolic task keys, `depends_on`, `dry_run: true`, and rejects
+  cycles or unknown dependencies with 400 before creating any session).
+- `GET /api/sessions` — list sessions with optional filtering and pagination
+  (`q`, `status`, `bucket`, `project`, `repo`, `engine`, `limit`, `offset`,
+  `compact=1`, `paginated=1`).
+- `GET /api/sessions/<id>/transcript` — paginated, searchable transcript view
+  (`offset`, `limit`, `q`, `errors_only=1`, returning `first_error_index`).
+- `GET /api/sessions/<id>/merge-check` — non-destructive `git merge-tree` dry-run
+  conflict check (`clean`, `conflicting_files`, `commits_ahead`, `commits_behind`,
+  `can_fast_forward`).
+- `GET /api/sessions/<id>/patch` — exports the session's verified work as a
+  downloadable `.patch` (`?format=format-patch|unified-diff`, or `?json=1`).
+- `POST /api/sessions/<id>/merge` (optional `{"strategy": "merge-commit"|"squash"|"fast-forward-only"}`),
+  `/retry`, `/steer` (`{"message": ...}`), `/stop`, and `/dismiss`. Actions on a
+  session in the wrong state answer 409 with a plain sentence; an unknown session
+  answers 404.
+- `GET /api/events/stream` — real-time Server-Sent Events stream with
+  `Last-Event-ID` / `?since=` replay and 15s keepalive heartbeats.
 - `GET /api/inbox` lists the needs-you sessions. `GET /api/policy` shows the
-  parallel cap, detected agents, default agent, active per-engine models, and
-  `version`.
+  parallel cap, detected agents, default agent, active per-engine models,
+  budgets, feature flags, and `version`.
+- `POST /api/policies/test` — live dry-run policy rules evaluation (`repo`, `task`,
+  optional `engine` or candidate `script`), returning the routed engine, model,
+  check steps, timeout, budgets, file-scope globs, and trace.
 - `GET /api/repos` (loopback-only) discovers local git repositories and their
-  checked-out branches for the `New session` repository picker.
+  checked-out branches; `POST /api/repos/prune-worktrees` (loopback-only) prunes
+  inactive worktrees strictly inside Fleet's worktrees directory.
 - `GET /api/config` and `POST /api/config` (loopback-only) read and persist
-  live default-engine and per-engine model settings in `config.json` inside the
-  data folder without restarting Fleet.
+  live default-engine, per-engine model, and `max_parallel_agents` (`1..=64`)
+  settings in `config.json` inside the data folder without restarting Fleet.
 - `GET /api/version`, `GET /api/update`, `POST /api/update/check`,
   `POST /api/update/apply`, `POST /api/update/restart` — see "Versions and
   updates".
@@ -234,14 +254,14 @@ binary (one under a `target` folder) unless `FLEET_UPDATE_DEV=1`.
 
 ## Tests and checks
 
-`cargo test` runs the Rust unit and CLI integration tests: 54 tests (45 unit +
-9 CLI), all passing. They cover the session store and recovery, the runner's
-settle path, check reasons, the engine invocation shapes, per-engine model and
-repo-discovery routes (`GET /api/repos`, `GET/POST /api/config`), merge refusals
-and automatic worktree cleanup, retry after a lost worktree, concurrent retry
-protection, task and repo validation, Host and header limits, desktop launch
-data-dir/port-fallback/browser rules, self-update verification, and the steering
-and dismiss routes.
+`cargo test` runs the full Rust test suite (library unit tests, server unit
+tests, CLI integration tests, and v0.5.0 engine integration tests), covering the
+session store and recovery, DAG batch scheduling & 2,000-node cycle rejection,
+multi-step check pipelines, file-scope guardrails, non-destructive `merge-tree`
+checks, `.patch` export, merge strategies (`merge-commit`/`squash`/`ff-only`),
+policy rules dry-run routing & fuzz resilience, SSE event streaming, 2,000-session
+and 50,000-line transcript scale benchmarks, graceful `SIGTERM -> SIGKILL`
+cancellation, worktree pruning, and desktop launch/self-update verification.
 
 `bash .loop/verify` builds the binary, runs `cargo test`, runs all 20 hermetic
 HTTP/process checks in `.loop/checks/`, and runs `proof.sh` (23/23 checks
@@ -250,13 +270,16 @@ worst-case data replay across desktop and mobile viewports in both themes.
 
 ## Layout
 
-- `src/main.rs` & `src/update.rs` — the single-binary Rust server: sessions,
-  worktree runner, pristine-checkout verifier, defensive merger, persistence,
-  Rune policy evaluation, self-updater, HTTP API, and unit tests.
-- `frontend/` & `rune/used/` — the React + Tailwind 4 + House Frontend Mission
-  Control Board (`JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md`), compiled into a
+- `src/main.rs`, `src/lib.rs`, `src/events.rs`, `src/dag.rs`, `src/checks.rs`,
+  `src/merge_check.rs`, `src/policy.rs`, `src/update.rs` — the single-binary
+  Rust server and engine library: SSE event bus, DAG/batch scheduler, multi-step
+  check pipelines & file-scope guardrails, non-destructive merge checker &
+  patch exporter, policy rules engine, worktree runner, persistence, and
+  self-updater.
+- `frontend/` — the React + Tailwind 4 Mission Control Board, compiled into a
   single self-contained `assets/index.html` with self-hosted Geist and Geist
   Mono fonts embedded directly into the Rust binary. Light default + full dark
   theme parity.
-- `policies.rn` — the Rune policies file: parallel session cap, per-project
-  check command, default agent model, and execution timeout.
+- `policies.rn` — the routing and policy rules file: parallel session cap, repo/task engine
+  and model routing, per-task timeouts, retry/steer budgets, file-scope globs,
+  and default check commands/steps.

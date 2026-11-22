@@ -144,7 +144,7 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
   await p.waitForTimeout(1200)
   ok('dismissed card leaves the Needs you lane', await p.locator('article[aria-label^="Fix the sign-in"]').count() === 0)
 
-  // Inbox popover, New session MorphingDialog, Engines & Rune policy Vaul sheet
+  // Inbox popover, New session MorphingDialog, Engines & settings Vaul sheet
   await p.getByRole('button', { name: /^Needs you/ }).first().click(); await p.waitForTimeout(300)
   ok('Needs you inbox popover opens', await p.locator('text=Go to Needs you').isVisible())
   await p.keyboard.press('Escape'); await p.waitForTimeout(250)
