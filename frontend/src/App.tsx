@@ -33,6 +33,7 @@ import { Pill, PillIndicator } from "@/components/kibo-ui/pill";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import { cn } from "@/lib/utils";
 import {
+  computeLocalBudget,
   computeLocalMetrics,
   DEFAULT_PLAYBOOKS,
   downloadSessionPatch,
@@ -54,6 +55,7 @@ import {
   statusText,
   supportsV050,
   supportsV060,
+  supportsV070,
   type BoardMetrics,
   type PlaybookTemplate,
   type Policy,
@@ -62,12 +64,15 @@ import {
   type Session,
   type StatusFilter,
   type TabId,
+  type ViewMode,
   type WebEngineStatus,
 } from "./api";
 import { BoardFilterBulkBar, BoardMetricsStrip, HeroVerifiedReceipt, ThreeLaneBoard } from "./board";
+import { DagWaveGraph } from "./dag-graph";
 import { DetailBody } from "./detail";
 import { NewSession, type ComposerMode } from "./composer";
 import { CommandPalette } from "./palette";
+import { PrPreviewModal } from "./pr-modal";
 import { PolicyTesterSection } from "./settings-policy";
 import { useFleetStream } from "./stream";
 import { onThisMachine, resultLine as resultLineOf, UpdateStrip, useUpdate } from "./update";
@@ -126,6 +131,8 @@ export function App() {
   const [config, setConfig] = useState<RuntimeConfig | null>(null);
   const [playbooks, setPlaybooks] = useState<PlaybookTemplate[]>(DEFAULT_PLAYBOOKS);
   const [serverMetrics, setServerMetrics] = useState<BoardMetrics | null>(null);
+  const [viewMode, setViewMode] = useState<ViewMode>("board");
+  const [prSession, setPrSession] = useState<Session | null>(null);
 
   const wide = useMediaQuery("(min-width: 1100px)");
   const md = useMediaQuery("(min-width: 768px)");
@@ -134,11 +141,13 @@ export function App() {
     setInboxOpenDesktop(false);
     setInboxOpenMobile(false);
     setPaletteOpen(false);
+    setPrSession(null);
   }, []);
   const upd = useUpdate(closeOverlaysForUpdate);
   const searchRef = useRef<HTMLInputElement>(null);
   const composerModeRef = useRef<ComposerMode>("single");
   const composerPlaybookRef = useRef<PlaybookTemplate | null>(null);
+  const modalClosedAtRef = useRef(0);
   const webEngine = isWebEngineMode();
   const localHost = onThisMachine();
   const hasServerV050 = useMemo(
@@ -147,6 +156,10 @@ export function App() {
   );
   const hasServerV060 = useMemo(
     () => supportsV060(upd.version, policy),
+    [upd.version, policy],
+  );
+  const hasServerV070 = useMemo(
+    () => supportsV070(upd.version, policy),
     [upd.version, policy],
   );
 
@@ -208,13 +221,13 @@ export function App() {
     if (!sessions || !hasServerV060) return;
     let alive = true;
     const mp = policy?.max_parallel ?? config?.max_parallel ?? 4;
-    void fetchBoardMetrics(sessions, mp, true).then((m) => {
+    void fetchBoardMetrics(sessions, mp, true, policy).then((m) => {
       if (alive) setServerMetrics(m);
     });
     return () => {
       alive = false;
     };
-  }, [sessions, hasServerV060, policy?.max_parallel, config?.max_parallel]);
+  }, [sessions, hasServerV060, policy, config?.max_parallel]);
 
   useEffect(() => {
     if (settingsOpen) void refreshConfig();
@@ -340,12 +353,21 @@ export function App() {
         Boolean(active?.isContentEditable);
       const dialogOpen = Boolean(document.querySelector('[role="dialog"]'));
 
-      if (e.key === "Escape" && selected && !dialogOpen && !paletteOpen) {
+      if (
+        e.key === "Escape" &&
+        !e.defaultPrevented &&
+        Date.now() - modalClosedAtRef.current > 150 &&
+        selected &&
+        !dialogOpen &&
+        !paletteOpen &&
+        !prSession &&
+        !settingsOpen
+      ) {
         closeDetail();
         return;
       }
 
-      if (inEditable || dialogOpen || paletteOpen || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (inEditable || dialogOpen || paletteOpen || Boolean(prSession) || settingsOpen || e.metaKey || e.ctrlKey || e.altKey) return;
 
       if (e.key === "/") {
         e.preventDefault();
@@ -356,6 +378,12 @@ export function App() {
       if (e.key === "n") {
         e.preventDefault();
         triggerComposer("single");
+        return;
+      }
+
+      if (e.key === "g") {
+        e.preventDefault();
+        setViewMode((cur) => (cur === "board" ? "dag" : "board"));
         return;
       }
 
@@ -389,7 +417,7 @@ export function App() {
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [selected, requestedTab, navOrdered, paletteOpen, closeDetail, openSession, triggerComposer]);
+  }, [selected, requestedTab, navOrdered, paletteOpen, prSession, settingsOpen, closeDetail, openSession, triggerComposer]);
 
   const verifiedAll = all.filter(isVerified);
   const verifiedCount = verifiedAll.length;
@@ -401,12 +429,15 @@ export function App() {
   const workingCount = all.filter((s) => s.bucket === "working").length;
   const maxParallel = policy?.max_parallel ?? config?.max_parallel ?? 4;
   const liveMetrics = useMemo(() => {
-    const local = computeLocalMetrics(all, maxParallel);
+    const local: BoardMetrics = {
+      ...computeLocalMetrics(all, maxParallel),
+      budget: computeLocalBudget(all, policy),
+    };
     if (serverMetrics && hasServerV060) {
       return serverMetrics;
     }
     return local;
-  }, [all, maxParallel, serverMetrics, hasServerV060]);
+  }, [all, maxParallel, policy, serverMetrics, hasServerV060]);
   const testMode = !webEngine && (policy?.default_agent_engine === "custom" || all.some((s) => s.test_mode));
   const hasActiveFilters = Boolean(query.trim() || statusFilter !== "all" || repoFilter || engineFilter);
 
@@ -552,6 +583,14 @@ export function App() {
     setEngineFilter("");
   };
 
+  const openPrPreview = useCallback(
+    (s: Session) => {
+      if (!wide) setSelected(null);
+      setPrSession(s);
+    },
+    [wide],
+  );
+
   const detailBody = current && (
     <DetailBody
       s={current}
@@ -561,6 +600,7 @@ export function App() {
       supportsServerV050={hasServerV050}
       onClose={closeDetail}
       onOpenSession={openSession}
+      onOpenPrPreview={openPrPreview}
       onChanged={refresh}
       onDismissed={() => void dismiss(current.id)}
     />
@@ -857,6 +897,7 @@ export function App() {
 
             {sessions !== null && (
               <BoardFilterBulkBar
+                viewMode={viewMode}
                 statusFilter={statusFilter}
                 repoFilter={repoFilter}
                 engineFilter={engineFilter}
@@ -867,6 +908,7 @@ export function App() {
                 selectedIds={bulkSelected}
                 visibleSessions={shown}
                 bulkBusy={bulkBusy}
+                onViewMode={setViewMode}
                 onStatusFilter={setStatusFilter}
                 onRepoFilter={setRepoFilter}
                 onEngineFilter={setEngineFilter}
@@ -885,18 +927,27 @@ export function App() {
               />
             )}
 
-            <ThreeLaneBoard
-              sessions={sessions === null ? null : shown}
-              unreachable={unreachable}
-              selected={selected}
-              bulkMode={multiSelect}
-              bulkSelected={bulkSelected}
-              latestHeroId={latestVerified?.id ?? null}
-              onOpen={openSession}
-              onToggleBulk={toggleBulkCard}
-              onRetry={retry}
-              onDismiss={dismiss}
-            />
+            {viewMode === "dag" && sessions !== null ? (
+              <DagWaveGraph
+                sessions={shown}
+                selectedId={selected}
+                onOpen={(id) => openSession(id, "tr")}
+                onNewBatch={() => triggerComposer("batch", null)}
+              />
+            ) : (
+              <ThreeLaneBoard
+                sessions={sessions === null ? null : shown}
+                unreachable={unreachable}
+                selected={selected}
+                bulkMode={multiSelect}
+                bulkSelected={bulkSelected}
+                latestHeroId={latestVerified?.id ?? null}
+                onOpen={openSession}
+                onToggleBulk={toggleBulkCard}
+                onRetry={retry}
+                onDismiss={dismiss}
+              />
+            )}
 
             {sessions !== null && all.length > 0 && shown.length === 0 && (
               <p role="status" className="px-4 py-4 text-sm text-ink-2 md:px-6">
@@ -936,8 +987,11 @@ export function App() {
           playbooks={playbooks}
           repos={repos}
           engines={distinctEngines}
+          viewMode={viewMode}
           multiSelect={multiSelect}
+          onViewMode={setViewMode}
           onOpenSession={openSession}
+          onOpenPrPreview={openPrPreview}
           onSwitchTab={(t) => {
             setRequestedTab(t);
             if (!selected && navOrdered[0]) openSession(navOrdered[0].id, t);
@@ -1046,7 +1100,11 @@ export function App() {
                   policy={policy}
                   config={config}
                   repos={repos}
+                  sessions={all}
+                  metrics={liveMetrics}
+                  settingsOpen={settingsOpen}
                   supportsServerV050={hasServerV050}
+                  supportsServerV070={hasServerV070}
                   canPrune={localHost && !webEngine}
                   onPruned={refresh}
                 />
@@ -1152,6 +1210,16 @@ export function App() {
             />
           </span>
         </nav>
+
+        <PrPreviewModal
+          session={prSession}
+          supportsServerV070={hasServerV070}
+          onClose={() => {
+            modalClosedAtRef.current = Date.now();
+            setPrSession(null);
+          }}
+          onCreated={refresh}
+        />
 
         <Toaster
           position={md ? "bottom-right" : "top-center"}

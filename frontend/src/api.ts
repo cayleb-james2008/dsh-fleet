@@ -1,8 +1,9 @@
-// The /api routes of Fleet (v0.4.0 + v0.5.0 + v0.6.0), with defensive normalization and graceful fallbacks
+// The /api routes of Fleet (v0.4.0..v0.7.0), with defensive normalization and graceful fallbacks
 // so malformed, partial, null, or pending endpoints never throw or blank the board.
 
 export type Bucket = "needs-you" | "working" | "done";
 export type TabId = "tr" | "df" | "rc";
+export type ViewMode = "board" | "dag";
 export type MergeStrategy = "merge" | "squash" | "ff";
 export type StatusFilter = "all" | "needs-you" | "working" | "queued" | "done";
 
@@ -67,6 +68,61 @@ export type RepoMetricsRow = {
   median_check_ms: number | null;
 };
 
+export type BudgetStatus = {
+  max_session_mins: number;
+  daily_session_limit: number;
+  max_heal_attempts: number;
+  sessions_today: number;
+  remaining_today: number;
+  limit_reached: boolean;
+  utilization_pct: number;
+  source: "server" | "local";
+};
+
+export type PrPreview = {
+  session_id: string;
+  repo: string;
+  title: string;
+  body: string;
+  base_branch: string;
+  head_branch: string;
+  gh_available: boolean;
+  gh_status?: string;
+  can_create: boolean;
+  warnings: string[];
+  diff_files: number;
+  diff_add: number;
+  diff_del: number;
+  source: "server" | "local";
+};
+
+export type PrCreateResult = {
+  ok: boolean;
+  url?: string;
+  number?: number;
+  draft?: boolean;
+  dry_run?: boolean;
+  message: string;
+  error?: string;
+};
+
+export type WorktreeEntry = {
+  repo: string;
+  project: string;
+  path: string;
+  branch: string;
+  head?: string;
+  is_main: boolean;
+  is_orphan: boolean;
+  dirty: boolean;
+  is_locked?: boolean;
+  lock_reason?: string | null;
+  removable: boolean;
+  session_id?: string | null;
+  session_status?: string | null;
+  session_task?: string | null;
+};
+
 export type BoardMetrics = {
   total: number;
   first_pass_count: number;
@@ -79,6 +135,7 @@ export type BoardMetrics = {
   max_parallel: number;
   queued_count: number;
   per_repo_breakdown: RepoMetricsRow[];
+  budget?: BudgetStatus;
   source: "server" | "local";
 };
 
@@ -185,6 +242,9 @@ export type PolicyFeatures = {
   auto_heal?: boolean;
   templates?: boolean;
   metrics?: boolean;
+  pr_preview?: boolean;
+  worktrees?: boolean;
+  budget?: boolean;
 };
 export type Policy = {
   agents: Agent[];
@@ -343,6 +403,12 @@ export function supportsV060(version?: string | null, policy?: Policy | null): b
   if (isWebEngineMode()) return true;
   if (policy?.features?.auto_heal || policy?.features?.templates || policy?.features?.metrics) return true;
   return semverGte(version || policy?.version, [0, 6, 0]);
+}
+
+export function supportsV070(version?: string | null, policy?: Policy | null): boolean {
+  if (isWebEngineMode()) return true;
+  if (policy?.features?.pr_preview || policy?.features?.worktrees || policy?.features?.budget) return true;
+  return semverGte(version || policy?.version, [0, 7, 0]);
 }
 
 export function repoBasename(repoPath: string): string {
@@ -657,6 +723,9 @@ export function normalizePolicy(raw: unknown): Policy | null {
           auto_heal: Boolean(fRaw.auto_heal),
           templates: Boolean(fRaw.templates),
           metrics: Boolean(fRaw.metrics),
+          pr_preview: Boolean(fRaw.pr_preview),
+          worktrees: Boolean(fRaw.worktrees),
+          budget: Boolean(fRaw.budget),
         }
       : undefined,
   };
@@ -821,12 +890,68 @@ export function computeLocalMetrics(sessions: Session[], maxParallel: number): B
   };
 }
 
+export function computeLocalBudget(sessions: Session[], policy?: Policy | null): BudgetStatus {
+  const dailyLimit = 50;
+  const used = sessions.length;
+  const remaining = Math.max(0, dailyLimit - used);
+  const maxSessionMins = Math.max(1, Math.round((policy?.timeout_secs ?? 1800) / 60));
+  const maxHealAttempts = policy?.auto_steer_budget ?? 2;
+  const util = dailyLimit > 0 ? Math.min(100, Math.round((used / dailyLimit) * 1000) / 10) : 0;
+  return {
+    max_session_mins: maxSessionMins,
+    daily_session_limit: dailyLimit,
+    max_heal_attempts: maxHealAttempts,
+    sessions_today: used,
+    remaining_today: remaining,
+    limit_reached: dailyLimit > 0 && used >= dailyLimit,
+    utilization_pct: util,
+    source: "local",
+  };
+}
+
+export function normalizeBudgetStatus(raw: unknown, fallback: BudgetStatus): BudgetStatus {
+  if (!raw || typeof raw !== "object") return fallback;
+  const o = raw as Record<string, unknown>;
+  const cfg = o.config && typeof o.config === "object" ? (o.config as Record<string, unknown>) : o;
+  const dailyLimit = asNum(o.daily_session_limit ?? cfg.daily_session_limit) ?? fallback.daily_session_limit;
+  const maxSessionMins = asNum(o.max_session_mins ?? cfg.max_session_mins) ?? fallback.max_session_mins;
+  const maxHealAttempts = asNum(o.max_heal_attempts ?? cfg.max_heal_attempts) ?? fallback.max_heal_attempts;
+  const used = asNum(o.sessions_today ?? o.dispatched_today ?? o.used_today) ?? fallback.sessions_today;
+  const remaining =
+    asNum(o.remaining_today ?? o.remaining) ?? (dailyLimit > 0 ? Math.max(0, dailyLimit - used) : fallback.remaining_today);
+  const limitReached =
+    typeof o.daily_limit_reached === "boolean"
+      ? o.daily_limit_reached
+      : typeof o.limit_reached === "boolean"
+        ? o.limit_reached
+        : typeof o.exhausted === "boolean"
+          ? o.exhausted
+          : typeof o.blocked === "boolean"
+            ? o.blocked
+            : dailyLimit > 0 && used >= dailyLimit;
+  const util =
+    asNum(o.usage_pct ?? o.utilization_pct) ??
+    (dailyLimit > 0 ? Math.min(100, Math.round((used / dailyLimit) * 1000) / 10) : 0);
+  return {
+    max_session_mins: maxSessionMins,
+    daily_session_limit: dailyLimit,
+    max_heal_attempts: maxHealAttempts,
+    sessions_today: used,
+    remaining_today: remaining,
+    limit_reached: limitReached,
+    utilization_pct: util,
+    source: "server",
+  };
+}
+
 export async function fetchBoardMetrics(
   sessions: Session[],
   maxParallel: number,
   useServer: boolean,
+  policy?: Policy | null,
 ): Promise<BoardMetrics> {
-  const local = computeLocalMetrics(sessions, maxParallel);
+  const localBudget = computeLocalBudget(sessions, policy);
+  const local: BoardMetrics = { ...computeLocalMetrics(sessions, maxParallel), budget: localBudget };
   if (!useServer) return local;
   try {
     const r = await fetch("/api/metrics", { cache: "no-store" });
@@ -850,6 +975,7 @@ export async function fetchBoardMetrics(
       });
     const rawQueued = asNum(raw.queued_count);
     const rawBlocked = asNum(raw.blocked_count) ?? 0;
+    const rawBudget = raw.budget ?? raw.budget_status;
     return {
       total: asNum(raw.total) ?? local.total,
       first_pass_count: asNum(raw.first_pass_count) ?? local.first_pass_count,
@@ -862,6 +988,7 @@ export async function fetchBoardMetrics(
       max_parallel: asNum(raw.max_slots ?? raw.max_parallel) ?? maxParallel,
       queued_count: rawQueued !== null ? rawQueued + rawBlocked : local.queued_count,
       per_repo_breakdown: perRepo.length ? perRepo : local.per_repo_breakdown,
+      budget: rawBudget ? normalizeBudgetStatus(rawBudget, localBudget) : localBudget,
       source: "server",
     };
   } catch {
@@ -1358,6 +1485,292 @@ export async function pruneStaleWorktrees(useServer: boolean): Promise<{ ok: boo
     };
   } catch {
     return { ok: false, message: "Could not reach Fleet to prune worktrees." };
+  }
+}
+
+export function buildLocalPrPreview(s: Session): PrPreview {
+  const ds = diffStat(s.diff);
+  const baseBranch = s.merge_target || "main";
+  const headBranch = s.branch || `fleet/${s.id}`;
+  const title = s.task.replace(/\s+/g, " ").trim().slice(0, 72) || `Session ${s.id}`;
+  const lines: string[] = [
+    `## Summary`,
+    ``,
+    s.task.trim(),
+    ``,
+    `- **Session:** \`${s.id}\``,
+    `- **Project:** \`${s.project}\``,
+    `- **Branch:** \`${headBranch}\` → \`${baseBranch}\``,
+    `- **Diff:** ${ds.files} ${ds.files === 1 ? "file" : "files"} (+${ds.add} / -${ds.del})`,
+    ``,
+    `## Verification`,
+    ``,
+  ];
+  if (s.check_steps && s.check_steps.length > 0) {
+    for (const st of s.check_steps) {
+      const mark = st.passed || st.status === "passed" ? "x" : " ";
+      const dur = st.elapsed_ms !== null ? ` (${formatDurationMs(st.elapsed_ms)})` : "";
+      lines.push(`- [${mark}] **${st.name}** \`${st.cmd}\` — ${st.tail_line || st.status}${dur}`);
+    }
+  } else {
+    const mark = s.check_passed ? "x" : " ";
+    lines.push(`- [${mark}] \`${s.check_cmd || "policy check"}\` — ${receiptLine(s)}`);
+  }
+  if (s.heal_attempts && s.heal_attempts.length > 0) {
+    lines.push(``, `## Auto-Heal Timeline`, ``);
+    for (const h of s.heal_attempts) {
+      const outcome = h.healed ? "healed" : "retry";
+      const dur = h.elapsed_ms !== null ? ` (${formatDurationMs(h.elapsed_ms)})` : "";
+      lines.push(`- Attempt ${h.attempt} (\`${h.trigger_step}\`): ${outcome}${dur} — ${h.stderr_tail || "diagnostic steer"}`);
+    }
+  }
+  const warnings: string[] = [];
+  if (!isVerified(s)) {
+    warnings.push("Session check has not passed verified done yet.");
+  }
+  if (ds.files === 0) {
+    warnings.push("No diff changes detected on this branch yet.");
+  }
+  return {
+    session_id: s.id,
+    repo: s.repo || s.project,
+    title,
+    body: lines.join("\n"),
+    base_branch: baseBranch,
+    head_branch: headBranch,
+    gh_available: false,
+    gh_status: isWebEngineMode()
+      ? "Standalone browser preview — copy Markdown or connect local fleet-rs with gh CLI to publish."
+      : "PR preview generated locally (upgrade to Fleet v0.7.0+ for live gh CLI creation).",
+    can_create: isWebEngineMode(),
+    warnings,
+    diff_files: ds.files,
+    diff_add: ds.add,
+    diff_del: ds.del,
+    source: "local",
+  };
+}
+
+export async function fetchPrPreview(s: Session, useServer: boolean): Promise<PrPreview> {
+  const local = buildLocalPrPreview(s);
+  if (!useServer) return local;
+  try {
+    const r = await fetch(`/api/sessions/${encodeURIComponent(s.id)}/pr-preview`, { cache: "no-store" });
+    if (!r.ok) return local;
+    const raw = (await r.json()) as Record<string, unknown>;
+    const dsObj = raw.diff_stat && typeof raw.diff_stat === "object" ? (raw.diff_stat as Record<string, unknown>) : null;
+    const ghAvailable =
+      typeof raw.gh_available === "boolean"
+        ? raw.gh_available
+        : typeof raw.gh_ready === "boolean"
+          ? raw.gh_ready
+          : typeof raw.has_gh === "boolean"
+            ? raw.has_gh
+            : false;
+    return {
+      session_id: asStr(raw.session_id, s.id),
+      repo: asStr(raw.repo, local.repo),
+      title: asStr(raw.title, local.title),
+      body: asStr(raw.body ?? raw.markdown, local.body),
+      base_branch: asStr(raw.base_branch ?? raw.base, local.base_branch),
+      head_branch: asStr(raw.head_branch ?? raw.head ?? raw.branch, local.head_branch),
+      gh_available: ghAvailable,
+      gh_status: raw.gh_status
+        ? asStr(raw.gh_status)
+        : raw.gh_message
+          ? asStr(raw.gh_message)
+          : ghAvailable
+            ? "gh CLI ready on host"
+            : "gh CLI unavailable or unauthenticated on host — copy Markdown below or authenticate gh.",
+      can_create:
+        typeof raw.ready_to_create === "boolean"
+          ? raw.ready_to_create
+          : typeof raw.can_create === "boolean"
+            ? raw.can_create
+            : ghAvailable,
+      warnings: asStrList(raw.warnings),
+      diff_files: asNum(dsObj?.files_changed ?? raw.diff_files ?? raw.files_changed) ?? local.diff_files,
+      diff_add: asNum(dsObj?.insertions ?? raw.diff_add ?? raw.insertions ?? dsObj?.add ?? dsObj?.additions) ?? local.diff_add,
+      diff_del: asNum(dsObj?.deletions ?? raw.diff_del ?? raw.deletions ?? dsObj?.del) ?? local.diff_del,
+      source: "server",
+    };
+  } catch {
+    return local;
+  }
+}
+
+export async function createSessionPr(
+  sessionId: string,
+  payload: { title: string; body: string; draft: boolean; confirm: boolean },
+  useServer: boolean,
+): Promise<PrCreateResult> {
+  if (!payload.confirm) {
+    return { ok: false, message: "Explicit confirmation is required before pushing or opening a PR.", error: "confirmation required" };
+  }
+  if (!useServer) {
+    return { ok: false, message: "Creating a GitHub PR requires Fleet v0.7.0+ with gh CLI configured.", error: "unsupported" };
+  }
+  try {
+    const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/pr`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: payload.title.trim(),
+        body: payload.body,
+        draft: payload.draft,
+        confirm: true,
+      }),
+    });
+    const raw = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!r.ok) {
+      const err = asStr(raw.error ?? raw.message, `Could not create pull request (HTTP ${r.status}).`);
+      return { ok: false, message: err, error: err };
+    }
+    const url = raw.url ? asStr(raw.url) : raw.pr_url ? asStr(raw.pr_url) : undefined;
+    const num = asNum(raw.number ?? raw.pr_number) ?? undefined;
+    return {
+      ok: true,
+      url,
+      number: num,
+      draft: typeof raw.draft === "boolean" ? raw.draft : payload.draft,
+      dry_run: Boolean(raw.dry_run),
+      message: asStr(raw.message, url ? `Pull request created: ${url}` : "Pull request created."),
+    };
+  } catch {
+    return { ok: false, message: "Could not reach Fleet to create pull request.", error: "network error" };
+  }
+}
+
+export function normalizeWorktrees(raw: unknown): WorktreeEntry[] {
+  const flat: Record<string, unknown>[] = [];
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (item && typeof item === "object") flat.push(item as Record<string, unknown>);
+    }
+  } else if (raw && typeof raw === "object") {
+    const obj = raw as Record<string, unknown>;
+    if (Array.isArray(obj.worktrees)) {
+      for (const item of obj.worktrees) {
+        if (item && typeof item === "object") flat.push(item as Record<string, unknown>);
+      }
+    } else if (Array.isArray(obj.repos)) {
+      for (const grp of obj.repos) {
+        if (!grp || typeof grp !== "object") continue;
+        const g = grp as Record<string, unknown>;
+        const repoPath = asStr(g.repo ?? g.path, "");
+        if (Array.isArray(g.worktrees)) {
+          for (const wt of g.worktrees) {
+            if (wt && typeof wt === "object") {
+              flat.push({ repo: repoPath, ...(wt as Record<string, unknown>) });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return flat
+    .map((o): WorktreeEntry | null => {
+      const wtPath = asStr(o.path ?? o.worktree_path, "").trim();
+      if (!wtPath) return null;
+      const repoPath = asStr(o.repo ?? o.repo_path, wtPath).trim();
+      const proj = asStr(o.project, "").trim() || repoBasename(repoPath) || repoBasename(wtPath) || "repo";
+      const isMain = Boolean(o.is_main ?? o.main);
+      const isLocked = Boolean(o.is_locked ?? o.locked);
+      return {
+        repo: repoPath,
+        project: proj,
+        path: wtPath,
+        branch: asStr(o.branch, "(detached)"),
+        head: o.head ? asStr(o.head) : undefined,
+        is_main: isMain,
+        is_orphan: Boolean(o.is_orphan ?? o.orphan),
+        dirty: Boolean(o.dirty ?? o.is_dirty),
+        is_locked: isLocked,
+        lock_reason: o.lock_reason ? asStr(o.lock_reason) : null,
+        removable: typeof o.removable === "boolean" ? o.removable : !isMain && !isLocked,
+        session_id: o.session_id ? asStr(o.session_id) : null,
+        session_status: o.session_status ? asStr(o.session_status) : null,
+        session_task: o.session_task ? asStr(o.session_task) : null,
+      };
+    })
+    .filter((w): w is WorktreeEntry => w !== null);
+}
+
+export async function fetchRepoWorktrees(
+  sessions: Session[],
+  repos: RepoInfo[],
+  useServer: boolean,
+): Promise<{ worktrees: WorktreeEntry[]; source: "server" | "local" }> {
+  const local = (): WorktreeEntry[] => {
+    const out: WorktreeEntry[] = [];
+    for (const r of repos) {
+      out.push({
+        repo: r.path,
+        project: r.name || repoBasename(r.path) || "repo",
+        path: r.path,
+        branch: r.branch || "main",
+        is_main: true,
+        is_orphan: false,
+        dirty: false,
+        removable: false,
+      });
+    }
+    for (const s of sessions) {
+      if (!s.branch) continue;
+      const repoPath = s.repo || `/workspace/${s.project}`;
+      out.push({
+        repo: repoPath,
+        project: s.project || repoBasename(repoPath) || "repo",
+        path: `${repoPath}/.worktrees/${s.id}`,
+        branch: s.branch,
+        is_main: false,
+        is_orphan: false,
+        dirty: s.bucket === "working",
+        removable: s.bucket !== "working",
+        session_id: s.id,
+        session_status: s.status,
+        session_task: s.task,
+      });
+    }
+    return out;
+  };
+
+  if (!useServer) return { worktrees: local(), source: "local" };
+  try {
+    const r = await fetch("/api/repos/worktrees", { cache: "no-store" });
+    if (!r.ok) return { worktrees: local(), source: "local" };
+    const raw = await r.json();
+    return { worktrees: normalizeWorktrees(raw), source: "server" };
+  } catch {
+    return { worktrees: local(), source: "local" };
+  }
+}
+
+export async function deleteRepoWorktree(
+  entry: { repo: string; path: string },
+  useServer: boolean,
+): Promise<{ ok: boolean; message: string }> {
+  if (!useServer) {
+    return { ok: false, message: "Targeted worktree removal requires Fleet v0.7.0+." };
+  }
+  try {
+    const qs = new URLSearchParams({ repo: entry.repo, path: entry.path }).toString();
+    const r = await fetch(`/api/repos/worktrees?${qs}`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repo: entry.repo, path: entry.path }),
+    });
+    const raw = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!r.ok) {
+      return { ok: false, message: asStr(raw.error ?? raw.message, `Could not remove worktree (HTTP ${r.status}).`) };
+    }
+    return {
+      ok: true,
+      message: asStr(raw.message, `Removed worktree ${repoBasename(entry.path) || entry.path}.`),
+    };
+  } catch {
+    return { ok: false, message: "Could not reach Fleet to remove worktree." };
   }
 }
 
