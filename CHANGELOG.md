@@ -4,6 +4,38 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running app shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.6.0 - 2026-11-22
+
+- Autonomous Auto-Heal / Auto-Steer Feedback Loop (`src/autoheal.rs`,
+  `run_agent_and_check`): when a healable verification step fails under a
+  session's `auto_steer_budget`, Fleet generates a deterministic diagnostic
+  steering prompt containing the failing step command, exit status, and
+  ANSI-stripped stderr tail, re-invokes the agent via `--continue`, records
+  each `HealAttempt` (`trigger_step`, `exit_code`, `stderr_tail`, `prompt_sent`,
+  `elapsed_ms`, `healed`), emits live SSE `auto_heal_attempt` events, enforces
+  an identical-error SHA-256 fingerprint loop guard so repeated failures halt
+  early instead of burning budget, and never bypasses file-scope guardrails or
+  gitignored/commit/stop refusals.
+- Reusable Engineering Playbook Templates (`src/templates.rs`,
+  `GET /api/templates`, `POST /api/templates`, `DELETE /api/templates/:id`):
+  ships 4 clean built-in engineering playbooks (`rust-lint-test`,
+  `web-typecheck-build`, `python-pytest-guard`, `docs-safe-update`), atomic
+  `<data_dir>/templates.json` persistence with corruption quarantine, live
+  `templates_updated` SSE broadcasts, and same-origin CSRF enforcement across
+  `POST`/`DELETE`/`PUT`/`PATCH`.
+- Live Board Telemetry (`src/metrics.rs`, `GET /api/metrics`): single-pass
+  $O(N)$ `state_rev`-cached board telemetry reporting `first_pass_count`,
+  `auto_healed_count`, `needs_you_count`, honest `first_pass_rate_pct` vs
+  `effective_pass_rate_pct`, `median_check_ms`, `active_slots`/`max_slots`,
+  `queued_count`/`blocked_count`, and per-repository breakdowns.
+- Mission Control UI v0.6.0: compact Board Telemetry Strip with `By repo (N)`
+  popover breakdown, `Healed N/M` & `Auto-healing N/M` badges across session
+  cards, hero receipt, and inspector, expandable Auto-Heal Timeline inside the
+  Receipt tab (zero native `<details>`), Playbook selector + inline Save/Delete
+  and `auto_steer_budget` control in the Composer, `Playbooks` group in `Cmd+K`
+  Command Palette, and full v0.6.0 parity in the standalone browser bundle
+  (`shared-live-web/dsh-fleet/index.html`).
+
 ## 0.5.0 - 2026-11-22
 
 - Real-time Server-Sent Events stream (`GET /api/events/stream`, `src/events.rs`):
@@ -91,7 +123,7 @@ itself from the newest release (see README, "Versions and updates").
 - Top Command Bar: `Fleet` wordmark and version chip, `/` search filter with `Kbd`
   hint across tasks/projects/branches, `Needs you` Inbox popover with live count
   and 1-click session jump/Retry, `New session` `MorphingDialog` (`Cmd/Ctrl+Enter`
-  dispatch), `Engines and Rune policy` Vaul right sheet, and Light/Dark
+  dispatch), `Engines and settings` Vaul right sheet, and Light/Dark
   `SegmentedControl` (`id="themeBtn"`).
 - Scan Strip & Latest Verified Receipt hero: four `SlidingNumber` counters
   (`Sessions`, `Needs you`, `Working`, `Verified`), Kibo UI running `AvatarStack`,

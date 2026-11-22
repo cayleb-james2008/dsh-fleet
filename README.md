@@ -124,10 +124,20 @@ the task, status, bucket and transcript, each carries:
 ## HTTP
 
 - `POST /api/sessions` — hand out (201), accepting optional `depends_on`,
-  `check_steps`, `allowed_globs`, `forbidden_globs`, `model`, and `next`.
+  `check_steps`, `allowed_globs`, `forbidden_globs`, `auto_steer_budget`,
+  `model`, and `next`.
 - `POST /api/sessions/batch` — atomic multi-task / multi-repo DAG batch dispatch
-  (201; supports symbolic task keys, `depends_on`, `dry_run: true`, and rejects
-  cycles or unknown dependencies with 400 before creating any session).
+  (201; supports symbolic task keys, `depends_on`, `auto_steer_budget`,
+  `dry_run: true`, and rejects cycles or unknown dependencies with 400 before
+  creating any session).
+- `GET /api/metrics` — live cached board telemetry (`first_pass_count`,
+  `auto_healed_count`, `needs_you_count`, `first_pass_rate_pct`,
+  `effective_pass_rate_pct`, `median_check_ms`, `active_slots`, `max_slots`,
+  `queued_count`, `blocked_count`, and `per_repo_breakdown`).
+- `GET /api/templates`, `POST /api/templates`, `DELETE /api/templates/<id>` —
+  reusable engineering playbook templates persisted atomically to
+  `<data_dir>/templates.json` (ships 4 built-in playbooks and supports custom
+  save/delete with live `templates_updated` SSE updates).
 - `GET /api/sessions` — list sessions with optional filtering and pagination
   (`q`, `status`, `bucket`, `project`, `repo`, `engine`, `limit`, `offset`,
   `compact=1`, `paginated=1`).
@@ -163,8 +173,9 @@ the task, status, bucket and transcript, each carries:
   plus any names in `FLEET_ALLOWED_HOSTS` (comma-separated). Any other Host is
   a 403. A request with more than 100 header lines, or more than 32 KiB of
   headers, is a 431. A request body over 1 MiB is a 413.
-- A POST must be `Content-Type: application/json` (415 otherwise), and a POST
-  with an `Origin` that is not this machine is refused (403).
+- A POST must be `Content-Type: application/json` (415 otherwise), and any
+  mutating request (`POST`, `DELETE`, `PUT`, `PATCH`) with an `Origin` that is
+  not this machine is refused (403).
 
 ## Agents, honestly
 
