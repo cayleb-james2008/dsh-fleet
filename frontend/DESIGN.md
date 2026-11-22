@@ -1,8 +1,15 @@
-# Fleet front end: design (v0.6.0 Mission Control Board)
+# Fleet front end: design (v0.7.0 Mission Control Board)
 
-Status: v0.6.0 complete. Built on the House Frontend system (`JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md`), self-hosted **Geist** and **Geist Mono** (`frontend/src/fonts/*.woff2`), light default + full dark parity (`frontend/src/theme.css`).
+Status: v0.7.0 complete. Built on the House Frontend system (`JOB.md`, `ROLE-COVERAGE.md`, `ALIVE.md`), self-hosted **Geist** and **Geist Mono** (`frontend/src/fonts/*.woff2`), light default + full dark parity (`frontend/src/theme.css`).
 
-## What v0.6.0 adds
+## What v0.7.0 adds
+
+- **Interactive Multi-Wave DAG Dependency Visualizer** (`frontend/src/dag-graph.tsx`): `Board` / `DAG Graph` `SegmentedControl` toggle (+ `g` shortcut & `Cmd+K` command), topological wave columns, status rails, SVG directed cubic Bezier dependency arrows, and click-node -> Session Inspector navigation.
+- **PR Preview & Confirmation-Gated Create PR Modal** (`frontend/src/pr-modal.tsx`): structured PR title & copyable Markdown body (`GET /api/sessions/:id/pr-preview`), draft toggle, explicit confirmation checkbox gating `POST /api/sessions/:id/pr` (`confirm: true`), mounted outside Vaul `<Drawer.Content>` for reliable `390x844` mobile taps.
+- **Worktrees Inspector & Budget Guardrails** (`frontend/src/settings-policy.tsx`, `frontend/src/board.tsx`): live `Daily budget` chip in `BoardMetricsStrip`, `Budget guardrails` panel with GPU-composited `scaleX` progress bar inside Settings, and per-worktree `Worktrees inspector` (`GET/DELETE /api/repos/worktrees`) showing main/active/orphan/dirty status with inline-confirmed targeted pruning.
+- **Standalone Browser Bundle v0.7.0** (`shared-live-web/dsh-fleet/index.html`): full browser-only parity for DAG Graph, PR Preview + dry-run confirmation, Worktrees Inspector with orphan prune, and Budget Guardrails with zero external requests.
+
+## What v0.6.0 added
 
 - **Board Telemetry Strip** (`GET /api/metrics`): compact live strip showing First-pass %, Auto-healed count + effective pass rate, Median check duration, Active/Max parallel slots (+ queued/blocked), and an interactive `By repo (N)` popover breakdown.
 - **Autonomous Auto-Heal Badges & Timeline** (`auto_heal_attempt` SSE): live `Healed N/M` / `Auto-healing N/M` badges across session cards, hero verified receipt, and inspector header, plus an expandable `Auto-heal timeline` inside the Receipt tab showing each attempt's failing step, stderr tail, elapsed time, and diagnostic steer prompt (zero native `<details>`).
@@ -58,8 +65,8 @@ Full mapping in `../ROLE-COVERAGE.md` and motion preset table in `../ALIVE.md`:
 ## Verification gates
 
 - `cargo clippy --all-targets -- -D warnings`: 0 warnings
-- `cargo test`: 102 passed (18 lib + 60 bin + 9 CLI + 11 v0.5.0 engine + 4 v0.6.0 engine)
+- `cargo test`: 113 passed (23 lib + 63 bin + 9 CLI + 11 v0.5.0 engine + 4 v0.6.0 engine + 3 v0.7.0 engine)
 - `bash .loop/verify`: 23/23 passed (including `verify2.sh`, `engines.sh`, `ui.sh`, `theme.sh`, `inbox.sh`, `proof.sh`)
-- `cd frontend && npm run check:ui -- --lints`: `gate` 52/52, `replay` 6/6, Hallmark `sloplint` 0 FAIL / 0 REFLEX
-- `cd frontend && node e2e/test-live-web.mjs`: 24/24 passed (Auto-Heal timeline, Board Telemetry Strip, Playbooks CRUD, Batch DAG, 0 external requests, 0 console errors)
-- Real live-agent 3-repo multi-wave campaign (real `opencode` CLI, zero `FLEET_AGENT` shim): parallel Wave 1 across `py-ledger-api`, `node-cli-tools`, and `sh-ops-kit`, real autonomous Auto-Heal fixing a failing CI contract check into verified `done`, Wave 2 `depends_on` auto-launch, file-scope guardrail refusal, non-destructive conflict check, and real squash merges + worktree cleanup
+- `cd frontend && npm run check:ui -- --lints`: `gate` 56/56, `replay` 6/6, Hallmark `sloplint` 0 FAIL / 0 REFLEX
+- `cd frontend && node e2e/test-live-web.mjs`: 28/28 passed (DAG Graph, PR Preview modal, Worktrees Inspector orphan prune, Budget Guardrails, Auto-Heal timeline, Playbooks CRUD, Batch DAG, 0 external requests, 0 console errors)
+- Real live-agent E2E (real `opencode` CLI, zero `FLEET_AGENT` shim, local bare git remotes): multi-wave DAG Graph visualization, PR preview Markdown + confirmation-gated `dry_run` without touching GitHub, Worktree Inspector orphan cleanup + main/traversal 403 refusals, and atomic HTTP `429` daily budget enforcement
