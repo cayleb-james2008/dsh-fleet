@@ -529,6 +529,9 @@ struct App {
     merge_target_cache: Mutex<std::collections::HashMap<String, (Option<String>, std::time::Instant)>>,
     /// Cached serialized GET /api/sessions payload keyed by (state_rev, cached_at).
     sessions_cache: Mutex<Option<(u64, std::time::Instant, String)>>,
+    /// Cached GET /api/repos discovery result keyed by (state_rev, FLEET_REPOS_DIR, cached_at).
+    #[allow(clippy::type_complexity)]
+    repos_cache: Mutex<Option<(u64, String, std::time::Instant, Vec<RepoInfo>)>>,
     /// Session IDs whose `.record.json` needs writing on the next persist() pass.
     dirty_records: Mutex<std::collections::HashSet<String>>,
     /// Transcript lines logged since the last snapshot — the persist
@@ -1027,12 +1030,29 @@ impl App {
     }
 
     fn discover_repos(&self) -> Vec<RepoInfo> {
-        let mut seen = std::collections::HashSet::<PathBuf>::new();
-        let mut repos = Vec::<RepoInfo>::new();
+        const REPOS_TTL: std::time::Duration = std::time::Duration::from_secs(3);
         const MAX_REPOS: usize = 60;
+        let rev = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
+        let env_dirs_opt = std::env::var("FLEET_REPOS_DIR").ok();
+        let env_key = env_dirs_opt.as_deref().unwrap_or("").to_string();
+        let now = std::time::Instant::now();
+        {
+            let guard = self.repos_cache.lock().unwrap();
+            if let Some((cached_rev, ref cached_env, at, ref cached_repos)) = *guard {
+                if cached_rev == rev
+                    && *cached_env == env_key
+                    && now.duration_since(at) < REPOS_TTL
+                {
+                    return cached_repos.clone();
+                }
+            }
+        }
+
+        let mut seen = std::collections::HashSet::<PathBuf>::new();
+        let mut discovered: Vec<(String, String)> = Vec::new();
 
         let mut try_add = |p: &Path| -> bool {
-            if repos.len() >= MAX_REPOS {
+            if discovered.len() >= MAX_REPOS {
                 return false;
             }
             if !p.is_dir() || !p.join(".git").exists() {
@@ -1049,22 +1069,25 @@ impl App {
                 .filter(|s| !s.is_empty())
                 .unwrap_or("repo")
                 .to_string();
-            let branch = merge_target(&path_str);
-            repos.push(RepoInfo {
-                name,
-                path: path_str,
-                branch,
-            });
-            repos.len() < MAX_REPOS
+            discovered.push((name, path_str));
+            discovered.len() < MAX_REPOS
         };
 
+        // Deduplicate raw session repo paths BEFORE canonicalizing or leaving the lock
+        // so 2,000+ sessions on a handful of repos do O(unique_repos) filesystem checks.
         let session_repos: Vec<String> = {
             let sessions = self.sessions.lock().unwrap();
-            sessions
-                .iter()
-                .filter(|s| !s.repo.is_empty())
-                .map(|s| s.repo.clone())
-                .collect()
+            let mut uniq = std::collections::HashSet::<&str>::new();
+            let mut out = Vec::new();
+            for s in sessions.iter() {
+                if !s.repo.is_empty() && uniq.insert(s.repo.as_str()) {
+                    out.push(s.repo.clone());
+                    if out.len() >= MAX_REPOS {
+                        break;
+                    }
+                }
+            }
+            out
         };
         for r in session_repos {
             if !try_add(Path::new(&r)) {
@@ -1073,7 +1096,7 @@ impl App {
         }
 
         let mut roots: Vec<PathBuf> = Vec::new();
-        if let Ok(env_dirs) = std::env::var("FLEET_REPOS_DIR") {
+        if let Some(env_dirs) = env_dirs_opt {
             for part in env_dirs.split(':').filter(|s| !s.trim().is_empty()) {
                 roots.push(PathBuf::from(part.trim()));
             }
@@ -1147,12 +1170,26 @@ impl App {
             }
         }
 
+        let paths: Vec<String> = discovered.iter().map(|(_, p)| p.clone()).collect();
+        let targets = self.cached_merge_targets(&paths);
+        let mut repos: Vec<RepoInfo> = discovered
+            .into_iter()
+            .map(|(name, path)| {
+                let branch = targets.get(&path).cloned().flatten();
+                RepoInfo { name, path, branch }
+            })
+            .collect();
+
         repos.sort_by(|a, b| {
             a.name
                 .to_lowercase()
                 .cmp(&b.name.to_lowercase())
                 .then(a.path.cmp(&b.path))
         });
+        let rev_after = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
+        if rev_after == rev {
+            *self.repos_cache.lock().unwrap() = Some((rev, env_key, now, repos.clone()));
+        }
         repos
     }
 
@@ -1421,18 +1458,23 @@ impl App {
             .and_then(|v| v.parse::<usize>().ok())
             .map(|l| l.min(2000));
 
-        let (matched, repos, counts, status_map) = {
+        let max_take = limit.unwrap_or(usize::MAX);
+        let (page, total, repos, counts, status_map) = {
             let sessions = self.sessions.lock().unwrap();
-            let mut pos = 0usize;
-            let mut queue_pos = std::collections::HashMap::<String, usize>::new();
-            let mut status_map = std::collections::HashMap::<String, String>::with_capacity(sessions.len());
+            let mut queued_pos = 0usize;
             let (mut c_all, mut c_needs, mut c_work, mut c_done) = (0usize, 0usize, 0usize, 0usize);
+            let mut total = 0usize;
+            let mut page: Vec<(Session, Option<usize>)> =
+                Vec::with_capacity(limit.unwrap_or(64).min(256));
+            let mut repo_set = std::collections::HashSet::<String>::new();
+
             for s in sessions.iter() {
-                status_map.insert(s.id.clone(), s.status.clone());
-                if s.status == "queued" {
-                    pos += 1;
-                    queue_pos.insert(s.id.clone(), pos);
-                }
+                let qp = if s.status == "queued" {
+                    queued_pos += 1;
+                    Some(queued_pos)
+                } else {
+                    None
+                };
                 if s.bucket != "archived" {
                     c_all += 1;
                     match s.bucket.as_str() {
@@ -1442,49 +1484,44 @@ impl App {
                         _ => {}
                     }
                 }
-            }
-            let filtered: Vec<(Session, Option<usize>)> = sessions
-                .iter()
-                .filter(|s| {
-                    if let Some(ref st) = status_f {
-                        if s.status.to_lowercase() != *st {
-                            return false;
-                        }
+                if let Some(ref st) = status_f {
+                    if !s.status.eq_ignore_ascii_case(st) {
+                        continue;
                     }
-                    if let Some(ref b) = bucket_f {
-                        if s.bucket.to_lowercase() != *b {
-                            return false;
-                        }
+                }
+                if let Some(ref b) = bucket_f {
+                    if !s.bucket.eq_ignore_ascii_case(b) {
+                        continue;
                     }
-                    if let Some(ref p) = project_f {
-                        if s.project.to_lowercase() != *p {
-                            return false;
-                        }
+                }
+                if let Some(ref p) = project_f {
+                    if !s.project.eq_ignore_ascii_case(p) {
+                        continue;
                     }
-                    if let Some(ref r) = repo_f {
-                        if s.repo != *r {
-                            return false;
-                        }
+                }
+                if let Some(ref r) = repo_f {
+                    if s.repo != *r {
+                        continue;
                     }
-                    if let Some(ref e) = engine_f {
-                        if engine_kind(&s.agent).label() != e.as_str() {
-                            return false;
-                        }
+                }
+                if let Some(ref e) = engine_f {
+                    if engine_kind(&s.agent).label() != e.as_str() {
+                        continue;
                     }
-                    if let Some(ref needle) = q {
-                        let hit = s.task.to_lowercase().contains(needle)
-                            || s.project.to_lowercase().contains(needle)
-                            || s.branch.to_lowercase().contains(needle)
-                            || s.id.to_lowercase().contains(needle)
-                            || s.repo.to_lowercase().contains(needle);
-                        if !hit {
-                            return false;
-                        }
+                }
+                if let Some(ref needle) = q {
+                    let hit = s.task.to_lowercase().contains(needle)
+                        || s.project.to_lowercase().contains(needle)
+                        || s.branch.to_lowercase().contains(needle)
+                        || s.id.to_lowercase().contains(needle)
+                        || s.repo.to_lowercase().contains(needle);
+                    if !hit {
+                        continue;
                     }
-                    true
-                })
-                .map(|s| {
-                    let qp = queue_pos.get(&s.id).copied();
+                }
+                let match_idx = total;
+                total += 1;
+                if match_idx >= offset && page.len() < max_take {
                     let mut clone = s.clone();
                     if compact {
                         if clone.transcript.len() > 3 {
@@ -1493,33 +1530,37 @@ impl App {
                         }
                         clone.diff.clear();
                     }
-                    (clone, qp)
-                })
-                .collect();
-            let mut r: Vec<String> = filtered
-                .iter()
-                .filter(|(s, _)| !s.repo.is_empty())
-                .map(|(s, _)| s.repo.clone())
-                .collect();
+                    if !clone.repo.is_empty() {
+                        repo_set.insert(clone.repo.clone());
+                    }
+                    page.push((clone, qp));
+                }
+            }
+
+            // Populate `status_map` ONLY for `depends_on` targets referenced by this page.
+            let mut needed_deps = std::collections::HashSet::<&str>::new();
+            for (s, _) in &page {
+                for dep in &s.depends_on {
+                    needed_deps.insert(dep.as_str());
+                }
+            }
+            let mut status_map = std::collections::HashMap::<String, String>::with_capacity(needed_deps.len());
+            if !needed_deps.is_empty() {
+                for s in sessions.iter() {
+                    if needed_deps.contains(s.id.as_str()) {
+                        status_map.insert(s.id.clone(), s.status.clone());
+                    }
+                }
+            }
+
+            let mut r: Vec<String> = repo_set.into_iter().collect();
             r.sort();
-            r.dedup();
-            (filtered, r, (c_all, c_needs, c_work, c_done), status_map)
+            (page, total, r, (c_all, c_needs, c_work, c_done), status_map)
         };
 
-        let total = matched.len();
         let targets = self.cached_merge_targets(&repos);
-        let slice_end = match limit {
-            Some(l) => offset.saturating_add(l).min(total),
-            None => total,
-        };
-        let slice = if offset >= total {
-            &matched[0..0]
-        } else {
-            &matched[offset..slice_end]
-        };
-        let mut arr = serde_json::Value::Array(
-            slice
-                .iter()
+        let arr = serde_json::Value::Array(
+            page.iter()
                 .map(|(s, qp)| {
                     let mut v = session_to_api_value(s, &targets, &status_map);
                     v["queue_position"] = match qp {
@@ -1530,7 +1571,6 @@ impl App {
                 })
                 .collect(),
         );
-        let _ = &mut arr;
         if paginated {
             serde_json::json!({
                 "sessions": arr,
@@ -5477,6 +5517,7 @@ fn main() {
         state_rev: std::sync::atomic::AtomicU64::new(1),
         merge_target_cache: Mutex::new(std::collections::HashMap::new()),
         sessions_cache: Mutex::new(None),
+        repos_cache: Mutex::new(None),
         dirty_records: Mutex::new(std::collections::HashSet::new()),
         lines_since_persist: std::sync::atomic::AtomicU64::new(0),
         counter: Mutex::new(restored_counter),
@@ -5775,6 +5816,7 @@ mod tests {
             state_rev: std::sync::atomic::AtomicU64::new(1),
             merge_target_cache: Mutex::new(std::collections::HashMap::new()),
             sessions_cache: Mutex::new(None),
+        repos_cache: Mutex::new(None),
             dirty_records: Mutex::new(std::collections::HashSet::new()),
             lines_since_persist: std::sync::atomic::AtomicU64::new(0),
             counter: Mutex::new(0),
@@ -5854,6 +5896,7 @@ mod tests {
             state_rev: std::sync::atomic::AtomicU64::new(1),
             merge_target_cache: Mutex::new(std::collections::HashMap::new()),
             sessions_cache: Mutex::new(None),
+        repos_cache: Mutex::new(None),
             dirty_records: Mutex::new(std::collections::HashSet::new()),
             lines_since_persist: std::sync::atomic::AtomicU64::new(0),
             counter: Mutex::new(0),
@@ -6677,6 +6720,7 @@ mod tests {
             state_rev: std::sync::atomic::AtomicU64::new(1),
             merge_target_cache: Mutex::new(std::collections::HashMap::new()),
             sessions_cache: Mutex::new(None),
+        repos_cache: Mutex::new(None),
             dirty_records: Mutex::new(std::collections::HashSet::new()),
             lines_since_persist: std::sync::atomic::AtomicU64::new(0),
             counter: Mutex::new(0),
