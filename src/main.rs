@@ -6,6 +6,7 @@
 //! Session policies (parallel cap, default checks) live in policies.rn and
 //! are executed through Rune — they drive behaviour, they are not metadata.
 
+mod events;
 mod update;
 
 use serde::Serialize;
@@ -537,6 +538,8 @@ struct RuntimeConfig {
     claude_model: Option<String>,
     #[serde(default)]
     codex_model: Option<String>,
+    #[serde(default)]
+    max_parallel_agents: Option<i64>,
 }
 
 fn load_config(data_dir: &Path) -> RuntimeConfig {
@@ -566,12 +569,23 @@ struct App {
     env_model: Option<String>,
     env_claude_model: Option<String>,
     env_codex_model: Option<String>,
+    env_max_parallel: Option<i64>,
     data_dir: PathBuf,
     /// Tag unique to this server run, baked into session ids and branch
     /// names so a restarted server can never collide with worktrees or
     /// branches a previous run left in the target repo.
     run_tag: String,
     sessions: Mutex<Vec<Session>>,
+    /// Monotonic revision bumped on every session state/log mutation to
+    /// invalidate cached GET /api/sessions responses cleanly.
+    state_rev: std::sync::atomic::AtomicU64,
+    /// Per-repo checked-out branch cache (5s TTL) so listing 2,000+ sessions
+    /// never shells out to git on every poll.
+    merge_target_cache: Mutex<std::collections::HashMap<String, (Option<String>, std::time::Instant)>>,
+    /// Cached serialized GET /api/sessions payload keyed by (state_rev, cached_at).
+    sessions_cache: Mutex<Option<(u64, std::time::Instant, String)>>,
+    /// Session IDs whose `.record.json` needs writing on the next persist() pass.
+    dirty_records: Mutex<std::collections::HashSet<String>>,
     /// Transcript lines logged since the last snapshot — the persist
     /// cadence counter (see log()).
     lines_since_persist: std::sync::atomic::AtomicU64,
@@ -581,6 +595,8 @@ struct App {
     /// endpoint sets it. In-memory only — a restart already lands
     /// every live session in needs-you with the reason stated.
     stops: Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    /// Real-time SSE event bus (`GET /api/events/stream`).
+    events: Arc<events::EventBus>,
     /// Version checks and self-update (see `update`).
     updater: Arc<update::Updater>,
 }
@@ -647,6 +663,24 @@ fn kill_group(pid: u32) {
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
     }
+}
+
+/// Send SIGTERM to the entire process group first so agents can flush/exit
+/// cleanly, then escalate to SIGKILL after `grace_ms` if the child is still alive.
+fn kill_group_graceful(pid: u32, child: &mut std::process::Child, grace_ms: u64) {
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGTERM);
+    }
+    let steps = (grace_ms / 50).max(1);
+    for _ in 0..steps {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    kill_group(pid);
+    let _ = child.kill();
 }
 
 /// Run a command in its OWN process group, streaming lines to
@@ -726,8 +760,7 @@ fn run_bounded(
     };
     let end = loop {
         if child_status.is_none() && stopped() {
-            kill_group(pid);
-            let _ = child.kill();
+            kill_group_graceful(pid, &mut child, 1200);
             break RunEnd::Stopped;
         }
         if child_status.is_none() {
@@ -743,8 +776,7 @@ fn run_bounded(
         }
         let now = std::time::Instant::now();
         if child_status.is_none() && now >= deadline {
-            kill_group(pid);
-            let _ = child.kill();
+            kill_group_graceful(pid, &mut child, 400);
             break RunEnd::TimedOut;
         }
         if let Some(x) = exited_at {
@@ -770,8 +802,7 @@ fn run_bounded(
                 let mut stop_hit = false;
                 loop {
                     if stopped() {
-                        kill_group(pid);
-                        let _ = child.kill();
+                        kill_group_graceful(pid, &mut child, 1200);
                         stop_hit = true;
                         break;
                     }
@@ -783,8 +814,7 @@ fn run_bounded(
                         }
                         Ok(None) => {
                             if std::time::Instant::now() >= deadline {
-                                kill_group(pid);
-                                let _ = child.kill();
+                                kill_group_graceful(pid, &mut child, 400);
                                 child_status = None;
                                 break;
                             }
@@ -866,6 +896,48 @@ impl App {
         }
     }
 
+    fn effective_max_parallel(&self) -> i64 {
+        let cfg = self.config.lock().unwrap();
+        cfg.max_parallel_agents
+            .or(self.env_max_parallel)
+            .unwrap_or(self.policy.max_parallel)
+            .clamp(1, 64)
+    }
+
+    fn queue_counts(&self) -> (usize, usize, usize) {
+        let sessions = self.sessions.lock().unwrap();
+        let active = sessions
+            .iter()
+            .filter(|s| s.bucket == "working" && s.status != "queued")
+            .count();
+        let queued = sessions.iter().filter(|s| s.status == "queued").count();
+        let total = sessions.iter().filter(|s| s.bucket != "archived").count();
+        (active, queued, total)
+    }
+
+    fn bump_rev(&self) {
+        self.state_rev
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn mark_dirty(&self, id: &str) {
+        self.dirty_records.lock().unwrap().insert(id.to_string());
+        self.bump_rev();
+    }
+
+    fn emit_queue_depth(&self) {
+        let (active, queued, total) = self.queue_counts();
+        self.events.publish(
+            "queue_depth",
+            &serde_json::json!({
+                "active": active,
+                "queued": queued,
+                "total": total,
+                "max_parallel": self.effective_max_parallel(),
+            }),
+        );
+    }
+
     fn config_json(&self) -> serde_json::Value {
         let default_agent = self.effective_default_agent();
         let default_agent_engine = default_agent
@@ -874,6 +946,8 @@ impl App {
         let eff_opencode = self.effective_model_for("opencode");
         let eff_claude = self.effective_model_for("claude");
         let eff_codex = self.effective_model_for("codex");
+        let max_parallel = self.effective_max_parallel();
+        let (active, queued, _) = self.queue_counts();
         let cfg = self.config.lock().unwrap();
         serde_json::json!({
             "default_agent": default_agent,
@@ -881,6 +955,10 @@ impl App {
             "opencode_model": cfg.opencode_model,
             "claude_model": cfg.claude_model,
             "codex_model": cfg.codex_model,
+            "max_parallel_agents": cfg.max_parallel_agents,
+            "effective_max_parallel": max_parallel,
+            "active_sessions": active,
+            "queued_sessions": queued,
             "effective_models": {
                 "opencode": eff_opencode,
                 "claude": eff_claude,
@@ -889,6 +967,103 @@ impl App {
             "policy_model": self.policy.model,
             "env_model": self.env_model,
         })
+    }
+
+    /// Prune inactive worktrees strictly inside `self.data_dir/worktrees` and
+    /// run `git worktree prune` on target git repos. Active sessions (`queued`,
+    /// `working`, `checking`, `done`, `needs-you`) are never touched.
+    fn prune_worktrees(&self, filter_repo: Option<&str>) -> serde_json::Value {
+        let wt_root = self.data_dir.join("worktrees");
+        let (active_ids, session_repos, repo_by_id): (
+            std::collections::HashSet<String>,
+            std::collections::HashSet<String>,
+            std::collections::HashMap<String, String>,
+        ) = {
+            let sessions = self.sessions.lock().unwrap();
+            let mut active = std::collections::HashSet::new();
+            let mut repos = std::collections::HashSet::new();
+            let mut map = std::collections::HashMap::new();
+            for s in sessions.iter() {
+                if !s.repo.is_empty() {
+                    repos.insert(s.repo.clone());
+                    map.insert(s.id.clone(), s.repo.clone());
+                }
+                if !matches!(s.status.as_str(), "merged" | "archived") {
+                    active.insert(s.id.clone());
+                }
+            }
+            (active, repos, map)
+        };
+
+        let mut removed_worktrees: Vec<String> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&wt_root) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if !p.starts_with(&wt_root) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if active_ids.contains(&name) {
+                    continue;
+                }
+                if let Some(target_repo) = filter_repo {
+                    if repo_by_id.get(&name).map(|r| r.as_str()) != Some(target_repo) {
+                        continue;
+                    }
+                }
+                if let Some(repo) = repo_by_id.get(&name) {
+                    if Path::new(repo).join(".git").exists() {
+                        let _ = Command::new("git")
+                            .arg("-C")
+                            .arg(repo)
+                            .args(["worktree", "remove", "--force"])
+                            .arg(&p)
+                            .output();
+                    }
+                }
+                if p.exists() {
+                    let _ = std::fs::remove_dir_all(&p);
+                }
+                if !p.exists() {
+                    removed_worktrees.push(name);
+                }
+            }
+        }
+        removed_worktrees.sort();
+
+        let mut repos_to_prune: Vec<String> = if let Some(r) = filter_repo {
+            vec![r.to_string()]
+        } else {
+            let mut all_r: std::collections::HashSet<String> = session_repos;
+            for info in self.discover_repos() {
+                all_r.insert(info.path);
+            }
+            all_r.into_iter().collect()
+        };
+        repos_to_prune.sort();
+        let mut pruned_repos: Vec<String> = Vec::new();
+        for repo in repos_to_prune {
+            if !Path::new(&repo).join(".git").exists() {
+                continue;
+            }
+            if Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["worktree", "prune"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                pruned_repos.push(repo);
+            }
+        }
+        let payload = serde_json::json!({
+            "pruned": true,
+            "removed_worktrees": removed_worktrees,
+            "pruned_repos": pruned_repos,
+        });
+        self.events.publish("worktrees_pruned", &payload);
+        payload
     }
 
     fn discover_repos(&self) -> Vec<RepoInfo> {
@@ -1023,16 +1198,28 @@ impl App {
 
     /// Snapshot all session state to disk (atomic rename), so a server
     /// restart loses nothing. The per-session log files are the durable
-    /// transcript record; this file is the state snapshot.
+    /// transcript record; this file is the state snapshot. Only dirty or
+    /// missing `.record.json` files are rewritten so 2,000+ sessions stay fast.
     fn persist(&self) {
+        self.bump_rev();
+        let logs_dir = self.data_dir.join("logs");
+        let _ = std::fs::create_dir_all(&logs_dir);
+        let dirty: std::collections::HashSet<String> = {
+            let mut d = self.dirty_records.lock().unwrap();
+            std::mem::take(&mut *d)
+        };
         let (snapshot, records) = {
             let sessions = self.sessions.lock().unwrap();
             let counter = self.counter.lock().unwrap();
             let snapshot = serde_json::json!({ "counter": *counter, "sessions": *sessions });
-            // Each session's record: its settings and settled outcome,
-            // next to its log. The transcript is already in the log.
+            // Write `.record.json` only for modified sessions or any session
+            // missing its record file on disk (preserves crash-recovery tests
+            // while avoiding 2,000+ redundant renames on every log flush).
             let records: Vec<Session> = sessions
                 .iter()
+                .filter(|s| {
+                    dirty.contains(&s.id) || !logs_dir.join(format!("{}.record.json", s.id)).exists()
+                })
                 .map(|s| {
                     let mut r = s.clone();
                     r.transcript.clear();
@@ -1050,8 +1237,6 @@ impl App {
         if std::fs::write(&tmp, snapshot.to_string()).is_ok() {
             let _ = std::fs::rename(&tmp, &dst);
         }
-        let logs_dir = self.data_dir.join("logs");
-        let _ = std::fs::create_dir_all(&logs_dir);
         for r in records {
             let Ok(text) = serde_json::to_string(&r) else {
                 continue;
@@ -1071,7 +1256,20 @@ impl App {
                 s.bucket = status.bucket().to_string();
             }
         }
+        self.mark_dirty(id);
         self.persist();
+        let (active, queued, _) = self.queue_counts();
+        self.events.publish(
+            "session_status",
+            &serde_json::json!({
+                "id": id,
+                "status": status.label(),
+                "bucket": status.bucket(),
+                "active": active,
+                "queued": queued,
+                "max_parallel": self.effective_max_parallel(),
+            }),
+        );
     }
 
     /// Mark a session needs-you with the reason recorded on the session
@@ -1086,8 +1284,22 @@ impl App {
                 s.verified_commit = None;
             }
         }
+        self.mark_dirty(id);
         self.log(id, format!("needs you: {reason}"));
         self.persist();
+        let (active, queued, _) = self.queue_counts();
+        self.events.publish(
+            "session_status",
+            &serde_json::json!({
+                "id": id,
+                "status": Status::NeedsYou.label(),
+                "bucket": Status::NeedsYou.bucket(),
+                "reason": reason,
+                "active": active,
+                "queued": queued,
+                "max_parallel": self.effective_max_parallel(),
+            }),
+        );
     }
     fn status_of(&self, id: &str) -> Option<String> {
         self.sessions
@@ -1098,34 +1310,310 @@ impl App {
             .map(|s| s.status.clone())
     }
 
-    /// The session JSON for the API. Each distinct repo's merge target
-    /// is resolved with git outside the sessions lock, once per request;
-    /// the JSON is then built under the lock with no git calls in it. A
-    /// session that appears while the targets are being resolved is
-    /// picked up on the next pass.
-    fn sessions_view(&self) -> serde_json::Value {
-        let mut targets: std::collections::HashMap<String, Option<String>> =
-            std::collections::HashMap::new();
-        loop {
-            let missing: Vec<String> = {
-                let sessions = self.sessions.lock().unwrap();
-                let mut repos: Vec<String> = sessions
-                    .iter()
-                    .filter(|s| !s.repo.is_empty() && !targets.contains_key(&s.repo))
-                    .map(|s| s.repo.clone())
-                    .collect();
-                repos.sort();
-                repos.dedup();
-                if repos.is_empty() {
-                    return sessions_json(&sessions, &targets);
+    /// Resolve checked-out merge targets for a set of repo paths using a 5s TTL
+    /// cache so 2,000-session API queries never re-spawn `git symbolic-ref`.
+    fn cached_merge_targets(
+        &self,
+        repos: &[String],
+    ) -> std::collections::HashMap<String, Option<String>> {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(5);
+        let now = std::time::Instant::now();
+        let mut out = std::collections::HashMap::with_capacity(repos.len());
+        let mut missing = Vec::new();
+        {
+            let cache = self.merge_target_cache.lock().unwrap();
+            for r in repos {
+                if let Some((val, at)) = cache.get(r) {
+                    if now.duration_since(*at) < TTL {
+                        out.insert(r.clone(), val.clone());
+                        continue;
+                    }
                 }
-                repos
-            };
-            for repo in missing {
-                let target = merge_target(&repo);
-                targets.insert(repo, target);
+                missing.push(r.clone());
             }
         }
+        for r in missing {
+            let val = merge_target(&r);
+            self.merge_target_cache
+                .lock()
+                .unwrap()
+                .insert(r.clone(), (val.clone(), now));
+            out.insert(r, val);
+        }
+        out
+    }
+
+    fn invalidate_merge_target_cache(&self, repo: &str) {
+        self.merge_target_cache.lock().unwrap().remove(repo);
+        self.bump_rev();
+    }
+
+    /// The session JSON for the API. Each distinct repo's merge target
+    /// is resolved with git outside the sessions lock (with a 5s TTL cache).
+    fn sessions_view(&self) -> serde_json::Value {
+        let repos: Vec<String> = {
+            let sessions = self.sessions.lock().unwrap();
+            let mut r: Vec<String> = sessions
+                .iter()
+                .filter(|s| !s.repo.is_empty())
+                .map(|s| s.repo.clone())
+                .collect();
+            r.sort();
+            r.dedup();
+            r
+        };
+        let targets = self.cached_merge_targets(&repos);
+        let sessions = self.sessions.lock().unwrap();
+        sessions_json(&sessions, &targets)
+    }
+
+    /// Cached JSON string for unfiltered `GET /api/sessions`, reused across
+    /// concurrent HTTP clients while `state_rev` is unchanged (<1ms p95 at 2,000+ sessions).
+    fn sessions_view_cached(&self) -> String {
+        const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+        let rev = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
+        let now = std::time::Instant::now();
+        {
+            let guard = self.sessions_cache.lock().unwrap();
+            if let Some((cached_rev, at, ref body)) = *guard {
+                if cached_rev == rev && now.duration_since(at) < CACHE_TTL {
+                    return body.clone();
+                }
+            }
+        }
+        let body = self.sessions_view().to_string();
+        let rev_after = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
+        if rev_after == rev {
+            *self.sessions_cache.lock().unwrap() = Some((rev, now, body.clone()));
+        }
+        body
+    }
+
+    /// Fast filtered / paginated query over sessions (supports `q`, `status`,
+    /// `bucket`, `project`, `repo`, `engine`, `limit`, `offset`, `compact`, `paginated`).
+    fn sessions_query(&self, params: &std::collections::HashMap<String, String>) -> serde_json::Value {
+        let q = params.get("q").map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+        let status_f = params.get("status").map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+        let bucket_f = params.get("bucket").map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+        let project_f = params.get("project").map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+        let repo_f = params.get("repo").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let engine_f = params.get("engine").map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+        let compact = matches!(
+            params.get("compact").or_else(|| params.get("summary")).map(String::as_str),
+            Some("1" | "true" | "yes")
+        );
+        let paginated = matches!(
+            params.get("paginated").map(String::as_str),
+            Some("1" | "true" | "yes")
+        );
+        let offset = params
+            .get("offset")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|l| l.min(2000));
+
+        let (matched, repos, counts) = {
+            let sessions = self.sessions.lock().unwrap();
+            let mut pos = 0usize;
+            let mut queue_pos = std::collections::HashMap::<String, usize>::new();
+            let (mut c_all, mut c_needs, mut c_work, mut c_done) = (0usize, 0usize, 0usize, 0usize);
+            for s in sessions.iter() {
+                if s.status == "queued" {
+                    pos += 1;
+                    queue_pos.insert(s.id.clone(), pos);
+                }
+                if s.bucket != "archived" {
+                    c_all += 1;
+                    match s.bucket.as_str() {
+                        "needs-you" => c_needs += 1,
+                        "working" => c_work += 1,
+                        "done" => c_done += 1,
+                        _ => {}
+                    }
+                }
+            }
+            let filtered: Vec<(Session, Option<usize>)> = sessions
+                .iter()
+                .filter(|s| {
+                    if let Some(ref st) = status_f {
+                        if s.status.to_lowercase() != *st {
+                            return false;
+                        }
+                    }
+                    if let Some(ref b) = bucket_f {
+                        if s.bucket.to_lowercase() != *b {
+                            return false;
+                        }
+                    }
+                    if let Some(ref p) = project_f {
+                        if s.project.to_lowercase() != *p {
+                            return false;
+                        }
+                    }
+                    if let Some(ref r) = repo_f {
+                        if s.repo != *r {
+                            return false;
+                        }
+                    }
+                    if let Some(ref e) = engine_f {
+                        if engine_kind(&s.agent).label() != e.as_str() {
+                            return false;
+                        }
+                    }
+                    if let Some(ref needle) = q {
+                        let hit = s.task.to_lowercase().contains(needle)
+                            || s.project.to_lowercase().contains(needle)
+                            || s.branch.to_lowercase().contains(needle)
+                            || s.id.to_lowercase().contains(needle)
+                            || s.repo.to_lowercase().contains(needle);
+                        if !hit {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .map(|s| {
+                    let qp = queue_pos.get(&s.id).copied();
+                    let mut clone = s.clone();
+                    if compact {
+                        if clone.transcript.len() > 3 {
+                            let start = clone.transcript.len() - 3;
+                            clone.transcript = clone.transcript.split_off(start);
+                        }
+                        clone.diff.clear();
+                    }
+                    (clone, qp)
+                })
+                .collect();
+            let mut r: Vec<String> = filtered
+                .iter()
+                .filter(|(s, _)| !s.repo.is_empty())
+                .map(|(s, _)| s.repo.clone())
+                .collect();
+            r.sort();
+            r.dedup();
+            (filtered, r, (c_all, c_needs, c_work, c_done))
+        };
+
+        let total = matched.len();
+        let targets = self.cached_merge_targets(&repos);
+        let slice_end = match limit {
+            Some(l) => offset.saturating_add(l).min(total),
+            None => total,
+        };
+        let slice = if offset >= total {
+            &matched[0..0]
+        } else {
+            &matched[offset..slice_end]
+        };
+        let only_sessions: Vec<Session> = slice.iter().map(|(s, _)| s.clone()).collect();
+        let mut arr = sessions_json(&only_sessions, &targets);
+        if let Some(items) = arr.as_array_mut() {
+            for (v, (_, qp)) in items.iter_mut().zip(slice.iter()) {
+                v["queue_position"] = match qp {
+                    Some(p) => serde_json::json!(p),
+                    None => serde_json::Value::Null,
+                };
+            }
+        }
+        if paginated {
+            serde_json::json!({
+                "sessions": arr,
+                "total": total,
+                "offset": offset,
+                "limit": limit.unwrap_or(total),
+                "counts": {
+                    "all": counts.0,
+                    "needs_you": counts.1,
+                    "working": counts.2,
+                    "done": counts.3,
+                }
+            })
+        } else {
+            arr
+        }
+    }
+
+    /// Paginated, searchable transcript view for a single session (supports
+    /// 50,000+ lines from `logs/<id>.log` or in-memory transcript cleanly).
+    fn transcript_query(
+        &self,
+        id: &str,
+        params: &std::collections::HashMap<String, String>,
+    ) -> Option<serde_json::Value> {
+        let mem_lines: Vec<String> = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions.iter().find(|s| s.id == id)?.transcript.clone()
+        };
+        let log_path = self.data_dir.join("logs").join(format!("{id}.log"));
+        let disk_lines = std::fs::read_to_string(&log_path)
+            .ok()
+            .map(|t| transcript_lines_from_log(&t))
+            .unwrap_or_default();
+        let all_lines = if disk_lines.len() >= mem_lines.len() && !disk_lines.is_empty() {
+            disk_lines
+        } else {
+            mem_lines
+        };
+        let is_err_line = |l: &str| {
+            let low = l.to_lowercase();
+            low.starts_with("stderr:")
+                || low.contains("error")
+                || low.contains("fail")
+                || low.contains("panic")
+                || low.contains("exception")
+                || low.contains("assertion")
+        };
+        let total = all_lines.len();
+        let first_error_index = all_lines.iter().position(|l| is_err_line(l));
+        let q = params.get("q").map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+        let errors_only = matches!(
+            params.get("errors_only").map(String::as_str),
+            Some("1" | "true" | "yes")
+        );
+        let offset = params
+            .get("offset")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(500)
+            .clamp(1, 5000);
+
+        let mut filtered_total = 0usize;
+        let mut page = Vec::with_capacity(limit.min(500));
+        for (idx, line) in all_lines.iter().enumerate() {
+            let err = is_err_line(line);
+            if errors_only && !err {
+                continue;
+            }
+            if let Some(ref needle) = q {
+                if !line.to_lowercase().contains(needle) {
+                    continue;
+                }
+            }
+            if filtered_total >= offset && page.len() < limit {
+                page.push(serde_json::json!({
+                    "index": idx,
+                    "text": line,
+                    "is_error": err,
+                }));
+            }
+            filtered_total += 1;
+        }
+        Some(serde_json::json!({
+            "id": id,
+            "total": total,
+            "filtered_total": filtered_total,
+            "offset": offset,
+            "limit": limit,
+            "first_error_index": first_error_index,
+            "lines": page,
+        }))
     }
 
     /// The session's stop flag, created on first use. The worker
@@ -1225,17 +1713,18 @@ impl App {
                     let bytes: usize = s.transcript.iter().map(|l| l.len() + 1).sum();
                     if bytes > TRANSCRIPT_BYTES {
                         let mut over = bytes - TRANSCRIPT_BYTES;
-                        // Keep the marker (index 0 when present) and
-                        // the newest lines; drop oldest real lines.
                         let start = if s.transcript.first().is_some_and(|l| l.starts_with('…')) {
                             1
                         } else {
                             0
                         };
-                        let idx = start;
-                        while over > 0 && s.transcript.len() > idx + 1 {
-                            over = over.saturating_sub(s.transcript[idx].len() + 1);
-                            s.transcript.remove(idx);
+                        let mut drop_end = start;
+                        while over > 0 && drop_end + 1 < s.transcript.len() {
+                            over = over.saturating_sub(s.transcript[drop_end].len() + 1);
+                            drop_end += 1;
+                        }
+                        if drop_end > start {
+                            s.transcript.drain(start..drop_end);
                         }
                     }
                     s.transcript.len()
@@ -1243,6 +1732,7 @@ impl App {
                 None => return,
             }
         };
+        self.mark_dirty(id);
         // The per-session log file is written on every line: it is the
         // transcript record that survives even a hard kill.
         let logs_dir = self.data_dir.join("logs");
@@ -1260,7 +1750,15 @@ impl App {
                 };
             let _ = writeln!(f, "{stored}");
         }
-        let _ = count;
+        self.events.publish(
+            "transcript_line",
+            &serde_json::json!({
+                "id": id,
+                "line": line,
+                "is_err": line.starts_with("stderr:"),
+                "line_count": count,
+            }),
+        );
         let since = self
             .lines_since_persist
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1276,10 +1774,7 @@ impl App {
     /// otherwise it stays queued. Called on creation and whenever a
     /// session settles.
     fn maybe_start(self: &Arc<Self>, id: &str) {
-        // Claim the session under one lock hold: the status check,
-        // the cap check and the move to Working are one atomic step,
-        // so two concurrent callers (a settle pumping the queue, an
-        // HTTP retry) can never both spawn a worker for one session.
+        let cap = self.effective_max_parallel();
         {
             let mut sessions = self.sessions.lock().unwrap();
             let active = sessions
@@ -1292,13 +1787,23 @@ impl App {
             if s.status != "queued" {
                 return;
             }
-            if active >= self.policy.max_parallel {
+            if active >= cap {
                 return;
             }
             s.status = Status::Working.label().to_string();
             s.bucket = Status::Working.bucket().to_string();
         }
+        self.mark_dirty(id);
         self.persist();
+        self.emit_queue_depth();
+        self.events.publish(
+            "session_status",
+            &serde_json::json!({
+                "id": id,
+                "status": Status::Working.label(),
+                "bucket": Status::Working.bucket(),
+            }),
+        );
         let app = self.clone();
         let id = id.to_string();
         std::thread::spawn(move || app.run_session(&id));
@@ -1832,6 +2337,14 @@ impl App {
         // 4. Verified done: the app runs the task's check itself, on
         // the committed tree (the worktree now matches the commit).
         self.set_status(id, Status::Checking);
+        self.events.publish(
+            "check_progress",
+            &serde_json::json!({
+                "id": id,
+                "phase": "started",
+                "check_cmd": session.check_cmd,
+            }),
+        );
         let timeout = self.policy.timeout_secs;
         // The check judges the pinned commit, literally: it runs in
         // a pristine checkout of that commit (a throwaway worktree),
@@ -1961,7 +2474,7 @@ impl App {
         {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
-                s.check_output = Some(truncate_output(output));
+                s.check_output = Some(truncate_output(output.clone()));
                 s.check_passed = Some(passed);
                 s.check_ran = check_ran;
                 s.check_exit = check_exit;
@@ -1970,6 +2483,18 @@ impl App {
                 s.verified_commit = tip.clone();
             }
         }
+        self.mark_dirty(id);
+        self.events.publish(
+            "check_progress",
+            &serde_json::json!({
+                "id": id,
+                "phase": "finished",
+                "check_cmd": session.check_cmd,
+                "check_passed": passed,
+                "check_exit": check_exit,
+                "output_tail": output.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(""),
+            }),
+        );
         self.persist();
         if let Some(err) = commit_error {
             // The work cannot land at all (a failing pre-commit hook is
@@ -2352,8 +2877,10 @@ fn retry_prompt_text(
             s.status = Status::Queued.label().to_string();
             s.bucket = Status::Queued.bucket().to_string();
         }
+        self.mark_dirty(id);
         self.log(id, "retry: handed back to the agent".to_string());
         self.persist();
+        self.emit_queue_depth();
         self.maybe_start(id);
         Ok(())
     }
@@ -2387,7 +2914,9 @@ fn retry_prompt_text(
                 s.bucket = Status::Queued.bucket().to_string();
             }
         }
+        self.mark_dirty(id);
         self.persist();
+        self.emit_queue_depth();
         self.maybe_start(id);
     }
 
@@ -2459,6 +2988,8 @@ fn retry_prompt_text(
             sessions.push(child);
             task
         };
+        self.mark_dirty(id);
+        self.mark_dirty(&new_id);
         self.persist();
         self.log(
             id,
@@ -2521,6 +3052,7 @@ fn retry_prompt_text(
             s.steer.push(message.to_string());
             s.status.clone()
         };
+        self.mark_dirty(id);
         self.persist();
         match status.as_str() {
             "needs-you" => {
@@ -2560,7 +3092,9 @@ fn retry_prompt_text(
             s.bucket = Status::Archived.bucket().to_string();
         }
         self.log(id, "dismissed by you — it left the board and the inbox; this log stays on disk".to_string());
+        self.mark_dirty(id);
         self.persist();
+        self.emit_queue_depth();
         Ok(())
     }
 
@@ -2776,6 +3310,7 @@ fn retry_prompt_text(
             );
         }
         self.set_status(id, Status::Merged);
+        self.invalidate_merge_target_cache(&session.repo);
         self.log(
             id,
             format!("merged into {target_branch} at {pin}"),
@@ -2842,24 +3377,27 @@ fn html_response(body: &str) -> String {
 /// forever.
 const READ_DEADLINE_SECS: u64 = 30;
 
+#[cfg(test)]
 fn read_request(
     stream: &mut std::net::TcpStream,
 ) -> Option<(String, String, String, String, String, String)> {
+    let (m, p, b, ct, o, h, _) = read_request_full(stream)?;
+    Some((m, p, b, ct, o, h))
+}
+
+#[allow(clippy::type_complexity)]
+fn read_request_full(
+    stream: &mut std::net::TcpStream,
+) -> Option<(String, String, String, String, String, String, Option<u64>)> {
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(READ_DEADLINE_SECS);
     let mut reader = BufReader::new(stream.try_clone().ok()?);
-    // Arm the socket timeout for the next read: never more than the
-    // per-read timeout, never past the request's deadline.
     let arm = |stream: &std::net::TcpStream| -> Option<()> {
         let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
         let t = remaining.min(std::time::Duration::from_secs(READ_TIMEOUT_SECS));
         stream.set_read_timeout(Some(t)).ok()?;
         Some(())
     };
-    // Lines are read byte by byte so the deadline is re-armed for
-    // EVERY byte: arming once per read_line would let a drip feed
-    // one byte per per-read timeout and outlive the deadline inside
-    // a single line.
     let read_line_by_byte =
         |reader: &mut BufReader<std::net::TcpStream>,
          stream: &std::net::TcpStream|
@@ -2886,6 +3424,7 @@ fn read_request(
     let mut content_type = String::new();
     let mut origin = String::new();
     let mut host = String::new();
+    let mut last_event_id: Option<u64> = None;
     let mut header_count = 0usize;
     let mut header_bytes = 0usize;
     loop {
@@ -2903,6 +3442,7 @@ fn read_request(
                 String::new(),
                 String::new(),
                 String::new(),
+                None,
             ));
         }
         let lower = line.to_lowercase();
@@ -2914,11 +3454,10 @@ fn read_request(
             origin = v.trim().to_string();
         } else if let Some(v) = lower.strip_prefix("host:") {
             host = v.trim().to_string();
+        } else if let Some(v) = lower.strip_prefix("last-event-id:") {
+            last_event_id = v.trim().parse::<u64>().ok();
         }
     }
-    // A declared body over the cap is refused without being read —
-    // otherwise one connection can pin its handler thread (and a huge
-    // allocation) by declaring a giant body and sending nothing.
     if content_length > MAX_BODY_BYTES {
         return Some((
             "__too_large__".to_string(),
@@ -2927,6 +3466,7 @@ fn read_request(
             String::new(),
             String::new(),
             host,
+            None,
         ));
     }
     let mut body: Vec<u8> = Vec::with_capacity(content_length);
@@ -2949,7 +3489,98 @@ fn read_request(
         content_type,
         origin,
         host,
+        last_event_id,
     ))
+}
+
+fn url_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(val) = u8::from_str_radix(hex, 16) {
+                    out.push(val);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(b'%');
+            i += 1;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for pair in query.split('&').filter(|s| !s.is_empty()) {
+        if let Some((k, v)) = pair.split_once('=') {
+            map.insert(url_decode(k), url_decode(v));
+        } else {
+            map.insert(url_decode(pair), String::new());
+        }
+    }
+    map
+}
+
+/// Serve a long-lived Server-Sent Events stream (`GET /api/events/stream`).
+fn serve_sse(
+    app: &Arc<App>,
+    stream: &mut std::net::TcpStream,
+    last_event_id: Option<u64>,
+) {
+    let _ = stream.set_read_timeout(None);
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
+    let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n";
+    if stream.write_all(headers.as_bytes()).is_err() {
+        return;
+    }
+    let (sub, replay) = app.events.subscribe(last_event_id);
+    let (active, queued, total) = app.queue_counts();
+    let hello = format!(
+        "event: connected\ndata: {}\n\n",
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "active": active,
+            "queued": queued,
+            "total": total,
+            "max_parallel": app.effective_max_parallel(),
+        })
+    );
+    if stream.write_all(hello.as_bytes()).is_err() || stream.flush().is_err() {
+        app.events.unsubscribe(sub.id);
+        return;
+    }
+    for frame in replay {
+        if stream.write_all(frame.as_bytes()).is_err() || stream.flush().is_err() {
+            app.events.unsubscribe(sub.id);
+            return;
+        }
+    }
+    loop {
+        match sub.rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok(frame) => {
+                if stream.write_all(frame.as_bytes()).is_err() || stream.flush().is_err() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if stream.write_all(b": keepalive\n\n").is_err() || stream.flush().is_err() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    app.events.unsubscribe(sub.id);
 }
 
 /// An Origin is acceptable only when it names this machine: the
@@ -3060,6 +3691,28 @@ fn update_route(app: &Arc<App>, method: &str, route: &str, body: &str, host: &st
             let repos = app.discover_repos();
             json_response(200, &serde_json::json!(repos).to_string())
         }
+        ("POST", "/api/repos/prune-worktrees") => {
+            if !host_allowed(host, "") {
+                return Some(error_response(
+                    403,
+                    "pruning worktrees is only allowed from this machine, not through a shared address",
+                ));
+            }
+            let req: serde_json::Value = if body.trim().is_empty() {
+                serde_json::json!({})
+            } else {
+                match serde_json::from_str(body) {
+                    Ok(v) => v,
+                    Err(e) => return Some(error_response(400, &format!("bad json: {e}"))),
+                }
+            };
+            let filter_repo = req["repo"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let res = app.prune_worktrees(filter_repo);
+            json_response(200, &res.to_string())
+        }
         ("GET", "/api/config") => {
             if !host_allowed(host, "") {
                 return Some(error_response(
@@ -3123,9 +3776,27 @@ fn update_route(app: &Arc<App>, method: &str, route: &str, body: &str, host: &st
                     }
                 }
             }
+            if let Some(val) = obj.get("max_parallel_agents").or_else(|| obj.get("max_parallel")) {
+                match val {
+                    serde_json::Value::Null => next_cfg.max_parallel_agents = None,
+                    serde_json::Value::Number(n) => {
+                        let Some(cap) = n.as_i64() else {
+                            return Some(error_response(400, "max_parallel_agents must be an integer between 1 and 64"));
+                        };
+                        if !(1..=64).contains(&cap) {
+                            return Some(error_response(400, "max_parallel_agents must be between 1 and 64"));
+                        }
+                        next_cfg.max_parallel_agents = Some(cap);
+                    }
+                    _ => return Some(error_response(400, "max_parallel_agents must be an integer or null")),
+                }
+            }
             *app.config.lock().unwrap() = next_cfg;
             app.save_config();
-            json_response(200, &app.config_json().to_string())
+            app.pump_queue();
+            let snap = app.config_json();
+            app.events.publish("config_updated", &snap);
+            json_response(200, &snap.to_string())
         }
         ("GET", "/api/update") => json_response(200, &app.updater.snapshot().to_string()),
         ("POST", "/api/update/check") => json_response(200, &app.updater.check_now().to_string()),
@@ -3258,7 +3929,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
         Some((r, q)) => (r, q),
         None => (path, ""),
     };
-    let _ = query;
+    let params = parse_query(query);
     match (method, route) {
         ("GET", "/") => html_response(include_str!("../assets/index.html")),
         ("GET", "/api/policy") => {
@@ -3266,10 +3937,16 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
             let opencode_model = app.effective_model_for("opencode");
             let claude_model = app.effective_model_for("claude");
             let codex_model = app.effective_model_for("codex");
+            let max_parallel = app.effective_max_parallel();
+            let (active, queued, total) = app.queue_counts();
             json_response(
                 200,
                 &serde_json::json!({
-                    "max_parallel": app.policy.max_parallel,
+                    "max_parallel": max_parallel,
+                    "max_parallel_agents": max_parallel,
+                    "active_sessions": active,
+                    "queued_sessions": queued,
+                    "total_sessions": total,
                     "agents": app.agents,
                     "default_agent": default_agent,
                     "default_agent_engine": default_agent
@@ -3290,7 +3967,11 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
             )
         }
         ("GET", "/api/sessions") => {
-            json_response(200, &app.sessions_view().to_string())
+            if params.is_empty() {
+                json_response(200, &app.sessions_view_cached())
+            } else {
+                json_response(200, &app.sessions_query(&params).to_string())
+            }
         }
         ("POST", "/api/sessions") => {
             let req: serde_json::Value = match serde_json::from_str(body) {
@@ -3440,7 +4121,21 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 transcript: Vec::new(),
             };
             app.sessions.lock().unwrap().push(session.clone());
+            app.mark_dirty(&id);
             app.persist();
+            app.events.publish(
+                "session_created",
+                &serde_json::json!({
+                    "id": id,
+                    "task": session.task,
+                    "project": session.project,
+                    "repo": session.repo,
+                    "branch": session.branch,
+                    "status": session.status,
+                    "bucket": session.bucket,
+                }),
+            );
+            app.emit_queue_depth();
             app.maybe_start(&id);
             let all = app.sessions_view();
             let mine = all
@@ -3452,6 +4147,13 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 })
                 .unwrap_or_else(|| serde_json::to_value(&session).unwrap());
             json_response(201, &mine.to_string())
+        }
+        ("GET", route) if route.starts_with("/api/sessions/") && route.ends_with("/transcript") => {
+            let id = &route["/api/sessions/".len()..route.len() - "/transcript".len()];
+            match app.transcript_query(id, &params) {
+                Some(v) => json_response(200, &v.to_string()),
+                None => error_response(404, "no such session"),
+            }
         }
         ("GET", route) if route.starts_with("/api/sessions/") => {
             let id = &route["/api/sessions/".len()..];
@@ -3597,10 +4299,13 @@ fn cap_transcript(lines: Vec<String>) -> Vec<String> {
         } else {
             0
         };
-        let idx = start;
-        while over > 0 && kept.len() > idx + 1 {
-            over = over.saturating_sub(kept[idx].len() + 1);
-            kept.remove(idx);
+        let mut drop_end = start;
+        while over > 0 && drop_end + 1 < kept.len() {
+            over = over.saturating_sub(kept[drop_end].len() + 1);
+            drop_end += 1;
+        }
+        if drop_end > start {
+            kept.drain(start..drop_end);
         }
     }
     kept
@@ -3835,6 +4540,10 @@ fn main() {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let env_max_parallel = std::env::var("FLEET_MAX_PARALLEL")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .map(|v| v.clamp(1, 64));
     let policy_path = args
         .get(1)
         .cloned()
@@ -3879,12 +4588,18 @@ fn main() {
         env_model,
         env_claude_model,
         env_codex_model,
+        env_max_parallel,
         data_dir,
         run_tag,
         sessions: Mutex::new(restored),
+        state_rev: std::sync::atomic::AtomicU64::new(1),
+        merge_target_cache: Mutex::new(std::collections::HashMap::new()),
+        sessions_cache: Mutex::new(None),
+        dirty_records: Mutex::new(std::collections::HashSet::new()),
         lines_since_persist: std::sync::atomic::AtomicU64::new(0),
         counter: Mutex::new(restored_counter),
         stops: Mutex::new(std::collections::HashMap::new()),
+        events: Arc::new(events::EventBus::new()),
         updater: update::Updater::from_env(
             "FLEET",
             "fleet-rs",
@@ -3987,7 +4702,7 @@ fn main() {
         "fleet-rs listening on http://127.0.0.1:{port}/ (agents: {}; default: {}; max_parallel: {})",
         detected.join(", "),
         app.effective_default_agent().as_deref().unwrap_or("none"),
-        app.policy.max_parallel
+        app.effective_max_parallel()
     );
     println!("  Data:    {data_dir_label}");
     println!(
@@ -4004,9 +4719,27 @@ fn main() {
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(
                         READ_TIMEOUT_SECS,
                     )));
-                    if let Some((method, path, body, content_type, origin, host)) =
-                        read_request(&mut stream)
+                    if let Some((method, path, body, content_type, origin, host, last_event_id)) =
+                        read_request_full(&mut stream)
                     {
+                        let (route, query) = match path.split_once('?') {
+                            Some((r, q)) => (r, q),
+                            None => (path.as_str(), ""),
+                        };
+                        if method == "GET" && route == "/api/events/stream" {
+                            if !host_allowed(&host, &allowed_hosts) {
+                                let resp = error_response(403, "this board answers only to its own host name");
+                                let _ = stream.write_all(resp.as_bytes());
+                                return;
+                            }
+                            let since = last_event_id.or_else(|| {
+                                parse_query(query)
+                                    .get("since")
+                                    .and_then(|v| v.parse::<u64>().ok())
+                            });
+                            serve_sse(&app, &mut stream, since);
+                            return;
+                        }
                         let response = respond(&app, &allowed_hosts, &method, &path, &body, &content_type, &origin, &host);
                         let _ = stream.write_all(response.as_bytes());
                     }
@@ -4175,12 +4908,18 @@ mod tests {
             env_model: None,
             env_claude_model: None,
             env_codex_model: None,
+            env_max_parallel: None,
             data_dir: dir.join("data"),
             run_tag: "test".to_string(),
             sessions: Mutex::new(Vec::new()),
+            state_rev: std::sync::atomic::AtomicU64::new(1),
+            merge_target_cache: Mutex::new(std::collections::HashMap::new()),
+            sessions_cache: Mutex::new(None),
+            dirty_records: Mutex::new(std::collections::HashSet::new()),
             lines_since_persist: std::sync::atomic::AtomicU64::new(0),
             counter: Mutex::new(0),
             stops: Mutex::new(std::collections::HashMap::new()),
+            events: Arc::new(events::EventBus::new()),
             updater: update::Updater::new(update::Config {
                 bin: "fleet-rs",
                 current: env!("CARGO_PKG_VERSION"),
@@ -4240,12 +4979,18 @@ mod tests {
             env_model: None,
             env_claude_model: None,
             env_codex_model: None,
+            env_max_parallel: None,
             data_dir,
             run_tag: "test".to_string(),
             sessions: Mutex::new(sessions),
+            state_rev: std::sync::atomic::AtomicU64::new(1),
+            merge_target_cache: Mutex::new(std::collections::HashMap::new()),
+            sessions_cache: Mutex::new(None),
+            dirty_records: Mutex::new(std::collections::HashSet::new()),
             lines_since_persist: std::sync::atomic::AtomicU64::new(0),
             counter: Mutex::new(0),
             stops: Mutex::new(std::collections::HashMap::new()),
+            events: Arc::new(events::EventBus::new()),
             updater: update::Updater::new(update::Config {
                 bin: "fleet-rs",
                 current: env!("CARGO_PKG_VERSION"),
@@ -5049,12 +5794,18 @@ mod tests {
             env_model: None,
             env_claude_model: None,
             env_codex_model: None,
+            env_max_parallel: None,
             data_dir: data.clone(),
             run_tag: "test".to_string(),
             sessions: Mutex::new(vec![s]),
+            state_rev: std::sync::atomic::AtomicU64::new(1),
+            merge_target_cache: Mutex::new(std::collections::HashMap::new()),
+            sessions_cache: Mutex::new(None),
+            dirty_records: Mutex::new(std::collections::HashSet::new()),
             lines_since_persist: std::sync::atomic::AtomicU64::new(0),
             counter: Mutex::new(0),
             stops: Mutex::new(std::collections::HashMap::new()),
+            events: Arc::new(events::EventBus::new()),
             updater: update::Updater::new(update::Config {
                 bin: "fleet-rs",
                 current: env!("CARGO_PKG_VERSION"),
@@ -5163,6 +5914,242 @@ mod tests {
         assert!(merge_resp.starts_with("HTTP/1.1 200"), "{merge_resp}");
         assert!(repo.join("output.txt").exists(), "merged output must land on main");
         assert!(!wt.exists(), "merged worktree should be cleaned up automatically");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn max_parallel_agents_config_validates_and_persists() {
+        let dir = std::env::temp_dir().join(format!("fleet-v050-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let app = test_app(data.clone(), Vec::new());
+
+        // Reject invalid caps
+        let bad0 = respond(&app, "", "POST", "/api/config", r#"{"max_parallel_agents":0}"#, "application/json", "", "127.0.0.1:8471");
+        assert!(bad0.starts_with("HTTP/1.1 400"), "{bad0}");
+        let bad99 = respond(&app, "", "POST", "/api/config", r#"{"max_parallel_agents":99}"#, "application/json", "", "127.0.0.1:8471");
+        assert!(bad99.starts_with("HTTP/1.1 400"), "{bad99}");
+
+        // Valid cap persists and shows in /api/policy
+        let ok_r = respond(&app, "", "POST", "/api/config", r#"{"max_parallel_agents":8}"#, "application/json", "", "127.0.0.1:8471");
+        assert!(ok_r.starts_with("HTTP/1.1 200"), "{ok_r}");
+        assert_eq!(response_body(&ok_r)["effective_max_parallel"], 8);
+        let pol = response_body(&respond(&app, "", "GET", "/api/policy", "", "", "", "127.0.0.1:8471"));
+        assert_eq!(pol["max_parallel"], 8);
+        assert_eq!(load_config(&data).max_parallel_agents, Some(8));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_worktrees_preserves_active_and_cleans_inactive_only_on_loopback() {
+        let dir = std::env::temp_dir().join(format!("fleet-v050-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir);
+        let data = dir.join("data");
+        let wt_root = data.join("worktrees");
+        std::fs::create_dir_all(&wt_root).unwrap();
+
+        let active_wt = wt_root.join("s-active");
+        let merged_wt = wt_root.join("s-merged");
+        let orphan_wt = wt_root.join("s-orphan");
+        std::fs::create_dir_all(&active_wt).unwrap();
+        std::fs::create_dir_all(&merged_wt).unwrap();
+        std::fs::create_dir_all(&orphan_wt).unwrap();
+
+        let mut s_act = test_session("s-active", Status::NeedsYou, &dir);
+        s_act.repo = repo.to_string_lossy().to_string();
+        s_act.worktree = active_wt.to_string_lossy().to_string();
+        let mut s_mrg = test_session("s-merged", Status::Merged, &dir);
+        s_mrg.repo = repo.to_string_lossy().to_string();
+        s_mrg.worktree = merged_wt.to_string_lossy().to_string();
+        let app = test_app(data.clone(), vec![s_act, s_mrg]);
+
+        // Non-loopback host refused
+        let denied = respond(&app, "lan.local", "POST", "/api/repos/prune-worktrees", "{}", "application/json", "", "lan.local:8471");
+        assert!(denied.starts_with("HTTP/1.1 403"), "{denied}");
+
+        // Loopback prunes merged & orphan while leaving active intact
+        let r = respond(&app, "", "POST", "/api/repos/prune-worktrees", "{}", "application/json", "", "127.0.0.1:8471");
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        let body = response_body(&r);
+        assert_eq!(body["pruned"], true);
+        let removed: Vec<&str> = body["removed_worktrees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(removed.contains(&"s-merged"), "{body}");
+        assert!(removed.contains(&"s-orphan"), "{body}");
+        assert!(!removed.contains(&"s-active"), "{body}");
+        assert!(active_wt.exists());
+        assert!(!merged_wt.exists());
+        assert!(!orphan_wt.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn graceful_sigterm_reaches_agent_before_sigkill_on_stop() {
+        let dir = std::env::temp_dir().join(format!("fleet-v050-term-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("got-sigterm.txt");
+        let script = script_agent(
+            &dir,
+            "trapper.sh",
+            &format!(
+                "trap 'echo sigterm > \"{}\"; exit 0' TERM\necho ready\nsleep 30\n",
+                marker.display()
+            ),
+        );
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_bg = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            stop_bg.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let mut sink = |_: bool, _: &str| {};
+        let out = run_bounded(Command::new(&script), 15, Some(&stop), &mut sink);
+        assert!(matches!(out.end, RunEnd::Stopped));
+        assert!(marker.exists(), "expected graceful SIGTERM handler to fire before SIGKILL");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sse_stream_delivers_connected_and_live_events() {
+        let dir = std::env::temp_dir().join(format!("fleet-v050-sse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = test_app(dir.join("data"), Vec::new());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv_app = app.clone();
+        let server_handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request_full(&mut stream);
+            serve_sse(&srv_app, &mut stream, None);
+        });
+
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        client
+            .write_all(b"GET /api/events/stream HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .unwrap();
+
+        let pub_app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            pub_app.events.publish(
+                "transcript_line",
+                &serde_json::json!({"id": "s1", "line": "hello sse"}),
+            );
+        });
+
+        let mut buf = [0u8; 4096];
+        let mut acc = String::new();
+        for _ in 0..10 {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if acc.contains("hello sse") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        drop(client);
+        // Trigger one write so serve_sse detects EOF immediately instead of waiting for keepalive.
+        app.events.publish("queue_depth", &serde_json::json!({"active": 0}));
+        let _ = server_handle.join();
+        assert!(acc.contains("text/event-stream"), "{acc}");
+        assert!(acc.contains("event: connected"), "{acc}");
+        assert!(acc.contains("event: transcript_line"), "{acc}");
+        assert!(acc.contains("hello sse"), "{acc}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scale_2000_sessions_and_50000_transcript_lines_stay_fast() {
+        let dir = std::env::temp_dir().join(format!("fleet-v050-scale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        std::fs::create_dir_all(data.join("logs")).unwrap();
+
+        let mut sessions = Vec::with_capacity(2000);
+        for i in 0..2000usize {
+            let st = match i % 4 {
+                0 => Status::Done,
+                1 => Status::NeedsYou,
+                2 => Status::Queued,
+                _ => Status::Merged,
+            };
+            let mut s = test_session(&format!("s-{i:04}"), st, &dir);
+            s.repo = String::new(); // avoid non-existent repo git calls
+            s.project = format!("proj-{}", i % 10);
+            s.task = if i == 1337 {
+                "needle: optimize websocket frame parser".to_string()
+            } else {
+                format!("batch task #{i}")
+            };
+            s.transcript = vec![format!("line 1 for {i}"), format!("line 2 for {i}")];
+            sessions.push(s);
+        }
+
+        // Write a real 50,000-line log file for session s-0000 with an error at line 32,000.
+        let mut big_log = String::with_capacity(50_000 * 32);
+        for i in 0..50_000usize {
+            if i == 32_000 {
+                big_log.push_str("stderr: AssertionError at step 32000\n");
+            } else {
+                big_log.push_str(&format!("build step {i}: ok\n"));
+            }
+        }
+        std::fs::write(data.join("logs/s-0000.log"), &big_log).unwrap();
+
+        let app = test_app(data.clone(), sessions);
+
+        // 1. Paginated filtered query across 2,000 sessions
+        let t0 = std::time::Instant::now();
+        let r = handle(&app, "GET", "/api/sessions?q=needle&compact=1&paginated=1&limit=25&offset=0", "");
+        let q_ms = t0.elapsed().as_millis();
+        assert!(r.starts_with("HTTP/1.1 200"));
+        let body = response_body(&r);
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["sessions"][0]["id"], "s-1337");
+        assert!(q_ms < 200, "filtered query over 2,000 sessions took {q_ms}ms");
+
+        // 2. Cached full GET /api/sessions under repeat reads
+        let _warm = handle(&app, "GET", "/api/sessions", "");
+        let t1 = std::time::Instant::now();
+        for _ in 0..30 {
+            let full = handle(&app, "GET", "/api/sessions", "");
+            assert!(full.starts_with("HTTP/1.1 200"));
+        }
+        let cached_avg_ms = t1.elapsed().as_millis() / 30;
+        assert!(cached_avg_ms < 50, "cached 2,000-session GET averaged {cached_avg_ms}ms");
+
+        // 3. 50,000-line transcript pagination + first_error_index + search
+        let t2 = std::time::Instant::now();
+        let tr = handle(&app, "GET", "/api/sessions/s-0000/transcript?offset=31995&limit=20", "");
+        let tr_ms = t2.elapsed().as_millis();
+        assert!(tr.starts_with("HTTP/1.1 200"));
+        let tbody = response_body(&tr);
+        assert_eq!(tbody["total"], 50_000);
+        assert_eq!(tbody["first_error_index"], 32_000);
+        assert_eq!(tbody["lines"].as_array().unwrap().len(), 20);
+        assert!(tr_ms < 200, "50,000-line transcript slice took {tr_ms}ms");
+
+        let tr_err = response_body(&handle(&app, "GET", "/api/sessions/s-0000/transcript?errors_only=1&limit=10", ""));
+        assert_eq!(tr_err["filtered_total"], 1);
+        assert_eq!(tr_err["lines"][0]["index"], 32_000);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
