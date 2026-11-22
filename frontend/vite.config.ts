@@ -28,7 +28,7 @@ function runeUsed(): Plugin {
   };
 }
 
-const STAMP = "/* Hallmark · checked: 2026-11-21 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v0.3.0 */";
+const STAMP = "/* Hallmark · checked: 2026-11-22 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v0.5.0 */";
 
 // After the build: inline the script, the stylesheet and (through assetsInlineLimit) the fonts into one page.
 function singleFile(): Plugin {

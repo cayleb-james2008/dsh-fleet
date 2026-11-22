@@ -1,11 +1,12 @@
 (() => {
-  const APP_VERSION = "0.4.0";
-  const DB_NAME = "fleet-worktrees-v1";
+  const APP_VERSION = "0.5.0";
+  const DB_NAME = "fleet-worktrees-v2";
   const STORE_NAME = "state";
   const BYOK_KEY_SS = "fleet-byok-api-key";
   const BYOK_URL_LS = "fleet-byok-url";
   const BYOK_MODEL_LS = "fleet-byok-model";
   const LOCAL_URL_LS = "fleet-local-url";
+  const MAX_PARALLEL = 4;
 
   const INITIAL_REPOS = () => ({
     "/workspace/ledger-kit": {
@@ -119,6 +120,67 @@
           }
         }
       ]
+    },
+    "/workspace/dag-scheduler": {
+      name: "dag-scheduler",
+      path: "/workspace/dag-scheduler",
+      branch: "main",
+      commits: [
+        {
+          hash: "c94e21a",
+          parent: null,
+          message: "Initial dag-scheduler commit",
+          ts: Date.now() - 3400_000,
+          files: {
+            "src/dag.js": [
+              "export function topoSort(nodes) {",
+              "  const indeg = new Map();",
+              "  const adj = new Map();",
+              "  for (const n of nodes) {",
+              "    indeg.set(n.id, 0);",
+              "    adj.set(n.id, []);",
+              "  }",
+              "  for (const n of nodes) {",
+              "    for (const dep of n.dependsOn || []) {",
+              "      if (!adj.has(dep)) continue;",
+              "      adj.get(dep).push(n.id);",
+              "      indeg.set(n.id, (indeg.get(n.id) || 0) + 1);",
+              "    }",
+              "  }",
+              "  const q = [...indeg.entries()].filter(([, d]) => d === 0).map(([id]) => id);",
+              "  const order = [];",
+              "  while (q.length) {",
+              "    const id = q.shift();",
+              "    order.push(id);",
+              "    for (const nxt of adj.get(id) || []) {",
+              "      const d = indeg.get(nxt) - 1;",
+              "      indeg.set(nxt, d);",
+              "      if (d === 0) q.push(nxt);",
+              "    }",
+              "  }",
+              "  if (order.length !== nodes.length) throw new Error('DAG cycle detected');",
+              "  return order;",
+              "}",
+              ""
+            ].join("\n"),
+            "tests/dag.test.js": [
+              "import { topoSort } from '../src/dag.js';",
+              "",
+              "export function run(assert) {",
+              "  const order = topoSort([",
+              "    { id: 'c', dependsOn: ['b'] },",
+              "    { id: 'a', dependsOn: [] },",
+              "    { id: 'b', dependsOn: ['a'] }",
+              "  ]);",
+              "  assert.deepEqual(order, ['a', 'b', 'c'], 'topological order respects dependsOn');",
+              "  assert.throws(() => topoSort([{ id: 'x', dependsOn: ['y'] }, { id: 'y', dependsOn: ['x'] }]), 'rejects cycle');",
+              "  return 'dag.test.js: 2 assertions passed';",
+              "}",
+              ""
+            ].join("\n")
+          }
+        }
+      ]
     }
   });
 
@@ -129,6 +191,57 @@
       h = Math.imul(h, 16777619) >>> 0;
     }
     return h.toString(16).padStart(7, "0").slice(0, 7);
+  }
+
+  function globToRegExp(glob) {
+    const clean = String(glob || "").trim().replace(/^\/+/, "");
+    let re = "^";
+    for (let i = 0; i < clean.length; i++) {
+      const ch = clean[i];
+      if (ch === "*") {
+        if (clean[i + 1] === "*") {
+          if (clean[i + 2] === "/") {
+            re += "(?:.*/)?";
+            i += 2;
+          } else {
+            re += ".*";
+            i += 1;
+          }
+        } else {
+          re += "[^/]*";
+        }
+      } else if (ch === "?") {
+        re += "[^/]";
+      } else if (/[.+^${}()|[\]\\]/.test(ch)) {
+        re += "\\" + ch;
+      } else {
+        re += ch;
+      }
+    }
+    re += "$";
+    return new RegExp(re);
+  }
+
+  function matchesAnyGlob(filePath, globs) {
+    if (!Array.isArray(globs) || globs.length === 0) return false;
+    const norm = String(filePath || "").replace(/^\/+/, "");
+    return globs.some((g) => globToRegExp(g).test(norm));
+  }
+
+  function checkFileScopeGuardrails(baseFiles, branchFiles, allowedGlobs, forbiddenGlobs) {
+    const keys = Array.from(new Set([...Object.keys(baseFiles || {}), ...Object.keys(branchFiles || {})])).sort();
+    const changed = keys.filter((k) => baseFiles[k] !== branchFiles[k]);
+    const violations = [];
+    for (const f of changed) {
+      if (Array.isArray(forbiddenGlobs) && forbiddenGlobs.length > 0 && matchesAnyGlob(f, forbiddenGlobs)) {
+        violations.push(f + " (matched forbidden glob)");
+        continue;
+      }
+      if (Array.isArray(allowedGlobs) && allowedGlobs.length > 0 && !matchesAnyGlob(f, allowedGlobs)) {
+        violations.push(f + " (outside allowed_globs: " + allowedGlobs.join(", ") + ")");
+      }
+    }
+    return violations;
   }
 
   // Real LCS line-level unified git diff generator
@@ -191,7 +304,7 @@
     return parts.join("\n");
   }
 
-  // Real sandboxed Web Worker check evaluator
+  // Real sandboxed Blob Web Worker check evaluator
   function workerMain() {
     self.onmessage = async (ev) => {
       const { files, checkCmd } = ev.data;
@@ -277,6 +390,16 @@
         }
         return passed;
       }
+      function runSyntaxLint() {
+        const jsFiles = Object.keys(files).filter((k) => k.endsWith(".js")).sort();
+        for (const f of jsFiles) {
+          const src = String(files[f] || "")
+            .replace(/^\s*import\s+.*$/gm, "")
+            .replace(/^\s*export\s+(?:default\s+)?/gm, "");
+          new Function(src);
+        }
+        logs.push("lint: " + jsFiles.length + " module(s) parsed cleanly");
+      }
       function runClause(clause) {
         const c = clause.trim();
         if (!c || c === "true") return;
@@ -303,6 +426,10 @@
           const content = files[f] || "";
           if (!content.includes(pat)) throw new Error("grep: pattern " + JSON.stringify(pat) + " not found in " + f);
           logs.push("grep " + f + ": matched " + JSON.stringify(pat));
+          return;
+        }
+        if (/^(npm\s+run\s+lint|eslint|lint|typecheck|tsc)$/.test(c)) {
+          runSyntaxLint();
           return;
         }
         if (/^(npm\s+test|pnpm\s+test|vitest|jest|cargo\s+test|test)$/.test(c)) {
@@ -373,6 +500,68 @@
     });
   }
 
+  // Real Shimmed EventSource for /api/events/stream in Browser Worktree Engine mode
+  const sseClients = new Set();
+  function emitSse(eventName, payload) {
+    const data = JSON.stringify({ type: eventName, ...payload });
+    for (const client of sseClients) {
+      client._dispatch(eventName, data);
+    }
+  }
+
+  const NativeEventSource = window.EventSource;
+  if (NativeEventSource) {
+    class FleetBrowserEventSource {
+      constructor(url, init) {
+        const u = new URL(url, window.location.origin);
+        if (u.pathname === "/api/events/stream" && !localMode) {
+          this.url = url;
+          this.readyState = 0;
+          this._listeners = new Map();
+          this.onopen = null;
+          this.onmessage = null;
+          this.onerror = null;
+          sseClients.add(this);
+          setTimeout(() => {
+            if (this.readyState === 2) return;
+            this.readyState = 1;
+            const ev = new Event("open");
+            if (typeof this.onopen === "function") this.onopen(ev);
+          }, 20);
+        } else {
+          const target = localMode && u.pathname.startsWith("/api/") ? localUrl + u.pathname + u.search : url;
+          return new NativeEventSource(target, init);
+        }
+      }
+      addEventListener(name, fn) {
+        if (!this._listeners.has(name)) this._listeners.set(name, new Set());
+        this._listeners.get(name).add(fn);
+      }
+      removeEventListener(name, fn) {
+        this._listeners.get(name)?.delete(fn);
+      }
+      _dispatch(eventName, data) {
+        if (this.readyState === 2) return;
+        const msg = new MessageEvent(eventName, { data });
+        const set = this._listeners.get(eventName);
+        if (set) {
+          for (const fn of set) fn(msg);
+        }
+        if (eventName === "message" && typeof this.onmessage === "function") {
+          this.onmessage(msg);
+        }
+      }
+      close() {
+        this.readyState = 2;
+        sseClients.delete(this);
+      }
+    }
+    FleetBrowserEventSource.CONNECTING = 0;
+    FleetBrowserEventSource.OPEN = 1;
+    FleetBrowserEventSource.CLOSED = 2;
+    window.EventSource = FleetBrowserEventSource;
+  }
+
   // IndexedDB persistence
   function openDb() {
     return new Promise((resolve, reject) => {
@@ -440,6 +629,77 @@
     const r = state.repos[repoPath];
     if (!r || !r.commits.length) return null;
     return r.commits[r.commits.length - 1];
+  }
+
+  function commitsBehind(repoPath, baseHash) {
+    const r = state.repos[repoPath];
+    if (!r || !r.commits.length) return 0;
+    const idx = r.commits.findIndex((c) => c.hash === baseHash);
+    if (idx === -1) return 0;
+    return Math.max(0, r.commits.length - 1 - idx);
+  }
+
+  function computeMergeCheck(s) {
+    const repo = state.repos[s.repo];
+    if (!repo) {
+      return { clean: false, conflicting_files: ["repository not found"], commits_ahead: 0, commits_behind: 0 };
+    }
+    const head = repoHead(s.repo);
+    const conflicts = [];
+    const keys = Array.from(new Set([...Object.keys(s._baseFiles || {}), ...Object.keys(s._branchFiles || {})]));
+    const changedKeys = keys.filter((k) => s._branchFiles[k] !== s._baseFiles[k]);
+    for (const k of changedKeys) {
+      if (head.files[k] !== s._baseFiles[k] && head.files[k] !== s._branchFiles[k]) {
+        conflicts.push(k);
+      }
+    }
+    return {
+      clean: conflicts.length === 0,
+      conflicting_files: conflicts,
+      commits_ahead: changedKeys.length > 0 ? 1 : 0,
+      commits_behind: commitsBehind(s.repo, s._baseCommit)
+    };
+  }
+
+  // Real DFS cycle detection across existing + candidate DAG nodes
+  function detectDagCycle(allNodes) {
+    const depMap = new Map();
+    for (const n of allNodes) {
+      depMap.set(n.id, Array.isArray(n.depends_on) ? n.depends_on : []);
+    }
+    const color = new Map(); // 0=white, 1=gray, 2=black
+    const stack = [];
+    function dfs(id) {
+      color.set(id, 1);
+      stack.push(id);
+      for (const dep of depMap.get(id) || []) {
+        if (!depMap.has(dep)) continue;
+        const c = color.get(dep) || 0;
+        if (c === 1) {
+          const idx = stack.indexOf(dep);
+          return [...stack.slice(idx), dep];
+        }
+        if (c === 0) {
+          const cyc = dfs(dep);
+          if (cyc) return cyc;
+        }
+      }
+      stack.pop();
+      color.set(id, 2);
+      return null;
+    }
+    for (const n of allNodes) {
+      if ((color.get(n.id) || 0) === 0) {
+        const cyc = dfs(n.id);
+        if (cyc) return cyc;
+      }
+    }
+    return null;
+  }
+
+  function appendLine(session, line) {
+    session.transcript = [...session.transcript, line];
+    emitSse("transcript", { session_id: session.id, line });
   }
 
   async function runByokAgent(session, promptText) {
@@ -578,6 +838,40 @@
       return "added summarizeLedger() in src/ledger.js and covered it in tests/ledger.test.js";
     }
 
+    if (files["src/dag.js"] && /ready|batch|queue|depth|wave/i.test(lower) && !files["src/dag.js"].includes("readyWaves")) {
+      files["src/dag.js"] =
+        files["src/dag.js"].trimEnd() +
+        "\n\n" +
+        [
+          "export function readyWaves(nodes) {",
+          "  const done = new Set();",
+          "  const remaining = new Map(nodes.map((n) => [n.id, n.dependsOn || []]));",
+          "  const waves = [];",
+          "  while (remaining.size > 0) {",
+          "    const wave = [];",
+          "    for (const [id, deps] of remaining.entries()) {",
+          "      if (deps.every((d) => done.has(d))) wave.push(id);",
+          "    }",
+          "    if (!wave.length) throw new Error('DAG cycle detected');",
+          "    wave.sort();",
+          "    for (const id of wave) { done.add(id); remaining.delete(id); }",
+          "    waves.push(wave);",
+          "  }",
+          "  return waves;",
+          "}",
+          ""
+        ].join("\n");
+      if (files["tests/dag.test.js"] && !files["tests/dag.test.js"].includes("readyWaves")) {
+        files["tests/dag.test.js"] = files["tests/dag.test.js"]
+          .replace("import { topoSort }", "import { topoSort, readyWaves }")
+          .replace(
+            "return 'dag.test.js: 2 assertions passed';",
+            "const waves = readyWaves([{ id: 'a' }, { id: 'b' }, { id: 'c', dependsOn: ['a', 'b'] }]);\n  assert.deepEqual(waves, [['a', 'b'], ['c']], 'computes parallel waves');\n  return 'dag.test.js: 3 assertions passed';"
+          );
+      }
+      return "added readyWaves() parallel wave planner in src/dag.js and covered it in tests/dag.test.js";
+    }
+
     const wantFile = /^test\s+-s\s+(\S+)/.exec(session.check_cmd || "");
     if (wantFile && !/\b(fail|without writing|broken)\b/i.test(lower)) {
       const target = wantFile[1].replace(/^['"]|['"]$/g, "");
@@ -608,32 +902,205 @@
     return "added " + fnName + "() to " + targetSrc + " and updated tests";
   }
 
-  async function executeSessionRun(session, promptText, isRetryOrSteer) {
+  async function runPipelineChecks(session, commitHash, skipSchedule = false) {
+    const specs =
+      Array.isArray(session._checkStepSpecs) && session._checkStepSpecs.length > 0
+        ? session._checkStepSpecs
+        : [{ name: "verify", cmd: session.check_cmd || "npm test", timeout_secs: 300 }];
+
+    // Enforce file-scope guardrails before marking done
+    const violations = checkFileScopeGuardrails(
+      session._baseFiles,
+      session._branchFiles,
+      session.allowed_globs,
+      session.forbidden_globs
+    );
+    session.guardrail_violations = violations;
+
+    const receipts = specs.map((sp) => ({
+      name: sp.name || sp.cmd,
+      cmd: sp.cmd,
+      exit_code: null,
+      elapsed_ms: null,
+      passed: null,
+      tail_line: "",
+      output: "",
+      status: "pending"
+    }));
+    session.check_steps = receipts;
+
+    const combinedChunks = [];
+    let allPassed = true;
+    let firstFailExit = 0;
+    let firstFailReason = "";
+    let totalMs = 0;
+
+    for (let idx = 0; idx < specs.length; idx++) {
+      const sp = specs[idx];
+      receipts[idx].status = "running";
+      emitSse("check_step", { session_id: session.id, step: receipts[idx] });
+
+      const timeoutMs = Math.min(Math.max((sp.timeout_secs || 5) * 1000, 1500), 10_000);
+      const result = await runCheckInWorker(session._branchFiles, sp.cmd, timeoutMs);
+      const outText = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+      const tail = outText.split("\n").map((l) => l.trim()).filter(Boolean).pop() || "";
+      totalMs += result.durationMs || 0;
+
+      receipts[idx] = {
+        name: sp.name || sp.cmd,
+        cmd: sp.cmd,
+        exit_code: result.exitCode,
+        elapsed_ms: result.durationMs,
+        passed: result.exitCode === 0,
+        tail_line: tail || (result.exitCode === 0 ? "passed (exit 0)" : "failed"),
+        output: outText,
+        status: result.exitCode === 0 ? "passed" : "failed"
+      };
+      session.check_steps = [...receipts];
+      emitSse("check_step", { session_id: session.id, step: receipts[idx] });
+      combinedChunks.push("[" + receipts[idx].name + "] " + outText);
+
+      if (result.exitCode !== 0) {
+        allPassed = false;
+        firstFailExit = result.exitCode;
+        firstFailReason = (result.stderr || result.stdout || "non-zero exit").split("\n")[0];
+        for (let k = idx + 1; k < receipts.length; k++) {
+          receipts[k].status = "skipped";
+          receipts[k].tail_line = "Skipped after earlier step failed";
+        }
+        session.check_steps = [...receipts];
+        break;
+      }
+    }
+
+    session.check_ran = true;
+    session.check_output = combinedChunks.join("\n\n").trim();
+    session.check_exit = allPassed ? 0 : firstFailExit;
+    session.elapsed_ms = totalMs;
+
+    if (violations.length > 0) {
+      session.check_passed = false;
+      session.status = "needs-you";
+      session.bucket = "needs-you";
+      session.verified_commit = null;
+      session.reason = "File-scope guardrail blocked edits outside allowed globs: " + violations.join("; ");
+      appendLine(session, "guardrail blocked: " + violations.join(", "));
+    } else if (allPassed) {
+      session.check_passed = true;
+      session.status = "done";
+      session.bucket = "done";
+      session.verified_commit = commitHash;
+      session.reason = null;
+      appendLine(
+        session,
+        "all " + receipts.length + " check step(s) passed (exit 0 in " + totalMs + "ms) — verified done at " + commitHash
+      );
+    } else {
+      session.check_passed = false;
+      session.status = "needs-you";
+      session.bucket = "needs-you";
+      session.verified_commit = null;
+      session.reason = "Check failed (exit " + firstFailExit + "): " + session.check_cmd + ". " + firstFailReason;
+      appendLine(session, "check failed (exit " + firstFailExit + "): " + firstFailReason);
+    }
+
+    await persistState();
+    emitSse("session_update", { session: publicSession(session) });
+    if (!skipSchedule) await evaluateDagScheduler();
+  }
+
+  async function evaluateDagScheduler() {
+    const byId = new Map(state.sessions.map((s) => [s.id, s]));
+    const activeCount = state.sessions.filter(
+      (s) => s.bucket === "working" && s.status !== "queued" && s.status !== "blocked"
+    ).length;
+    let availableSlots = Math.max(0, MAX_PARALLEL - activeCount);
+    let qPos = 1;
+    let mutated = false;
+
+    for (const s of [...state.sessions].reverse()) {
+      if (s.status !== "blocked" && s.status !== "queued") continue;
+      const deps = Array.isArray(s.depends_on) ? s.depends_on : [];
+      const failedDep = deps.find((d) => {
+        const up = byId.get(d);
+        return up && (up.status === "needs-you" || up.status === "archived");
+      });
+      if (failedDep) {
+        s.status = "needs-you";
+        s.bucket = "needs-you";
+        s.blocked_by = [];
+        s.reason = "Upstream dependency " + failedDep + " failed or was dismissed.";
+        appendLine(s, "dag halt: upstream " + failedDep + " did not reach verified done");
+        emitSse("session_update", { session: publicSession(s) });
+        mutated = true;
+        continue;
+      }
+
+      const unfinished = deps.filter((d) => {
+        const up = byId.get(d);
+        return up && up.status !== "done" && up.status !== "merged";
+      });
+
+      if (unfinished.length > 0) {
+        s.status = "blocked";
+        s.bucket = "working";
+        s.blocked_by = unfinished;
+        s.queue_position = null;
+        continue;
+      }
+
+      s.blocked_by = [];
+      if (availableSlots > 0) {
+        availableSlots--;
+        s.queue_position = null;
+        mutated = true;
+        setTimeout(() => {
+          executeSessionRun(s, s.task, false);
+        }, 80);
+      } else {
+        s.status = "queued";
+        s.bucket = "working";
+        s.queue_position = qPos++;
+      }
+    }
+
+    if (mutated) {
+      await persistState();
+      emitSse("queue", { active: MAX_PARALLEL - availableSlots, max_parallel: MAX_PARALLEL });
+    }
+  }
+
+  async function executeSessionRun(session, promptText, isRetryOrSteer, skipSchedule = false) {
+    if (session._inFlight) return;
+    session._inFlight = true;
     session.status = "working";
     session.bucket = "working";
     session.reason = null;
     session.merge_error = null;
-    session.transcript = [
-      ...session.transcript,
-      "worktree ready on branch " + session.branch + " (base " + session._baseCommit + ")"
-    ];
+    session.blocked_by = [];
+    session.queue_position = null;
+    appendLine(session, "worktree ready on branch " + session.branch + " (base " + session._baseCommit + ")");
     await persistState();
+    emitSse("session_update", { session: publicSession(session) });
 
     try {
       const byokSummary = await runByokAgent(session, promptText);
       if (byokSummary) {
-        session.transcript = [...session.transcript, "byok (" + byokModel + "): " + byokSummary];
+        appendLine(session, "byok (" + byokModel + "): " + byokSummary);
       } else {
         const note = applyBuiltInPatch(session, promptText, isRetryOrSteer);
-        session.transcript = [...session.transcript, session.engine + ": " + note];
+        appendLine(session, session.engine + ": " + note);
       }
     } catch (err) {
+      session._inFlight = false;
       const msg = err && err.message ? err.message : String(err);
       session.status = "needs-you";
       session.bucket = "needs-you";
       session.reason = "Agent failed: " + msg;
-      session.transcript = [...session.transcript, "agent error: " + msg];
+      appendLine(session, "agent error: " + msg);
       await persistState();
+      emitSse("session_update", { session: publicSession(session) });
+      if (!skipSchedule) await evaluateDagScheduler();
       return;
     }
 
@@ -641,40 +1108,15 @@
     session.bucket = "working";
     session.diff = computeTreeDiff(session._baseFiles, session._branchFiles);
     const commitHash = shortHash(session.id + ":" + JSON.stringify(session._branchFiles));
-    session.transcript = [
-      ...session.transcript,
-      "committed branch tree at " + commitHash + " — running Web Worker check: " + session.check_cmd
-    ];
+    appendLine(session, "committed branch tree at " + commitHash + " — running Blob Web Worker pipeline: " + session.check_cmd);
     await persistState();
+    emitSse("session_update", { session: publicSession(session) });
 
-    const result = await runCheckInWorker(session._branchFiles, session.check_cmd);
-    const combinedOutput = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
-    session.check_ran = true;
-    session.check_exit = result.exitCode;
-    session.check_output = combinedOutput;
-    session.check_passed = result.exitCode === 0;
-
-    if (result.exitCode === 0) {
-      session.status = "done";
-      session.bucket = "done";
-      session.verified_commit = commitHash;
-      session.reason = null;
-      session.transcript = [
-        ...session.transcript,
-        "check passed (exit 0 in " + result.durationMs + "ms) — verified done at " + commitHash
-      ];
-    } else {
-      session.status = "needs-you";
-      session.bucket = "needs-you";
-      session.verified_commit = null;
-      const errSnippet = (result.stderr || result.stdout || "non-zero exit").split("\n")[0];
-      session.reason = "Check failed (exit " + result.exitCode + "): " + session.check_cmd + ". " + errSnippet;
-      session.transcript = [
-        ...session.transcript,
-        "check failed (exit " + result.exitCode + "): " + errSnippet
-      ];
+    try {
+      await runPipelineChecks(session, commitHash, skipSchedule);
+    } finally {
+      session._inFlight = false;
     }
-    await persistState();
   }
 
   async function recheckBranchOnly(session, editedPath) {
@@ -684,77 +1126,103 @@
     session.merge_error = null;
     session.diff = computeTreeDiff(session._baseFiles, session._branchFiles);
     const commitHash = shortHash(session.id + ":" + JSON.stringify(session._branchFiles));
-    session.transcript = [
-      ...session.transcript,
-      "operator edited " + editedPath + " — re-running Web Worker check: " + session.check_cmd
-    ];
+    appendLine(session, "operator edited " + editedPath + " — re-running Blob Web Worker pipeline: " + session.check_cmd);
     await persistState();
+    emitSse("session_update", { session: publicSession(session) });
 
-    const result = await runCheckInWorker(session._branchFiles, session.check_cmd);
-    const combinedOutput = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
-    session.check_ran = true;
-    session.check_exit = result.exitCode;
-    session.check_output = combinedOutput;
-    session.check_passed = result.exitCode === 0;
-
-    if (result.exitCode === 0) {
-      session.status = "done";
-      session.bucket = "done";
-      session.verified_commit = commitHash;
-      session.reason = null;
-      session.transcript = [
-        ...session.transcript,
-        "check passed (exit 0 in " + result.durationMs + "ms) — verified done at " + commitHash
-      ];
-    } else {
-      session.status = "needs-you";
-      session.bucket = "needs-you";
-      session.verified_commit = null;
-      const errSnippet = (result.stderr || result.stdout || "non-zero exit").split("\n")[0];
-      session.reason = "Check failed (exit " + result.exitCode + "): " + session.check_cmd + ". " + errSnippet;
-      session.transcript = [
-        ...session.transcript,
-        "check failed (exit " + result.exitCode + "): " + errSnippet
-      ];
-    }
-    await persistState();
+    await runPipelineChecks(session, commitHash);
   }
 
-  function createSessionRecord({ repoPath, project, task, agent, checkCmd, next }) {
+  function createSessionRecord({
+    repoPath,
+    project,
+    task,
+    agent,
+    checkCmd,
+    checkSteps,
+    next,
+    dependsOn,
+    allowedGlobs,
+    forbiddenGlobs
+  }) {
     const head = repoHead(repoPath);
     const id = "s-" + String(state.seq++).padStart(3, "0");
     const slug = task.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) || id;
     const baseFiles = { ...head.files };
     const branchFiles = { ...head.files };
+    const cleanSteps =
+      Array.isArray(checkSteps) && checkSteps.length > 0
+        ? checkSteps
+            .filter((x) => x && typeof x.cmd === "string" && x.cmd.trim())
+            .map((x, idx) => ({
+              name: String(x.name || "step-" + (idx + 1)).trim(),
+              cmd: String(x.cmd).trim(),
+              timeout_secs: typeof x.timeout_secs === "number" ? x.timeout_secs : 300
+            }))
+        : null;
+    const effectiveCmd = (checkCmd || "").trim() || (cleanSteps && cleanSteps[0]?.cmd) || "npm test";
+    const cleanDeps = Array.isArray(dependsOn) ? dependsOn.map((d) => String(d).trim()).filter(Boolean) : [];
     return {
       id,
       task,
       project: project || state.repos[repoPath].name,
       repo: repoPath,
       branch: "fleet/" + id + "-" + slug,
-      status: "queued",
+      status: cleanDeps.length > 0 ? "blocked" : "queued",
       bucket: "working",
       agent: agent || "web-worker",
       engine: agent || "web-worker",
       model: getByokKey() ? byokModel : null,
       test_mode: false,
-      check_cmd: checkCmd || "npm test",
+      check_cmd: effectiveCmd,
       check_output: "",
       check_passed: null,
       check_ran: false,
       check_exit: null,
+      check_steps: [],
       diff: "",
       reason: null,
       verified_commit: null,
       steer: [],
       next_queue: next ? [next] : [],
+      depends_on: cleanDeps,
+      blocked_by: cleanDeps,
+      allowed_globs: Array.isArray(allowedGlobs) ? allowedGlobs.filter(Boolean) : [],
+      forbidden_globs: Array.isArray(forbiddenGlobs) ? forbiddenGlobs.filter(Boolean) : [],
+      guardrail_violations: [],
       merge_target: state.repos[repoPath].branch || "main",
       merge_error: null,
       transcript: [],
+      elapsed_ms: null,
+      _checkStepSpecs: cleanSteps,
       _baseCommit: head.hash,
       _baseFiles: baseFiles,
       _branchFiles: branchFiles
     };
+  }
+
+  function ensureRepoExists(repoPath) {
+    if (!state.repos[repoPath]) {
+      const name = repoPath.split("/").filter(Boolean).pop() || "workspace";
+      state.repos[repoPath] = {
+        name,
+        path: repoPath,
+        branch: "main",
+        commits: [
+          {
+            hash: shortHash(repoPath),
+            parent: null,
+            message: "Initial commit",
+            ts: Date.now(),
+            files: {
+              "src/index.js": "export function main() {\n  return true;\n}\n",
+              "tests/index.test.js":
+                "import { main } from '../src/index.js';\nexport function run(assert) {\n  assert.equal(main(), true, 'main returns true');\n  return 'index.test.js: 1 assertion passed';\n}\n"
+            }
+          }
+        ]
+      };
+    }
   }
 
   async function seedRealInitialRuns() {
@@ -763,18 +1231,41 @@
       project: "ledger-kit",
       task: "Add summarizeLedger() helper and unit assertions to ledger-kit",
       agent: "web-worker",
-      checkCmd: "npm test"
+      checkCmd: "npm test",
+      checkSteps: [
+        { name: "syntax-lint", cmd: "lint" },
+        { name: "unit-tests", cmd: "npm test" }
+      ],
+      allowedGlobs: ["src/**", "tests/**"]
     });
     const s2 = createSessionRecord({
       repoPath: "/workspace/rate-limiter",
       project: "rate-limiter",
       task: "Investigate off-by-one token bucket refill threshold bug in rate-limiter",
       agent: "web-worker",
-      checkCmd: "npm test"
+      checkCmd: "npm test",
+      checkSteps: [
+        { name: "syntax-lint", cmd: "lint" },
+        { name: "unit-tests", cmd: "npm test" }
+      ]
     });
-    state.sessions = [s1, s2];
-    await executeSessionRun(s1, s1.task, false);
-    await executeSessionRun(s2, s2.task, false);
+    const s3 = createSessionRecord({
+      repoPath: "/workspace/dag-scheduler",
+      project: "dag-scheduler",
+      task: "Add readyWaves() parallel wave batch planner to dag-scheduler",
+      agent: "web-worker",
+      checkCmd: "npm test",
+      checkSteps: [
+        { name: "syntax-lint", cmd: "lint" },
+        { name: "unit-tests", cmd: "npm test" }
+      ],
+      dependsOn: [s1.id],
+      allowedGlobs: ["src/**", "tests/**"]
+    });
+    state.sessions = [s3, s2, s1];
+    await executeSessionRun(s1, s1.task, false, true);
+    await executeSessionRun(s2, s2.task, false, true);
+    await executeSessionRun(s3, s3.task, false, true);
   }
 
   async function ensureReady() {
@@ -797,6 +1288,8 @@
     delete out._baseCommit;
     delete out._baseFiles;
     delete out._branchFiles;
+    delete out._checkStepSpecs;
+    delete out._inFlight;
     return out;
   }
 
@@ -861,6 +1354,7 @@
       state = { repos: INITIAL_REPOS(), sessions: [], seq: 1 };
       await seedRealInitialRuns();
       await persistState();
+      emitSse("sessions", { sessions: state.sessions.filter((s) => s.bucket !== "archived").map(publicSession) });
     },
     getSessionFiles(sessionId) {
       const s = state.sessions.find((x) => x.id === sessionId);
@@ -911,27 +1405,74 @@
       const list = Object.values(state.repos).map((r) => ({ name: r.name, path: r.path, branch: r.branch }));
       return jsonResp(list);
     }
+    if (method === "POST" && u.pathname === "/api/repos/prune-worktrees") {
+      let pruned = 0;
+      for (const s of state.sessions) {
+        if (s.status === "archived" && s._branchFiles) {
+          delete s._branchFiles;
+          pruned++;
+        }
+      }
+      await persistState();
+      return jsonResp({ pruned, message: pruned === 0 ? "All browser worktrees are clean." : "Pruned " + pruned + " archived worktree(s)." });
+    }
     if (method === "GET" && u.pathname === "/api/policy") {
       const hasByok = Boolean(getByokKey());
       return jsonResp({
         agents: [
-          { name: "web-worker", found: true, path: "Browser Worktree + Web Worker" },
+          { name: "web-worker", found: true, path: "Browser Worktree + Blob Web Worker" },
           ...(hasByok ? [{ name: "byok-llm", found: true, path: byokModel }] : [])
         ],
-        max_parallel: 4,
+        max_parallel: MAX_PARALLEL,
         timeout_secs: 1800,
+        auto_retry_budget: 1,
+        auto_steer_budget: 2,
         source: "policies.rn (browser)",
         default_agent: hasByok ? "byok-llm" : "web-worker",
         default_agent_engine: hasByok ? "byok-llm" : "web-worker",
         model: hasByok ? byokModel : null,
-        version: APP_VERSION
+        version: APP_VERSION,
+        features: { sse: true, batch: true, merge_check: true, policy_test: true, prune_worktrees: true }
+      });
+    }
+    if (method === "POST" && u.pathname === "/api/policies/test") {
+      const repo = String(body.repo || "").trim();
+      const project = String(body.project || repo.split("/").filter(Boolean).pop() || "default").trim();
+      const task = String(body.task || "").trim();
+      const reqEngine = String(body.engine || "").trim();
+      const hasByok = Boolean(getByokKey());
+      const engine = reqEngine || (hasByok ? "byok-llm" : "web-worker");
+      const isRust = /rust|cargo|fleet|ergon/.test((repo + " " + project + " " + task).toLowerCase());
+      const checkCmd = isRust ? "cargo test" : "npm test";
+      const warnings = [];
+      if (!repo) warnings.push("Empty repository path; defaulted to workspace rule.");
+      if (reqEngine && !["web-worker", "byok-llm", "opencode", "claude", "codex"].includes(reqEngine)) {
+        warnings.push("Unknown engine override '" + reqEngine + "'; policy fell back to default.");
+      }
+      return jsonResp({
+        engine,
+        model: engine === "byok-llm" ? byokModel : engine === "opencode" ? "opencode/deepseek-v4.1-flash-free" : null,
+        check_cmd: checkCmd,
+        check_steps: [
+          { name: "syntax-lint", cmd: "lint", timeout_secs: 60 },
+          { name: "unit-tests", cmd: checkCmd, timeout_secs: 300 }
+        ],
+        timeout_secs: 1800,
+        max_parallel: MAX_PARALLEL,
+        auto_retry_budget: 1,
+        auto_steer_budget: 2,
+        allowed_globs: ["src/**", "tests/**"],
+        forbidden_globs: [".env*", "*.pem", "*.key"],
+        matched_rule: "policies.rn -> route_repo(" + JSON.stringify(project) + ")",
+        warnings
       });
     }
     if (method === "GET" && u.pathname === "/api/config") {
       return jsonResp({
         default_agent: getByokKey() ? "byok-llm" : "web-worker",
         default_agent_engine: getByokKey() ? "byok-llm" : "web-worker",
-        effective_models: { opencode: null, claude: null, codex: null }
+        max_parallel: MAX_PARALLEL,
+        effective_models: { opencode: "opencode/deepseek-v4.1-flash-free", claude: null, codex: null }
       });
     }
     if (method === "GET" && u.pathname === "/api/sessions") {
@@ -940,48 +1481,116 @@
     if (method === "GET" && u.pathname === "/api/inbox") {
       return jsonResp(state.sessions.filter((s) => s.bucket === "needs-you").map(publicSession));
     }
+
+    const mcMatch = /^\/api\/sessions\/([^/]+)\/merge-check$/.exec(u.pathname);
+    if (method === "GET" && mcMatch) {
+      const s = state.sessions.find((x) => x.id === mcMatch[1]);
+      if (!s) return jsonResp({ error: "no such session" }, 404);
+      return jsonResp(computeMergeCheck(s));
+    }
+
+    const patchMatch = /^\/api\/sessions\/([^/]+)\/patch$/.exec(u.pathname);
+    if (method === "GET" && patchMatch) {
+      const s = state.sessions.find((x) => x.id === patchMatch[1]);
+      if (!s) return jsonResp({ error: "no such session" }, 404);
+      const patchHeader = [
+        "From " + (s.verified_commit || "0000000") + "000000000000000000000000000000000 Mon Sep 17 00:00:00 2001",
+        "From: Fleet Browser Engine <fleet@local>",
+        "Date: " + new Date().toUTCString(),
+        "Subject: [PATCH] " + s.task.replace(/\r?\n/g, " "),
+        "",
+        "Session: " + s.id,
+        "Branch: " + s.branch,
+        "---",
+        ""
+      ].join("\n");
+      return new Response(patchHeader + (s.diff || "") + "\n", {
+        status: 200,
+        headers: { "Content-Type": "text/x-patch; charset=utf-8" }
+      });
+    }
+
     if (method === "GET" && u.pathname.startsWith("/api/sessions/")) {
       const id = u.pathname.slice("/api/sessions/".length);
       const s = state.sessions.find((x) => x.id === id);
       return s ? jsonResp(publicSession(s)) : jsonResp({ error: "no such session" }, 404);
     }
+
+    if (method === "POST" && u.pathname === "/api/sessions/batch") {
+      const rawItems = Array.isArray(body.tasks) ? body.tasks : Array.isArray(body.sessions) ? body.sessions : [];
+      if (rawItems.length === 0) return jsonResp({ error: "Provide at least one task in tasks[]." }, 400);
+      const aliasMap = new Map();
+      const pending = [];
+
+      for (let i = 0; i < rawItems.length; i++) {
+        const it = rawItems[i] || {};
+        const repoPath = String(it.repo || "").trim();
+        const task = String(it.task || "").trim();
+        if (!repoPath || !task) {
+          return jsonResp({ error: "Task #" + (i + 1) + " requires both repo and task." }, 400);
+        }
+        ensureRepoExists(repoPath);
+        const rec = createSessionRecord({
+          repoPath,
+          project: String(it.project || "").trim() || state.repos[repoPath].name,
+          task,
+          agent: String(it.agent || "").trim() || (getByokKey() ? "byok-llm" : "web-worker"),
+          checkCmd: String(it.check || "").trim(),
+          checkSteps: Array.isArray(it.check_steps) ? it.check_steps : null,
+          next: String(it.next || "").trim(),
+          dependsOn: Array.isArray(it.depends_on) ? it.depends_on : [],
+          allowedGlobs: Array.isArray(it.allowed_globs) ? it.allowed_globs : [],
+          forbiddenGlobs: Array.isArray(it.forbidden_globs) ? it.forbidden_globs : []
+        });
+        if (it.alias) aliasMap.set(String(it.alias), rec.id);
+        aliasMap.set("#" + (i + 1), rec.id);
+        aliasMap.set("@" + i, rec.id);
+        pending.push(rec);
+      }
+
+      for (const rec of pending) {
+        rec.depends_on = rec.depends_on.map((d) => aliasMap.get(d) || d);
+        rec.blocked_by = [...rec.depends_on];
+      }
+
+      const cycle = detectDagCycle([...state.sessions, ...pending]);
+      if (cycle) {
+        return jsonResp({ error: "Cyclic depends_on graph rejected: " + cycle.join(" -> ") }, 400);
+      }
+
+      state.sessions = [...pending.slice().reverse(), ...state.sessions];
+      await persistState();
+      emitSse("sessions", { sessions: state.sessions.filter((s) => s.bucket !== "archived").map(publicSession) });
+      setTimeout(() => { void evaluateDagScheduler(); }, 60);
+      return jsonResp({ sessions: pending.map(publicSession) }, 201);
+    }
+
     if (method === "POST" && u.pathname === "/api/sessions") {
       const task = String(body.task || "").trim();
       const repoPath = String(body.repo || "").trim();
       if (!repoPath) return jsonResp({ error: "Give the repo path: select a browser git repository." }, 400);
       if (!task) return jsonResp({ error: "Write the task: say what the agent should do." }, 400);
-      if (!state.repos[repoPath]) {
-        const name = repoPath.split("/").filter(Boolean).pop() || "workspace";
-        state.repos[repoPath] = {
-          name,
-          path: repoPath,
-          branch: "main",
-          commits: [
-            {
-              hash: shortHash(repoPath),
-              parent: null,
-              message: "Initial commit",
-              ts: Date.now(),
-              files: {
-                "src/index.js": "export function main() {\n  return true;\n}\n",
-                "tests/index.test.js":
-                  "import { main } from '../src/index.js';\nexport function run(assert) {\n  assert.equal(main(), true, 'main returns true');\n  return 'index.test.js: 1 assertion passed';\n}\n"
-              }
-            }
-          ]
-        };
-      }
+      ensureRepoExists(repoPath);
       const created = createSessionRecord({
         repoPath,
         project: String(body.project || "").trim() || state.repos[repoPath].name,
         task,
         agent: String(body.agent || "").trim() || (getByokKey() ? "byok-llm" : "web-worker"),
-        checkCmd: String(body.check || "").trim() || "npm test",
-        next: String(body.next || "").trim()
+        checkCmd: String(body.check || "").trim(),
+        checkSteps: Array.isArray(body.check_steps) ? body.check_steps : null,
+        next: String(body.next || "").trim(),
+        dependsOn: Array.isArray(body.depends_on) ? body.depends_on : [],
+        allowedGlobs: Array.isArray(body.allowed_globs) ? body.allowed_globs : [],
+        forbiddenGlobs: Array.isArray(body.forbidden_globs) ? body.forbidden_globs : []
       });
+      const cycle = detectDagCycle([...state.sessions, created]);
+      if (cycle) {
+        return jsonResp({ error: "Cyclic depends_on rejected: " + cycle.join(" -> ") }, 400);
+      }
       state.sessions = [created, ...state.sessions];
       await persistState();
-      setTimeout(() => { executeSessionRun(created, created.task, false); }, 120);
+      emitSse("session_update", { session: publicSession(created) });
+      setTimeout(() => { void evaluateDagScheduler(); }, 80);
       return jsonResp(publicSession(created), 201);
     }
 
@@ -994,19 +1603,19 @@
       if (action === "retry") {
         if (s.status !== "needs-you") return jsonResp({ error: "only a needs-you session can be retried" }, 409);
         const prompt = s.task + (s.check_output ? "\nFix failing check: " + s.check_output : "");
-        setTimeout(() => { executeSessionRun(s, prompt, true); }, 120);
+        setTimeout(() => { executeSessionRun(s, prompt, true); }, 100);
         return jsonResp({ retried: true });
       }
       if (action === "steer") {
         const msg = String(body.message || "").trim();
         if (!msg) return jsonResp({ error: "Write the message first." }, 400);
         s.steer = [...(s.steer || []), msg];
-        s.transcript = [...s.transcript, "operator steer: " + msg];
+        appendLine(s, "operator steer: " + msg);
         await persistState();
         setTimeout(async () => {
           s.steer = [];
           await executeSessionRun(s, msg, true);
-        }, 120);
+        }, 100);
         return jsonResp({ steered: true });
       }
       if (action === "merge") {
@@ -1015,48 +1624,54 @@
         }
         const repo = state.repos[s.repo];
         if (!repo) return jsonResp({ error: "Repository not found." }, 409);
-        const head = repoHead(s.repo);
-        const conflicts = [];
-        const mergedFiles = { ...head.files };
-        const changedKeys = Object.keys(s._branchFiles).filter((k) => s._branchFiles[k] !== s._baseFiles[k]);
-        for (const k of changedKeys) {
-          if (head.files[k] !== s._baseFiles[k] && head.files[k] !== s._branchFiles[k]) {
-            conflicts.push(k);
-          } else {
-            mergedFiles[k] = s._branchFiles[k];
-          }
+        const strategy = String(body.strategy || "merge").toLowerCase();
+        const chk = computeMergeCheck(s);
+        if (strategy === "ff" && chk.commits_behind > 0) {
+          const errMsg = "Fast-forward merge refused: target branch " + repo.branch + " is " + chk.commits_behind + " commit(s) ahead.";
+          s.merge_error = { message: errMsg, detail: "hint: Use Merge commit or Squash strategy.", ts: Math.floor(Date.now() / 1000) };
+          await persistState();
+          return jsonResp({ error: errMsg, detail: s.merge_error.detail }, 409);
         }
-        if (conflicts.length > 0) {
-          const errMsg = "Merge conflict in " + conflicts.join(", ") + ". Nothing was merged.";
+        if (!chk.clean) {
+          const errMsg = "Merge conflict in " + chk.conflicting_files.join(", ") + ". Nothing was merged.";
           s.merge_error = {
             message: errMsg,
-            detail: "CONFLICT (content): Merge conflict in " + conflicts.join(", "),
+            detail: "CONFLICT (content): Merge conflict in " + chk.conflicting_files.join(", "),
             ts: Math.floor(Date.now() / 1000)
           };
           await persistState();
           return jsonResp({ error: errMsg, detail: s.merge_error.detail }, 409);
         }
-        const mergeHash = shortHash(head.hash + ":" + s.verified_commit + ":" + Date.now());
+        const head = repoHead(s.repo);
+        const mergedFiles = { ...head.files };
+        const changedKeys = Object.keys(s._branchFiles).filter((k) => s._branchFiles[k] !== s._baseFiles[k]);
+        for (const k of changedKeys) mergedFiles[k] = s._branchFiles[k];
+
+        const mergeHash = shortHash(head.hash + ":" + s.verified_commit + ":" + strategy + ":" + Date.now());
         repo.commits.push({
           hash: mergeHash,
           parent: head.hash,
-          message: "merge fleet session " + s.id + ": " + s.task,
+          message: (strategy === "squash" ? "squash " : strategy === "ff" ? "ff " : "merge ") + "fleet session " + s.id + ": " + s.task,
           ts: Date.now(),
           files: mergedFiles
         });
         s.status = "merged";
         s.bucket = "done";
+        s.merge_strategy = strategy;
         s.merge_error = null;
-        s.transcript = [...s.transcript, "merged into " + repo.branch + " at " + mergeHash + " (worktree removed)"];
+        appendLine(s, "merged (" + strategy + ") into " + repo.branch + " at " + mergeHash + " (worktree removed)");
         await persistState();
-        return jsonResp({ merged: true, commit: s.verified_commit, branch: repo.branch });
+        emitSse("session_update", { session: publicSession(s) });
+        return jsonResp({ merged: true, commit: s.verified_commit, branch: repo.branch, strategy });
       }
       if (action === "stop") {
         s.status = "needs-you";
         s.bucket = "needs-you";
         s.reason = "stopped by you mid-run";
-        s.transcript = [...s.transcript, "stopped by you"];
+        appendLine(s, "stopped by you");
         await persistState();
+        emitSse("session_update", { session: publicSession(s) });
+        await evaluateDagScheduler();
         return jsonResp({ stopped: true });
       }
       if (action === "dismiss") {
@@ -1064,6 +1679,8 @@
         s.status = "archived";
         s.bucket = "archived";
         await persistState();
+        emitSse("sessions", { sessions: state.sessions.filter((x) => x.bucket !== "archived").map(publicSession) });
+        await evaluateDagScheduler();
         return jsonResp({ dismissed: true });
       }
     }
