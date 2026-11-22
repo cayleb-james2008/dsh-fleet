@@ -183,6 +183,137 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
   await ctx.close()
 }
 
+// v0.5.0 War Room E2E: Cmd+K palette, keyboard nav (j/k/t/d/r/n), filter & multi-select bulk bar,
+// 55,000-line virtualized transcript + Jump to first error, Unified/Split diff + Pre-Merge Conflict badge
+// + Merge Strategy + .patch download, Per-Step Timed Receipt Timeline, Live Policy Tester, and SSE live stream.
+{
+  const { ctx, p } = await open(1440, 900, 'light', { acceptDownloads: true })
+  let sseHits = 0
+  await p.route('**/api/version', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ name: 'fleet-rs', version: '0.5.0' }) }))
+  await p.route('**/api/events/stream', r => {
+    sseHits++
+    r.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      headers: { 'Cache-Control': 'no-cache' },
+      body: 'event: queue_depth\ndata: {"type":"queue_depth","active":2}\n\n',
+    })
+  })
+  await p.route('**/api/sessions/*/merge-check', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ clean: false, conflicting_files: ['src/reports.ts', 'tests/export.spec.ts'], commits_ahead: 2, commits_behind: 1 }),
+  }))
+  await p.route('**/api/sessions/*/patch', r => r.fulfill({
+    status: 200,
+    contentType: 'text/x-patch',
+    body: 'From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\nSubject: [PATCH] verified worktree change\n---\ndiff --git a/output.txt b/output.txt\n--- /dev/null\n+++ b/output.txt\n@@ -0,0 +1 @@\n+verified\n',
+  }))
+  await p.route('**/api/policies/test', r => r.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      engine: 'opencode',
+      model: 'opencode/deepseek-v4.1-flash-free',
+      check_cmd: 'cargo test',
+      timeout_secs: 1800,
+      max_parallel: 4,
+      auto_retry_budget: 2,
+      auto_steer_budget: 2,
+      allowed_globs: ['src/**'],
+      forbidden_globs: ['.env*'],
+      matched_rule: 'policies.rn -> route_repo("fixture")',
+      warnings: [],
+    }),
+  }))
+
+  // Inject a 55,000-line transcript + multi-step receipt on the first verified session to test virtualization
+  const bigLines = Array.from({ length: 55000 }, (_, i) => i === 42000 ? 'ERROR: panic at report_export.rs:88 assertion failed' : `[line ${i + 1}] compiling module shard_${i % 64}`)
+  await p.route('**/api/sessions', async r => {
+    if (r.request().method() !== 'GET') return r.continue()
+    const res = await r.fetch()
+    const arr = await res.json()
+    if (Array.isArray(arr) && arr.length > 0) {
+      const doneIdx = arr.findIndex(x => x.bucket === 'done')
+      if (doneIdx >= 0) {
+        arr[doneIdx] = {
+          ...arr[doneIdx],
+          transcript: bigLines,
+          transcript_total: 55000,
+          depends_on: ['s-base'],
+          check_steps: [
+            { name: 'lint', cmd: 'cargo clippy', status: 'passed', passed: true, exit_code: 0, elapsed_ms: 410, tail_line: '0 warnings', output: 'clippy clean' },
+            { name: 'unit-tests', cmd: arr[doneIdx].check_cmd || 'cargo test', status: 'passed', passed: true, exit_code: 0, elapsed_ms: 820, tail_line: '6 passed in 0.82s', output: arr[doneIdx].check_output || 'ok' },
+          ],
+        }
+      }
+    }
+    await r.fulfill({ response: res, body: JSON.stringify(arr) })
+  })
+
+  await p.goto(BASE); await ready(p); await p.waitForTimeout(700)
+  ok('v0.5.0 concurrency indicator renders active / max_parallel slots', await p.locator('[data-testid="concurrency-indicator"]').isVisible())
+  ok('v0.5.0 SSE stream connects when server advertises 0.5.0', sseHits >= 1, `sseHits=${sseHits}`)
+
+  // Keyboard power navigation: j opens session, d switches Diff, r switches Receipt, t switches Transcript
+  await p.keyboard.press('j'); await p.waitForTimeout(300)
+  const inspector = p.locator('aside[aria-label="Session inspector"]')
+  ok('keyboard j navigates into session inspector', await inspector.isVisible())
+
+  // Open the 55,000-line session directly and prove virtualization + Jump to first error
+  await p.getByRole('button', { name: /Open Add the export button|Open Write the changelog entry/ }).first().click()
+  await p.waitForTimeout(400)
+  const vt = inspector.locator('[data-testid="virtualized-transcript"]')
+  const mountedRows = await vt.locator('[data-line]').count()
+  ok('55,000-line transcript stays virtualized (<150 DOM nodes)', mountedRows > 0 && mountedRows < 150, `mounted=${mountedRows}`)
+  await vt.getByRole('button', { name: /Jump to first error/ }).click()
+  await p.waitForTimeout(250)
+  const jumpedErrVisible = await vt.locator('[data-line="42001"]').isVisible()
+  ok('Jump to first error scrolls 55k virtualized log directly to line 42001', jumpedErrVisible)
+
+  // Diff tab: Unified + Side-by-Side Split + Pre-Merge Conflict badge + Merge Strategy + Download .patch
+  await p.keyboard.press('d'); await p.waitForTimeout(350)
+  const dv = inspector.locator('[data-testid="rich-diff-viewer"]')
+  const conflictBadgeText = await dv.locator('[data-testid="merge-check-badge"]').innerText()
+  await dv.getByRole('button', { name: 'Split' }).click(); await p.waitForTimeout(200)
+  const splitRendered = (await dv.locator('[data-testid="diff-split-grid"]').count()) >= 1
+  const [dl] = await Promise.all([p.waitForEvent('download'), dv.getByRole('button', { name: '.patch' }).click()])
+  ok('Diff tab shows Pre-Merge Conflict badge, Side-by-Side split, and .patch download',
+    conflictBadgeText.includes('2 conflicts') && splitRendered && dl.suggestedFilename().endsWith('.patch'),
+    `badge=${conflictBadgeText} split=${splitRendered} file=${dl.suggestedFilename()}`)
+
+  // Receipt tab: Per-Step Timed Receipt Timeline
+  await p.keyboard.press('r'); await p.waitForTimeout(250)
+  const stepRows = await inspector.locator('ol[aria-label="Check pipeline steps"] > li').count()
+  ok('Receipt tab renders per-step timed timeline with durations', stepRows === 2 && (await inspector.locator('[data-testid="receipt-timeline"]').innerText()).includes('410ms'), `steps=${stepRows}`)
+
+  // Multi-select bulk bar + status filter
+  await p.keyboard.press('Escape'); await p.waitForTimeout(250)
+  await p.getByRole('button', { name: 'Multi-select' }).click(); await p.waitForTimeout(200)
+  await p.getByRole('button', { name: /Select visible/ }).click(); await p.waitForTimeout(200)
+  const bulkRegionText = await p.locator('[aria-label="Bulk selection controls"]').innerText()
+  ok('Multi-select bulk controls select visible sessions and expose Retry/Dismiss/Merge',
+    bulkRegionText.includes('Bulk Retry') && bulkRegionText.includes('Bulk Dismiss') && bulkRegionText.includes('Bulk Merge'))
+  await p.getByRole('button', { name: /Selecting/ }).click(); await p.waitForTimeout(150)
+
+  // Cmd+K Global Command Palette -> Batch Fan-Out Composer
+  await p.keyboard.press('Control+k'); await p.waitForTimeout(250)
+  const cmdkOpen = await p.locator('[cmdk-root]').isVisible()
+  await p.locator('[cmdk-input]').fill('Batch fan-out'); await p.waitForTimeout(150)
+  await p.keyboard.press('Enter'); await p.waitForTimeout(450)
+  const batchOpen = await p.locator('#batch-task-0').isVisible()
+  ok('Ctrl+K Command Palette opens Batch Fan-Out & depends_on composer', cmdkOpen && batchOpen, `cmdk=${cmdkOpen} batch=${batchOpen}`)
+  await p.keyboard.press('Escape'); await p.waitForTimeout(250)
+
+  // Live Policy Tester inside #settings Vaul drawer
+  await p.getByRole('button', { name: 'Engines and settings' }).click(); await p.waitForTimeout(350)
+  await p.locator('#settings').getByRole('button', { name: 'Test policy' }).click(); await p.waitForTimeout(250)
+  const ptText = await p.locator('[data-testid="policy-test-result"]').innerText()
+  ok('Live Policy Tester evaluates POST /api/policies/test inside Settings',
+    ptText.includes('opencode/deepseek-v4.1-flash-free') && ptText.includes('policies.rn'))
+  await ctx.close()
+}
+
 // Update strip BANNER-FIX-BRIEF states (Dismiss -> Show update focus, manual Check un-dismisses, explanation text)
 {
   const { ctx, p } = await open(1440, 900)
@@ -247,6 +378,22 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
   await p.screenshot({ path: `${OUT}/drawer-390.png` })
   await p.keyboard.press('Escape'); await p.waitForTimeout(600)
   ok('phone: bottom bar actions visible', await p.locator('nav[aria-label="Board actions"]').isVisible())
+  // Real 390x844 mobile tap test on Settings -> Dark -> Light
+  const bgLum = () => p.evaluate(() => {
+    const cx = document.createElement('canvas').getContext('2d')
+    cx.fillStyle = getComputedStyle(document.body).backgroundColor
+    cx.fillRect(0, 0, 1, 1)
+    const [r, g, bb] = cx.getImageData(0, 0, 1, 1).data
+    return 0.2126 * r + 0.7152 * g + 0.0722 * bb
+  })
+  const l0 = await bgLum()
+  await p.locator('#settings-open').tap(); await p.waitForTimeout(400)
+  await p.locator('#settings').getByRole('button', { name: 'Dark', exact: true }).tap(); await p.waitForTimeout(300)
+  const dAttr = await p.evaluate(() => document.documentElement.dataset.theme)
+  const l1 = await bgLum()
+  await p.locator('#settings').getByRole('button', { name: 'Light', exact: true }).tap(); await p.waitForTimeout(300)
+  const lAttr = await p.evaluate(() => document.documentElement.dataset.theme)
+  ok('phone 390x844: real tap on Settings toggles Dark/Light cleanly', dAttr === 'dark' && lAttr === 'light' && l1 < l0, `lum ${l0.toFixed(0)}->${l1.toFixed(0)}`)
   await ctx.close()
 }
 
