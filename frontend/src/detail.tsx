@@ -1,74 +1,67 @@
 // Split-Pane Session Inspector (desktop right pane >=1100px, Vaul bottom drawer <1100px).
-// Preserves all behavioral contracts: confirms before merge/stop/dismiss, honest check-passed-but-needs-you banner,
-// Cult UI Expandable disclosures (zero <details>), roving ArrowLeft/ArrowRight/Home/End tabs across Transcript · Diff · Receipt,
-// syntax-tinted +/- diff lines in Geist Mono, focus management on open/close, and per-session Steer composer.
-import { useEffect, useRef, useState } from "react";
-import { X, Send, RotateCcw, GitMerge, Square, FileCode2, Play } from "lucide-react";
+// Upgraded for v0.5.0: Virtualized searchable Transcript (50k+ lines, Jump to first error),
+// Unified & Side-by-Side Diff Viewer with Pre-Merge Conflict Badge, Merge Strategy selector,
+// Download .patch, Per-Step Timed Receipt Timeline, DAG depends_on links, and File-Scope Guardrails.
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  CheckCircle2,
+  Clock,
+  FileCode2,
+  GitBranch,
+  GitMerge,
+  Play,
+  RotateCcw,
+  Send,
+  ShieldAlert,
+  Square,
+  X,
+  XCircle,
+} from "lucide-react";
 import { AnimatedBackground } from "@/components/ui/animated-background";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Expandable, ExpandableContent, ExpandableTrigger } from "@/components/ui/expandable";
+import { Pill, PillIndicator } from "@/components/kibo-ui/pill";
 import { glide } from "@/motion";
 import { cn } from "@/lib/utils";
 import {
-  diffStat,
+  formatDurationMs,
   getWebEngine,
   HONEST,
+  isActivelyRunning,
   isFailed,
   isHonest,
   isVerified,
-  parseDiffLines,
   postJson,
   receiptLine,
   statusText,
+  type CheckStepReceipt,
+  type MergeStrategy,
   type Session,
   type TabId,
 } from "./api";
+import { VirtualizedTranscript } from "./transcript";
+import { MERGE_STRATEGIES, MergeStrategyControl, RichDiffViewer, useMergeCheck } from "./diff";
 import { toast } from "sonner";
 
 type Act = "merge" | "stop" | "dismiss" | null;
 
 const draftKey = (id: string) => "fleet-steer:" + id;
 export function draftGet(id: string): string {
-  try { return sessionStorage.getItem(draftKey(id)) || ""; } catch { return ""; }
+  try {
+    return sessionStorage.getItem(draftKey(id)) || "";
+  } catch {
+    return "";
+  }
 }
 function draftSet(id: string, v: string) {
-  try { if (v) sessionStorage.setItem(draftKey(id), v); else sessionStorage.removeItem(draftKey(id)); } catch { /* private window */ }
-}
-
-const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
-
-function DiffViewer({ diff }: { diff?: string }) {
-  const rows = parseDiffLines(diff);
-  if (rows.length === 0) {
-    return (
-      <pre className="min-h-24 rounded-card border border-hairline bg-canvas p-3 font-mono text-xs leading-relaxed text-ink-2">
-        No changes on this branch yet.
-      </pre>
-    );
+  try {
+    if (v) sessionStorage.setItem(draftKey(id), v);
+    else sessionStorage.removeItem(draftKey(id));
+  } catch {
+    /* private window */
   }
-  return (
-    <div className="max-h-[46vh] overflow-x-auto overflow-y-auto rounded-card border border-hairline bg-canvas font-mono text-xs leading-relaxed">
-      <div className="min-w-full py-1.5">
-        {rows.map((r, idx) => (
-          <div
-            key={idx}
-            className={cn(
-              "whitespace-pre px-3 py-0.5",
-              r.kind === "meta" && "bg-board font-medium text-ink",
-              r.kind === "hunk" && "bg-track/60 text-ink-3",
-              r.kind === "add" && "bg-diff-add-bg text-diff-add-fg",
-              r.kind === "del" && "bg-diff-del-bg text-diff-del-fg",
-              r.kind === "ctx" && "text-ink-2",
-            )}
-          >
-            {r.text || " "}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
 }
 
 function BranchFileEditor({ sessionId, onSaved }: { sessionId: string; onSaved: () => void }) {
@@ -145,7 +138,7 @@ function BranchFileEditor({ sessionId, onSaved }: { sessionId: string; onSaved: 
                 className="font-mono text-xs leading-relaxed"
               />
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <p className="text-xs text-ink-3">Edits apply only to this session’s branch and re-run the Web Worker check.</p>
+                <p className="text-xs text-ink-3">Edits apply only to this session’s branch and re-run the Web Worker check pipeline.</p>
                 <Button type="button" size="sm" disabled={saving} onClick={saveAndCheck} className="max-md:min-h-11 max-md:px-4">
                   <Play className="size-3.5" strokeWidth={1.5} aria-hidden />
                   {saving ? "Running check..." : "Save and re-run check"}
@@ -159,34 +152,189 @@ function BranchFileEditor({ sessionId, onSaved }: { sessionId: string; onSaved: 
   );
 }
 
+function ReceiptStepTimeline({ s, ranCheck }: { s: Session; ranCheck: boolean }) {
+  const steps: CheckStepReceipt[] = useMemo(() => {
+    if (s.check_steps && s.check_steps.length > 0) return s.check_steps;
+    if (!ranCheck && !s.check_cmd) return [];
+    return [
+      {
+        name: "verify",
+        cmd: s.check_cmd || "policy check",
+        exit_code: s.check_exit ?? (s.check_passed === true ? 0 : s.check_passed === false ? 1 : null),
+        elapsed_ms: s.elapsed_ms ?? null,
+        passed: ranCheck ? Boolean(s.check_passed) : null,
+        tail_line: ranCheck ? receiptLine(s) : "Waiting for agent run to finish",
+        output: s.check_output || "",
+        status: !ranCheck ? "pending" : s.check_passed ? "passed" : "failed",
+      },
+    ];
+  }, [s, ranCheck]);
+
+  const totalMs = useMemo(
+    () => steps.reduce((acc, st) => acc + (typeof st.elapsed_ms === "number" ? st.elapsed_ms : 0), 0),
+    [steps],
+  );
+
+  return (
+    <div className="space-y-3" data-testid="receipt-timeline">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p
+          className={cn(
+            "text-sm font-medium",
+            ranCheck ? (s.check_passed ? "text-success-foreground" : "text-destructive-foreground") : "text-ink-2",
+          )}
+        >
+          {!ranCheck
+            ? "No check has run yet."
+            : s.check_passed
+              ? `Passed (${steps.filter((x) => x.status === "passed").length}/${steps.length} ${steps.length === 1 ? "step" : "steps"}).`
+              : `Failed${s.check_exit != null ? ` with exit code ${s.check_exit}` : ""}.`}
+        </p>
+        {totalMs > 0 && (
+          <span className="inline-flex items-center gap-1 rounded-chip bg-track px-2 py-0.5 font-mono text-xs tabular-nums text-ink-2">
+            <Clock className="size-3 text-icon" strokeWidth={1.5} aria-hidden />
+            <span>{formatDurationMs(totalMs)}</span>
+          </span>
+        )}
+      </div>
+
+      {s.guardrail_violations && s.guardrail_violations.length > 0 && (
+        <div role="status" className="rounded-card border border-hairline bg-pill-pro-bg p-3 text-destructive-foreground">
+          <p className="flex items-center gap-1.5 text-xs font-medium text-ink">
+            <ShieldAlert className="size-4 text-destructive-foreground" strokeWidth={1.5} aria-hidden />
+            <span>File-scope guardrail blocked completion</span>
+          </p>
+          <ul className="mt-2 space-y-1 font-mono text-xs text-ink">
+            {s.guardrail_violations.map((v) => (
+              <li key={v} className="break-all">{v}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {steps.length > 0 ? (
+        <ol aria-label="Check pipeline steps" className="space-y-2">
+          {steps.map((step, idx) => {
+            const passed = step.status === "passed" || step.passed === true;
+            const failed = step.status === "failed" || step.passed === false;
+            const skipped = step.status === "skipped";
+            return (
+              <li
+                key={`${step.name}-${idx}`}
+                className="rounded-card border border-hairline bg-canvas p-3"
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="inline-flex size-5 shrink-0 items-center justify-center rounded-full bg-track font-mono text-xs text-ink-2">
+                    {idx + 1}
+                  </span>
+                  {passed ? (
+                    <CheckCircle2 className="size-4 shrink-0 text-success-foreground" strokeWidth={1.5} aria-hidden />
+                  ) : failed ? (
+                    <XCircle className="size-4 shrink-0 text-destructive-foreground" strokeWidth={1.5} aria-hidden />
+                  ) : (
+                    <Clock className="size-4 shrink-0 text-icon" strokeWidth={1.5} aria-hidden />
+                  )}
+                  <span className="font-medium text-sm text-ink">{step.name}</span>
+                  <Badge
+                    variant={passed ? "success" : failed ? "error" : skipped ? "secondary" : "warning"}
+                    size="sm"
+                    className="ml-auto font-mono"
+                  >
+                    {step.exit_code !== null ? `exit ${step.exit_code}` : step.status}
+                  </Badge>
+                  {step.elapsed_ms !== null && (
+                    <span className="rounded-chip bg-track px-1.5 py-0.5 font-mono text-xs tabular-nums text-ink-2">
+                      {formatDurationMs(step.elapsed_ms)}
+                    </span>
+                  )}
+                </div>
+
+                <p className="mt-1.5 font-mono text-xs text-ink-3 [overflow-wrap:anywhere]">$ {step.cmd}</p>
+                {step.tail_line && (
+                  <p
+                    className={cn(
+                      "mt-1.5 border-l-2 pl-2 font-mono text-xs [overflow-wrap:anywhere]",
+                      passed
+                        ? "border-dot-green text-ink"
+                        : failed
+                          ? "border-unread text-destructive-foreground"
+                          : "border-hairline text-ink-2",
+                    )}
+                  >
+                    {step.tail_line}
+                  </p>
+                )}
+
+                {step.output && step.output.trim() && (
+                  <Expandable expandDirection="vertical" expandBehavior="push" className="mt-2">
+                    {({ isExpanded }) => (
+                      <>
+                        <ExpandableTrigger
+                          aria-label={`Output of step ${step.name}`}
+                          className="inline-flex cursor-pointer items-center rounded-control text-xs font-medium text-ink-2 outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11 max-md:px-2"
+                        >
+                          {isExpanded ? "Hide step output" : "Show step output"}
+                        </ExpandableTrigger>
+                        <ExpandableContent preset="fade">
+                          <pre className="mt-2 max-h-[28vh] overflow-y-auto whitespace-pre-wrap break-all rounded-control border border-hairline bg-surface p-2.5 font-mono text-xs leading-relaxed text-ink">
+                            {step.output}
+                          </pre>
+                        </ExpandableContent>
+                      </>
+                    )}
+                  </Expandable>
+                )}
+              </li>
+            );
+          })}
+        </ol>
+      ) : (
+        <pre className="max-h-[36vh] min-h-24 overflow-y-auto whitespace-pre-wrap break-all rounded-card border border-hairline bg-canvas p-3 font-mono text-xs leading-relaxed text-ink">
+          Waiting for the agent run to finish before executing the check.
+        </pre>
+      )}
+    </div>
+  );
+}
+
 export function DetailBody({
   s,
+  allSessions,
   requestedTab,
   openSeq,
+  supportsServerV050,
   onClose,
+  onOpenSession,
   onChanged,
   onDismissed,
 }: {
   s: Session;
+  allSessions: Session[];
   requestedTab: TabId;
   openSeq: number;
+  supportsServerV050: boolean;
   onClose: () => void;
+  onOpenSession: (id: string, tab?: TabId) => void;
   onChanged: () => void;
   onDismissed: () => void;
 }) {
   const [tab, setTab] = useState<TabId>(requestedTab);
   const [act, setAct] = useState<Act>(null);
+  const [strategy, setStrategy] = useState<MergeStrategy>(s.merge_strategy || "merge");
   const [err, setErr] = useState("");
   const [mergeOk, setMergeOk] = useState("");
   const [steer, setSteer] = useState(() => draftGet(s.id));
   const headingRef = useRef<HTMLHeadingElement>(null);
+
+  const { mergeCheck, checkingMerge, recheckMerge } = useMergeCheck(s, supportsServerV050);
 
   useEffect(() => {
     setSteer(draftGet(s.id));
     setAct(null);
     setErr("");
     setMergeOk("");
-  }, [s.id]);
+    setStrategy(s.merge_strategy || "merge");
+  }, [s.id, s.merge_strategy]);
 
   useEffect(() => {
     setTab(requestedTab);
@@ -201,13 +349,17 @@ export function DetailBody({
 
   const verified = isVerified(s);
   const honest = isHonest(s);
-  const ds = diffStat(s.diff);
   const ranCheck = s.check_ran !== undefined ? Boolean(s.check_ran) : s.check_passed === true || s.check_passed === false;
   const agent = s.test_mode ? "test mode (custom command)" : s.engine || s.agent || "unknown";
   const chain: string[] = [];
   if (s.spawned_from) chain.push(`Handed out automatically when ${s.spawned_from} finished.`);
   if (s.successor) chain.push(`Its finish handed out ${s.successor}.`);
   if ((s.next_queue || []).length) chain.push(`Then: ${s.next_queue!.join(", ")}.`);
+
+  const downstream = useMemo(
+    () => allSessions.filter((other) => (other.depends_on || []).includes(s.id)),
+    [allSessions, s.id],
+  );
 
   const hint =
     s.status === "needs-you"
@@ -234,17 +386,23 @@ export function DetailBody({
   async function run(fn: () => Promise<string | null>, ok: string) {
     const e = await fn();
     setErr(e || "");
-    if (e) toast.error(e); else if (ok) toast.success(ok);
+    if (e) toast.error(e);
+    else if (ok) toast.success(ok);
     onChanged();
   }
 
   const doMerge = async () => {
     setAct(null);
     try {
-      const r = await fetch(`/api/sessions/${s.id}/merge`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      const r = await fetch(`/api/sessions/${s.id}/merge`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ strategy }),
+      });
       if (r.ok) {
         const j = await r.json().catch(() => ({}));
-        const text = `Merged ${s.branch} into ${j.branch || s.merge_target || "the target branch"}.`;
+        const label = MERGE_STRATEGIES.find((m) => m.id === strategy)?.label || strategy;
+        const text = `Merged ${s.branch} into ${j.branch || s.merge_target || "the target branch"} (${label}).`;
         setMergeOk(text);
         setErr("");
         toast.success(text);
@@ -263,7 +421,10 @@ export function DetailBody({
 
   const sendSteer = async () => {
     const msg = steer.trim();
-    if (!msg) { setErr("Write the message first."); return; }
+    if (!msg) {
+      setErr("Write the message first.");
+      return;
+    }
     const e = await postJson(`/api/sessions/${s.id}/steer`, { message: msg });
     if (!e) {
       draftSet(s.id, "");
@@ -276,20 +437,47 @@ export function DetailBody({
     onChanged();
   };
 
+  const stratLabel = MERGE_STRATEGIES.find((m) => m.id === strategy)?.label || strategy;
   const mergeQ = s.merge_target
-    ? `Merge ${s.branch || "this session"} into ${s.merge_target}? Fleet refuses if the target is dirty or in the middle of a merge.`
-    : `Merge ${s.branch || "this session"}? Fleet refuses if the target is dirty or in the middle of a merge.`;
+    ? `Merge ${s.branch || "this session"} into ${s.merge_target} using ${stratLabel}? Fleet refuses if the target is dirty or conflicts.`
+    : `Merge ${s.branch || "this session"} using ${stratLabel}? Fleet refuses if the target is dirty or conflicts.`;
 
   return (
     <div className="flex min-h-0 flex-col gap-5">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <Badge
-          variant={verified ? "success" : isFailed(s) ? "error" : s.bucket === "needs-you" ? "info" : s.bucket === "done" ? "success" : "secondary"}
+          variant={
+            verified
+              ? "success"
+              : isFailed(s)
+                ? "error"
+                : s.bucket === "needs-you"
+                  ? "info"
+                  : s.bucket === "done"
+                    ? "success"
+                    : "secondary"
+          }
           size="sm"
         >
           {verified ? (s.status === "merged" ? "merged" : "verified") : statusText(s)}
         </Badge>
-        <Button variant="ghost" size="sm" className="ml-auto max-md:min-h-11 max-md:px-3" onClick={onClose} aria-label="Close this session">
+        {s.status === "done" && mergeCheck && (
+          <Pill variant={mergeCheck.clean ? "success" : "destructive"} className="px-2 py-0.5 font-mono text-xs">
+            <PillIndicator variant={mergeCheck.clean ? "success" : "error"} />
+            <span>
+              {mergeCheck.clean
+                ? "Clean merge"
+                : `${mergeCheck.conflicting_files.length || 1} conflicts`}
+            </span>
+          </Pill>
+        )}
+        <Button
+          variant="ghost"
+          size="sm"
+          className="ml-auto max-md:min-h-11 max-md:px-3"
+          onClick={onClose}
+          aria-label="Close this session"
+        >
           <X className="size-4" strokeWidth={1.5} aria-hidden />Close
         </Button>
       </div>
@@ -302,17 +490,98 @@ export function DetailBody({
       )}
 
       <div className="min-w-0">
-        <h2 ref={headingRef} tabIndex={-1} className="font-heading text-xl font-medium leading-tight text-ink outline-none md:text-[24px] [overflow-wrap:anywhere]">
+        <h2
+          ref={headingRef}
+          tabIndex={-1}
+          className="font-heading text-xl font-medium leading-tight text-ink outline-none md:text-[24px] [overflow-wrap:anywhere]"
+        >
           {s.task}
         </h2>
         <dl className="mt-3 flex flex-wrap gap-x-5 gap-y-1.5 text-sm text-ink-2 tabular-nums">
-          <div className="flex min-w-0 gap-2"><dt className="text-ink-3">Project</dt><dd className="min-w-0 [overflow-wrap:anywhere] text-ink">{s.project}</dd></div>
-          <div className="flex gap-2"><dt className="text-ink-3">Agent</dt><dd className="text-ink">{agent}</dd></div>
-          {s.model && <div className="flex min-w-0 gap-2"><dt className="text-ink-3">Model</dt><dd className="min-w-0 break-all font-mono text-xs text-ink">{s.model}</dd></div>}
-          <div className="flex min-w-0 gap-2"><dt className="text-ink-3">Branch</dt><dd className="min-w-0 break-all font-mono text-xs text-ink">{s.branch || "—"}</dd></div>
-          {s.queue_position ? <div className="flex gap-2"><dt className="text-ink-3">Queue</dt><dd className="font-mono text-ink">#{s.queue_position}</dd></div> : null}
+          <div className="flex min-w-0 gap-2">
+            <dt className="text-ink-3">Project</dt>
+            <dd className="min-w-0 [overflow-wrap:anywhere] text-ink">{s.project}</dd>
+          </div>
+          <div className="flex gap-2">
+            <dt className="text-ink-3">Agent</dt>
+            <dd className="text-ink">{agent}</dd>
+          </div>
+          {s.model && (
+            <div className="flex min-w-0 gap-2">
+              <dt className="text-ink-3">Model</dt>
+              <dd className="min-w-0 break-all font-mono text-xs text-ink">{s.model}</dd>
+            </div>
+          )}
+          <div className="flex min-w-0 gap-2">
+            <dt className="text-ink-3">Branch</dt>
+            <dd className="min-w-0 break-all font-mono text-xs text-ink">{s.branch || "—"}</dd>
+          </div>
+          {s.queue_position ? (
+            <div className="flex gap-2">
+              <dt className="text-ink-3">Queue</dt>
+              <dd className="font-mono text-ink">#{s.queue_position}</dd>
+            </div>
+          ) : null}
         </dl>
-        {chain.map((c) => <p key={c} className="mt-2 text-sm text-ink-2 [overflow-wrap:anywhere]">{c}</p>)}
+
+        {((s.depends_on && s.depends_on.length > 0) || downstream.length > 0) && (
+          <div className="mt-3 space-y-1.5 rounded-card border border-hairline bg-canvas p-2.5 text-xs">
+            {s.depends_on && s.depends_on.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="inline-flex items-center gap-1 font-medium text-ink-2">
+                  <GitBranch className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
+                  <span>Depends on:</span>
+                </span>
+                {s.depends_on.map((depId) => {
+                  const target = allSessions.find((x) => x.id === depId);
+                  return (
+                    <Button
+                      key={depId}
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => target && onOpenSession(target.id, "tr")}
+                      disabled={!target}
+                      className="h-7 px-2 font-mono text-xs max-md:min-h-11"
+                    >
+                      {depId}
+                      {target ? ` (${statusText(target)})` : ""}
+                    </Button>
+                  );
+                })}
+              </div>
+            )}
+            {downstream.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="font-medium text-ink-2">Unblocks:</span>
+                {downstream.map((child) => (
+                  <Button
+                    key={child.id}
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => onOpenSession(child.id, "tr")}
+                    className="h-7 px-2 font-mono text-xs max-md:min-h-11"
+                  >
+                    {child.id}
+                  </Button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {s.allowed_globs && s.allowed_globs.length > 0 && (
+          <p className="mt-2 font-mono text-xs text-ink-3 [overflow-wrap:anywhere]">
+            Allowed scope: <span className="text-ink-2">{s.allowed_globs.join(", ")}</span>
+          </p>
+        )}
+
+        {chain.map((c) => (
+          <p key={c} className="mt-2 text-sm text-ink-2 [overflow-wrap:anywhere]">
+            {c}
+          </p>
+        ))}
         {s.transcript.some((l) => l.includes("restored from its record")) && (
           <p className="mt-2 text-sm text-ink-2">This session was restored from its record after the session store was lost.</p>
         )}
@@ -322,11 +591,16 @@ export function DetailBody({
         <section aria-label="Receipt" className="relative rounded-card border border-hairline bg-canvas p-4">
           <p className="border-l-2 border-dot-green pl-2.5 font-medium text-ink">Check passed: verified done</p>
           <p className="mt-2 font-mono text-sm text-ink [overflow-wrap:anywhere]">{receiptLine(s)}</p>
-          <p className="mt-1 font-mono text-xs text-ink-3 [overflow-wrap:anywhere]">verified by: <span className="text-ink-2">{s.check_cmd || "policy check"}</span></p>
+          <p className="mt-1 font-mono text-xs text-ink-3 [overflow-wrap:anywhere]">
+            verified by: <span className="text-ink-2">{s.check_cmd || "policy check"}</span>
+          </p>
           <Expandable expandDirection="vertical" expandBehavior="push" className="mt-3">
             {({ isExpanded }) => (
               <>
-                <ExpandableTrigger aria-label="Details of the check output" className="inline-flex cursor-pointer items-center rounded-control text-sm text-ink-2 outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11 max-md:px-2">
+                <ExpandableTrigger
+                  aria-label="Details of the check output"
+                  className="inline-flex cursor-pointer items-center rounded-control text-sm text-ink-2 outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11 max-md:px-2"
+                >
                   {isExpanded ? "Hide details" : "Details"}
                 </ExpandableTrigger>
                 <ExpandableContent preset="fade">
@@ -352,6 +626,12 @@ export function DetailBody({
         </p>
       )}
 
+      {s.status === "done" && (
+        <div className="space-y-2.5 rounded-card border border-hairline bg-canvas p-3">
+          <MergeStrategyControl value={strategy} onChange={setStrategy} />
+        </div>
+      )}
+
       {act && (
         <div role="group" aria-label="Confirm" className="rounded-card border border-hairline bg-raised p-4">
           <p className="text-sm text-ink-2 [overflow-wrap:anywhere]">
@@ -365,11 +645,19 @@ export function DetailBody({
             <Button
               variant={act === "merge" ? "default" : "destructive-outline"}
               className="max-md:min-h-11 max-md:px-4"
-              onClick={() => (act === "merge" ? doMerge() : act === "dismiss" ? onDismissed() : run(() => postJson(`/api/sessions/${s.id}/stop`), "Stopped"))}
+              onClick={() =>
+                act === "merge"
+                  ? void doMerge()
+                  : act === "dismiss"
+                    ? onDismissed()
+                    : void run(() => postJson(`/api/sessions/${s.id}/stop`), "Stopped")
+              }
             >
               {act === "merge" ? "Merge now" : act === "dismiss" ? "Dismiss now" : "Stop now"}
             </Button>
-            <Button variant="outline" className="max-md:min-h-11 max-md:px-4" onClick={() => setAct(null)}>Keep it</Button>
+            <Button variant="outline" className="max-md:min-h-11 max-md:px-4" onClick={() => setAct(null)}>
+              Keep it
+            </Button>
           </div>
         </div>
       )}
@@ -382,14 +670,20 @@ export function DetailBody({
             </Button>
           )}
           {s.status === "needs-you" && (
-            <Button variant="outline" onClick={() => run(() => postJson(`/api/sessions/${s.id}/retry`), "Retrying the session")} className="max-md:min-h-11 max-md:px-4">
+            <Button
+              variant="outline"
+              onClick={() => void run(() => postJson(`/api/sessions/${s.id}/retry`), "Retrying the session")}
+              className="max-md:min-h-11 max-md:px-4"
+            >
               <RotateCcw className="size-4" strokeWidth={1.5} aria-hidden />Retry this session
             </Button>
           )}
           {s.status === "needs-you" && (
-            <Button variant="ghost" onClick={() => setAct("dismiss")} className="max-md:min-h-11 max-md:px-4">Dismiss</Button>
+            <Button variant="ghost" onClick={() => setAct("dismiss")} className="max-md:min-h-11 max-md:px-4">
+              Dismiss
+            </Button>
           )}
-          {(s.status === "queued" || s.status === "working" || s.status === "checking") && (
+          {(s.status === "queued" || s.status === "blocked" || s.status === "working" || s.status === "checking") && (
             <Button variant="destructive-outline" onClick={() => setAct("stop")} className="max-md:min-h-11 max-md:px-4">
               <Square className="size-4" strokeWidth={1.5} aria-hidden />Stop this session
             </Button>
@@ -397,16 +691,25 @@ export function DetailBody({
         </div>
       )}
 
-      {mergeOk && <p role="status" className="border-l-2 border-dot-green pl-2.5 text-sm text-ink [overflow-wrap:anywhere]">{mergeOk}</p>}
+      {mergeOk && (
+        <p role="status" className="border-l-2 border-dot-green pl-2.5 text-sm text-ink [overflow-wrap:anywhere]">
+          {mergeOk}
+        </p>
+      )}
 
       {s.merge_error && (
         <div className="rounded-card bg-pill-pro-bg p-3 text-destructive-foreground">
-          <p className="text-sm font-medium text-ink [overflow-wrap:anywhere]">{s.merge_error.message || "The merge was refused."}</p>
+          <p className="text-sm font-medium text-ink [overflow-wrap:anywhere]">
+            {s.merge_error.message || "The merge was refused."}
+          </p>
           {s.merge_error.detail && (
             <Expandable expandDirection="vertical" expandBehavior="push" className="mt-2">
               {({ isExpanded }) => (
                 <>
-                  <ExpandableTrigger aria-label="Details of the refused merge" className="inline-flex cursor-pointer items-center rounded-control text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11 max-md:px-2">
+                  <ExpandableTrigger
+                    aria-label="Details of the refused merge"
+                    className="inline-flex cursor-pointer items-center rounded-control text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11 max-md:px-2"
+                  >
                     {isExpanded ? "Hide details" : "Details"}
                   </ExpandableTrigger>
                   <ExpandableContent preset="fade">
@@ -421,17 +724,32 @@ export function DetailBody({
         </div>
       )}
 
-      {err && <p role="alert" className="text-sm text-destructive-foreground [overflow-wrap:anywhere]">{err}</p>}
+      {err && (
+        <p role="alert" className="text-sm text-destructive-foreground [overflow-wrap:anywhere]">
+          {err}
+        </p>
+      )}
 
       <div>
-        <div role="tablist" aria-label="Session views" onKeyDown={onTabKey} className="inline-flex gap-0.5 rounded-control bg-track p-0.5">
+        <div
+          role="tablist"
+          aria-label="Session views"
+          onKeyDown={onTabKey}
+          className="inline-flex gap-0.5 rounded-control bg-track p-0.5"
+        >
           <AnimatedBackground
             defaultValue={tab}
             onValueChange={(id) => id && setTab(id as TabId)}
             className="rounded-segment bg-ink-button"
             transition={glide}
           >
-            {([["tr", "Transcript"], ["df", "Diff"], ["rc", "Receipt"]] as const).map(([id, label]) => (
+            {(
+              [
+                ["tr", "Transcript"],
+                ["df", "Diff"],
+                ["rc", "Receipt"],
+              ] as const
+            ).map(([id, label]) => (
               <Button
                 key={id}
                 type="button"
@@ -451,43 +769,29 @@ export function DetailBody({
 
         <div className="mt-4">
           {tab === "tr" && (
-            <>
-              <p className="mb-2 text-sm text-ink-3">{plural(s.transcript.length, "line")} so far.</p>
-              <pre className="max-h-[46vh] min-h-24 overflow-y-auto whitespace-pre-wrap break-all rounded-card border border-hairline bg-canvas p-3 font-mono text-xs leading-relaxed text-ink">
-                {s.transcript.length ? s.transcript.join("\n") : "No output yet."}
-              </pre>
-              {s.transcript.length >= 2000 && (
-                <p className="mt-2 text-xs text-ink-3">Showing the most recent lines. The full log is kept on disk as logs/{s.id}.log in the Fleet data folder.</p>
-              )}
-            </>
+            <VirtualizedTranscript
+              sessionId={s.id}
+              lines={s.transcript}
+              totalHint={s.transcript_total}
+              isRunning={isActivelyRunning(s)}
+              supportsServerV050={supportsServerV050}
+            />
           )}
 
           {tab === "df" && (
             <>
-              <p className="mb-2 flex flex-wrap items-center gap-1.5 text-sm text-ink-2 tabular-nums">
-                <span>{plural(ds.files, "file")} changed,</span>
-                <span className="rounded-chip bg-diff-add-bg px-1.5 py-0.5 font-mono text-xs text-diff-add-fg">+{ds.add}</span>
-                <span className="rounded-chip bg-diff-del-bg px-1.5 py-0.5 font-mono text-xs text-diff-del-fg">−{ds.del}</span>
-                <span>lines against base branch.</span>
-              </p>
-              <DiffViewer diff={s.diff} />
+              <RichDiffViewer
+                session={s}
+                supportsServerV050={supportsServerV050}
+                mergeCheck={mergeCheck}
+                checkingMerge={checkingMerge}
+                onRecheckMerge={recheckMerge}
+              />
               {s.status !== "merged" && <BranchFileEditor sessionId={s.id} onSaved={onChanged} />}
             </>
           )}
 
-          {tab === "rc" && (
-            <>
-              <p className={cn("mb-1 text-sm font-medium", ranCheck ? (s.check_passed ? "text-success-foreground" : "text-destructive-foreground") : "text-ink-2")}>
-                {!ranCheck ? "No check has run yet." : s.check_passed ? "Passed." : `Failed${s.check_exit != null ? ` with exit code ${s.check_exit}` : ""}.`}
-              </p>
-              <p className="mb-2 font-mono text-xs text-ink-3 [overflow-wrap:anywhere]">
-                {ranCheck ? `Command: ${s.check_cmd || ""}` : s.check_cmd ? `Check command: ${s.check_cmd}` : ""}
-              </p>
-              <pre className="max-h-[46vh] min-h-24 overflow-y-auto whitespace-pre-wrap break-all rounded-card border border-hairline bg-canvas p-3 font-mono text-xs leading-relaxed text-ink">
-                {ranCheck ? s.check_output || "(printed nothing)" : "Waiting for the agent run to finish before executing the check."}
-              </pre>
-            </>
-          )}
+          {tab === "rc" && <ReceiptStepTimeline s={s} ranCheck={ranCheck} />}
         </div>
       </div>
 
@@ -501,20 +805,25 @@ export function DetailBody({
             placeholder="Tell the agent what to change"
             aria-describedby="steerHint"
             value={steer}
-            onChange={(e) => { setSteer(e.target.value); draftSet(s.id, e.target.value); }}
+            onChange={(e) => {
+              setSteer(e.target.value);
+              draftSet(s.id, e.target.value);
+            }}
             onKeyDown={(e) => {
               if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
                 e.preventDefault();
-                sendSteer();
+                void sendSteer();
               }
             }}
           />
           <div className="mt-2.5 flex flex-wrap items-center gap-3">
-            <Button variant="outline" onClick={sendSteer} className="max-md:min-h-11 max-md:px-4">
+            <Button variant="outline" onClick={() => void sendSteer()} className="max-md:min-h-11 max-md:px-4">
               <Send className="size-4" strokeWidth={1.5} aria-hidden />Send to the agent
             </Button>
           </div>
-          <p id="steerHint" className="mt-2 text-xs leading-relaxed text-ink-3">{hint}</p>
+          <p id="steerHint" className="mt-2 text-xs leading-relaxed text-ink-3">
+            {hint}
+          </p>
         </section>
       )}
     </div>
