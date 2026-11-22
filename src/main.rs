@@ -9,6 +9,10 @@
 mod events;
 mod update;
 
+use fleet_rs::autoheal::{
+    FailedCheckContext, HealAttempt, HealDecision, HealSessionContext, HealStopReason,
+    MAX_AUTO_HEAL_BUDGET, build_heal_prompt, evaluate_auto_heal, heal_badge_label,
+};
 use fleet_rs::checks::{
     CheckPipeline, CheckStep, CheckStepReceipt, FileScope, PipelineReceipt, ScopeViolation,
     verify_git_scope,
@@ -17,7 +21,9 @@ use fleet_rs::dag::{BatchSpec, BatchTaskSpec, DagGraph, DagNodeState, TaskNode};
 use fleet_rs::merge_check::{
     MergeStrategy, PatchFormat, dry_run_merge, execute_merge, export_patch,
 };
+use fleet_rs::metrics::{SessionMetricView, compute_metrics_with_capacity};
 use fleet_rs::policy::{MAX_TIMEOUT_SECS, Policy, test_policy_script};
+use fleet_rs::templates::{PlaybookInput, PlaybookTask, TemplateStore};
 use serde::Serialize;
 use std::os::unix::ffi::OsStrExt as _;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -442,10 +448,42 @@ struct Session {
     /// Merge strategy used when this session landed (`merge-commit`, `squash`, `fast-forward-only`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     merge_strategy: Option<MergeStrategy>,
+    /// Maximum autonomous auto-heal repair passes allowed when checks fail (`0` disables auto-heal).
+    #[serde(default)]
+    auto_steer_budget: u32,
+    /// Ordered history of autonomous auto-heal attempts executed on this session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    heal_attempts: Vec<HealAttempt>,
     /// Total transcript lines logged to disk (may exceed in-memory `TRANSCRIPT_CAP`).
     #[serde(default)]
     transcript_total: usize,
     transcript: Vec<String>,
+}
+
+impl SessionMetricView for Session {
+    fn status(&self) -> &str {
+        &self.status
+    }
+
+    fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    fn project(&self) -> &str {
+        &self.project
+    }
+
+    fn check_passed(&self) -> Option<bool> {
+        self.check_passed
+    }
+
+    fn check_elapsed_ms(&self) -> Option<u64> {
+        self.check_receipt.as_ref().map(|r| r.total_elapsed_ms)
+    }
+
+    fn heal_attempts(&self) -> &[HealAttempt] {
+        &self.heal_attempts
+    }
 }
 
 /// The branch a merge into this repo lands on: its checked-out branch.
@@ -532,6 +570,10 @@ struct App {
     /// Cached GET /api/repos discovery result keyed by (state_rev, FLEET_REPOS_DIR, cached_at).
     #[allow(clippy::type_complexity)]
     repos_cache: Mutex<Option<(u64, String, std::time::Instant, Vec<RepoInfo>)>>,
+    /// Cached serialized GET /api/metrics payload keyed by (state_rev, max_parallel).
+    metrics_cache: Mutex<Option<(u64, i64, String)>>,
+    /// Atomic file-backed playbook template store (`<data_dir>/templates.json`).
+    templates: Mutex<TemplateStore>,
     /// Session IDs whose `.record.json` needs writing on the next persist() pass.
     dirty_records: Mutex<std::collections::HashSet<String>>,
     /// Transcript lines logged since the last snapshot — the persist
@@ -1432,6 +1474,33 @@ impl App {
         body
     }
 
+    /// Cached JSON string for `GET /api/metrics`, invalidated automatically whenever
+    /// `state_rev` or `effective_max_parallel()` changes (O(1) cache hit, single O(N) pass on miss).
+    fn metrics_json_cached(&self) -> String {
+        let rev = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
+        let max_parallel = self.effective_max_parallel().max(1);
+        {
+            let guard = self.metrics_cache.lock().unwrap();
+            if let Some((cached_rev, cached_max, ref payload)) = *guard {
+                if cached_rev == rev && cached_max == max_parallel {
+                    return payload.clone();
+                }
+            }
+        }
+        let metrics = {
+            let sessions = self.sessions.lock().unwrap();
+            compute_metrics_with_capacity(&sessions, max_parallel as usize)
+        };
+        let mut val = serde_json::to_value(&metrics).unwrap_or_else(|_| serde_json::json!({}));
+        val["max_parallel"] = serde_json::json!(max_parallel);
+        let payload = val.to_string();
+        let rev_after = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
+        if rev_after == rev {
+            *self.metrics_cache.lock().unwrap() = Some((rev, max_parallel, payload.clone()));
+        }
+        payload
+    }
+
     /// Fast filtered / paginated query over sessions (supports `q`, `status`,
     /// `bucket`, `project`, `repo`, `engine`, `limit`, `offset`, `compact`, `paginated`).
     fn sessions_query(&self, params: &std::collections::HashMap<String, String>) -> serde_json::Value {
@@ -2328,6 +2397,14 @@ impl App {
                 return;
             }
         }
+        // Verify-and-auto-heal loop: drain any operator steering, commit,
+        // verify in a pristine checkout, and if a healable check fails under
+        // the session's `auto_steer_budget`, steer the agent with crisp
+        // diagnostics (with identical-error loop-guard protection) and
+        // re-verify before settling.
+        let mut active_heal_idx: Option<usize> = None;
+        let mut active_heal_started: Option<std::time::Instant> = None;
+        loop {
         // Drain the steering queue before anything is committed or
         // checked: each batch of pending messages becomes one
         // continuation run through the engine's own resume mechanism,
@@ -2645,6 +2722,45 @@ impl App {
         } else {
             Self::check_failure_reason(&session.check_cmd, check_exit, &output)
         };
+        let failed_ctx_for_heal = if !passed {
+            Some(
+                check_receipt
+                    .as_ref()
+                    .and_then(|r| FailedCheckContext::from_pipeline_receipt(r, &session.check_cmd))
+                    .unwrap_or_else(|| {
+                        FailedCheckContext::from_legacy(&session.check_cmd, check_exit, &output)
+                    }),
+            )
+        } else {
+            None
+        };
+        let completed_heal_pass = active_heal_idx.is_some();
+        let finished_heal_event = if let Some(h_idx) = active_heal_idx.take() {
+            let elapsed_ms = active_heal_started
+                .take()
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            let attempt_healed = passed
+                && commit_error.is_none()
+                && dirty_after_commit.is_empty()
+                && tree_problems.is_empty()
+                && new_ignored.is_empty()
+                && scope_violations.is_empty()
+                && !diff.trim().is_empty()
+                && !self.stop_flag(id).load(std::sync::atomic::Ordering::Relaxed);
+            let mut sessions = self.sessions.lock().unwrap();
+            sessions
+                .iter_mut()
+                .find(|s| s.id == id)
+                .and_then(|s| s.heal_attempts.get_mut(h_idx))
+                .map(|a| {
+                    a.elapsed_ms = elapsed_ms;
+                    a.healed = attempt_healed;
+                    a.clone()
+                })
+        } else {
+            None
+        };
         {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
@@ -2672,7 +2788,155 @@ impl App {
                 "output_tail": output.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(""),
             }),
         );
+        if let Some(ref finished_attempt) = finished_heal_event {
+            self.events.publish(
+                "auto_heal_attempt",
+                &serde_json::json!({
+                    "id": id,
+                    "session_id": id,
+                    "phase": "finished",
+                    "attempt": finished_attempt,
+                }),
+            );
+        }
         self.persist();
+
+        // Autonomous Auto-Heal / Auto-Steer feedback loop:
+        // Only heal clean check failures (never commit errors, gitignored outputs,
+        // tree corruption, file-scope guardrail violations, or operator stops).
+        let mut heal_stop_note: Option<String> = None;
+        let healable_check_failure = commit_error.is_none()
+            && dirty_after_commit.is_empty()
+            && tree_problems.is_empty()
+            && new_ignored.is_empty()
+            && scope_violations.is_empty()
+            && !passed
+            && !pristine_failed
+            && check_ran
+            && !check_pipes_held
+            && !check_stopped;
+        if healable_check_failure {
+            if let Some(ref failed_ctx) = failed_ctx_for_heal {
+                let (prev_attempts, budget) = {
+                    let sessions = self.sessions.lock().unwrap();
+                    sessions
+                        .iter()
+                        .find(|s| s.id == id)
+                        .map(|s| (s.heal_attempts.clone(), s.auto_steer_budget))
+                        .unwrap_or_else(|| (Vec::new(), 0))
+                };
+                let stop_requested = self.stop_flag(id).load(std::sync::atomic::Ordering::Relaxed);
+                match evaluate_auto_heal(
+                    prev_attempts.len() as u32,
+                    budget,
+                    stop_requested,
+                    &prev_attempts,
+                    failed_ctx,
+                ) {
+                    HealDecision::Proceed { next_attempt, .. } => {
+                        let effective_budget = budget.min(MAX_AUTO_HEAL_BUDGET);
+                        let heal_ctx = HealSessionContext {
+                            session_id: id.to_string(),
+                            task: session.task.clone(),
+                            repo: session.repo.clone(),
+                            branch: session.branch.clone(),
+                            allowed_globs: effective_scope.allowed_globs.clone(),
+                            forbidden_globs: effective_scope.forbidden_globs.clone(),
+                            attempt: next_attempt,
+                            budget: effective_budget,
+                        };
+                        let heal_prompt = build_heal_prompt(&heal_ctx, failed_ctx);
+                        let trigger_step = if failed_ctx.step_name.trim().is_empty() {
+                            "check".to_string()
+                        } else {
+                            failed_ctx.step_name.clone()
+                        };
+                        let attempt_record = HealAttempt {
+                            attempt: next_attempt,
+                            trigger_step: trigger_step.clone(),
+                            exit_code: failed_ctx.exit_code,
+                            stderr_tail: failed_ctx.diagnostic_tail(),
+                            prompt_sent: heal_prompt.clone(),
+                            started_ms: HealAttempt::now_ms(),
+                            elapsed_ms: 0,
+                            healed: false,
+                        };
+                        let pushed_idx = {
+                            let mut sessions = self.sessions.lock().unwrap();
+                            sessions.iter_mut().find(|s| s.id == id).map(|s| {
+                                s.verified_commit = None;
+                                s.heal_attempts.push(attempt_record.clone());
+                                s.heal_attempts.len() - 1
+                            })
+                        };
+                        self.mark_dirty(id);
+                        self.persist();
+                        self.log(
+                            id,
+                            format!(
+                                "auto-heal {next_attempt}/{effective_budget}: check step '{trigger_step}' failed — sending diagnostic steering to the agent"
+                            ),
+                        );
+                        self.events.publish(
+                            "auto_heal_attempt",
+                            &serde_json::json!({
+                                "id": id,
+                                "session_id": id,
+                                "phase": "started",
+                                "attempt": attempt_record,
+                            }),
+                        );
+                        self.set_status(id, Status::Working);
+                        let heal_started = std::time::Instant::now();
+                        let outcome = self.run_one(id, session, wt, &heal_prompt, true);
+                        if outcome != AgentRun::Clean {
+                            if let Some(h_idx) = pushed_idx {
+                                let finished = {
+                                    let mut sessions = self.sessions.lock().unwrap();
+                                    sessions
+                                        .iter_mut()
+                                        .find(|s| s.id == id)
+                                        .and_then(|s| s.heal_attempts.get_mut(h_idx))
+                                        .map(|a| {
+                                            a.elapsed_ms =
+                                                heal_started.elapsed().as_millis() as u64;
+                                            a.healed = false;
+                                            a.clone()
+                                        })
+                                };
+                                if let Some(a) = finished {
+                                    self.mark_dirty(id);
+                                    self.persist();
+                                    self.events.publish(
+                                        "auto_heal_attempt",
+                                        &serde_json::json!({
+                                            "id": id,
+                                            "session_id": id,
+                                            "phase": "finished",
+                                            "attempt": a,
+                                        }),
+                                    );
+                                }
+                            }
+                            return;
+                        }
+                        active_heal_idx = pushed_idx;
+                        active_heal_started = Some(heal_started);
+                        continue;
+                    }
+                    HealDecision::Stop { reason, message } => {
+                        if matches!(
+                            reason,
+                            HealStopReason::BudgetExhausted | HealStopReason::IdenticalErrorLoop
+                        ) {
+                            self.log(id, message.clone());
+                            heal_stop_note = Some(message);
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(err) = commit_error {
             // The work cannot land at all (a failing pre-commit hook is
             // the usual cause) — never let it be called done.
@@ -2775,7 +3039,14 @@ impl App {
                 // (set_status itself is an unconditional write —
                 // the residual no-CAS shape is named in the ledger.)
                 self.set_status(id, Status::Done);
-                self.log(id, "check passed — verified done".to_string());
+                if completed_heal_pass {
+                    self.log(
+                        id,
+                        "check passed — auto-healed and verified done".to_string(),
+                    );
+                } else {
+                    self.log(id, "check passed — verified done".to_string());
+                }
             }
         } else if check_pipes_held {
             self.log(
@@ -2794,21 +3065,29 @@ impl App {
                 id,
                 format!("check TIMED OUT after {timeout}s — this needs you"),
             );
-            self.set_needs_you(
-                id,
-                &format!("check timed out after {timeout}s: {}", session.check_cmd),
-            );
+            let base = format!("check timed out after {timeout}s: {}", session.check_cmd);
+            let reason = match heal_stop_note {
+                Some(note) => format!("{base} — {note}"),
+                None => base,
+            };
+            self.set_needs_you(id, &reason);
         } else if check_stopped {
             self.log(id, "check stopped by you — this needs you".to_string());
             self.set_needs_you(id, "stopped by you while the check was running");
         } else {
             self.log(id, "check FAILED — this needs you".to_string());
-            let reason = if check_ran {
+            let base = if check_ran {
                 failed_reason
             } else {
                 format!("the check did not run: {}", session.check_cmd)
             };
+            let reason = match heal_stop_note {
+                Some(note) => format!("{base} — {note}"),
+                None => base,
+            };
             self.set_needs_you(id, &reason);
+        }
+        break;
         }
         // Steering that arrived while the check ran must not be
         // stranded on a settled session. If the session finished
@@ -3055,6 +3334,7 @@ fn retry_prompt_text(
             s.check_exit = None;
             s.check_receipt = None;
             s.scope_violations.clear();
+            s.heal_attempts.clear();
             s.reason = None;
             s.diff = String::new();
             s.verified_commit = None;
@@ -3098,6 +3378,7 @@ fn retry_prompt_text(
                 s.check_exit = None;
                 s.check_receipt = None;
                 s.scope_violations.clear();
+                s.heal_attempts.clear();
                 s.reason = None;
                 s.diff = String::new();
                 s.verified_commit = None;
@@ -3186,6 +3467,8 @@ fn retry_prompt_text(
                 forbidden_globs: parent.forbidden_globs.clone(),
                 scope_violations: Vec::new(),
                 merge_strategy: None,
+                auto_steer_budget: parent.auto_steer_budget,
+                heal_attempts: Vec::new(),
                 transcript_total: 0,
                 transcript: Vec::new(),
             };
@@ -4024,6 +4307,14 @@ fn session_to_api_value(
     v["check_passed"] = serde_json::json!(s.check_passed);
     v["check_ran"] = serde_json::json!(s.check_ran);
     v["check_exit"] = serde_json::json!(s.check_exit);
+    v["auto_steer_budget"] = serde_json::json!(s.auto_steer_budget);
+    v["heal_attempts"] = serde_json::json!(&s.heal_attempts);
+    let auto_healed = s.heal_attempts.iter().any(|a| a.healed)
+        && matches!(s.status.as_str(), "done" | "merged");
+    v["auto_healed"] = serde_json::json!(auto_healed);
+    if let Some(badge) = heal_badge_label(&s.heal_attempts, s.auto_steer_budget) {
+        v["heal_badge"] = serde_json::json!(badge);
+    }
     v["transcript_total"] = serde_json::json!(s.transcript_total.max(s.transcript.len()));
     // Surface structured per-step check receipts for the Receipt tab.
     if let Some(ref receipt) = s.check_receipt {
@@ -4214,6 +4505,189 @@ fn parse_check_steps_field(val: &serde_json::Value) -> Result<Vec<CheckStep>, St
     }
 }
 
+fn parse_auto_steer_budget_field(val: &serde_json::Value) -> Result<Option<u32>, String> {
+    match val {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(n) => {
+            let Some(v) = n.as_u64() else {
+                return Err(format!(
+                    "auto_steer_budget must be an integer between 0 and {MAX_AUTO_HEAL_BUDGET}"
+                ));
+            };
+            if v > MAX_AUTO_HEAL_BUDGET as u64 {
+                return Err(format!(
+                    "auto_steer_budget cannot exceed {MAX_AUTO_HEAL_BUDGET}"
+                ));
+            }
+            Ok(Some(v as u32))
+        }
+        _ => Err(format!(
+            "auto_steer_budget must be an integer between 0 and {MAX_AUTO_HEAL_BUDGET}"
+        )),
+    }
+}
+
+fn resolve_auto_steer_budget(
+    app: &App,
+    explicit: Option<u32>,
+    repo: &str,
+    task: &str,
+    agent: &str,
+) -> u32 {
+    if let Some(n) = explicit {
+        return n.min(MAX_AUTO_HEAL_BUDGET);
+    }
+    let kind = engine_kind(agent);
+    if kind == EngineKind::Custom {
+        // Preserve single-pass determinism for custom test scripts unless a budget is requested.
+        0
+    } else {
+        app.policy
+            .auto_steer_budget(repo, task, kind.label())
+            .min(MAX_AUTO_HEAL_BUDGET)
+    }
+}
+
+fn handle_upsert_template(app: &Arc<App>, body: &str) -> String {
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return error_response(400, &format!("bad json: {e}")),
+    };
+    let Some(obj) = req.as_object() else {
+        return error_response(400, "playbook payload must be a JSON object");
+    };
+    let id = obj
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let name = obj
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let description = obj
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let repo = obj
+        .get("repo")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let check_steps = match parse_check_steps_field(
+        obj.get("check_steps").unwrap_or(&serde_json::Value::Null),
+    ) {
+        Ok(steps) => steps,
+        Err(e) => return error_response(400, &e),
+    };
+    let allowed_globs = match parse_string_list_field(
+        obj.get("allowed_globs").unwrap_or(&serde_json::Value::Null),
+        "allowed_globs",
+    ) {
+        Ok(v) => v,
+        Err(e) => return error_response(400, &e),
+    };
+    let forbidden_globs = match parse_string_list_field(
+        obj.get("forbidden_globs")
+            .unwrap_or(&serde_json::Value::Null),
+        "forbidden_globs",
+    ) {
+        Ok(v) => v,
+        Err(e) => return error_response(400, &e),
+    };
+    let auto_steer_budget = match parse_auto_steer_budget_field(
+        obj.get("auto_steer_budget")
+            .unwrap_or(&serde_json::Value::Null),
+    ) {
+        Ok(v) => v.unwrap_or(0),
+        Err(e) => return error_response(400, &e),
+    };
+    let tasks = match obj.get("tasks") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (idx, item) in items.iter().enumerate() {
+                match item {
+                    serde_json::Value::String(s) => out.push(PlaybookTask::simple(s.clone())),
+                    serde_json::Value::Object(t) => {
+                        let key = t
+                            .get("key")
+                            .or_else(|| t.get("alias"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        let task = t
+                            .get("task")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let depends_on = match parse_string_list_field(
+                            t.get("depends_on").unwrap_or(&serde_json::Value::Null),
+                            "depends_on",
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => return error_response(400, &format!("task #{idx}: {e}")),
+                        };
+                        let agent = t
+                            .get("agent")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        let task_repo = t
+                            .get("repo")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        out.push(PlaybookTask {
+                            key,
+                            task,
+                            depends_on,
+                            agent,
+                            repo: task_repo,
+                        });
+                    }
+                    _ => return error_response(400, "playbook tasks must be strings or objects"),
+                }
+            }
+            out
+        }
+        _ => return error_response(400, "playbook tasks must be an array"),
+    };
+    let input = PlaybookInput {
+        id,
+        name,
+        description,
+        repo,
+        check_steps,
+        allowed_globs,
+        forbidden_globs,
+        auto_steer_budget,
+        tasks,
+    };
+    let saved = {
+        let mut store = app.templates.lock().unwrap();
+        match store.upsert(input) {
+            Ok(tpl) => tpl,
+            Err(e) => return error_response(400, &e),
+        }
+    };
+    app.events.publish(
+        "templates_updated",
+        &serde_json::json!({
+            "action": "upsert",
+            "id": saved.id,
+            "template": saved,
+        }),
+    );
+    json_response(201, &serde_json::to_string(&saved).unwrap())
+}
+
 fn validate_git_repo(repo: &str) -> Result<(), String> {
     if !Path::new(repo).is_dir() {
         return Err(format!("There is no folder at {repo}."));
@@ -4320,6 +4794,7 @@ fn handle_batch_sessions(app: &Arc<App>, body: &str) -> String {
     }
 
     let mut parsed_tasks: Vec<BatchTaskSpec> = Vec::with_capacity(raw_tasks.len());
+    let mut task_budgets: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut explicit_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
     for item in raw_tasks {
         if let Some(k) = item
@@ -4414,6 +4889,17 @@ fn handle_batch_sessions(app: &Arc<App>, body: &str) -> String {
             Ok(v) => v,
             Err(e) => return error_response(400, &format!("task #{idx}: {e}")),
         };
+        let task_budget = match parse_auto_steer_budget_field(
+            t_obj
+                .get("auto_steer_budget")
+                .unwrap_or(&serde_json::Value::Null),
+        ) {
+            Ok(v) => v,
+            Err(e) => return error_response(400, &format!("task #{idx}: {e}")),
+        };
+        if let (Some(k), Some(b)) = (key.as_ref(), task_budget) {
+            task_budgets.insert(k.clone(), b);
+        }
         parsed_tasks.push(BatchTaskSpec {
             key,
             task,
@@ -4447,6 +4933,13 @@ fn handle_batch_sessions(app: &Arc<App>, body: &str) -> String {
         obj.get("forbidden_globs")
             .unwrap_or(&serde_json::Value::Null),
         "forbidden_globs",
+    ) {
+        Ok(v) => v,
+        Err(e) => return error_response(400, &e),
+    };
+    let batch_budget = match parse_auto_steer_budget_field(
+        obj.get("auto_steer_budget")
+            .unwrap_or(&serde_json::Value::Null),
     ) {
         Ok(v) => v,
         Err(e) => return error_response(400, &e),
@@ -4534,6 +5027,7 @@ fn handle_batch_sessions(app: &Arc<App>, body: &str) -> String {
         agent: String,
         model: Option<String>,
         check_cmd: String,
+        auto_steer_budget: u32,
     }
     let mut ready_specs: Vec<ReadySpec> = Vec::with_capacity(expanded.sessions.len());
 
@@ -4594,11 +5088,24 @@ fn handle_batch_sessions(app: &Arc<App>, body: &str) -> String {
                 Err(e) => return error_response(500, &e),
             }
         };
+        let explicit_budget = planned
+            .key
+            .as_ref()
+            .and_then(|k| task_budgets.get(k).copied())
+            .or(batch_budget);
+        let auto_steer_budget = resolve_auto_steer_budget(
+            app,
+            explicit_budget,
+            &planned.repo,
+            &planned.task,
+            &agent,
+        );
         ready_specs.push(ReadySpec {
             planned,
             agent,
             model,
             check_cmd,
+            auto_steer_budget,
         });
     }
 
@@ -4674,6 +5181,8 @@ fn handle_batch_sessions(app: &Arc<App>, body: &str) -> String {
                 forbidden_globs: rs.planned.forbidden_globs,
                 scope_violations: Vec::new(),
                 merge_strategy: None,
+                auto_steer_budget: rs.auto_steer_budget,
+                heal_attempts: Vec::new(),
                 transcript_total: 0,
                 transcript: Vec::new(),
             };
@@ -4763,12 +5272,45 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                         "merge_check": true,
                         "policy_test": true,
                         "prune_worktrees": true,
+                        "auto_heal": true,
+                        "templates": true,
+                        "metrics": true,
                     },
                     "source": app.policy_source,
                     "version": env!("CARGO_PKG_VERSION")
                 })
                 .to_string(),
             )
+        }
+        ("GET", "/api/metrics") => json_response(200, &app.metrics_json_cached()),
+        ("GET", "/api/templates") => {
+            let templates = app.templates.lock().unwrap().list();
+            json_response(
+                200,
+                &serde_json::json!({ "templates": templates }).to_string(),
+            )
+        }
+        ("POST", "/api/templates") => handle_upsert_template(app, body),
+        ("DELETE", route) if route.starts_with("/api/templates/") => {
+            let raw_id = &route["/api/templates/".len()..];
+            let id = url_decode(raw_id);
+            let removed = app.templates.lock().unwrap().delete(&id);
+            match removed {
+                Ok(tpl) => {
+                    app.events.publish(
+                        "templates_updated",
+                        &serde_json::json!({
+                            "action": "delete",
+                            "id": tpl.id,
+                        }),
+                    );
+                    json_response(
+                        200,
+                        &serde_json::json!({ "deleted": true, "id": tpl.id }).to_string(),
+                    )
+                }
+                Err(e) => error_response(404, &e),
+            }
         }
         ("POST", "/api/policies/test") => handle_policy_test(app, body),
         ("GET", "/api/sessions") => {
@@ -4864,6 +5406,12 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                     Ok(v) => v,
                     Err(e) => return error_response(400, &e),
                 };
+            let explicit_budget = match parse_auto_steer_budget_field(&req["auto_steer_budget"]) {
+                Ok(v) => v,
+                Err(e) => return error_response(400, &e),
+            };
+            let auto_steer_budget =
+                resolve_auto_steer_budget(app, explicit_budget, &repo, &task, &agent);
             // Validate every `depends_on` target exists before creating the session.
             if !depends_on.is_empty() {
                 let known: std::collections::HashSet<String> = app
@@ -4961,6 +5509,8 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 forbidden_globs,
                 scope_violations: Vec::new(),
                 merge_strategy: None,
+                auto_steer_budget,
+                heal_attempts: Vec::new(),
                 transcript_total: 0,
                 transcript: Vec::new(),
             };
@@ -5321,6 +5871,8 @@ fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
             forbidden_globs: Vec::new(),
             scope_violations: Vec::new(),
             merge_strategy: None,
+            auto_steer_budget: 0,
+            heal_attempts: Vec::new(),
             transcript_total: lines.len(),
             transcript: cap_transcript(lines),
         });
@@ -5504,6 +6056,7 @@ fn main() {
         .map(|d| d.as_secs().to_string())
         .unwrap_or_else(|_| "run".to_string());
     let (restored, restored_counter) = load_persisted(&data_dir);
+    let template_store = TemplateStore::load(&data_dir);
     let app = Arc::new(App {
         policy,
         policy_source: policy_path.clone(),
@@ -5521,6 +6074,8 @@ fn main() {
         merge_target_cache: Mutex::new(std::collections::HashMap::new()),
         sessions_cache: Mutex::new(None),
         repos_cache: Mutex::new(None),
+        metrics_cache: Mutex::new(None),
+        templates: Mutex::new(template_store),
         dirty_records: Mutex::new(std::collections::HashSet::new()),
         lines_since_persist: std::sync::atomic::AtomicU64::new(0),
         counter: Mutex::new(restored_counter),
@@ -5819,7 +6374,9 @@ mod tests {
             state_rev: std::sync::atomic::AtomicU64::new(1),
             merge_target_cache: Mutex::new(std::collections::HashMap::new()),
             sessions_cache: Mutex::new(None),
-        repos_cache: Mutex::new(None),
+            repos_cache: Mutex::new(None),
+            metrics_cache: Mutex::new(None),
+            templates: Mutex::new(TemplateStore::load(dir.join("data"))),
             dirty_records: Mutex::new(std::collections::HashSet::new()),
             lines_since_persist: std::sync::atomic::AtomicU64::new(0),
             counter: Mutex::new(0),
@@ -5870,6 +6427,8 @@ mod tests {
             forbidden_globs: Vec::new(),
             scope_violations: Vec::new(),
             merge_strategy: None,
+            auto_steer_budget: 0,
+            heal_attempts: Vec::new(),
             transcript_total: 0,
             transcript: Vec::new(),
         };
@@ -5893,13 +6452,15 @@ mod tests {
             env_claude_model: None,
             env_codex_model: None,
             env_max_parallel: None,
-            data_dir,
+            data_dir: data_dir.clone(),
             run_tag: "test".to_string(),
             sessions: Mutex::new(sessions),
             state_rev: std::sync::atomic::AtomicU64::new(1),
             merge_target_cache: Mutex::new(std::collections::HashMap::new()),
             sessions_cache: Mutex::new(None),
-        repos_cache: Mutex::new(None),
+            repos_cache: Mutex::new(None),
+            metrics_cache: Mutex::new(None),
+            templates: Mutex::new(TemplateStore::load(&data_dir)),
             dirty_records: Mutex::new(std::collections::HashSet::new()),
             lines_since_persist: std::sync::atomic::AtomicU64::new(0),
             counter: Mutex::new(0),
@@ -5952,6 +6513,8 @@ mod tests {
             forbidden_globs: Vec::new(),
             scope_violations: Vec::new(),
             merge_strategy: None,
+            auto_steer_budget: 0,
+            heal_attempts: Vec::new(),
             transcript_total: 0,
             transcript: Vec::new(),
         }
@@ -6723,7 +7286,9 @@ mod tests {
             state_rev: std::sync::atomic::AtomicU64::new(1),
             merge_target_cache: Mutex::new(std::collections::HashMap::new()),
             sessions_cache: Mutex::new(None),
-        repos_cache: Mutex::new(None),
+            repos_cache: Mutex::new(None),
+            metrics_cache: Mutex::new(None),
+            templates: Mutex::new(TemplateStore::load(&data)),
             dirty_records: Mutex::new(std::collections::HashSet::new()),
             lines_since_persist: std::sync::atomic::AtomicU64::new(0),
             counter: Mutex::new(0),
@@ -7449,6 +8014,297 @@ mod tests {
                 resp.lines().next().unwrap_or("")
             );
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v060_auto_heal_recovers_failing_check_and_emits_sse() {
+        let dir = std::env::temp_dir().join(format!("fleet-v060-heal-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir.join("repo"));
+        let agent = script_agent(
+            &dir,
+            "healing-agent.sh",
+            r#"#!/bin/sh
+if echo "$1" | grep -q "Verification check failed"; then
+    echo "fixed" > answer.txt
+else
+    echo "broken" > answer.txt
+fi
+"#,
+        );
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let app = test_app(data.clone(), Vec::new());
+        let (sub, _replay) = app.events.subscribe(None);
+
+        let body = serde_json::json!({
+            "repo": repo.to_string_lossy(),
+            "task": "write fixed answer",
+            "agent": agent.to_string_lossy(),
+            "check_steps": [
+                { "name": "verify-answer", "cmd": "grep -qx fixed answer.txt" }
+            ],
+            "auto_steer_budget": 2
+        })
+        .to_string();
+        let resp = handle(&app, "POST", "/api/sessions", &body);
+        assert!(resp.starts_with("HTTP/1.1 201"), "{resp}");
+        let created = response_body(&resp);
+        let sid = created["id"].as_str().unwrap().to_string();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            if matches!(app.status_of(&sid).as_deref(), Some("done" | "needs-you")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let got = handle(&app, "GET", &format!("/api/sessions/{sid}"), "");
+        let session = response_body(&got);
+        assert_eq!(session["status"], "done", "session={session}");
+        assert_eq!(session["auto_healed"], true, "session={session}");
+        assert_eq!(session["auto_steer_budget"], 2);
+        assert_eq!(session["heal_badge"], "Healed on attempt 1/2");
+        let attempts = session["heal_attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0]["attempt"], 1);
+        assert_eq!(attempts[0]["trigger_step"], "verify-answer");
+        assert_eq!(attempts[0]["healed"], true);
+        assert!(attempts[0]["prompt_sent"]
+            .as_str()
+            .unwrap()
+            .contains("Verification check failed"));
+
+        // Verify SSE auto_heal_attempt events were broadcast for both started and finished phases.
+        let mut saw_started = false;
+        let mut saw_finished = false;
+        while let Ok(frame) = sub.rx.try_recv() {
+            if frame.contains("event: auto_heal_attempt\n") {
+                if let Some(data_line) = frame.lines().find(|l| l.starts_with("data: ")) {
+                    let payload: serde_json::Value =
+                        serde_json::from_str(&data_line["data: ".len()..]).unwrap();
+                    if payload["id"] == sid {
+                        if payload["phase"] == "started" {
+                            saw_started = true;
+                        }
+                        if payload["phase"] == "finished" && payload["attempt"]["healed"] == true {
+                            saw_finished = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saw_started, "expected SSE auto_heal_attempt phase=started");
+        assert!(saw_finished, "expected SSE auto_heal_attempt phase=finished healed=true");
+
+        // Verify GET /api/metrics counts this as auto_healed (not first_pass).
+        let m_resp = handle(&app, "GET", "/api/metrics", "");
+        assert!(m_resp.starts_with("HTTP/1.1 200"));
+        let metrics = response_body(&m_resp);
+        assert_eq!(metrics["total"], 1);
+        assert_eq!(metrics["first_pass_count"], 0);
+        assert_eq!(metrics["auto_healed_count"], 1);
+        assert_eq!(metrics["effective_pass_rate_pct"], 100.0);
+        assert_eq!(metrics["first_pass_rate_pct"], 0.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v060_auto_heal_loop_guard_halts_identical_error_early() {
+        let dir = std::env::temp_dir().join(format!("fleet-v060-heal-loop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir.join("repo"));
+        let agent = script_agent(
+            &dir,
+            "stubborn-agent.sh",
+            "#!/bin/sh\necho still-broken >> log.txt\n",
+        );
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let app = test_app(data.clone(), Vec::new());
+
+        let body = serde_json::json!({
+            "repo": repo.to_string_lossy(),
+            "task": "fix stubborn test",
+            "agent": agent.to_string_lossy(),
+            "check_steps": [
+                { "name": "unit", "cmd": "echo 'AssertionError: expected 42 got 0' >&2; exit 2" }
+            ],
+            "auto_steer_budget": 3
+        })
+        .to_string();
+        let resp = handle(&app, "POST", "/api/sessions", &body);
+        assert!(resp.starts_with("HTTP/1.1 201"), "{resp}");
+        let sid = response_body(&resp)["id"].as_str().unwrap().to_string();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            if matches!(app.status_of(&sid).as_deref(), Some("done" | "needs-you")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let got = handle(&app, "GET", &format!("/api/sessions/{sid}"), "");
+        let session = response_body(&got);
+        assert_eq!(session["status"], "needs-you", "session={session}");
+        assert_eq!(session["auto_healed"], false);
+        let attempts = session["heal_attempts"].as_array().unwrap();
+        assert_eq!(
+            attempts.len(),
+            1,
+            "loop guard must halt after attempt 1 on identical error instead of exhausting budget=3"
+        );
+        assert!(session["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("identical error"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v060_guardrail_violation_never_triggers_auto_heal() {
+        let dir = std::env::temp_dir().join(format!("fleet-v060-heal-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir.join("repo"));
+        let agent = script_agent(
+            &dir,
+            "naughty-agent.sh",
+            "#!/bin/sh\necho SECRET=1 > .env\necho ok > README.md\n",
+        );
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let app = test_app(data.clone(), Vec::new());
+
+        let body = serde_json::json!({
+            "repo": repo.to_string_lossy(),
+            "task": "update docs only",
+            "agent": agent.to_string_lossy(),
+            "check": "test -s README.md",
+            "allowed_globs": ["README.md"],
+            "forbidden_globs": [".env"],
+            "auto_steer_budget": 3
+        })
+        .to_string();
+        let resp = handle(&app, "POST", "/api/sessions", &body);
+        assert!(resp.starts_with("HTTP/1.1 201"), "{resp}");
+        let sid = response_body(&resp)["id"].as_str().unwrap().to_string();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            if matches!(app.status_of(&sid).as_deref(), Some("done" | "needs-you")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let got = handle(&app, "GET", &format!("/api/sessions/{sid}"), "");
+        let session = response_body(&got);
+        assert_eq!(session["status"], "needs-you", "session={session}");
+        assert_eq!(session["heal_attempts"].as_array().unwrap().len(), 0);
+        assert!(!session["guardrail_violations"].as_array().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v060_templates_crud_persistence_and_metrics_endpoint() {
+        let dir = std::env::temp_dir().join(format!("fleet-v060-tpl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+
+        let mut s1 = test_session("s1", Status::Done, &dir);
+        s1.repo = "/work/alpha".to_string();
+        s1.project = "alpha".to_string();
+        let mut s2 = test_session("s2", Status::NeedsYou, &dir);
+        s2.repo = "/work/beta".to_string();
+        s2.project = "beta".to_string();
+        s2.check_passed = Some(false);
+        let app = test_app(data.clone(), vec![s1, s2]);
+
+        // Policy advertises v0.6.0 features.
+        let pol = response_body(&handle(&app, "GET", "/api/policy", ""));
+        assert_eq!(pol["features"]["auto_heal"], true);
+        assert_eq!(pol["features"]["templates"], true);
+        assert_eq!(pol["features"]["metrics"], true);
+
+        // GET /api/metrics returns exact counts and max_parallel.
+        let met = response_body(&handle(&app, "GET", "/api/metrics", ""));
+        assert_eq!(met["total"], 2);
+        assert_eq!(met["first_pass_count"], 1);
+        assert_eq!(met["needs_you_count"], 1);
+        assert_eq!(met["first_pass_rate_pct"], 50.0);
+        assert!(met["max_parallel"].as_i64().unwrap_or(0) >= 1);
+        assert_eq!(met["per_repo_breakdown"].as_array().unwrap().len(), 2);
+
+        // GET /api/templates returns 4 built-in playbooks.
+        let list = response_body(&handle(&app, "GET", "/api/templates", ""));
+        assert_eq!(list["templates"].as_array().unwrap().len(), 4);
+
+        // POST /api/templates creates a custom playbook (accepting UI-style `alias` on tasks).
+        let create_payload = serde_json::json!({
+            "name": "API Release Smoke",
+            "description": "Lint + contract smoke across backend services",
+            "repo": "/work/alpha",
+            "check_steps": [{ "name": "smoke", "cmd": "npm test", "timeout_secs": 90 }],
+            "allowed_globs": ["src/**", "tests/**"],
+            "forbidden_globs": [".env"],
+            "auto_steer_budget": 2,
+            "tasks": [
+                { "alias": "api", "task": "Add endpoint" },
+                { "alias": "tests", "task": "Add contract test", "depends_on": ["api"] }
+            ]
+        })
+        .to_string();
+        let created_resp = handle(&app, "POST", "/api/templates", &create_payload);
+        assert!(created_resp.starts_with("HTTP/1.1 201"), "{created_resp}");
+        let created = response_body(&created_resp);
+        let tpl_id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["name"], "API Release Smoke");
+        assert_eq!(created["tasks"][0]["key"], "api");
+
+        // Reload store from disk and verify persistence.
+        let reloaded = test_app(data.clone(), Vec::new());
+        let after_reload = response_body(&handle(&reloaded, "GET", "/api/templates", ""));
+        assert_eq!(after_reload["templates"].as_array().unwrap().len(), 5);
+
+        // Cross-origin DELETE is blocked by CSRF guard (403).
+        let csrf_block = respond(
+            &app,
+            "",
+            "DELETE",
+            &format!("/api/templates/{tpl_id}"),
+            "",
+            "",
+            "https://evil.example",
+            "127.0.0.1:8471",
+        );
+        assert!(csrf_block.starts_with("HTTP/1.1 403"), "{csrf_block}");
+
+        // Same-origin DELETE succeeds (200) and second DELETE returns 404.
+        let del_ok = respond(
+            &app,
+            "",
+            "DELETE",
+            &format!("/api/templates/{tpl_id}"),
+            "",
+            "",
+            "http://127.0.0.1:8471",
+            "127.0.0.1:8471",
+        );
+        assert!(del_ok.starts_with("HTTP/1.1 200"), "{del_ok}");
+        let del_again = handle(&app, "DELETE", &format!("/api/templates/{tpl_id}"), "");
+        assert!(del_again.starts_with("HTTP/1.1 404"), "{del_again}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
