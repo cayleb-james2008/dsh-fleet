@@ -1,16 +1,45 @@
-// Fleet Mission Control: Latest Verified Receipt hero + Three-Lane Board (Needs you · Working · Done).
+// Fleet Mission Control: Latest Verified Receipt hero + Filter/Bulk Action Strip + Three-Lane Board.
 // Motion layoutId glides sessions across lanes when state changes; BorderTrail + TextShimmer appear strictly on running sessions.
 import { useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { CheckCircle2, FileDiff, GitBranch, GitMerge, RotateCcw, Terminal, X } from "lucide-react";
+import {
+  Check,
+  CheckCircle2,
+  CheckSquare,
+  Cpu,
+  FileDiff,
+  FolderGit2,
+  GitBranch,
+  GitMerge,
+  RotateCcw,
+  ShieldAlert,
+  Square,
+  Terminal,
+  X,
+} from "lucide-react";
 import { BorderTrail } from "@/components/ui/border-trail";
 import { TextShimmer } from "@/components/ui/text-shimmer";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { SegmentedControl, SegmentedControlItem } from "@/components/ui/segmented-control";
 import { Pill, PillIndicator } from "@/components/kibo-ui/pill";
 import { layout } from "@/motion";
 import { cn } from "@/lib/utils";
-import { diffStat, HONEST, isFailed, isHonest, isVerified, receiptLine, statusText, type Session, type TabId } from "./api";
+import {
+  diffStat,
+  HONEST,
+  isActivelyRunning,
+  isFailed,
+  isHonest,
+  isQueuedOrBlocked,
+  isVerified,
+  receiptLine,
+  statusText,
+  type Session,
+  type StatusFilter,
+  type TabId,
+} from "./api";
 
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
 
@@ -63,7 +92,11 @@ export function HeroVerifiedReceipt({
 
   if (!latest) {
     return (
-      <section aria-label="Latest verified receipt" data-answers="3" className="border-b border-hairline bg-surface px-4 py-4 md:px-6">
+      <section
+        aria-label="Latest verified receipt"
+        data-answers="3"
+        className="border-b border-hairline bg-surface px-4 py-4 md:px-6"
+      >
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0 space-y-1">
             <div className="flex flex-wrap items-center gap-2">
@@ -72,7 +105,9 @@ export function HeroVerifiedReceipt({
                 <span>{totalCount === 0 ? "No verified receipt yet" : "Awaiting verified receipt"}</span>
               </Pill>
               {workingCount > 0 && (
-                <span className="font-mono text-xs text-ink-2 tabular-nums">{plural(workingCount, "session")} in progress</span>
+                <span className="font-mono text-xs text-ink-2 tabular-nums">
+                  {plural(workingCount, "session")} in progress
+                </span>
               )}
             </div>
             <p className="text-sm text-ink-2 [overflow-wrap:anywhere]">
@@ -85,7 +120,12 @@ export function HeroVerifiedReceipt({
           </div>
           {needsTop && (
             <div className="flex flex-wrap items-center gap-2">
-              <Button size="sm" variant="outline" onClick={() => onInspect(needsTop.id, "rc")} className="max-md:min-h-11 max-md:px-4">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => onInspect(needsTop.id, "rc")}
+                className="max-md:min-h-11 max-md:px-4"
+              >
                 Inspect failure
               </Button>
               <Button size="sm" onClick={() => onRetry(needsTop.id)} className="max-md:min-h-11 max-md:px-4">
@@ -105,7 +145,11 @@ export function HeroVerifiedReceipt({
     : `Merge ${latest.branch || "this branch"}? Fleet refuses if the target is dirty.`;
 
   return (
-    <section aria-label="Latest verified receipt" data-answers="3" className="border-b border-hairline bg-surface px-4 py-3 md:px-6 md:py-4">
+    <section
+      aria-label="Latest verified receipt"
+      data-answers="3"
+      className="border-b border-hairline bg-surface px-4 py-3 md:px-6 md:py-4"
+    >
       <div className="relative rounded-card border border-hairline bg-canvas px-4 py-3.5 md:p-5">
         <Corners size={9} />
         <div className="flex flex-wrap items-center gap-2">
@@ -113,7 +157,12 @@ export function HeroVerifiedReceipt({
             <PillIndicator variant="success" />
             <span>{merged ? "Latest receipt · merged" : "Latest verified receipt"}</span>
           </Pill>
-          <span className={cn("inline-flex items-center rounded-chip px-2 py-0.5 text-xs font-medium [overflow-wrap:anywhere]", projectSkin(latest.project))}>
+          <span
+            className={cn(
+              "inline-flex items-center rounded-chip px-2 py-0.5 text-xs font-medium [overflow-wrap:anywhere]",
+              projectSkin(latest.project),
+            )}
+          >
             {latest.project}
           </span>
           {latest.branch && (
@@ -148,10 +197,20 @@ export function HeroVerifiedReceipt({
 
           {!confirming ? (
             <div className="flex flex-wrap items-center gap-2 shrink-0">
-              <Button size="sm" variant="outline" onClick={() => onInspect(latest.id, "rc")} className="max-md:min-h-11 max-md:px-3.5">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => onInspect(latest.id, "rc")}
+                className="max-md:min-h-11 max-md:px-3.5"
+              >
                 <Terminal className="size-4" strokeWidth={1.5} aria-hidden />Inspect receipt
               </Button>
-              <Button size="sm" variant="outline" onClick={() => onInspect(latest.id, "df")} className="max-md:min-h-11 max-md:px-3.5">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => onInspect(latest.id, "df")}
+                className="max-md:min-h-11 max-md:px-3.5"
+              >
                 <FileDiff className="size-4" strokeWidth={1.5} aria-hidden />View diff
               </Button>
               {!merged && (
@@ -161,7 +220,11 @@ export function HeroVerifiedReceipt({
               )}
             </div>
           ) : (
-            <div role="group" aria-label="Confirm hero merge" className="flex flex-wrap items-center gap-2 rounded-control border border-hairline bg-surface p-2.5">
+            <div
+              role="group"
+              aria-label="Confirm hero merge"
+              className="flex flex-wrap items-center gap-2 rounded-control border border-hairline bg-surface p-2.5"
+            >
               <span className="text-xs text-ink-2 [overflow-wrap:anywhere]">{mergePrompt}</span>
               <Button
                 size="sm"
@@ -176,7 +239,12 @@ export function HeroVerifiedReceipt({
               >
                 {merging ? "Merging..." : "Merge now"}
               </Button>
-              <Button size="sm" variant="outline" onClick={() => setConfirming(false)} className="max-md:min-h-11 max-md:px-3.5">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setConfirming(false)}
+                className="max-md:min-h-11 max-md:px-3.5"
+              >
                 Keep it
               </Button>
             </div>
@@ -187,16 +255,305 @@ export function HeroVerifiedReceipt({
   );
 }
 
+export function BoardFilterBulkBar({
+  statusFilter,
+  repoFilter,
+  engineFilter,
+  repos,
+  engines,
+  hasActiveFilters,
+  multiSelect,
+  selectedIds,
+  visibleSessions,
+  bulkBusy,
+  onStatusFilter,
+  onRepoFilter,
+  onEngineFilter,
+  onClearFilters,
+  onToggleMultiSelect,
+  onSelectVisible,
+  onClearSelection,
+  onBulkRetry,
+  onBulkDismiss,
+  onBulkMerge,
+}: {
+  statusFilter: StatusFilter;
+  repoFilter: string;
+  engineFilter: string;
+  repos: string[];
+  engines: string[];
+  hasActiveFilters: boolean;
+  multiSelect: boolean;
+  selectedIds: Set<string>;
+  visibleSessions: Session[];
+  bulkBusy: boolean;
+  onStatusFilter: (s: StatusFilter) => void;
+  onRepoFilter: (r: string) => void;
+  onEngineFilter: (e: string) => void;
+  onClearFilters: () => void;
+  onToggleMultiSelect: () => void;
+  onSelectVisible: () => void;
+  onClearSelection: () => void;
+  onBulkRetry: (ids: string[]) => Promise<void>;
+  onBulkDismiss: (ids: string[]) => Promise<void>;
+  onBulkMerge: (ids: string[]) => Promise<void>;
+}) {
+  const [confirmBulk, setConfirmBulk] = useState<"dismiss" | "merge" | null>(null);
+
+  const selectedSessions = visibleSessions.filter((s) => selectedIds.has(s.id));
+  const retryable = selectedSessions.filter((s) => s.status === "needs-you").map((s) => s.id);
+  const dismissable = retryable;
+  const mergeable = selectedSessions.filter((s) => isVerified(s) && s.status === "done").map((s) => s.id);
+
+  return (
+    <section
+      aria-label="Filter and bulk actions"
+      className="border-b border-hairline bg-surface/80 px-4 py-2.5 md:px-6"
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <SegmentedControl aria-label="Filter by status" size="sm" className="max-w-full overflow-x-auto">
+          {(
+            [
+              ["all", "All"],
+              ["needs-you", "Needs you"],
+              ["working", "Working"],
+              ["queued", "Queued"],
+              ["done", "Done"],
+            ] as const
+          ).map(([id, label]) => (
+            <SegmentedControlItem
+              key={id}
+              aria-pressed={statusFilter === id}
+              data-checked={statusFilter === id ? "" : undefined}
+              onClick={() => onStatusFilter(id)}
+              className="whitespace-nowrap px-2.5 text-xs max-md:!min-h-11 max-md:!min-w-11"
+            >
+              {label}
+            </SegmentedControlItem>
+          ))}
+        </SegmentedControl>
+
+        {repos.length > 0 && (
+          <Popover>
+            <PopoverTrigger className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-control border border-hairline bg-canvas px-2.5 text-xs font-medium text-ink outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:bg-raised focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11 max-md:px-3">
+              <FolderGit2 className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
+              <span>{repoFilter || "All repos"}</span>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="z-30 w-56 rounded-card border border-hairline bg-surface p-1 text-ink shadow-lift">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => onRepoFilter("")}
+                className={cn("w-full justify-start text-xs max-md:min-h-11", !repoFilter && "bg-board font-medium")}
+              >
+                All repos
+              </Button>
+              {repos.map((r) => (
+                <Button
+                  key={r}
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => onRepoFilter(r)}
+                  className={cn("w-full justify-start font-mono text-xs max-md:min-h-11", repoFilter === r && "bg-board font-medium")}
+                >
+                  <span className="truncate">{r}</span>
+                </Button>
+              ))}
+            </PopoverContent>
+          </Popover>
+        )}
+
+        {engines.length > 0 && (
+          <Popover>
+            <PopoverTrigger className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-control border border-hairline bg-canvas px-2.5 text-xs font-medium text-ink outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:bg-raised focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11 max-md:px-3">
+              <Cpu className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
+              <span>{engineFilter || "All engines"}</span>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="z-30 w-48 rounded-card border border-hairline bg-surface p-1 text-ink shadow-lift">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => onEngineFilter("")}
+                className={cn("w-full justify-start text-xs max-md:min-h-11", !engineFilter && "bg-board font-medium")}
+              >
+                All engines
+              </Button>
+              {engines.map((eng) => (
+                <Button
+                  key={eng}
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => onEngineFilter(eng)}
+                  className={cn("w-full justify-start font-mono text-xs max-md:min-h-11", engineFilter === eng && "bg-board font-medium")}
+                >
+                  {eng}
+                </Button>
+              ))}
+            </PopoverContent>
+          </Popover>
+        )}
+
+        {hasActiveFilters && (
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            onClick={onClearFilters}
+            className="h-8 px-2 text-xs max-md:min-h-11 max-md:px-3"
+          >
+            <X className="size-3.5" strokeWidth={1.5} aria-hidden />
+            <span>Reset filters</span>
+          </Button>
+        )}
+
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant={multiSelect ? "default" : "outline"}
+            aria-pressed={multiSelect}
+            onClick={() => {
+              setConfirmBulk(null);
+              onToggleMultiSelect();
+            }}
+            className="h-8 px-2.5 text-xs max-md:min-h-11 max-md:px-3"
+          >
+            <CheckSquare className="size-3.5" strokeWidth={1.5} aria-hidden />
+            <span>{multiSelect ? `Selecting (${selectedIds.size})` : "Multi-select"}</span>
+          </Button>
+        </div>
+      </div>
+
+      {multiSelect && (
+        <div
+          role="region"
+          aria-label="Bulk selection controls"
+          className="mt-2.5 flex flex-wrap items-center gap-2 border-t border-hairline pt-2.5"
+        >
+          <span className="font-mono text-xs tabular-nums text-ink-2">
+            {selectedIds.size} selected
+          </span>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            onClick={onSelectVisible}
+            className="h-8 px-2.5 text-xs max-md:min-h-11"
+          >
+            Select visible ({visibleSessions.length})
+          </Button>
+          {selectedIds.size > 0 && (
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                setConfirmBulk(null);
+                onClearSelection();
+              }}
+              className="h-8 px-2.5 text-xs max-md:min-h-11"
+            >
+              Clear
+            </Button>
+          )}
+
+          {!confirmBulk ? (
+            <div className="ml-auto flex flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={bulkBusy || retryable.length === 0}
+                onClick={() => void onBulkRetry(retryable)}
+                className="h-8 px-2.5 text-xs max-md:min-h-11"
+              >
+                <RotateCcw className="size-3.5" strokeWidth={1.5} aria-hidden />
+                <span>Bulk Retry ({retryable.length})</span>
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={bulkBusy || dismissable.length === 0}
+                onClick={() => setConfirmBulk("dismiss")}
+                className="h-8 px-2.5 text-xs max-md:min-h-11"
+              >
+                <X className="size-3.5" strokeWidth={1.5} aria-hidden />
+                <span>Bulk Dismiss ({dismissable.length})</span>
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                disabled={bulkBusy || mergeable.length === 0}
+                onClick={() => setConfirmBulk("merge")}
+                className="h-8 px-2.5 text-xs max-md:min-h-11"
+              >
+                <GitMerge className="size-3.5" strokeWidth={1.5} aria-hidden />
+                <span>Bulk Merge ({mergeable.length})</span>
+              </Button>
+            </div>
+          ) : (
+            <div
+              role="group"
+              aria-label="Confirm bulk action"
+              className="ml-auto flex flex-wrap items-center gap-2 rounded-control border border-hairline bg-canvas px-2.5 py-1.5"
+            >
+              <span className="text-xs text-ink-2">
+                {confirmBulk === "merge"
+                  ? `Merge ${mergeable.length} clean verified ${mergeable.length === 1 ? "session" : "sessions"}?`
+                  : `Dismiss ${dismissable.length} Needs-you ${dismissable.length === 1 ? "session" : "sessions"}?`}
+              </span>
+              <Button
+                type="button"
+                size="sm"
+                variant={confirmBulk === "merge" ? "default" : "destructive-outline"}
+                disabled={bulkBusy}
+                onClick={async () => {
+                  const action = confirmBulk;
+                  setConfirmBulk(null);
+                  if (action === "merge") await onBulkMerge(mergeable);
+                  else await onBulkDismiss(dismissable);
+                }}
+                className="h-8 px-2.5 text-xs max-md:min-h-11"
+              >
+                {confirmBulk === "merge" ? "Merge selected" : "Dismiss selected"}
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => setConfirmBulk(null)}
+                className="h-8 px-2.5 text-xs max-md:min-h-11"
+              >
+                Cancel
+              </Button>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
 const TAIL_LINES = 2;
 function RunningTail({ s }: { s: Session }) {
   const lines = Array.isArray(s.transcript) ? s.transcript : [];
   const from = Math.max(0, lines.length - TAIL_LINES);
   return (
     <div className="rounded-control border border-hairline bg-board p-2.5">
-      <ol aria-label={`Newest lines of the transcript of ${s.task}`} className="space-y-1 font-mono text-xs leading-relaxed text-ink-2">
+      <ol
+        aria-label={`Newest lines of the transcript of ${s.task}`}
+        className="space-y-1 font-mono text-xs leading-relaxed text-ink-2"
+      >
         {lines.length === 0 && <li>Waiting for first output line...</li>}
         {lines.slice(from).map((l, i) => (
-          <li key={from + i} className="break-words">{l}</li>
+          <li key={from + i} className="break-words">
+            {l}
+          </li>
         ))}
       </ol>
     </div>
@@ -206,24 +563,45 @@ function RunningTail({ s }: { s: Session }) {
 function SessionCard({
   s,
   selected,
+  bulkMode,
+  bulkChecked,
   isLatestHero,
   onOpen,
+  onToggleCheck,
   onRetry,
   onDismiss,
 }: {
   s: Session;
   selected: boolean;
+  bulkMode: boolean;
+  bulkChecked: boolean;
   isLatestHero: boolean;
   onOpen: (tab?: TabId) => void;
+  onToggleCheck: () => void;
   onRetry: () => void;
   onDismiss: () => void;
 }) {
   const ds = diffStat(s.diff);
-  const running = s.bucket === "working" && s.status !== "queued";
+  const running = isActivelyRunning(s);
   const verified = isVerified(s);
   const honest = isHonest(s);
   const failed = isFailed(s);
-  const badgeVariant = verified ? "success" : failed ? "error" : s.bucket === "needs-you" ? "info" : s.status === "queued" ? "warning" : s.bucket === "done" ? "success" : "secondary";
+  const badgeVariant = verified
+    ? "success"
+    : failed
+      ? "error"
+      : s.bucket === "needs-you"
+        ? "info"
+        : isQueuedOrBlocked(s)
+          ? "warning"
+          : s.bucket === "done"
+            ? "success"
+            : "secondary";
+
+  const stepSummary =
+    s.check_steps && s.check_steps.length > 1
+      ? `${s.check_steps.filter((st) => st.status === "passed" || st.passed === true).length}/${s.check_steps.length} steps`
+      : null;
 
   return (
     <motion.article
@@ -233,17 +611,53 @@ function SessionCard({
       aria-label={s.task}
       className={cn(
         "relative flex min-w-0 flex-col gap-2.5 overflow-hidden rounded-card border p-3.5 transition-colors duration-(--dur-press) ease-(--ease-house) md:p-4",
-        selected ? "border-ink bg-raised" : "border-hairline bg-surface hover:bg-raised",
+        bulkChecked
+          ? "border-blue bg-blue-soft/35"
+          : selected
+            ? "border-ink bg-raised"
+            : "border-hairline bg-surface hover:bg-raised",
       )}
     >
       {running && <BorderTrail className="bg-ink" size={110} />}
 
       <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-        <span className={cn("inline-flex max-w-full truncate rounded-chip px-2 py-0.5 text-xs font-medium", projectSkin(s.project))}>
+        {bulkMode && (
+          <button
+            type="button"
+            role="checkbox"
+            aria-checked={bulkChecked}
+            aria-label={`Select session ${s.task}`}
+            onClick={onToggleCheck}
+            className={cn(
+              "inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-chip border outline-none transition-colors duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring max-md:size-11",
+              bulkChecked
+                ? "border-blue bg-blue text-blue-fg"
+                : "border-edge bg-canvas text-ink-2 hover:bg-raised",
+            )}
+          >
+            {bulkChecked ? (
+              <Check className="size-3.5" strokeWidth={2} aria-hidden />
+            ) : (
+              <Square className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
+            )}
+          </button>
+        )}
+        <span
+          className={cn(
+            "inline-flex max-w-full truncate rounded-chip px-2 py-0.5 text-xs font-medium",
+            projectSkin(s.project),
+          )}
+        >
           {s.project}
         </span>
         {isLatestHero && (
           <span className="rounded-chip bg-track px-1.5 py-0.5 font-mono text-xs text-ink-2">hero</span>
+        )}
+        {s.depends_on && s.depends_on.length > 0 && (
+          <span className="inline-flex items-center gap-1 rounded-chip bg-track px-1.5 py-0.5 font-mono text-xs text-ink-2">
+            <GitBranch className="size-3 text-icon" strokeWidth={1.5} aria-hidden />
+            <span>{s.depends_on.length} dep{s.depends_on.length === 1 ? "" : "s"}</span>
+          </span>
         )}
         <Badge variant={badgeVariant} size="sm" className="ml-auto shrink-0">
           {verified ? (s.status === "merged" ? "merged" : "verified") : statusText(s)}
@@ -268,7 +682,18 @@ function SessionCard({
               {HONEST}
             </p>
           ) : null}
-          <p className={cn("text-sm leading-relaxed [overflow-wrap:anywhere]", failed ? "text-destructive-foreground" : "text-info-foreground")}>
+          {s.guardrail_violations && s.guardrail_violations.length > 0 && (
+            <p className="inline-flex items-center gap-1.5 rounded-control bg-pill-pro-bg px-2 py-1 text-xs font-medium text-destructive-foreground">
+              <ShieldAlert className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
+              <span>File-scope guardrail blocked ({s.guardrail_violations.length})</span>
+            </p>
+          )}
+          <p
+            className={cn(
+              "text-sm leading-relaxed [overflow-wrap:anywhere]",
+              failed ? "text-destructive-foreground" : "text-info-foreground",
+            )}
+          >
             {s.reason || "Stopped and waiting on your review."}
           </p>
           {s.check_cmd && (
@@ -299,6 +724,10 @@ function SessionCard({
               </div>
               <RunningTail s={s} />
             </>
+          ) : s.status === "blocked" ? (
+            <p className="text-sm text-ink-2">
+              Blocked by upstream DAG: {(s.blocked_by || s.depends_on || []).join(", ")}.
+            </p>
           ) : (
             <p className="text-sm text-ink-2">
               Waiting for a free slot (number {s.queue_position ?? "?"} in the queue).
@@ -316,6 +745,11 @@ function SessionCard({
             <span className="rounded-chip bg-track px-1.5 py-0.5 text-ink-2">{plural(ds.files, "file")}</span>
             <span className="rounded-chip bg-diff-add-bg px-1.5 py-0.5 text-diff-add-fg">+{ds.add}</span>
             <span className="rounded-chip bg-diff-del-bg px-1.5 py-0.5 text-diff-del-fg">−{ds.del}</span>
+            {stepSummary && (
+              <span className="rounded-chip bg-pill-active-bg px-1.5 py-0.5 text-pill-active-fg">
+                {stepSummary}
+              </span>
+            )}
             {s.check_cmd && <span className="ml-auto truncate text-ink-3">{s.check_cmd}</span>}
           </div>
         </div>
@@ -402,16 +836,22 @@ export function ThreeLaneBoard({
   sessions,
   unreachable,
   selected,
+  bulkMode,
+  bulkSelected,
   latestHeroId,
   onOpen,
+  onToggleBulk,
   onRetry,
   onDismiss,
 }: {
   sessions: Session[] | null;
   unreachable: boolean;
   selected: string | null;
+  bulkMode: boolean;
+  bulkSelected: Set<string>;
   latestHeroId: string | null;
   onOpen: (id: string, tab?: TabId) => void;
+  onToggleBulk: (id: string) => void;
   onRetry: (id: string) => void;
   onDismiss: (id: string) => void;
 }) {
@@ -436,10 +876,13 @@ export function ThreeLaneBoard({
   const needs = sessions.filter((s) => s.bucket === "needs-you");
   const working = sessions.filter((s) => s.bucket === "working");
   const done = sessions.filter((s) => s.bucket === "done");
-  const anyRunning = working.some((s) => s.status !== "queued");
+  const anyRunning = working.some(isActivelyRunning);
 
   return (
-    <div aria-label="Session lanes" className="grid gap-px border-b border-hairline bg-hairline md:grid-cols-[minmax(0,1.12fr)_minmax(0,1fr)_minmax(0,1fr)]">
+    <div
+      aria-label="Session lanes"
+      className="grid gap-px border-b border-hairline bg-hairline md:grid-cols-[minmax(0,1.12fr)_minmax(0,1fr)_minmax(0,1fr)]"
+    >
       <Lane
         id="needs"
         label="Needs you"
@@ -453,8 +896,11 @@ export function ThreeLaneBoard({
             key={s.id}
             s={s}
             selected={selected === s.id}
+            bulkMode={bulkMode}
+            bulkChecked={bulkSelected.has(s.id)}
             isLatestHero={false}
             onOpen={(tab) => onOpen(s.id, tab)}
+            onToggleCheck={() => onToggleBulk(s.id)}
             onRetry={() => onRetry(s.id)}
             onDismiss={() => onDismiss(s.id)}
           />
@@ -475,8 +921,11 @@ export function ThreeLaneBoard({
             key={s.id}
             s={s}
             selected={selected === s.id}
+            bulkMode={bulkMode}
+            bulkChecked={bulkSelected.has(s.id)}
             isLatestHero={false}
             onOpen={(tab) => onOpen(s.id, tab)}
+            onToggleCheck={() => onToggleBulk(s.id)}
             onRetry={() => onRetry(s.id)}
             onDismiss={() => onDismiss(s.id)}
           />
@@ -496,8 +945,11 @@ export function ThreeLaneBoard({
             key={s.id}
             s={s}
             selected={selected === s.id}
+            bulkMode={bulkMode}
+            bulkChecked={bulkSelected.has(s.id)}
             isLatestHero={s.id === latestHeroId}
             onOpen={(tab) => onOpen(s.id, tab)}
+            onToggleCheck={() => onToggleBulk(s.id)}
             onRetry={() => onRetry(s.id)}
             onDismiss={() => onDismiss(s.id)}
           />
