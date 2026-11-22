@@ -1,17 +1,36 @@
-// Live Policy Tester (POST /api/policies/test) & Worktree Prune inside the Engines and settings Vaul drawer.
-import { useState } from "react";
-import { FlaskConical, FolderSync, Play, ShieldAlert } from "lucide-react";
+// Live Policy Tester (POST /api/policies/test), Budget Guardrails, and Worktrees Inspector
+// (GET/DELETE /api/repos/worktrees + bulk prune) inside the Engines and settings Vaul drawer.
+import { useCallback, useEffect, useState } from "react";
+import {
+  FlaskConical,
+  FolderGit2,
+  FolderSync,
+  Gauge,
+  GitBranch,
+  Play,
+  RefreshCw,
+  ShieldAlert,
+  Trash2,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { InputGroup, InputGroupInput } from "@/components/ui/input-group";
 import { SegmentedControl, SegmentedControlItem } from "@/components/ui/segmented-control";
 import { Pill, PillIndicator } from "@/components/kibo-ui/pill";
+import { cn } from "@/lib/utils";
 import {
+  computeLocalBudget,
+  deleteRepoWorktree,
+  fetchRepoWorktrees,
   pruneStaleWorktrees,
   testPolicyRoute,
+  type BoardMetrics,
   type Policy,
   type PolicyTestResult,
   type RepoInfo,
   type RuntimeConfig,
+  type Session,
+  type WorktreeEntry,
 } from "./api";
 import { toast } from "sonner";
 
@@ -21,14 +40,22 @@ export function PolicyTesterSection({
   policy,
   config,
   repos,
+  sessions,
+  metrics,
+  settingsOpen,
   supportsServerV050,
+  supportsServerV070,
   canPrune,
   onPruned,
 }: {
   policy: Policy | null;
   config: RuntimeConfig | null;
   repos: RepoInfo[];
+  sessions: Session[];
+  metrics: BoardMetrics;
+  settingsOpen: boolean;
   supportsServerV050: boolean;
+  supportsServerV070: boolean;
   canPrune: boolean;
   onPruned?: () => void;
 }) {
@@ -38,6 +65,27 @@ export function PolicyTesterSection({
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<PolicyTestResult | null>(null);
   const [pruning, setPruning] = useState(false);
+
+  // Worktrees Inspector state
+  const [worktrees, setWorktrees] = useState<WorktreeEntry[]>([]);
+  const [wtSource, setWtSource] = useState<"server" | "local">("local");
+  const [wtLoading, setWtLoading] = useState(false);
+  const [confirmPath, setConfirmPath] = useState<string | null>(null);
+  const [deletingPath, setDeletingPath] = useState<string | null>(null);
+
+  const loadWorktrees = useCallback(async () => {
+    setWtLoading(true);
+    const res = await fetchRepoWorktrees(sessions, repos, supportsServerV070);
+    setWorktrees(res.worktrees);
+    setWtSource(res.source);
+    setWtLoading(false);
+  }, [sessions, repos, supportsServerV070]);
+
+  useEffect(() => {
+    if (settingsOpen) {
+      void loadWorktrees();
+    }
+  }, [settingsOpen, loadWorktrees]);
 
   const runTest = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -60,14 +108,105 @@ export function PolicyTesterSection({
     setPruning(false);
     if (res.ok) {
       toast.success(res.message);
+      void loadWorktrees();
       onPruned?.();
     } else {
       toast.error(res.message);
     }
   };
 
+  const removeOneWorktree = async (wt: WorktreeEntry) => {
+    if (wt.is_main || deletingPath) return;
+    setDeletingPath(wt.path);
+    const res = await deleteRepoWorktree({ repo: wt.repo, path: wt.path }, supportsServerV070);
+    setDeletingPath(null);
+    setConfirmPath(null);
+    if (res.ok) {
+      toast.success(res.message);
+      setWorktrees((prev) => prev.filter((item) => item.path !== wt.path));
+      void loadWorktrees();
+      onPruned?.();
+    } else {
+      toast.error(res.message);
+    }
+  };
+
+  const budget = metrics.budget ?? computeLocalBudget(sessions, policy);
+  const budgetPct =
+    budget.daily_session_limit > 0
+      ? Math.min(100, Math.round((budget.sessions_today / budget.daily_session_limit) * 100))
+      : 0;
+  const orphanCount = worktrees.filter((w) => w.is_orphan && !w.is_main).length;
+
   return (
     <>
+      <section
+        className="space-y-3 border-t border-hairline pt-5"
+        aria-label="Budget guardrails"
+        data-testid="budget-guardrails"
+      >
+        <div className="flex items-center justify-between gap-2">
+          <h3 className="flex items-center gap-1.5 text-sm font-medium text-ink">
+            <Gauge className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
+            <span>Budget guardrails</span>
+          </h3>
+          <Pill
+            variant={budget.limit_reached ? "secondary" : "success"}
+            className="px-2 py-0.5 font-mono text-xs"
+            data-testid="budget-status-pill"
+          >
+            <PillIndicator variant={budget.limit_reached ? "warning" : "success"} />
+            <span>
+              {budget.limit_reached
+                ? "daily cap reached"
+                : `${budget.sessions_today} / ${budget.daily_session_limit} today`}
+            </span>
+          </Pill>
+        </div>
+        <p className="text-xs leading-relaxed text-ink-3">
+          Prevents runaway dispatch loops with daily session caps (HTTP 429 on overflow), per-session time ceilings, and auto-heal retry limits.
+        </p>
+
+        <div className="space-y-2.5 rounded-card border border-hairline bg-canvas p-3 text-xs">
+          <div className="space-y-1">
+            <div className="flex items-center justify-between font-mono tabular-nums">
+              <span className="text-ink-2">Daily dispatch utilization</span>
+              <span className={cn("font-medium", budget.limit_reached ? "text-destructive-foreground" : "text-ink")}>
+                {budget.sessions_today} / {budget.daily_session_limit} ({budgetPct}%)
+              </span>
+            </div>
+            <div className="h-2 w-full overflow-hidden rounded-full bg-track">
+              <div
+                className={cn(
+                  "h-full w-full origin-left transition-transform duration-(--dur-press) ease-(--ease-house)",
+                  budget.limit_reached
+                    ? "bg-unread"
+                    : budgetPct >= 80
+                      ? "bg-dot-amber"
+                      : "bg-dot-green",
+                )}
+                style={{ transform: `scaleX(${Math.max(budgetPct, budget.sessions_today > 0 ? 4 : 0) / 100})` }}
+              />
+            </div>
+          </div>
+
+          <dl className="grid grid-cols-3 gap-2 border-t border-hairline pt-2.5 font-mono tabular-nums">
+            <div>
+              <dt className="font-sans text-ink-3">Remaining</dt>
+              <dd className="mt-0.5 font-medium text-ink">{budget.remaining_today}</dd>
+            </div>
+            <div>
+              <dt className="font-sans text-ink-3">Max session</dt>
+              <dd className="mt-0.5 font-medium text-ink">{budget.max_session_mins} min</dd>
+            </div>
+            <div>
+              <dt className="font-sans text-ink-3">Max heals</dt>
+              <dd className="mt-0.5 font-medium text-ink">{budget.max_heal_attempts} / run</dd>
+            </div>
+          </dl>
+        </div>
+      </section>
+
       <section className="space-y-3 border-t border-hairline pt-5" aria-label="Live Policy Tester">
         <div className="flex items-center justify-between gap-2">
           <h3 className="flex items-center gap-1.5 text-sm font-medium text-ink">
@@ -108,7 +247,7 @@ export function PolicyTesterSection({
                     size="sm"
                     variant={repo === r.path ? "default" : "outline"}
                     onClick={() => setRepo(r.path)}
-                    className="h-7 px-2 font-mono text-xs max-md:min-h-11"
+                    className="h-8 px-2.5 font-mono text-xs max-md:min-h-11"
                   >
                     {r.name}
                   </Button>
@@ -163,7 +302,7 @@ export function PolicyTesterSection({
             <dl className="grid grid-cols-2 gap-x-3 gap-y-2 font-mono tabular-nums">
               <div>
                 <dt className="text-ink-3">Routed engine</dt>
-                <dd className="text-ink font-medium">{result.engine}</dd>
+                <dd className="font-medium text-ink">{result.engine}</dd>
               </div>
               <div>
                 <dt className="text-ink-3">Model</dt>
@@ -213,27 +352,152 @@ export function PolicyTesterSection({
         )}
       </section>
 
-      {canPrune && supportsServerV050 && (
-        <section className="border-t border-hairline pt-5">
-          <div className="flex items-center justify-between gap-2">
-            <div className="min-w-0">
-              <h3 className="text-sm font-medium text-ink">Worktree hygiene</h3>
-              <p className="text-xs text-ink-3">Remove orphaned git worktrees left by dismissed or stopped runs.</p>
-            </div>
+      <section
+        className="space-y-3 border-t border-hairline pt-5"
+        aria-label="Worktrees inspector"
+        data-testid="worktrees-inspector"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="min-w-0">
+            <h3 className="flex items-center gap-1.5 text-sm font-medium text-ink">
+              <FolderGit2 className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
+              <span>Worktrees inspector</span>
+            </h3>
+            <p className="text-xs text-ink-3">
+              Inspect git worktrees across repositories, spot orphans, and prune individual non-main checkouts.
+            </p>
+          </div>
+          <div className="flex items-center gap-1.5">
             <Button
               type="button"
               size="sm"
-              variant="outline"
-              disabled={pruning}
-              onClick={runPrune}
-              className="shrink-0 max-md:min-h-11 max-md:px-4"
+              variant="ghost"
+              disabled={wtLoading}
+              onClick={() => void loadWorktrees()}
+              aria-label="Refresh worktrees"
+              className="h-8 px-2.5 text-xs max-md:min-h-11 max-md:px-3"
             >
-              <FolderSync className="size-3.5" strokeWidth={1.5} aria-hidden />
-              <span>{pruning ? "Pruning..." : "Prune worktrees"}</span>
+              <RefreshCw className={cn("size-3.5", wtLoading && "animate-spin")} strokeWidth={1.5} aria-hidden />
+              <span>Refresh</span>
             </Button>
+            {canPrune && supportsServerV050 && (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={pruning}
+                onClick={runPrune}
+                className="h-8 px-2.5 text-xs max-md:min-h-11 max-md:px-3"
+              >
+                <FolderSync className="size-3.5" strokeWidth={1.5} aria-hidden />
+                <span>{pruning ? "Pruning..." : "Prune all stale"}</span>
+              </Button>
+            )}
           </div>
-        </section>
-      )}
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 font-mono text-xs text-ink-3 tabular-nums">
+          <span>{worktrees.length} {worktrees.length === 1 ? "worktree" : "worktrees"}</span>
+          {orphanCount > 0 && (
+            <Badge variant="warning" size="sm">
+              {orphanCount} {orphanCount === 1 ? "orphan" : "orphans"}
+            </Badge>
+          )}
+          <span className="ml-auto">{wtSource === "server" ? "live git list" : "session preview"}</span>
+        </div>
+
+        {worktrees.length === 0 ? (
+          <p className="rounded-card border border-hairline bg-canvas px-3 py-2.5 text-xs text-ink-3">
+            No git worktrees reported yet.
+          </p>
+        ) : (
+          <ul className="space-y-2" aria-label="Repository worktrees">
+            {worktrees.map((wt) => {
+              const isConfirming = confirmPath === wt.path;
+              const isDeleting = deletingPath === wt.path;
+              return (
+                <li
+                  key={wt.path}
+                  data-testid="worktree-row"
+                  data-orphan={wt.is_orphan ? "true" : "false"}
+                  className="space-y-1.5 rounded-card border border-hairline bg-canvas p-2.5 text-xs"
+                >
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="font-medium text-ink">{wt.project}</span>
+                    <span className="inline-flex min-w-0 items-center gap-1 rounded-chip bg-track px-1.5 py-0.5 font-mono text-ink-2">
+                      <GitBranch className="size-3 shrink-0 text-icon" strokeWidth={1.5} aria-hidden />
+                      <span className="truncate">{wt.branch}</span>
+                    </span>
+                    {wt.is_main && (
+                      <Badge variant="secondary" size="sm">
+                        main
+                      </Badge>
+                    )}
+                    {wt.is_orphan && !wt.is_main && (
+                      <Badge variant="warning" size="sm">
+                        orphan
+                      </Badge>
+                    )}
+                    {wt.dirty && (
+                      <Badge variant="error" size="sm">
+                        dirty
+                      </Badge>
+                    )}
+                    {wt.session_id && (
+                      <span className="rounded-chip bg-board px-1.5 py-0.5 font-mono text-ink-2">
+                        {wt.session_id} · {wt.session_status || "linked"}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="min-w-0 flex-1 break-all font-mono text-ink-3">{wt.path}</p>
+                    {!wt.is_main && wt.removable && supportsServerV070 && (
+                      isConfirming ? (
+                        <div className="flex items-center gap-1.5">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="destructive-outline"
+                            disabled={isDeleting}
+                            onClick={() => void removeOneWorktree(wt)}
+                            data-testid="worktree-confirm-prune"
+                            className="h-8 px-2.5 text-xs max-md:min-h-11"
+                          >
+                            {isDeleting ? "Removing..." : "Confirm prune"}
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => setConfirmPath(null)}
+                            className="h-8 px-2 text-xs max-md:min-h-11"
+                          >
+                            Cancel
+                          </Button>
+                        </div>
+                      ) : (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => setConfirmPath(wt.path)}
+                          data-testid="worktree-prune-btn"
+                          aria-label={`Prune worktree ${wt.branch}`}
+                          className="h-8 px-2.5 text-xs max-md:min-h-11"
+                        >
+                          <Trash2 className="size-3.5" strokeWidth={1.5} aria-hidden />
+                          <span>Prune</span>
+                        </Button>
+                      )
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
     </>
   );
 }

@@ -8,7 +8,10 @@ import {
   Filter,
   FolderGit2,
   GitMerge,
+  GitPullRequest,
   Layers,
+  LayoutGrid,
+  Network,
   Plus,
   RotateCcw,
   Search,
@@ -35,6 +38,7 @@ import {
   type Session,
   type StatusFilter,
   type TabId,
+  type ViewMode,
 } from "./api";
 
 export function CommandPalette({
@@ -45,8 +49,11 @@ export function CommandPalette({
   playbooks,
   repos,
   engines,
+  viewMode,
   multiSelect,
+  onViewMode,
   onOpenSession,
+  onOpenPrPreview,
   onSwitchTab,
   onNewSingle,
   onNewBatch,
@@ -68,8 +75,11 @@ export function CommandPalette({
   playbooks: PlaybookTemplate[];
   repos: RepoInfo[];
   engines: string[];
+  viewMode: ViewMode;
   multiSelect: boolean;
+  onViewMode: (v: ViewMode) => void;
   onOpenSession: (id: string, tab?: TabId) => void;
+  onOpenPrPreview: (s: Session) => void;
   onSwitchTab: (tab: TabId) => void;
   onNewSingle: () => void;
   onNewBatch: () => void;
@@ -115,6 +125,18 @@ export function CommandPalette({
             <Search className="text-icon" strokeWidth={1.5} aria-hidden />
             <span>Focus search bar</span>
             <CommandShortcut>/</CommandShortcut>
+          </CommandItem>
+          <CommandItem
+            value="Switch workspace view board kanban dag dependency wave graph"
+            onSelect={() => act(() => onViewMode(viewMode === "board" ? "dag" : "board"))}
+          >
+            {viewMode === "board" ? (
+              <Network className="text-icon" strokeWidth={1.5} aria-hidden />
+            ) : (
+              <LayoutGrid className="text-icon" strokeWidth={1.5} aria-hidden />
+            )}
+            <span>{viewMode === "board" ? "Switch to DAG Graph view" : "Switch to Board lanes view"}</span>
+            <CommandShortcut>G</CommandShortcut>
           </CommandItem>
           <CommandItem
             value="Toggle multi select bulk inbox board actions"
@@ -178,6 +200,12 @@ export function CommandPalette({
                 <Download className="text-icon" strokeWidth={1.5} aria-hidden />
                 <span>Download .patch for {selectedSession.branch || selectedSession.id}</span>
               </CommandItem>
+              {selectedSession.branch && (
+                <CommandItem value="PR preview create github pull request markdown" onSelect={() => act(() => onOpenPrPreview(selectedSession))}>
+                  <GitPullRequest className="text-icon" strokeWidth={1.5} aria-hidden />
+                  <span>PR preview &amp; Create PR for {selectedSession.id}</span>
+                </CommandItem>
+              )}
               {selectedSession.status === "needs-you" && (
                 <CommandItem value="Retry selected session" onSelect={() => act(() => onRetrySession(selectedSession.id))}>
                   <RotateCcw className="text-icon" strokeWidth={1.5} aria-hidden />

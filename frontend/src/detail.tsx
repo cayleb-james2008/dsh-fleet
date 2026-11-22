@@ -9,6 +9,7 @@ import {
   FileCode2,
   GitBranch,
   GitMerge,
+  GitPullRequest,
   Play,
   RotateCcw,
   Send,
@@ -402,6 +403,7 @@ export function DetailBody({
   supportsServerV050,
   onClose,
   onOpenSession,
+  onOpenPrPreview,
   onChanged,
   onDismissed,
 }: {
@@ -412,6 +414,7 @@ export function DetailBody({
   supportsServerV050: boolean;
   onClose: () => void;
   onOpenSession: (id: string, tab?: TabId) => void;
+  onOpenPrPreview: (s: Session) => void;
   onChanged: () => void;
   onDismissed: () => void;
 }) {
@@ -780,6 +783,16 @@ export function DetailBody({
           {s.status === "done" && (
             <Button onClick={() => setAct("merge")} className="max-md:min-h-11 max-md:px-4">
               <GitMerge className="size-4" strokeWidth={1.5} aria-hidden />Merge this work
+            </Button>
+          )}
+          {s.branch && (s.status === "done" || s.status === "merged" || s.status === "needs-you") && (
+            <Button
+              variant="outline"
+              data-testid="open-pr-preview"
+              onClick={() => onOpenPrPreview(s)}
+              className="max-md:min-h-11 max-md:px-4"
+            >
+              <GitPullRequest className="size-4" strokeWidth={1.5} aria-hidden />PR preview
             </Button>
           )}
           {s.status === "needs-you" && (
