@@ -13,6 +13,7 @@ use fleet_rs::autoheal::{
     FailedCheckContext, HealAttempt, HealDecision, HealSessionContext, HealStopReason,
     MAX_AUTO_HEAL_BUDGET, build_heal_prompt, evaluate_auto_heal, heal_badge_label,
 };
+use fleet_rs::budget::{BudgetConfig, BudgetError, BudgetStatus, BudgetTracker};
 use fleet_rs::checks::{
     CheckPipeline, CheckStep, CheckStepReceipt, FileScope, PipelineReceipt, ScopeViolation,
     verify_git_scope,
@@ -23,7 +24,13 @@ use fleet_rs::merge_check::{
 };
 use fleet_rs::metrics::{SessionMetricView, compute_metrics_with_capacity};
 use fleet_rs::policy::{MAX_TIMEOUT_SECS, Policy, test_policy_script};
+use fleet_rs::pr::{
+    PrCreateRequest, PrSessionView, build_pr_preview, create_github_pr_with_options,
+};
 use fleet_rs::templates::{PlaybookInput, PlaybookTask, TemplateStore};
+use fleet_rs::worktrees::{
+    WorktreeSessionView, list_repo_worktrees, remove_worktree_checked,
+};
 use serde::Serialize;
 use std::os::unix::ffi::OsStrExt as _;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -486,6 +493,60 @@ impl SessionMetricView for Session {
     }
 }
 
+impl PrSessionView for Session {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn task(&self) -> &str {
+        &self.task
+    }
+    fn project(&self) -> &str {
+        &self.project
+    }
+    fn branch(&self) -> &str {
+        &self.branch
+    }
+    fn status(&self) -> &str {
+        &self.status
+    }
+    fn check_cmd(&self) -> &str {
+        &self.check_cmd
+    }
+    fn check_passed(&self) -> Option<bool> {
+        self.check_passed
+    }
+    fn verified_commit(&self) -> Option<&str> {
+        self.verified_commit.as_deref()
+    }
+    fn check_receipt(&self) -> Option<&PipelineReceipt> {
+        self.check_receipt.as_ref()
+    }
+    fn heal_attempts(&self) -> &[HealAttempt] {
+        &self.heal_attempts
+    }
+    fn diff(&self) -> &str {
+        &self.diff
+    }
+}
+
+impl WorktreeSessionView for Session {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn status(&self) -> &str {
+        &self.status
+    }
+    fn repo(&self) -> &str {
+        &self.repo
+    }
+    fn branch(&self) -> &str {
+        &self.branch
+    }
+    fn worktree(&self) -> &str {
+        &self.worktree
+    }
+}
+
 /// The branch a merge into this repo lands on: its checked-out branch.
 fn merge_target(repo: &str) -> Option<String> {
     if repo.is_empty() {
@@ -523,6 +584,8 @@ struct RuntimeConfig {
     codex_model: Option<String>,
     #[serde(default)]
     max_parallel_agents: Option<i64>,
+    #[serde(default)]
+    budget: BudgetConfig,
 }
 
 fn load_config(data_dir: &Path) -> RuntimeConfig {
@@ -570,10 +633,15 @@ struct App {
     /// Cached GET /api/repos discovery result keyed by (state_rev, FLEET_REPOS_DIR, cached_at).
     #[allow(clippy::type_complexity)]
     repos_cache: Mutex<Option<(u64, String, std::time::Instant, Vec<RepoInfo>)>>,
-    /// Cached serialized GET /api/metrics payload keyed by (state_rev, max_parallel).
-    metrics_cache: Mutex<Option<(u64, i64, String)>>,
+    /// Cached serialized GET /api/metrics payload keyed by (state_rev, budget_rev, max_parallel, cached_at).
+    #[allow(clippy::type_complexity)]
+    metrics_cache: Mutex<Option<(u64, u64, i64, std::time::Instant, String)>>,
     /// Atomic file-backed playbook template store (`<data_dir>/templates.json`).
     templates: Mutex<TemplateStore>,
+    /// Atomic file-backed daily session & auto-heal budget tracker (`<data_dir>/budget.json`).
+    budget: Mutex<BudgetTracker>,
+    /// Monotonic revision bumped whenever budget config or daily counters change.
+    budget_rev: std::sync::atomic::AtomicU64,
     /// Session IDs whose `.record.json` needs writing on the next persist() pass.
     dirty_records: Mutex<std::collections::HashSet<String>>,
     /// Transcript lines logged since the last snapshot — the persist
@@ -895,6 +963,50 @@ impl App {
             .clamp(1, 64)
     }
 
+    fn budget_config(&self) -> BudgetConfig {
+        self.config.lock().unwrap().budget.sanitized()
+    }
+
+    fn bump_budget_rev(&self) {
+        self.budget_rev
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn budget_status(&self) -> BudgetStatus {
+        let cfg = self.budget_config();
+        self.budget.lock().unwrap().status(&cfg)
+    }
+
+    fn budget_status_json(&self) -> serde_json::Value {
+        let st = self.budget_status();
+        let mut val = serde_json::to_value(&st).unwrap_or_else(|_| serde_json::json!({}));
+        val["limit_reached"] = serde_json::json!(st.daily_limit_reached);
+        val["utilization_pct"] = serde_json::json!(st.usage_pct);
+        val
+    }
+
+    fn try_reserve_budget(&self, count: u32) -> Result<BudgetStatus, BudgetError> {
+        let cfg = self.budget_config();
+        let res = self
+            .budget
+            .lock()
+            .unwrap()
+            .try_reserve_sessions(&cfg, count);
+        if res.is_ok() {
+            self.bump_budget_rev();
+        }
+        res
+    }
+
+    fn record_heal_attempt_budget(&self) {
+        self.budget.lock().unwrap().record_heal_attempt();
+        self.bump_budget_rev();
+    }
+
+    fn effective_timeout_secs(&self, policy_timeout_secs: u64) -> u64 {
+        self.budget_config().effective_timeout_secs(policy_timeout_secs)
+    }
+
     fn queue_counts(&self) -> (usize, usize, usize) {
         let sessions = self.sessions.lock().unwrap();
         let active = sessions
@@ -942,7 +1054,9 @@ impl App {
         let eff_codex = self.effective_model_for("codex");
         let max_parallel = self.effective_max_parallel();
         let (active, queued, _) = self.queue_counts();
+        let budget_val = self.budget_status_json();
         let cfg = self.config.lock().unwrap();
+        let bcfg = cfg.budget.sanitized();
         serde_json::json!({
             "default_agent": default_agent,
             "default_agent_engine": default_agent_engine,
@@ -953,6 +1067,10 @@ impl App {
             "effective_max_parallel": max_parallel,
             "active_sessions": active,
             "queued_sessions": queued,
+            "max_session_mins": bcfg.max_session_mins,
+            "daily_session_limit": bcfg.daily_session_limit,
+            "max_heal_attempts": bcfg.max_heal_attempts,
+            "budget": budget_val,
             "effective_models": {
                 "opencode": eff_opencode,
                 "claude": eff_claude,
@@ -1475,14 +1593,21 @@ impl App {
     }
 
     /// Cached JSON string for `GET /api/metrics`, invalidated automatically whenever
-    /// `state_rev` or `effective_max_parallel()` changes (O(1) cache hit, single O(N) pass on miss).
+    /// `state_rev`, `budget_rev`, or `effective_max_parallel()` changes (O(1) cache hit, single O(N) pass on miss).
     fn metrics_json_cached(&self) -> String {
+        const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
         let rev = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
+        let brev = self.budget_rev.load(std::sync::atomic::Ordering::SeqCst);
         let max_parallel = self.effective_max_parallel().max(1);
+        let now = std::time::Instant::now();
         {
             let guard = self.metrics_cache.lock().unwrap();
-            if let Some((cached_rev, cached_max, ref payload)) = *guard {
-                if cached_rev == rev && cached_max == max_parallel {
+            if let Some((cached_rev, cached_brev, cached_max, at, ref payload)) = *guard {
+                if cached_rev == rev
+                    && cached_brev == brev
+                    && cached_max == max_parallel
+                    && now.duration_since(at) < CACHE_TTL
+                {
                     return payload.clone();
                 }
             }
@@ -1491,12 +1616,16 @@ impl App {
             let sessions = self.sessions.lock().unwrap();
             compute_metrics_with_capacity(&sessions, max_parallel as usize)
         };
+        let budget_val = self.budget_status_json();
         let mut val = serde_json::to_value(&metrics).unwrap_or_else(|_| serde_json::json!({}));
         val["max_parallel"] = serde_json::json!(max_parallel);
+        val["budget"] = budget_val;
         let payload = val.to_string();
         let rev_after = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
-        if rev_after == rev {
-            *self.metrics_cache.lock().unwrap() = Some((rev, max_parallel, payload.clone()));
+        let brev_after = self.budget_rev.load(std::sync::atomic::Ordering::SeqCst);
+        if rev_after == rev && brev_after == brev {
+            *self.metrics_cache.lock().unwrap() =
+                Some((rev, brev, max_parallel, now, payload.clone()));
         }
         payload
     }
@@ -2273,11 +2402,12 @@ impl App {
         prompt: &str,
         continuation: bool,
     ) -> AgentRun {
-        let timeout = self.policy.timeout_for(
+        let policy_timeout = self.policy.timeout_for(
             &session.repo,
             &session.task,
             engine_kind(&session.agent).label(),
         );
+        let timeout = self.effective_timeout_secs(policy_timeout);
         let app_lines = self.clone();
         let id_lines = id.to_string();
         let mut on_line = move |is_err: bool, line: &str| {
@@ -2548,11 +2678,12 @@ impl App {
                 "check_cmd": session.check_cmd,
             }),
         );
-        let timeout = self.policy.timeout_for(
+        let policy_timeout = self.policy.timeout_for(
             &session.repo,
             &session.task,
             engine_kind(&session.agent).label(),
         );
+        let timeout = self.effective_timeout_secs(policy_timeout);
         // The check judges the pinned commit, literally: it runs in
         // a pristine checkout of that commit (a throwaway worktree),
         // never in the session's mutable worktree. A check that
@@ -2817,7 +2948,7 @@ impl App {
             && !check_stopped;
         if healable_check_failure {
             if let Some(ref failed_ctx) = failed_ctx_for_heal {
-                let (prev_attempts, budget) = {
+                let (prev_attempts, session_budget) = {
                     let sessions = self.sessions.lock().unwrap();
                     sessions
                         .iter()
@@ -2825,6 +2956,7 @@ impl App {
                         .map(|s| (s.heal_attempts.clone(), s.auto_steer_budget))
                         .unwrap_or_else(|| (Vec::new(), 0))
                 };
+                let budget = self.budget_config().effective_heal_budget(session_budget);
                 let stop_requested = self.stop_flag(id).load(std::sync::atomic::Ordering::Relaxed);
                 match evaluate_auto_heal(
                     prev_attempts.len() as u32,
@@ -2870,6 +3002,7 @@ impl App {
                             })
                         };
                         self.mark_dirty(id);
+                        self.record_heal_attempt_budget();
                         self.persist();
                         self.log(
                             id,
@@ -4079,7 +4212,8 @@ fn respond(
         error_response(403, "cross-origin requests are refused")
     } else {
         let route = path.split('?').next().unwrap_or("");
-        update_route(app, method, route, body, host).unwrap_or_else(|| handle(app, method, path, body))
+        update_route(app, method, route, path, body, host)
+            .unwrap_or_else(|| handle(app, method, path, body))
     }
 }
 
@@ -4095,10 +4229,263 @@ fn validate_model_field(raw: &str) -> Result<Option<String>, String> {
     Ok(Some(trimmed.to_string()))
 }
 
-/// Loopback-guarded routes: version, self-update, local repo discovery, and
-/// live engine/model configuration. A name from FLEET_ALLOWED_HOSTS does not
-/// count for machine-local mutation or filesystem discovery — only loopback does.
-fn update_route(app: &Arc<App>, method: &str, route: &str, body: &str, host: &str) -> Option<String> {
+fn budget_error_response(err: BudgetError) -> String {
+    let mut b = serde_json::to_value(&err.budget).unwrap_or_else(|_| serde_json::json!({}));
+    b["limit_reached"] = serde_json::json!(err.budget.daily_limit_reached);
+    b["utilization_pct"] = serde_json::json!(err.budget.usage_pct);
+    json_response(
+        err.status,
+        &serde_json::json!({
+            "error": err.message,
+            "code": err.code,
+            "budget": b,
+        })
+        .to_string(),
+    )
+}
+
+fn handle_pr_preview(app: &Arc<App>, id: &str) -> String {
+    let session = {
+        let sessions = app.sessions.lock().unwrap();
+        sessions.iter().find(|s| s.id == id).cloned()
+    };
+    let Some(s) = session else {
+        return error_response(404, "no such session");
+    };
+    if s.repo.is_empty() {
+        return error_response(409, "session has no repository path");
+    }
+    let preview = match build_pr_preview(Path::new(&s.repo), &s) {
+        Ok(p) => p,
+        Err(e) => return error_response(409, &e),
+    };
+    let mut out = serde_json::to_value(&preview).unwrap_or_else(|_| serde_json::json!({}));
+    out["repo"] = serde_json::json!(s.repo);
+    out["can_create"] = serde_json::json!(preview.ready_to_create);
+    out["diff_files"] = serde_json::json!(preview.diff_stat.files_changed);
+    out["diff_add"] = serde_json::json!(preview.diff_stat.insertions);
+    out["diff_del"] = serde_json::json!(preview.diff_stat.deletions);
+    json_response(200, &out.to_string())
+}
+
+fn handle_pr_create(app: &Arc<App>, id: &str, body: &str) -> String {
+    let req: PrCreateRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => return error_response(400, &format!("bad json: {e}")),
+    };
+    let session = {
+        let sessions = app.sessions.lock().unwrap();
+        sessions.iter().find(|s| s.id == id).cloned()
+    };
+    let Some(s) = session else {
+        return error_response(404, "no such session");
+    };
+    if s.repo.is_empty() {
+        return error_response(409, "session has no repository path");
+    }
+    let preview = build_pr_preview(Path::new(&s.repo), &s).ok();
+    let title = req
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .or_else(|| preview.as_ref().map(|p| p.title.clone()))
+        .unwrap_or_else(|| s.task.clone());
+    let pr_body = req
+        .body
+        .as_deref()
+        .filter(|b| !b.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| preview.as_ref().map(|p| p.body.clone()))
+        .unwrap_or_default();
+    match create_github_pr_with_options(
+        Path::new(&s.repo),
+        &s.branch,
+        req.base_branch.as_deref(),
+        &title,
+        &pr_body,
+        req.draft,
+        req.confirm,
+        req.dry_run,
+    ) {
+        Ok(res) => json_response(200, &serde_json::to_string(&res).unwrap()),
+        Err(e) => {
+            let mut payload = serde_json::json!({
+                "error": e.message,
+                "code": e.code,
+            });
+            if let Some(d) = e.detail {
+                payload["detail"] = serde_json::json!(d);
+            }
+            json_response(e.status, &payload.to_string())
+        }
+    }
+}
+
+fn handle_list_worktrees(app: &Arc<App>, params: &std::collections::HashMap<String, String>) -> String {
+    let sessions: Vec<Session> = app.sessions.lock().unwrap().clone();
+    let task_by_id: std::collections::HashMap<&str, &str> = sessions
+        .iter()
+        .map(|s| (s.id.as_str(), s.task.as_str()))
+        .collect();
+
+    let explicit_repo = params
+        .get("repo")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let repo_paths: Vec<String> = if let Some(r) = explicit_repo {
+        vec![r.to_string()]
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        let mut list = Vec::new();
+        for info in app.discover_repos() {
+            if seen.insert(info.path.clone()) {
+                list.push(info.path);
+            }
+        }
+        for s in &sessions {
+            if !s.repo.is_empty() && seen.insert(s.repo.clone()) {
+                list.push(s.repo.clone());
+            }
+        }
+        list
+    };
+
+    let mut seen_wt: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out_entries: Vec<serde_json::Value> = Vec::new();
+    let mut orphan_count = 0usize;
+
+    for repo_path in repo_paths {
+        match list_repo_worktrees(Path::new(&repo_path), &sessions) {
+            Ok(entries) => {
+                let project = Path::new(&repo_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("repo")
+                    .to_string();
+                for entry in entries {
+                    let dedup_key = format!("{}::{}", entry.repo, entry.path);
+                    if !seen_wt.insert(dedup_key) {
+                        continue;
+                    }
+                    if entry.is_orphan && !entry.is_main {
+                        orphan_count += 1;
+                    }
+                    let task = entry
+                        .session_id
+                        .as_deref()
+                        .and_then(|sid| task_by_id.get(sid).copied());
+                    let mut v =
+                        serde_json::to_value(&entry).unwrap_or_else(|_| serde_json::json!({}));
+                    v["project"] = serde_json::json!(project);
+                    if let Some(t) = task {
+                        v["session_task"] = serde_json::json!(t);
+                    }
+                    out_entries.push(v);
+                }
+            }
+            Err(e) if explicit_repo.is_some() => {
+                return json_response(
+                    e.status,
+                    &serde_json::json!({ "error": e.message, "code": e.code }).to_string(),
+                );
+            }
+            Err(_) => {
+                // Skip unavailable/vanished discovered repo gracefully during all-repo scan.
+            }
+        }
+    }
+
+    json_response(
+        200,
+        &serde_json::json!({
+            "worktrees": out_entries,
+            "count": out_entries.len(),
+            "orphan_count": orphan_count,
+        })
+        .to_string(),
+    )
+}
+
+fn handle_delete_worktree(
+    app: &Arc<App>,
+    params: &std::collections::HashMap<String, String>,
+    body: &str,
+) -> String {
+    let body_json: Option<serde_json::Value> = if body.trim().is_empty() {
+        None
+    } else {
+        match serde_json::from_str(body) {
+            Ok(v) => Some(v),
+            Err(e) => return error_response(400, &format!("bad json: {e}")),
+        }
+    };
+    let repo = body_json
+        .as_ref()
+        .and_then(|v| v.get("repo").and_then(serde_json::Value::as_str))
+        .or_else(|| params.get("repo").map(String::as_str))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let wt_path = body_json
+        .as_ref()
+        .and_then(|v| {
+            v.get("path")
+                .or_else(|| v.get("worktree"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            params
+                .get("path")
+                .or_else(|| params.get("worktree"))
+                .map(String::as_str)
+        })
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if repo.is_empty() || wt_path.is_empty() {
+        return error_response(400, "both 'repo' and 'path' are required to remove a worktree");
+    }
+    let sessions: Vec<Session> = app.sessions.lock().unwrap().clone();
+    match remove_worktree_checked(Path::new(&repo), Path::new(&wt_path), None, &sessions) {
+        Ok(res) => {
+            *app.repos_cache.lock().unwrap() = None;
+            app.events.publish(
+                "worktrees_pruned",
+                &serde_json::json!({
+                    "removed": 1,
+                    "repo": res.repo,
+                    "path": res.path,
+                }),
+            );
+            json_response(200, &serde_json::to_string(&res).unwrap())
+        }
+        Err(e) => json_response(
+            e.status,
+            &serde_json::json!({ "error": e.message, "code": e.code }).to_string(),
+        ),
+    }
+}
+
+/// Loopback-guarded routes: version, self-update, local repo discovery, worktree
+/// inspection/removal, PR creation, and live engine/model/budget configuration.
+/// A name from FLEET_ALLOWED_HOSTS does not count for machine-local mutation or
+/// filesystem discovery — only loopback does.
+fn update_route(
+    app: &Arc<App>,
+    method: &str,
+    route: &str,
+    full_path: &str,
+    body: &str,
+    host: &str,
+) -> Option<String> {
+    let query = full_path.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let params = parse_query(query);
     Some(match (method, route) {
         ("GET", "/api/version") => json_response(
             200,
@@ -4113,6 +4500,24 @@ fn update_route(app: &Arc<App>, method: &str, route: &str, body: &str, host: &st
             }
             let repos = app.discover_repos();
             json_response(200, &serde_json::json!(repos).to_string())
+        }
+        ("GET", "/api/repos/worktrees") => {
+            if !host_allowed(host, "") {
+                return Some(error_response(
+                    403,
+                    "inspecting worktrees is only allowed from this machine, not through a shared address",
+                ));
+            }
+            handle_list_worktrees(app, &params)
+        }
+        ("DELETE", "/api/repos/worktrees") => {
+            if !host_allowed(host, "") {
+                return Some(error_response(
+                    403,
+                    "removing worktrees is only allowed from this machine, not through a shared address",
+                ));
+            }
+            handle_delete_worktree(app, &params, body)
         }
         ("POST", "/api/repos/prune-worktrees") => {
             if !host_allowed(host, "") {
@@ -4135,6 +4540,56 @@ fn update_route(app: &Arc<App>, method: &str, route: &str, body: &str, host: &st
                 .filter(|s| !s.is_empty());
             let res = app.prune_worktrees(filter_repo);
             json_response(200, &res.to_string())
+        }
+        ("GET", "/api/budget") => {
+            if !host_allowed(host, "") {
+                return Some(error_response(
+                    403,
+                    "reading budget settings is only allowed from this machine, not through a shared address",
+                ));
+            }
+            json_response(200, &app.budget_status_json().to_string())
+        }
+        ("POST", "/api/budget") => {
+            if !host_allowed(host, "") {
+                return Some(error_response(
+                    403,
+                    "changing budget settings is only allowed from this machine, not through a shared address",
+                ));
+            }
+            let req: serde_json::Value = match serde_json::from_str(body) {
+                Ok(v) => v,
+                Err(e) => return Some(error_response(400, &format!("bad json: {e}"))),
+            };
+            let Some(obj) = req.as_object() else {
+                return Some(error_response(400, "budget payload must be a JSON object"));
+            };
+            let patch_map = match obj.get("budget") {
+                Some(serde_json::Value::Object(inner)) => inner,
+                Some(_) => return Some(error_response(400, "budget must be a JSON object")),
+                None => obj,
+            };
+            let mut next_cfg = app.config.lock().unwrap().clone();
+            match next_cfg.budget.apply_json_patch(patch_map) {
+                Ok(updated) => next_cfg.budget = updated,
+                Err(e) => return Some(error_response(400, &e)),
+            }
+            *app.config.lock().unwrap() = next_cfg;
+            app.save_config();
+            app.bump_budget_rev();
+            let b_val = app.budget_status_json();
+            app.events.publish("config_updated", &app.config_json());
+            json_response(200, &b_val.to_string())
+        }
+        ("POST", route) if route.starts_with("/api/sessions/") && route.ends_with("/pr") => {
+            if !host_allowed(host, "") {
+                return Some(error_response(
+                    403,
+                    "creating pull requests is only allowed from this machine, not through a shared address",
+                ));
+            }
+            let id = &route["/api/sessions/".len()..route.len() - "/pr".len()];
+            handle_pr_create(app, id, body)
         }
         ("GET", "/api/config") => {
             if !host_allowed(host, "") {
@@ -4214,8 +4669,28 @@ fn update_route(app: &Arc<App>, method: &str, route: &str, body: &str, host: &st
                     _ => return Some(error_response(400, "max_parallel_agents must be an integer or null")),
                 }
             }
+            if let Some(budget_val) = obj.get("budget") {
+                match budget_val {
+                    serde_json::Value::Object(inner) => match next_cfg.budget.apply_json_patch(inner) {
+                        Ok(updated) => next_cfg.budget = updated,
+                        Err(e) => return Some(error_response(400, &e)),
+                    },
+                    serde_json::Value::Null => next_cfg.budget = BudgetConfig::default(),
+                    _ => return Some(error_response(400, "budget must be a JSON object or null")),
+                }
+            }
+            if obj.contains_key("max_session_mins")
+                || obj.contains_key("daily_session_limit")
+                || obj.contains_key("max_heal_attempts")
+            {
+                match next_cfg.budget.apply_json_patch(obj) {
+                    Ok(updated) => next_cfg.budget = updated,
+                    Err(e) => return Some(error_response(400, &e)),
+                }
+            }
             *app.config.lock().unwrap() = next_cfg;
             app.save_config();
+            app.bump_budget_rev();
             app.pump_queue();
             let snap = app.config_json();
             app.events.publish("config_updated", &snap);
@@ -4534,18 +5009,20 @@ fn resolve_auto_steer_budget(
     task: &str,
     agent: &str,
 ) -> u32 {
-    if let Some(n) = explicit {
-        return n.min(MAX_AUTO_HEAL_BUDGET);
-    }
-    let kind = engine_kind(agent);
-    if kind == EngineKind::Custom {
-        // Preserve single-pass determinism for custom test scripts unless a budget is requested.
-        0
+    let raw = if let Some(n) = explicit {
+        n.min(MAX_AUTO_HEAL_BUDGET)
     } else {
-        app.policy
-            .auto_steer_budget(repo, task, kind.label())
-            .min(MAX_AUTO_HEAL_BUDGET)
-    }
+        let kind = engine_kind(agent);
+        if kind == EngineKind::Custom {
+            // Preserve single-pass determinism for custom test scripts unless a budget is requested.
+            0
+        } else {
+            app.policy
+                .auto_steer_budget(repo, task, kind.label())
+                .min(MAX_AUTO_HEAL_BUDGET)
+        }
+    };
+    app.budget_config().effective_heal_budget(raw)
 }
 
 fn handle_upsert_template(app: &Arc<App>, body: &str) -> String {
@@ -5109,6 +5586,11 @@ fn handle_batch_sessions(app: &Arc<App>, body: &str) -> String {
         });
     }
 
+    // Enforce daily dispatch budget atomically BEFORE creating any sessions in the batch.
+    if let Err(budget_err) = app.try_reserve_budget(ready_specs.len() as u32) {
+        return budget_error_response(budget_err);
+    }
+
     // Atomically commit counter + sessions under lock.
     let mut created_ids: Vec<String> = Vec::with_capacity(ready_specs.len());
     let mut created_sessions: Vec<Session> = Vec::with_capacity(ready_specs.len());
@@ -5266,6 +5748,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                     "timeout_secs": app.policy.timeout_secs,
                     "auto_retry_budget": app.policy.default_auto_retry_budget,
                     "auto_steer_budget": app.policy.default_auto_steer_budget,
+                    "budget": app.budget_status_json(),
                     "features": {
                         "sse": true,
                         "batch": true,
@@ -5275,6 +5758,9 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                         "auto_heal": true,
                         "templates": true,
                         "metrics": true,
+                        "pr_preview": true,
+                        "worktrees": true,
+                        "budget": true,
                     },
                     "source": app.policy_source,
                     "version": env!("CARGO_PKG_VERSION")
@@ -5461,6 +5947,10 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                     )
                 }
             }
+            // Enforce daily dispatch budget atomically AFTER all 400 validations pass.
+            if let Err(budget_err) = app.try_reserve_budget(1) {
+                return budget_error_response(budget_err);
+            }
             let n = {
                 let mut counter = app.counter.lock().unwrap();
                 *counter += 1;
@@ -5569,6 +6059,10 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 Ok(res) => json_response(200, &serde_json::to_string(&res).unwrap()),
                 Err(e) => error_response(409, &e),
             }
+        }
+        ("GET", route) if route.starts_with("/api/sessions/") && route.ends_with("/pr-preview") => {
+            let id = &route["/api/sessions/".len()..route.len() - "/pr-preview".len()];
+            handle_pr_preview(app, id)
         }
         ("GET", route) if route.starts_with("/api/sessions/") && route.ends_with("/patch") => {
             let id = &route["/api/sessions/".len()..route.len() - "/patch".len()];
@@ -6057,6 +6551,7 @@ fn main() {
         .unwrap_or_else(|_| "run".to_string());
     let (restored, restored_counter) = load_persisted(&data_dir);
     let template_store = TemplateStore::load(&data_dir);
+    let budget_tracker = BudgetTracker::load(&data_dir);
     let app = Arc::new(App {
         policy,
         policy_source: policy_path.clone(),
@@ -6076,6 +6571,8 @@ fn main() {
         repos_cache: Mutex::new(None),
         metrics_cache: Mutex::new(None),
         templates: Mutex::new(template_store),
+        budget: Mutex::new(budget_tracker),
+        budget_rev: std::sync::atomic::AtomicU64::new(1),
         dirty_records: Mutex::new(std::collections::HashSet::new()),
         lines_since_persist: std::sync::atomic::AtomicU64::new(0),
         counter: Mutex::new(restored_counter),
@@ -6377,6 +6874,8 @@ mod tests {
             repos_cache: Mutex::new(None),
             metrics_cache: Mutex::new(None),
             templates: Mutex::new(TemplateStore::load(dir.join("data"))),
+            budget: Mutex::new(BudgetTracker::load(dir.join("data"))),
+            budget_rev: std::sync::atomic::AtomicU64::new(1),
             dirty_records: Mutex::new(std::collections::HashSet::new()),
             lines_since_persist: std::sync::atomic::AtomicU64::new(0),
             counter: Mutex::new(0),
@@ -6461,6 +6960,8 @@ mod tests {
             repos_cache: Mutex::new(None),
             metrics_cache: Mutex::new(None),
             templates: Mutex::new(TemplateStore::load(&data_dir)),
+            budget: Mutex::new(BudgetTracker::load(&data_dir)),
+            budget_rev: std::sync::atomic::AtomicU64::new(1),
             dirty_records: Mutex::new(std::collections::HashSet::new()),
             lines_since_persist: std::sync::atomic::AtomicU64::new(0),
             counter: Mutex::new(0),
@@ -7289,6 +7790,8 @@ mod tests {
             repos_cache: Mutex::new(None),
             metrics_cache: Mutex::new(None),
             templates: Mutex::new(TemplateStore::load(&data)),
+            budget: Mutex::new(BudgetTracker::load(&data)),
+            budget_rev: std::sync::atomic::AtomicU64::new(1),
             dirty_records: Mutex::new(std::collections::HashSet::new()),
             lines_since_persist: std::sync::atomic::AtomicU64::new(0),
             counter: Mutex::new(0),
@@ -8305,6 +8808,426 @@ fi
         assert!(del_ok.starts_with("HTTP/1.1 200"), "{del_ok}");
         let del_again = handle(&app, "DELETE", &format!("/api/templates/{tpl_id}"), "");
         assert!(del_again.starts_with("HTTP/1.1 404"), "{del_again}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v070_pr_preview_and_confirmation_gated_pr_create() {
+        let dir = std::env::temp_dir().join(format!("fleet-v070-pr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bare = dir.join("remote.git");
+        let repo = git_repo(&dir.join("repo"));
+        git_run(&dir, &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()]);
+        git_run(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_run(&repo, &["push", "-qu", "origin", "main"]);
+
+        let agent = script_agent(
+            &dir,
+            "ok-agent.sh",
+            "#!/bin/sh\necho 'hello v0.7.0' > feature.txt\n",
+        );
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let app = test_app(data.clone(), Vec::new());
+
+        let create_body = serde_json::json!({
+            "repo": repo.to_string_lossy(),
+            "task": "Add feature.txt with greeting",
+            "agent": agent.to_string_lossy(),
+            "check_steps": [{ "name": "verify", "cmd": "test -s feature.txt" }]
+        })
+        .to_string();
+        let resp = handle(&app, "POST", "/api/sessions", &create_body);
+        assert!(resp.starts_with("HTTP/1.1 201"), "{resp}");
+        let sid = response_body(&resp)["id"].as_str().unwrap().to_string();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            if matches!(app.status_of(&sid).as_deref(), Some("done" | "needs-you")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(app.status_of(&sid).as_deref(), Some("done"));
+
+        // GET /api/sessions/:id/pr-preview returns structured title, Markdown body, diff stats & branch info.
+        let prev_resp = handle(&app, "GET", &format!("/api/sessions/{sid}/pr-preview"), "");
+        assert!(prev_resp.starts_with("HTTP/1.1 200"), "{prev_resp}");
+        let prev = response_body(&prev_resp);
+        assert_eq!(prev["session_id"], sid);
+        assert_eq!(prev["base_branch"], "main");
+        assert!(prev["title"].as_str().unwrap().contains("Add feature.txt"));
+        assert!(prev["body"].as_str().unwrap().contains("Verification Receipt"));
+        assert_eq!(prev["diff_files"], 1);
+        assert!(prev["diff_add"].as_u64().unwrap() >= 1);
+
+        // POST /api/sessions/:id/pr without confirm=true is refused 400 without pushing.
+        let no_confirm = respond(
+            &app,
+            "",
+            "POST",
+            &format!("/api/sessions/{sid}/pr"),
+            r#"{"confirm":false,"draft":true}"#,
+            "application/json",
+            "http://127.0.0.1:8471",
+            "127.0.0.1:8471",
+        );
+        assert!(no_confirm.starts_with("HTTP/1.1 400"), "{no_confirm}");
+        assert_eq!(response_body(&no_confirm)["code"], "confirmation-required");
+
+        // Cross-origin CSRF is refused 403.
+        let csrf = respond(
+            &app,
+            "",
+            "POST",
+            &format!("/api/sessions/{sid}/pr"),
+            r#"{"confirm":true,"dry_run":true}"#,
+            "application/json",
+            "https://evil.example",
+            "127.0.0.1:8471",
+        );
+        assert!(csrf.starts_with("HTTP/1.1 403"), "{csrf}");
+
+        // Shared LAN host is refused 403 (loopback-only).
+        let lan = respond(
+            &app,
+            "lan.local",
+            "POST",
+            &format!("/api/sessions/{sid}/pr"),
+            r#"{"confirm":true,"dry_run":true}"#,
+            "application/json",
+            "",
+            "lan.local:8471",
+        );
+        assert!(lan.starts_with("HTTP/1.1 403"), "{lan}");
+
+        // Confirmed dry_run against local bare remote succeeds cleanly without mutating remote.
+        let dry = respond(
+            &app,
+            "",
+            "POST",
+            &format!("/api/sessions/{sid}/pr"),
+            r#"{"confirm":true,"dry_run":true,"draft":true}"#,
+            "application/json",
+            "http://127.0.0.1:8471",
+            "127.0.0.1:8471",
+        );
+        assert!(dry.starts_with("HTTP/1.1 200"), "{dry}");
+        let dry_body = response_body(&dry);
+        assert_eq!(dry_body["dry_run"], true);
+        assert_eq!(dry_body["pushed"], false);
+        assert_eq!(dry_body["created"], false);
+        // Bare remote must still only contain refs/heads/main (nothing pushed).
+        let remote_refs = git_run(&bare, &["for-each-ref", "--format=%(refname:short)"]);
+        assert_eq!(remote_refs.trim(), "main");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v070_worktrees_inspector_and_safe_removal_guards() {
+        let dir = std::env::temp_dir().join(format!("fleet-v070-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir.join("repo"));
+        let orphan = dir.join("orphan-wt");
+        git_run(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "orphan/test",
+                orphan.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        std::fs::write(orphan.join("dirty.txt"), "uncommitted\n").unwrap();
+
+        let active_wt = dir.join("active-wt");
+        git_run(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "fleet/s-active",
+                active_wt.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+
+        let mut active_sess = test_session("s-active", Status::Working, &dir);
+        active_sess.repo = repo.to_string_lossy().to_string();
+        active_sess.branch = "fleet/s-active".to_string();
+        active_sess.worktree = active_wt.to_string_lossy().to_string();
+
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let app = test_app(data.clone(), vec![active_sess]);
+
+        // LAN host is refused 403.
+        let lan = respond(
+            &app,
+            "lan.local",
+            "GET",
+            "/api/repos/worktrees",
+            "",
+            "",
+            "",
+            "lan.local:8471",
+        );
+        assert!(lan.starts_with("HTTP/1.1 403"), "{lan}");
+
+        // Loopback GET /api/repos/worktrees lists main, active linked, and dirty orphan.
+        let list_resp = respond(
+            &app,
+            "",
+            "GET",
+            &format!("/api/repos/worktrees?repo={}", repo.to_string_lossy()),
+            "",
+            "",
+            "",
+            "127.0.0.1:8471",
+        );
+        assert!(list_resp.starts_with("HTTP/1.1 200"), "{list_resp}");
+        let list = response_body(&list_resp);
+        assert_eq!(list["count"], 3, "list={list}");
+        assert_eq!(list["orphan_count"], 1, "list={list}");
+        let wts = list["worktrees"].as_array().unwrap();
+        let orphan_entry = wts
+            .iter()
+            .find(|w| w["branch"] == "orphan/test")
+            .expect("orphan worktree present");
+        assert_eq!(orphan_entry["is_orphan"], true);
+        assert_eq!(orphan_entry["dirty"], true);
+        assert_eq!(orphan_entry["removable"], true);
+        let active_entry = wts
+            .iter()
+            .find(|w| w["session_id"] == "s-active")
+            .expect("active session worktree present");
+        assert_eq!(active_entry["is_orphan"], false);
+        assert_eq!(active_entry["removable"], false);
+
+        // Security guards on DELETE /api/repos/worktrees:
+        // 1. Refuse removing main repository worktree (403).
+        let del_main = respond(
+            &app,
+            "",
+            "DELETE",
+            "/api/repos/worktrees",
+            &serde_json::json!({ "repo": repo, "path": repo }).to_string(),
+            "application/json",
+            "http://127.0.0.1:8471",
+            "127.0.0.1:8471",
+        );
+        assert!(del_main.starts_with("HTTP/1.1 403"), "{del_main}");
+
+        // 2. Refuse '..' traversal (403).
+        let del_trav = respond(
+            &app,
+            "",
+            "DELETE",
+            "/api/repos/worktrees",
+            &serde_json::json!({ "repo": repo, "path": "/tmp/a/../etc/passwd" }).to_string(),
+            "application/json",
+            "http://127.0.0.1:8471",
+            "127.0.0.1:8471",
+        );
+        assert!(del_trav.starts_with("HTTP/1.1 403"), "{del_trav}");
+
+        // 3. Refuse active working session worktree (409).
+        let del_active = respond(
+            &app,
+            "",
+            "DELETE",
+            "/api/repos/worktrees",
+            &serde_json::json!({ "repo": repo, "path": active_wt }).to_string(),
+            "application/json",
+            "http://127.0.0.1:8471",
+            "127.0.0.1:8471",
+        );
+        assert!(del_active.starts_with("HTTP/1.1 409"), "{del_active}");
+
+        // 4. Refuse cross-origin CSRF (403).
+        let del_csrf = respond(
+            &app,
+            "",
+            "DELETE",
+            "/api/repos/worktrees",
+            &serde_json::json!({ "repo": repo, "path": orphan }).to_string(),
+            "application/json",
+            "https://evil.example",
+            "127.0.0.1:8471",
+        );
+        assert!(del_csrf.starts_with("HTTP/1.1 403"), "{del_csrf}");
+
+        // 5. Remove targeted orphan cleanly via loopback DELETE (200).
+        let del_ok = respond(
+            &app,
+            "",
+            "DELETE",
+            "/api/repos/worktrees",
+            &serde_json::json!({ "repo": repo, "path": orphan }).to_string(),
+            "application/json",
+            "http://127.0.0.1:8471",
+            "127.0.0.1:8471",
+        );
+        assert!(del_ok.starts_with("HTTP/1.1 200"), "{del_ok}");
+        assert!(!orphan.exists(), "orphan worktree directory should be removed");
+        assert!(repo.exists(), "main repository must remain untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v070_budget_guardrails_429_and_metrics_status() {
+        let dir = std::env::temp_dir().join(format!("fleet-v070-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir.join("repo"));
+        let agent = script_agent(&dir, "fast.sh", "#!/bin/sh\necho ok > out.txt\n");
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let app = test_app(data.clone(), Vec::new());
+
+        // Policy advertises v0.7.0 features.
+        let pol = response_body(&handle(&app, "GET", "/api/policy", ""));
+        assert_eq!(pol["features"]["pr_preview"], true);
+        assert_eq!(pol["features"]["worktrees"], true);
+        assert_eq!(pol["features"]["budget"], true);
+
+        // Fuzz invalid budget updates rejected with 400 (never panic or 500).
+        for bad in [
+            r#"{"daily_session_limit": -5}"#,
+            r#"{"max_session_mins": 999999}"#,
+            r#"{"max_heal_attempts": 99}"#,
+            r#"{"daily_session_limit": "ten"}"#,
+            r#"{"budget": "invalid"}"#,
+        ] {
+            let r = respond(
+                &app,
+                "",
+                "POST",
+                "/api/config",
+                bad,
+                "application/json",
+                "http://127.0.0.1:8471",
+                "127.0.0.1:8471",
+            );
+            assert!(r.starts_with("HTTP/1.1 400"), "payload={bad} resp={r}");
+        }
+
+        // Configure tight daily budget: 2 sessions/day, max_heal_attempts=1.
+        let cfg_resp = respond(
+            &app,
+            "",
+            "POST",
+            "/api/config",
+            r#"{"daily_session_limit":2,"max_session_mins":10,"max_heal_attempts":1}"#,
+            "application/json",
+            "http://127.0.0.1:8471",
+            "127.0.0.1:8471",
+        );
+        assert!(cfg_resp.starts_with("HTTP/1.1 200"), "{cfg_resp}");
+
+        // Invalid 400 dispatch and batch dry_run MUST NOT consume budget.
+        let bad_post = handle(&app, "POST", "/api/sessions", r#"{"task":"","repo":""}"#);
+        assert!(bad_post.starts_with("HTTP/1.1 400"));
+        let dry_batch = handle(
+            &app,
+            "POST",
+            "/api/sessions/batch",
+            &serde_json::json!({
+                "dry_run": true,
+                "repo": repo,
+                "tasks": [
+                    { "task": "a", "agent": agent },
+                    { "task": "b", "agent": agent },
+                    { "task": "c", "agent": agent }
+                ]
+            })
+            .to_string(),
+        );
+        assert!(dry_batch.starts_with("HTTP/1.1 200"), "{dry_batch}");
+
+        // Dispatch 1st session -> 201 (and auto_steer_budget clamped to max_heal_attempts=1).
+        let s1 = handle(
+            &app,
+            "POST",
+            "/api/sessions",
+            &serde_json::json!({
+                "repo": repo,
+                "task": "first budgeted task",
+                "agent": agent,
+                "check": "test -s out.txt",
+                "auto_steer_budget": 5
+            })
+            .to_string(),
+        );
+        assert!(s1.starts_with("HTTP/1.1 201"), "{s1}");
+        assert_eq!(response_body(&s1)["auto_steer_budget"], 1);
+
+        // Batch of 2 exceeds remaining=1 -> atomic HTTP 429 (0 sessions added!).
+        let batch_429 = handle(
+            &app,
+            "POST",
+            "/api/sessions/batch",
+            &serde_json::json!({
+                "repo": repo,
+                "tasks": [
+                    { "task": "over-1", "agent": agent, "check": "test -s out.txt" },
+                    { "task": "over-2", "agent": agent, "check": "test -s out.txt" }
+                ]
+            })
+            .to_string(),
+        );
+        assert!(batch_429.starts_with("HTTP/1.1 429"), "{batch_429}");
+        assert_eq!(response_body(&batch_429)["code"], "daily-budget-exceeded");
+
+        // Dispatch 2nd session -> 201 (reaches daily limit 2/2).
+        let s2 = handle(
+            &app,
+            "POST",
+            "/api/sessions",
+            &serde_json::json!({
+                "repo": repo,
+                "task": "second budgeted task",
+                "agent": agent,
+                "check": "test -s out.txt"
+            })
+            .to_string(),
+        );
+        assert!(s2.starts_with("HTTP/1.1 201"), "{s2}");
+
+        // 3rd session -> HTTP 429 Too Many Requests.
+        let s3 = handle(
+            &app,
+            "POST",
+            "/api/sessions",
+            &serde_json::json!({
+                "repo": repo,
+                "task": "third blocked task",
+                "agent": agent,
+                "check": "test -s out.txt"
+            })
+            .to_string(),
+        );
+        assert!(s3.starts_with("HTTP/1.1 429"), "{s3}");
+
+        // GET /api/metrics exposes live budget utilization (2/2, daily_limit_reached=true).
+        let met = response_body(&handle(&app, "GET", "/api/metrics", ""));
+        assert_eq!(met["budget"]["sessions_today"], 2, "met={met}");
+        assert_eq!(met["budget"]["daily_session_limit"], 2);
+        assert_eq!(met["budget"]["remaining_today"], 0);
+        assert_eq!(met["budget"]["daily_limit_reached"], true);
+        assert_eq!(met["budget"]["limit_reached"], true);
+        assert_eq!(met["budget"]["usage_pct"], 100);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
