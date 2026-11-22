@@ -146,6 +146,13 @@ the task, status, bucket and transcript, each carries:
 - `GET /api/sessions/<id>/merge-check` — non-destructive `git merge-tree` dry-run
   conflict check (`clean`, `conflicting_files`, `commits_ahead`, `commits_behind`,
   `can_fast_forward`).
+- `GET /api/sessions/<id>/pr-preview` — generates a structured PR title,
+  copy-ready Markdown body (task summary, verification receipt table, auto-heal
+  timeline, diff stats), base/head branch metadata, and `gh` availability check.
+- `POST /api/sessions/<id>/pr` (loopback-only + CSRF + `confirm: true`) —
+  confirmation-gated GitHub PR creation via `gh pr create --body-file -`
+  (supports `dry_run: true` for non-destructive `git push --dry-run` validation;
+  refuses `confirm: false` with 400 before pushing).
 - `GET /api/sessions/<id>/patch` — exports the session's verified work as a
   downloadable `.patch` (`?format=format-patch|unified-diff`, or `?json=1`).
 - `POST /api/sessions/<id>/merge` (optional `{"strategy": "merge-commit"|"squash"|"fast-forward-only"}`),
@@ -161,11 +168,19 @@ the task, status, bucket and transcript, each carries:
   optional `engine` or candidate `script`), returning the routed engine, model,
   check steps, timeout, budgets, file-scope globs, and trace.
 - `GET /api/repos` (loopback-only) discovers local git repositories and their
-  checked-out branches; `POST /api/repos/prune-worktrees` (loopback-only) prunes
-  inactive worktrees strictly inside Fleet's worktrees directory.
-- `GET /api/config` and `POST /api/config` (loopback-only) read and persist
-  live default-engine, per-engine model, and `max_parallel_agents` (`1..=64`)
-  settings in `config.json` inside the data folder without restarting Fleet.
+  checked-out branches; `GET /api/repos/worktrees` and `DELETE /api/repos/worktrees`
+  (loopback-only) inspect every registered git worktree (linked session status,
+  dirty flag, `is_orphan`, `removable`) and safely remove targeted non-main
+  worktrees (refusing main repos, path traversal, unregistered paths, locked
+  worktrees, and active sessions); `POST /api/repos/prune-worktrees`
+  (loopback-only) prunes inactive worktrees strictly inside Fleet's worktrees
+  directory.
+- `GET /api/config`, `POST /api/config`, `GET /api/budget`, and `POST /api/budget`
+  (loopback-only) read and persist live default-engine, per-engine model,
+  `max_parallel_agents` (`1..=64`), and daily budget guardrails
+  (`max_session_mins`, `daily_session_limit`, `max_heal_attempts`, enforcing
+  HTTP 429 on daily dispatch exhaustion and exposed inside `GET /api/metrics`)
+  without restarting Fleet.
 - `GET /api/version`, `GET /api/update`, `POST /api/update/check`,
   `POST /api/update/apply`, `POST /api/update/restart` — see "Versions and
   updates".

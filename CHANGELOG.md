@@ -4,6 +4,42 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running app shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.7.0 - 2026-11-22
+
+- Interactive Multi-Wave DAG Dependency Visualizer (`frontend/src/dag-graph.tsx`,
+  `Board` / `DAG Graph` toggle + `g` shortcut + `Cmd+K` command): topological
+  longest-path wave layering with cycle protection, color-coded status rails,
+  directed SVG cubic Bezier dependency arrows with hover path highlighting, and
+  1-click node jump into the Session Inspector.
+- PR Preview & Confirmation-Gated GitHub PR Creator (`src/pr.rs`,
+  `GET /api/sessions/:id/pr-preview`, loopback+CSRF-guarded `POST /api/sessions/:id/pr`,
+  `frontend/src/pr-modal.tsx`): generates structured titles and copy-ready
+  Markdown PR bodies (task summary, per-step verification receipt table,
+  auto-heal timeline, hardened `--no-ext-diff --no-textconv` diff stats,
+  base/head branch, `gh` availability), refuses pushing unless `confirm: true`,
+  supports non-destructive `dry_run: true` validation via `git push --dry-run`,
+  and passes PR bodies over stdin (`--body-file -`).
+- Git Worktree Inspector & Safe Non-Main Removal (`src/worktrees.rs`,
+  loopback-guarded `GET /api/repos/worktrees`, `DELETE /api/repos/worktrees`,
+  `frontend/src/settings-policy.tsx`): parses `git worktree list --porcelain`
+  with linked session status, branch, dirty flag, `is_orphan`, and `removable`;
+  strictly enforces an authoritative registered non-main worktree allowlist
+  blocking main repo deletion (`403`), `..` path traversal (`403`), relative
+  paths (`400`), symlink/unregistered escapes (`403`), locked worktrees (`409`),
+  and active running sessions (`409`).
+- Daily Dispatch & Session Budget Guardrails (`src/budget.rs`,
+  `GET/POST /api/budget`, `POST /api/config` patch, `GET /api/metrics` `budget`
+  object, `frontend/src/settings-policy.tsx` & `board.tsx`): atomic UTC-day
+  `<data_dir>/budget.json` tracker enforcing `daily_session_limit` with atomic
+  HTTP `429` refusals on single and batch dispatch (never charging invalid `400`
+  or `dry_run: true` requests), clamping session timeouts by `max_session_mins`,
+  and capping autonomous repair passes by `max_heal_attempts`.
+- Standalone Browser-Only Live Web Bundle v0.7.0
+  (`shared-live-web/dsh-fleet/index.html`): full browser parity for DAG Graph,
+  PR Preview + confirmation-gated dry-run, Worktrees Inspector with orphan
+  pruning, and Budget Guardrails with zero external requests and zero user-facing
+  internal jargon.
+
 ## 0.6.0 - 2026-11-22
 
 - Autonomous Auto-Heal / Auto-Steer Feedback Loop (`src/autoheal.rs`,
