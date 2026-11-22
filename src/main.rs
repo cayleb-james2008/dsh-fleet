@@ -565,6 +565,35 @@ impl WorktreeSessionView for Session {
     }
 }
 
+/// Lightweight projection of a session for worktree listing and removal checks,
+/// avoiding cloning multi-megabyte transcripts/diffs under concurrency.
+struct LightWorktreeSession {
+    id: String,
+    status: String,
+    repo: String,
+    branch: String,
+    worktree: String,
+    task: String,
+}
+
+impl WorktreeSessionView for LightWorktreeSession {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn status(&self) -> &str {
+        &self.status
+    }
+    fn repo(&self) -> &str {
+        &self.repo
+    }
+    fn branch(&self) -> &str {
+        &self.branch
+    }
+    fn worktree(&self) -> &str {
+        &self.worktree
+    }
+}
+
 /// The branch a merge into this repo lands on: its checked-out branch.
 fn merge_target(repo: &str) -> Option<String> {
     if repo.is_empty() {
@@ -654,6 +683,11 @@ struct App {
     /// Cached serialized GET /api/metrics payload keyed by (state_rev, budget_rev, max_parallel, cached_at).
     #[allow(clippy::type_complexity)]
     metrics_cache: Mutex<Option<(u64, u64, i64, std::time::Instant, String)>>,
+    /// Cached serialized GET /api/repos/worktrees responses keyed by explicit_repo -> (state_rev, env_key, cached_at, payload).
+    #[allow(clippy::type_complexity)]
+    worktrees_cache: Mutex<std::collections::HashMap<Option<String>, (u64, String, std::time::Instant, String)>>,
+    /// Single-flight lock serializing cold worktrees cache fills so 30x concurrent polls only shell out to git once.
+    worktrees_refresh_lock: Mutex<()>,
     /// Atomic file-backed playbook template store (`<data_dir>/templates.json`).
     templates: Mutex<TemplateStore>,
     /// Atomic file-backed daily session & auto-heal budget tracker (`<data_dir>/budget.json`).
@@ -4374,18 +4408,66 @@ fn handle_pr_create(app: &Arc<App>, id: &str, body: &str) -> String {
     }
 }
 
-fn handle_list_worktrees(app: &Arc<App>, params: &std::collections::HashMap<String, String>) -> String {
-    let sessions: Vec<Session> = app.sessions.lock().unwrap().clone();
-    let task_by_id: std::collections::HashMap<&str, &str> = sessions
+fn light_worktree_sessions(app: &Arc<App>) -> Vec<LightWorktreeSession> {
+    let guard = app.sessions.lock().unwrap();
+    guard
         .iter()
-        .map(|s| (s.id.as_str(), s.task.as_str()))
-        .collect();
+        .map(|s| LightWorktreeSession {
+            id: s.id.clone(),
+            status: s.status.clone(),
+            repo: s.repo.clone(),
+            branch: s.branch.clone(),
+            worktree: s.worktree.clone(),
+            task: s.task.clone(),
+        })
+        .collect()
+}
+
+fn handle_list_worktrees(app: &Arc<App>, params: &std::collections::HashMap<String, String>) -> String {
+    const CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(1500);
+    const MAX_CACHE_KEYS: usize = 16;
 
     let explicit_repo = params
         .get("repo")
         .map(String::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    let force_refresh = matches!(
+        params.get("refresh").or_else(|| params.get("fresh")).map(String::as_str),
+        Some("1" | "true" | "yes")
+    );
+    let cache_key = explicit_repo.map(str::to_string);
+    let env_key = std::env::var("FLEET_REPOS_DIR").unwrap_or_default();
+    let rev = app.state_rev.load(std::sync::atomic::Ordering::SeqCst);
+    let now = std::time::Instant::now();
+
+    if !force_refresh {
+        let guard = app.worktrees_cache.lock().unwrap();
+        if let Some((cached_rev, cached_env, at, payload)) = guard.get(&cache_key) {
+            if *cached_rev == rev && *cached_env == env_key && now.duration_since(*at) < CACHE_TTL {
+                return json_response(200, payload);
+            }
+        }
+    }
+
+    // Single-flight refresh: under 30+ concurrent polls, only one thread forks git.
+    let _refresh_guard = app.worktrees_refresh_lock.lock().unwrap();
+    let rev = app.state_rev.load(std::sync::atomic::Ordering::SeqCst);
+    let now = std::time::Instant::now();
+    if !force_refresh {
+        let guard = app.worktrees_cache.lock().unwrap();
+        if let Some((cached_rev, cached_env, at, payload)) = guard.get(&cache_key) {
+            if *cached_rev == rev && *cached_env == env_key && now.duration_since(*at) < CACHE_TTL {
+                return json_response(200, payload);
+            }
+        }
+    }
+
+    let sessions = light_worktree_sessions(app);
+    let task_by_id: std::collections::HashMap<&str, &str> = sessions
+        .iter()
+        .map(|s| (s.id.as_str(), s.task.as_str()))
+        .collect();
 
     let repo_paths: Vec<String> = if let Some(r) = explicit_repo {
         vec![r.to_string()]
@@ -4451,15 +4533,23 @@ fn handle_list_worktrees(app: &Arc<App>, params: &std::collections::HashMap<Stri
         }
     }
 
-    json_response(
-        200,
-        &serde_json::json!({
-            "worktrees": out_entries,
-            "count": out_entries.len(),
-            "orphan_count": orphan_count,
-        })
-        .to_string(),
-    )
+    let payload = serde_json::json!({
+        "worktrees": out_entries,
+        "count": out_entries.len(),
+        "orphan_count": orphan_count,
+    })
+    .to_string();
+
+    let rev_after = app.state_rev.load(std::sync::atomic::Ordering::SeqCst);
+    if rev_after == rev {
+        let mut guard = app.worktrees_cache.lock().unwrap();
+        if guard.len() >= MAX_CACHE_KEYS {
+            guard.clear();
+        }
+        guard.insert(cache_key, (rev, env_key, std::time::Instant::now(), payload.clone()));
+    }
+
+    json_response(200, &payload)
 }
 
 fn handle_delete_worktree(
@@ -4502,10 +4592,11 @@ fn handle_delete_worktree(
     if repo.is_empty() || wt_path.is_empty() {
         return error_response(400, "both 'repo' and 'path' are required to remove a worktree");
     }
-    let sessions: Vec<Session> = app.sessions.lock().unwrap().clone();
+    let sessions = light_worktree_sessions(app);
     match remove_worktree_checked(Path::new(&repo), Path::new(&wt_path), None, &sessions) {
         Ok(res) => {
             *app.repos_cache.lock().unwrap() = None;
+            app.worktrees_cache.lock().unwrap().clear();
             app.events.publish(
                 "worktrees_pruned",
                 &serde_json::json!({
@@ -4590,6 +4681,8 @@ fn update_route(
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
             let res = app.prune_worktrees(filter_repo);
+            *app.repos_cache.lock().unwrap() = None;
+            app.worktrees_cache.lock().unwrap().clear();
             json_response(200, &res.to_string())
         }
         ("GET", "/api/budget") => {
@@ -6765,6 +6858,8 @@ fn main() {
         sessions_cache: Mutex::new(None),
         repos_cache: Mutex::new(None),
         metrics_cache: Mutex::new(None),
+        worktrees_cache: Mutex::new(std::collections::HashMap::new()),
+        worktrees_refresh_lock: Mutex::new(()),
         templates: Mutex::new(template_store),
         budget: Mutex::new(budget_tracker),
         budget_rev: std::sync::atomic::AtomicU64::new(1),
@@ -7068,6 +7163,8 @@ mod tests {
             sessions_cache: Mutex::new(None),
             repos_cache: Mutex::new(None),
             metrics_cache: Mutex::new(None),
+        worktrees_cache: Mutex::new(std::collections::HashMap::new()),
+        worktrees_refresh_lock: Mutex::new(()),
             templates: Mutex::new(TemplateStore::load(dir.join("data"))),
             budget: Mutex::new(BudgetTracker::load(dir.join("data"))),
             budget_rev: std::sync::atomic::AtomicU64::new(1),
@@ -7154,6 +7251,8 @@ mod tests {
             sessions_cache: Mutex::new(None),
             repos_cache: Mutex::new(None),
             metrics_cache: Mutex::new(None),
+        worktrees_cache: Mutex::new(std::collections::HashMap::new()),
+        worktrees_refresh_lock: Mutex::new(()),
             templates: Mutex::new(TemplateStore::load(&data_dir)),
             budget: Mutex::new(BudgetTracker::load(&data_dir)),
             budget_rev: std::sync::atomic::AtomicU64::new(1),
@@ -7984,6 +8083,8 @@ mod tests {
             sessions_cache: Mutex::new(None),
             repos_cache: Mutex::new(None),
             metrics_cache: Mutex::new(None),
+        worktrees_cache: Mutex::new(std::collections::HashMap::new()),
+        worktrees_refresh_lock: Mutex::new(()),
             templates: Mutex::new(TemplateStore::load(&data)),
             budget: Mutex::new(BudgetTracker::load(&data)),
             budget_rev: std::sync::atomic::AtomicU64::new(1),
