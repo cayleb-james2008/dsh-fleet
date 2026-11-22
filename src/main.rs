@@ -1,43 +1,55 @@
-//! fleet-rs — your agents working in parallel under one screen.
+//! fleet — your agents working in parallel under one screen.
 //!
 //! You hand out work; each hand-out launches a real CLI agent in its own git
 //! worktree; when the agent claims completion the app itself runs the check
 //! attached to the task, and only a passing check earns the "done" status.
 //! Session policies (parallel cap, default checks) live in policies.rn and
-//! are executed through Rune — they drive behaviour, they are not metadata.
+//! drive behaviour directly — they are not metadata.
 
 mod events;
 mod update;
 
-use fleet_rs::autoheal::{
+use fleet::autoheal::{
     FailedCheckContext, HealAttempt, HealDecision, HealSessionContext, HealStopReason,
     MAX_AUTO_HEAL_BUDGET, build_heal_prompt, evaluate_auto_heal, heal_badge_label,
 };
-use fleet_rs::budget::{BudgetConfig, BudgetError, BudgetStatus, BudgetTracker};
-use fleet_rs::checks::{
+use fleet::budget::{BudgetConfig, BudgetError, BudgetStatus, BudgetTracker};
+use fleet::checks::{
     CheckPipeline, CheckStep, CheckStepReceipt, FileScope, PipelineReceipt, ScopeViolation,
     verify_git_scope,
 };
-use fleet_rs::dag::{BatchSpec, BatchTaskSpec, DagGraph, DagNodeState, TaskNode};
-use fleet_rs::merge_check::{
+use fleet::dag::{BatchSpec, BatchTaskSpec, DagGraph, DagNodeState, TaskNode};
+use fleet::merge_check::{
     MergeStrategy, PatchFormat, dry_run_merge, execute_merge, export_patch,
 };
-use fleet_rs::metrics::{SessionMetricView, compute_metrics_with_capacity};
-use fleet_rs::policy::{MAX_TIMEOUT_SECS, Policy, test_policy_script};
-use fleet_rs::pr::{
+use fleet::metrics::{SessionMetricView, compute_metrics_with_capacity};
+use fleet::policy::{MAX_TIMEOUT_SECS, Policy, test_policy_script};
+use fleet::pr::{
     PrCreateRequest, PrSessionView, build_pr_preview, create_github_pr_with_options,
 };
-use fleet_rs::templates::{PlaybookInput, PlaybookTask, TemplateStore};
-use fleet_rs::worktrees::{
+use fleet::templates::{PlaybookInput, PlaybookTask, TemplateStore};
+use fleet::worktrees::{
     WorktreeSessionView, list_repo_worktrees, remove_worktree_checked,
 };
 use serde::Serialize;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+
+fn bytes_to_os_string(bytes: &[u8]) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        std::ffi::OsStr::from_bytes(bytes).to_os_string()
+    }
+    #[cfg(not(unix))]
+    {
+        std::ffi::OsString::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Core limits & helpers
@@ -97,19 +109,25 @@ struct AgentInfo {
     path: Option<String>,
 }
 
-/// The CLI agents fleet-rs knows how to drive, probed against the real
-/// PATH at startup. A name is "found" only when `which` resolves it.
+/// The CLI agents Fleet knows how to drive, probed against the real
+/// PATH at startup. A name is "found" only when `which` (Unix) or `where` (Windows) resolves it.
 fn detect_agents() -> Vec<AgentInfo> {
+    let finder = if cfg!(windows) { "where" } else { "which" };
     ["opencode", "claude", "codex"]
         .iter()
         .map(|name| {
-            let path = Command::new("which")
+            let path = Command::new(finder)
                 .arg(name)
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .filter(|s| !s.is_empty());
+                .and_then(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty())
+                        .map(str::to_string)
+                });
             AgentInfo {
                 name: name.to_string(),
                 found: path.is_some(),
@@ -142,7 +160,7 @@ fn is_executable(p: &Path) -> bool {
 /// agent; a path must be an executable file. Anything else is refused
 /// with the problem named — before any session or worktree exists.
 fn validate_agent(app: &App, agent: &str) -> Result<String, String> {
-    if agent.contains('/') {
+    if agent.contains('/') || (cfg!(windows) && agent.contains('\\')) {
         if is_executable(Path::new(agent)) {
             Ok(agent.to_string())
         } else {
@@ -434,7 +452,7 @@ struct Session {
     #[serde(default)]
     merge_error: Option<MergeRefusal>,
     /// Upstream session IDs that must finish verified-done (or merged) before
-    /// this session starts. Evaluated by `fleet_rs::dag::DagGraph`.
+    /// this session starts. Evaluated by `fleet::dag::DagGraph`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     depends_on: Vec<String>,
     /// Optional multi-step verification pipeline specs; when empty, runs legacy `check_cmd`.
@@ -712,23 +730,45 @@ fn truncate_line(l: String) -> String {
     }
 }
 
-/// Kill a whole process group (killpg, via the syscall — this
-/// system's `kill` binary silently ignores negative pids, which is
-/// exactly the failure this function exists to avoid). The group is
-/// the unit a runaway run is stopped by: killing only the direct
-/// child leaves its children holding pipes and writing into
-/// worktrees the operator believes are settled.
+/// Kill a whole process group (killpg on Unix; `taskkill /PID <pid> /T /F` on Windows).
+/// The group/tree is the unit a runaway run is stopped by: killing only the direct
+/// child leaves its children holding pipes and writing into worktrees the operator
+/// believes are settled.
+#[cfg(unix)]
 fn kill_group(pid: u32) {
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
     }
 }
 
-/// Send SIGTERM to the entire process group first so agents can flush/exit
-/// cleanly, then escalate to SIGKILL after `grace_ms` if the child is still alive.
+#[cfg(windows)]
+fn kill_group(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn kill_group(_pid: u32) {}
+
+/// Send graceful termination to the entire process group/tree first so agents can
+/// flush/exit cleanly, then escalate to a forced kill after `grace_ms`.
 fn kill_group_graceful(pid: u32, child: &mut std::process::Child, grace_ms: u64) {
+    #[cfg(unix)]
     unsafe {
         libc::kill(-(pid as i32), libc::SIGTERM);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
     }
     let steps = (grace_ms / 50).max(1);
     for _ in 0..steps {
@@ -758,11 +798,14 @@ fn run_bounded(
     stop: Option<&std::sync::atomic::AtomicBool>,
     on_line: &mut dyn FnMut(bool, &str),
 ) -> RunOutcome {
-    use std::os::unix::process::CommandExt;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -1257,11 +1300,15 @@ impl App {
 
         let mut roots: Vec<PathBuf> = Vec::new();
         if let Some(env_dirs) = env_dirs_opt {
-            for part in env_dirs.split(':').filter(|s| !s.trim().is_empty()) {
+            let sep = if cfg!(windows) { ';' } else { ':' };
+            for part in env_dirs.split(sep).filter(|s| !s.trim().is_empty()) {
                 roots.push(PathBuf::from(part.trim()));
             }
         } else {
-            if let Some(home) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
+            let home_env = std::env::var_os("HOME")
+                .filter(|s| !s.is_empty())
+                .or_else(|| std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()));
+            if let Some(home) = home_env {
                 let h = PathBuf::from(home);
                 roots.push(h.join("Work/projects"));
                 roots.push(h.join("projects"));
@@ -2332,7 +2379,7 @@ impl App {
             let mut cmd = Command::new("git");
             cmd.arg("-C").arg(wt).args(["update-index", flag, "--"]);
             for p in &paths {
-                cmd.arg(std::ffi::OsStr::from_bytes(p));
+                cmd.arg(bytes_to_os_string(p));
             }
             let _ = cmd.output();
         }
@@ -2347,6 +2394,7 @@ impl App {
     /// agent's work. (A process that also leaves the tree and closes
     /// its files escapes this sweep; it can no longer touch the
     /// worktree's contents either, short of reopening them by path.)
+    #[cfg(unix)]
     fn sweep_detached(&self, id: &str, dir: &Path) {
         let me = std::process::id() as i32;
         let mut killed = 0;
@@ -2387,6 +2435,9 @@ impl App {
             );
         }
     }
+
+    #[cfg(not(unix))]
+    fn sweep_detached(&self, _id: &str, _dir: &Path) {}
 
     /// One agent run inside a session's worktree, through the engine
     /// adapter, streamed and bounded (timeout and the operator's stop
@@ -2594,7 +2645,7 @@ impl App {
         let commit = Command::new("git")
             .arg("-C")
             .arg(wt)
-            .args(["-c", "user.email=fleet@localhost", "-c", "user.name=fleet-rs"])
+            .args(["-c", "user.email=fleet@localhost", "-c", "user.name=fleet"])
             .args(["commit", "--allow-empty", "-m", &format!("fleet session {}: {}", id, session.task)])
             .output();
         let mut commit_error = match &commit {
@@ -2622,7 +2673,7 @@ impl App {
             let retry = Command::new("git")
                 .arg("-C")
                 .arg(wt)
-                .args(["-c", "user.email=fleet@localhost", "-c", "user.name=fleet-rs"])
+                .args(["-c", "user.email=fleet@localhost", "-c", "user.name=fleet"])
                 .args(["commit", "--allow-empty", "-m", &format!("fleet session {}: {}", id, session.task)])
                 .output();
             commit_error = match &retry {
@@ -3341,7 +3392,7 @@ impl App {
             let path = String::from_utf8_lossy(path_bytes).to_string();
             let mut lst = Command::new("git");
             lst.arg("-C").arg(repo).args(["ls-tree", "-z", commit, "--"]);
-            lst.arg(std::ffi::OsStr::from_bytes(path_bytes));
+            lst.arg(bytes_to_os_string(path_bytes));
             let mode = lst
                 .output()
                 .ok()
@@ -3367,7 +3418,7 @@ impl App {
                     .arg(repo)
                     .arg("cat-file")
                     .arg("-p")
-                    .arg(std::ffi::OsStr::from_bytes(&rev))
+                    .arg(bytes_to_os_string(&rev))
                     .output()
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                     .unwrap_or_default();
@@ -4489,7 +4540,7 @@ fn update_route(
     Some(match (method, route) {
         ("GET", "/api/version") => json_response(
             200,
-            &serde_json::json!({"name": "fleet-rs", "version": env!("CARGO_PKG_VERSION")}).to_string(),
+            &serde_json::json!({"name": "fleet", "version": env!("CARGO_PKG_VERSION")}).to_string(),
         ),
         ("GET", "/api/repos") => {
             if !host_allowed(host, "") {
@@ -4751,11 +4802,11 @@ fn restart_response(app: &Arc<App>) -> String {
         std::thread::sleep(std::time::Duration::from_millis(400));
         // Checked again at the last moment: a hand-out may have arrived.
         if busy(&app) > 0 {
-            eprintln!("fleet-rs: restart cancelled — a session started while the update was waiting");
+            eprintln!("fleet: restart cancelled — a session started while the update was waiting");
             return;
         }
         if let Err(e) = app.updater.restart() {
-            eprintln!("fleet-rs: restart failed: {e}");
+            eprintln!("fleet: restart failed: {e}");
         }
     });
     json_response(200, &serde_json::json!({"restarting": true}).to_string())
@@ -5500,7 +5551,7 @@ fn handle_batch_sessions(app: &Arc<App>, body: &str) -> String {
         std::collections::HashMap::new();
 
     struct ReadySpec {
-        planned: fleet_rs::dag::PlannedSession,
+        planned: fleet::dag::PlannedSession,
         agent: String,
         model: Option<String>,
         check_cmd: String,
@@ -6420,9 +6471,21 @@ fn load_persisted(data_dir: &Path) -> (Vec<Session>, u64) {
 /// Where Fleet keeps its state when the operator has not set `FLEET_DATA`:
 /// the platform data folder (`$XDG_DATA_HOME/fleet`, else
 /// `~/.local/share/fleet` on Linux, `~/Library/Application Support/fleet` on
-/// macOS). A relative `./fleet-data` default would scatter sessions across
-/// every directory the binary is launched from.
+/// macOS, `%LOCALAPPDATA%\fleet` on Windows). A relative `./fleet-data`
+/// default would scatter sessions across every directory the binary is launched from.
 fn default_data_dir() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|s| !s.is_empty()) {
+            return std::path::PathBuf::from(local).join("fleet");
+        }
+        if let Some(roaming) = std::env::var_os("APPDATA").filter(|s| !s.is_empty()) {
+            return std::path::PathBuf::from(roaming).join("fleet");
+        }
+        if let Some(profile) = std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()) {
+            return std::path::PathBuf::from(profile).join(".local/share/fleet");
+        }
+    }
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|s| !s.is_empty()) {
         return std::path::PathBuf::from(xdg).join("fleet");
     }
@@ -6454,23 +6517,118 @@ fn listen_port() -> Result<u16, String> {
     }
 }
 
-/// Open the board in the operator's browser once, at the given URL — the way
-/// a desktop app does. Suppressed when there is no display (a headless
-/// service), when the operator opts out (`FLEET_NO_OPEN` or `--no-open`), or
-/// when this is a systemd service (`INVOCATION_ID` set). Failures are silent:
-/// the board is still reachable at the URL.
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let cand = dir.join(name);
+        if is_executable(&cand) {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Resolve the chromeless desktop app launch command for the current OS:
+/// - Linux: `chromium --app=<url> --class=fleet` (or Chrome/Brave/Edge on PATH), falling back to `xdg-open`.
+/// - Windows: `msedge.exe --app=<url>` (or Chrome), falling back to `cmd /C start "" <url>`.
+/// - macOS: `open <url>`.
+///
+/// Setting `FLEET_APP_WINDOW=0` opts into the standard browser tab opener.
+fn desktop_launch_command(url: &str) -> (String, Vec<String>) {
+    let app_window = std::env::var("FLEET_APP_WINDOW")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+        .unwrap_or(true);
+
+    #[cfg(target_os = "windows")]
+    {
+        if app_window {
+            let candidates = [
+                find_in_path("msedge.exe"),
+                Some(PathBuf::from(
+                    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                ))
+                .filter(|p| p.is_file()),
+                Some(PathBuf::from(
+                    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                ))
+                .filter(|p| p.is_file()),
+                find_in_path("chrome.exe"),
+                Some(PathBuf::from(
+                    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                ))
+                .filter(|p| p.is_file()),
+                Some(PathBuf::from(
+                    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                ))
+                .filter(|p| p.is_file()),
+            ];
+            if let Some(browser) = candidates.into_iter().flatten().next() {
+                return (
+                    browser.to_string_lossy().to_string(),
+                    vec![format!("--app={url}")],
+                );
+            }
+        }
+        return (
+            "cmd".to_string(),
+            vec![
+                "/C".to_string(),
+                "start".to_string(),
+                String::new(),
+                url.to_string(),
+            ],
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app_window;
+        return ("open".to_string(), vec![url.to_string()]);
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        if app_window {
+            for browser in [
+                "chromium",
+                "chromium-browser",
+                "google-chrome",
+                "google-chrome-stable",
+                "brave",
+                "microsoft-edge",
+            ] {
+                if let Some(exe) = find_in_path(browser) {
+                    return (
+                        exe.to_string_lossy().to_string(),
+                        vec![format!("--app={url}"), "--class=fleet".to_string()],
+                    );
+                }
+            }
+        }
+        ("xdg-open".to_string(), vec![url.to_string()])
+    }
+}
+
+/// Open Fleet once in a chromeless desktop app window (with browser fallback).
+/// Suppressed when there is no display on Linux (a headless service), when the
+/// operator opts out (`FLEET_NO_OPEN` or `--no-open`), or when running under
+/// systemd (`INVOCATION_ID` set). Failures are silent: the board stays reachable
+/// at the URL on the banner.
 fn open_in_browser(url: &str) {
     let opted_out = std::env::var_os("FLEET_NO_OPEN").is_some()
         || std::env::var_os("INVOCATION_ID").is_some()
         || std::env::args().any(|a| a == "--no-open");
-    let has_display = std::env::var_os("DISPLAY").is_some()
-        || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let has_display = if cfg!(any(target_os = "windows", target_os = "macos")) {
+        true
+    } else {
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+    };
     if opted_out || !has_display {
         return;
     }
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    let _ = std::process::Command::new(opener)
-        .arg(url)
+    let (prog, args) = desktop_launch_command(url);
+    let _ = std::process::Command::new(prog)
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -6482,11 +6640,11 @@ fn main() {
     // Answered before anything else, in any argument position, so `--version`
     // never reads the policies path.
     if args.iter().skip(1).any(|a| a == "--version" || a == "-V") {
-        println!("fleet-rs {}", env!("CARGO_PKG_VERSION"));
+        println!("fleet {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     let port: u16 = listen_port().unwrap_or_else(|e| {
-        eprintln!("fleet-rs: {e}");
+        eprintln!("fleet: {e}");
         std::process::exit(1);
     });
     let agents = detect_agents();
@@ -6522,14 +6680,14 @@ fn main() {
     let script = match std::fs::read_to_string(&policy_path) {
         Ok(text) => text,
         Err(e) => {
-            eprintln!("fleet-rs: cannot read the policies file {policy_path}: {e}");
+            eprintln!("fleet: cannot read the policies file {policy_path}: {e}");
             std::process::exit(1);
         }
     };
     let policy = match Policy::load(&script) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("fleet-rs: the policies file {policy_path} is not valid: {e}");
+            eprintln!("fleet: the policies file {policy_path} is not valid: {e}");
             std::process::exit(1);
         }
     };
@@ -6580,9 +6738,9 @@ fn main() {
         events: Arc::new(events::EventBus::new()),
         updater: update::Updater::from_env(
             "FLEET",
-            "fleet-rs",
+            "fleet",
             env!("CARGO_PKG_VERSION"),
-            "cayleb-james2008/dsh-fleet",
+            "cayleb-james2008/fleet",
             true,
         ),
     });
@@ -6654,7 +6812,7 @@ fn main() {
     }
     if !app.sessions.lock().unwrap().is_empty() {
         println!(
-            "fleet-rs: restored {} session(s) from disk",
+            "fleet: restored {} session(s) from disk",
             app.sessions.lock().unwrap().len()
         );
     }
@@ -6663,10 +6821,10 @@ fn main() {
     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| {
         if e.kind() == std::io::ErrorKind::AddrInUse {
             eprintln!(
-                "fleet-rs: port {port} is busy. Set PORT to a free port, or stop the process using it."
+                "fleet: port {port} is busy. Set PORT to a free port, or stop the process using it."
             );
         } else {
-            eprintln!("fleet-rs: cannot listen on port {port}: {e}");
+            eprintln!("fleet: cannot listen on port {port}: {e}");
         }
         std::process::exit(1);
     });
@@ -6677,7 +6835,7 @@ fn main() {
         .map(|a| format!("{}:{}", a.name, if a.found { "found" } else { "not found" }))
         .collect();
     println!(
-        "fleet-rs listening on http://127.0.0.1:{port}/ (agents: {}; default: {}; max_parallel: {})",
+        "fleet listening on http://127.0.0.1:{port}/ (agents: {}; default: {}; max_parallel: {})",
         detected.join(", "),
         app.effective_default_agent().as_deref().unwrap_or("none"),
         app.effective_max_parallel()
@@ -6735,8 +6893,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fleet_rs::merge_check::plain_merge_refusal;
-    use fleet_rs::policy::DEFAULT_TIMEOUT_SECS;
+    use fleet::merge_check::plain_merge_refusal;
+    use fleet::policy::DEFAULT_TIMEOUT_SECS;
 
     const SCRIPT: &str = include_str!("../policies.rn");
 
@@ -6882,12 +7040,12 @@ mod tests {
             stops: Mutex::new(std::collections::HashMap::new()),
             events: Arc::new(events::EventBus::new()),
             updater: update::Updater::new(update::Config {
-                bin: "fleet-rs",
+                bin: "fleet",
                 current: env!("CARGO_PKG_VERSION"),
                 repo: "o/r".to_string(),
                 api: "http://127.0.0.1:1".to_string(),
                 mode: update::Mode::Notify,
-                exe: std::env::temp_dir().join("fleet-rs-test-no-such-binary"),
+                exe: std::env::temp_dir().join("fleet-test-no-such-binary"),
                 allow_dev: false,
                 may_apply: true,
             })
@@ -6968,12 +7126,12 @@ mod tests {
             stops: Mutex::new(std::collections::HashMap::new()),
             events: Arc::new(events::EventBus::new()),
             updater: update::Updater::new(update::Config {
-                bin: "fleet-rs",
+                bin: "fleet",
                 current: env!("CARGO_PKG_VERSION"),
                 repo: "o/r".to_string(),
                 api: "http://127.0.0.1:1".to_string(),
                 mode: update::Mode::Notify,
-                exe: std::env::temp_dir().join("fleet-rs-test-no-such-binary"),
+                exe: std::env::temp_dir().join("fleet-test-no-such-binary"),
                 allow_dev: false,
                 may_apply: true,
             })
@@ -7711,7 +7869,7 @@ mod tests {
         let r = call("GET", "/api/version", "127.0.0.1:9840", "");
         assert!(r.starts_with("HTTP/1.1 200"), "{r}");
         let v = response_body(&r);
-        assert_eq!(v["name"], "fleet-rs");
+        assert_eq!(v["name"], "fleet");
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         let p = response_body(&call("GET", "/api/policy", "127.0.0.1:9840", ""));
         assert_eq!(p["version"], env!("CARGO_PKG_VERSION"));
@@ -7798,12 +7956,12 @@ mod tests {
             stops: Mutex::new(std::collections::HashMap::new()),
             events: Arc::new(events::EventBus::new()),
             updater: update::Updater::new(update::Config {
-                bin: "fleet-rs",
+                bin: "fleet",
                 current: env!("CARGO_PKG_VERSION"),
                 repo: "o/r".to_string(),
                 api: "http://127.0.0.1:1".to_string(),
                 mode: update::Mode::Notify,
-                exe: std::env::temp_dir().join("fleet-rs-test-no-such-binary"),
+                exe: std::env::temp_dir().join("fleet-test-no-such-binary"),
                 allow_dev: false,
                 may_apply: true,
             })

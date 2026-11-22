@@ -111,9 +111,16 @@ pub struct WorktreeError {
 
 fn git_cmd(repo: &Path) -> Command {
     let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(repo)
-        .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]);
+    cmd.arg("-C").arg(repo).args([
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        if cfg!(windows) {
+            "core.hooksPath=NUL"
+        } else {
+            "core.hooksPath=/dev/null"
+        },
+    ]);
     cmd
 }
 

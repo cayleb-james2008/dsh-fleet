@@ -32,7 +32,7 @@ printf 'agent version\n' > orphan.txt
 EOF
 chmod +x "$WORK/agent.sh" "$WORK/agent2.sh" "$WORK/agent3.sh"
 
-FLEET_DATA="$WORK/data" PORT=$PORT "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" policies.rn > "$WORK/server.log" 2>&1 &
+FLEET_DATA="$WORK/data" PORT=$PORT "${CARGO_TARGET_DIR:-./target}/debug/fleet" policies.rn > "$WORK/server.log" 2>&1 &
 PIDS="$PIDS $!"
 api() { curl -s "http://127.0.0.1:$PORT$1"; }
 post() { curl -s -w "\n%{http_code}" -X POST "http://127.0.0.1:$PORT$1" -H 'Content-Type: application/json' -d "$2"; }

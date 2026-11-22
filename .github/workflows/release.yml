@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  BIN: fleet-rs
+  BIN: fleet
 
 jobs:
   plan:
@@ -55,6 +55,7 @@ jobs:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: '' }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, ext: '' }
           - { os: macos-latest, target: aarch64-apple-darwin, ext: '' }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: '.exe' }
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -67,9 +68,9 @@ jobs:
         run: cargo build --release --locked --bin "$BIN" --target ${{ matrix.target }}
       - name: Stage and check the asset
         run: |
-          mkdir dist
+          mkdir -p dist
           cp "target/${{ matrix.target }}/release/${BIN}${{ matrix.ext }}" "dist/${BIN}-${{ matrix.target }}${{ matrix.ext }}"
-          out="$("dist/${BIN}-${{ matrix.target }}${{ matrix.ext }}" --version)"
+          out="$("./dist/${BIN}-${{ matrix.target }}${{ matrix.ext }}" --version)"
           echo "$out"
           case "$out" in *"${{ needs.plan.outputs.version }}"*) ;; *) echo "binary does not report version ${{ needs.plan.outputs.version }}"; exit 1;; esac
       - uses: actions/upload-artifact@v4
@@ -97,4 +98,4 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "v${{ needs.plan.outputs.version }}" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$BIN v${{ needs.plan.outputs.version }}" --notes-file notes.md
+        run: gh release create "v${{ needs.plan.outputs.version }}" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Fleet v${{ needs.plan.outputs.version }}" --notes-file notes.md

@@ -55,7 +55,7 @@ git -C "$WORK/r_sub" update-index --add --cacheinfo 160000,111111111111111111111
 git -C "$WORK/r_sub" -c user.email=p@p -c user.name=proof commit -qm gitlink
 agent a_clean "printf 'work\n' > output.txt"
 
-FLEET_DATA="$WORK/data" PORT=$PORT "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" policies.rn > "$WORK/server.log" 2>&1 &
+FLEET_DATA="$WORK/data" PORT=$PORT "${CARGO_TARGET_DIR:-./target}/debug/fleet" policies.rn > "$WORK/server.log" 2>&1 &
 PIDS="$PIDS $!"
 api() { curl -s "http://127.0.0.1:$PORT$1"; }
 post() { curl -s -X POST "http://127.0.0.1:$PORT$1" -H 'Content-Type: application/json' -d "$2"; }
@@ -118,7 +118,7 @@ pub fn timeout_secs() { 3 }
 pub fn default_check(project) { "test -s output.txt" }
 RN
 agent a_ghost "printf 'real\n' > output.txt && setsid sh -c 'sleep 5; echo GHOST >> output.txt' </dev/null >/dev/null 2>&1 & sleep 30"
-FLEET_DATA="$WORK/data3" PORT=8552 "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" "$WORK/pol3.rn" > "$WORK/server3.log" 2>&1 &
+FLEET_DATA="$WORK/data3" PORT=8552 "${CARGO_TARGET_DIR:-./target}/debug/fleet" "$WORK/pol3.rn" > "$WORK/server3.log" 2>&1 &
 PIDS="$PIDS $!"
 for i in $(seq 1 20); do curl -s "http://127.0.0.1:8552/api/sessions" >/dev/null 2>&1 && break; sleep 0.5; done
 curl -s -X POST "http://127.0.0.1:8552/api/sessions" -H 'Content-Type: application/json' \
@@ -173,7 +173,7 @@ pub fn timeout_secs() { 9223372036854775807 }
 pub fn default_check(project) { "test -s output.txt" }
 RN
 agent a_fast "printf 'work\n' > output.txt"
-FLEET_DATA="$WORK/data8" PORT=8553 "${CARGO_TARGET_DIR:-./target}/debug/fleet-rs" "$WORK/polmax.rn" > "$WORK/server8.log" 2>&1 &
+FLEET_DATA="$WORK/data8" PORT=8553 "${CARGO_TARGET_DIR:-./target}/debug/fleet" "$WORK/polmax.rn" > "$WORK/server8.log" 2>&1 &
 PIDS="$PIDS $!"
 for i in $(seq 1 20); do curl -s "http://127.0.0.1:8553/api/policy" >/dev/null 2>&1 && break; sleep 0.5; done
 curl -s "http://127.0.0.1:8553/api/policy" | jq -e '.timeout_secs == 604800' >/dev/null \

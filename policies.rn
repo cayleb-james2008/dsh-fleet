@@ -1,4 +1,4 @@
-// Fleet session policies — loaded by fleet-rs at startup and consulted on
+// Fleet session policies — loaded by fleet at startup and consulted on
 // every session hand-out and live dry-run (`POST /api/policies/test`).
 // This file is behaviour, not decoration: the app enforces max_parallel(),
 // routes engines/models/timeouts/budgets, attaches default checks and
