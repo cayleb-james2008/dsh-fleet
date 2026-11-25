@@ -9,7 +9,7 @@ import tailwindcss from "@tailwindcss/vite";
 
 const root = import.meta.dirname;
 const STAMP =
-  "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v1.5.0 */";
+  "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v1.6.0 */";
 
 function sidecarSingleFile(): Plugin {
   return {
@@ -53,6 +53,11 @@ function sidecarSingleFile(): Plugin {
 export default defineConfig({
   plugins: [react(), tailwindcss(), sidecarSingleFile()],
   base: "./",
+  resolve: {
+    alias: {
+      "@radix-ui/react-dialog": path.resolve(root, "src/radix-dialog-noop.ts"),
+    },
+  },
   build: {
     target: "es2022",
     assetsInlineLimit: (filePath) => !filePath.endsWith(".woff2"),

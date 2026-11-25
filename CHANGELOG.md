@@ -3,6 +3,11 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as a
 ready-to-install Antigravity plugin bundle (`tar.gz` + `zip`) with `SHA256SUMS`.
 
+## 1.6.0 - 2026-11-25
+
+- **Peak V8 RSS (`<90 MB`) & Wire Diet (`<365 KB` raw / `<108 KB` gzip):** Added zero-string-allocation `Buffer` transcript scanning in `swarm_store.mjs`, eliminated duplicate cold-boot snapshot generation between `listSwarms` and `/api/swarm`, enabled V8 `--optimize-for-size` in `main.mjs` & `sidecar.json`, and aliased unused `@radix-ui/react-dialog` out of `cmdk` to shrink `dist/index.html` to `~350 KB` raw / `~104 KB` gzip.
+- **1-Click `#seq` Quote-Reply, `?` Cheatsheet & Clean Screenshot Chips (`frontend/src/`):** Added clickable `#seq` / **Reply** inline quote-reply (`Re #<seq>:`) on Board posts, `r` reply shortcut on Triage, `?` keyboard shortcut cheatsheet modal, and pretty `Screenshot:` media caption chips + `~/` worktree paths (never rendering raw `/home/...` paths in card excerpts).
+
 ## 1.5.0 - 2026-11-25
 
 - **Worker Duration Pills & Inline Quick-Action Nudge Bar (`frontend/src/components/{TriageView,RosterView}.tsx`, `ui.tsx`, `sidecars/fleet_pane/main.mjs`)**: added live elapsed state badges (`Working 1m`, `Waiting 3m`, `stalled` escalation) and 1-click **Ask status / Wrap up** quick-action chips populating confirmation-gated inline nudge composers, alongside control-character validation on `POST /api/nudge`.

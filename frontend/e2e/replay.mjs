@@ -52,7 +52,7 @@ await runChecks("replay", async (check) => {
     return checked === "true";
   });
 
-  await check("keyboard triage j/k/o/p and 1-5 tab shortcuts work cleanly", async () => {
+  await check("keyboard triage j/k/o/p/r, 1-5 tabs, and ? cheatsheet work cleanly", async () => {
     await page.evaluate(() => {
       window.__convCalls = [];
       if (window.sidecar?.ui) window.sidecar.ui.toggleConversation = (id) => window.__convCalls.push(id);
@@ -71,12 +71,24 @@ await runChecks("replay", async (check) => {
     await page.keyboard.press("p");
     const pinnedVisible = (await page.locator("#panel-triage").textContent()).includes("Pinned posts (1)");
     await page.keyboard.press("p");
+    await page.keyboard.press("r");
     await page.keyboard.press("k");
     const firstSelected = await page
       .locator('#panel-triage section[aria-labelledby="triage-heading"] > div.space-y-2 > div')
       .nth(0)
       .getAttribute("data-selected");
-    return onGit && secondSelected === "true" && chatOpened && pinnedVisible && firstSelected === "true";
+    await page.keyboard.press("?");
+    await page.waitForSelector('div[role="dialog"]:has-text("Keyboard shortcuts")');
+    const sheetText = await page.locator('div[role="dialog"]').textContent();
+    await page.keyboard.press("Escape");
+    return (
+      onGit &&
+      secondSelected === "true" &&
+      chatOpened &&
+      pinnedVisible &&
+      firstSelected === "true" &&
+      (sheetText.includes("Re") || sheetText.includes("Reply"))
+    );
   });
 
   await check("zero uncaught runtime errors during replay", () => errs.length === 0);

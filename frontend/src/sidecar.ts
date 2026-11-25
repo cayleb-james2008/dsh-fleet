@@ -99,6 +99,23 @@ export function openFileInAuxPane(uriOrPath: string): boolean {
   return true;
 }
 
+export function parseScreenshotLines(text: string): {
+  cleanText: string;
+  shots: Array<{ path: string; fileName: string; caption: string }>;
+} {
+  const shots: Array<{ path: string; fileName: string; caption: string }> = [];
+  const re = /(?:^|\n)\s*(?:[-*]\s*)?Screenshot:\s*`?(\/[^\s`|]+\.(?:png|jpe?g|webp))`?\s*(?:\|\s*([^\n]+?))?(?=\n|$)/gi;
+  const cleanText = String(text || "")
+    .replace(re, (_m, path: string, caption?: string) => {
+      const fileName = path.split("/").pop() || "screenshot.png";
+      shots.push({ path, fileName, caption: String(caption || "").trim() });
+      return "";
+    })
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return { cleanText, shots };
+}
+
 export function extractLocalFilePaths(text: string): string[] {
   const seen = new Set<string>();
   const re = /(?:^|[\s`("'])(\/[a-zA-Z0-9._/-]+\.[a-zA-Z0-9]{1,12})(?=$|[\s`)"',:])/g;

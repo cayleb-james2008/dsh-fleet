@@ -86,12 +86,57 @@ function readSmallCached(path, cache, maxBytes = VIEW_MAX_BYTES) {
   return { text, ...s };
 }
 
+const B_STEP_INDEX = Buffer.from('"step_index":');
+const B_CREATED_AT = Buffer.from('"created_at":');
+const B_PLANNER = Buffer.from('"PLANNER_RESPONSE"');
+const B_MODEL = Buffer.from('"model":');
+const B_USAGE = Buffer.from('"usage":');
+const B_INPUT_TOK = Buffer.from('"input_tokens":');
+const B_CACHE_SNAKE = Buffer.from('"cache_read_tokens":');
+const B_CACHE_CAMEL = Buffer.from('"cacheReadTokens":');
+const B_OUTPUT_TOK = Buffer.from('"output_tokens":');
+
+function bufIndexOfRange(buf, needle, start, end) {
+  const idx = buf.indexOf(needle, start);
+  return idx >= 0 && idx + needle.length <= end ? idx : -1;
+}
+
+function extractIntBuf(buf, start, end, keyBuf) {
+  const idx = bufIndexOfRange(buf, keyBuf, start, end);
+  if (idx < 0) return -1;
+  let pos = idx + keyBuf.length;
+  while (pos < end && (buf[pos] === 32 || buf[pos] === 9)) pos++;
+  let val = 0;
+  let digits = 0;
+  while (pos < end) {
+    const c = buf[pos];
+    if (c < 48 || c > 57) break;
+    val = val * 10 + (c - 48);
+    digits++;
+    pos++;
+  }
+  return digits > 0 ? val : -1;
+}
+
+function extractStrBuf(buf, start, end, keyBuf) {
+  const idx = bufIndexOfRange(buf, keyBuf, start, end);
+  if (idx < 0) return '';
+  let pos = idx + keyBuf.length;
+  while (pos < end && (buf[pos] === 32 || buf[pos] === 9)) pos++;
+  if (pos >= end || buf[pos] !== 34) return '';
+  const qStart = pos + 1;
+  const qEnd = buf.indexOf(34, qStart);
+  if (qEnd < 0 || qEnd >= end) return '';
+  const bs = buf.indexOf(92, qStart);
+  if (bs >= 0 && bs < qEnd) return '';
+  return buf.subarray(qStart, qEnd).toString('utf8');
+}
+
 /**
  * Incrementally stream lines from a growing JSONL file using bounded 64 KB chunks.
- * Scans 0x0A newlines directly on Buffer bytes and decodes one line at a time so
- * V8 never creates ConsString trees or SlicedString parent-buffer leaks.
+ * Passes raw `(buf, start, end)` spans so history lines scan with zero JS string allocations.
  */
-function streamLinesIncremental(filePath, prevMeta, onReset, onLine) {
+function streamLinesIncremental(filePath, prevMeta, onReset, onLine, { rawSpan = false } = {}) {
   const s = statOf(filePath);
   if (s.size < 0) return { exists: false, meta: null, changed: Boolean(prevMeta) };
 
@@ -123,7 +168,8 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine) {
           while (start < end && combined[start] <= 32) start++;
           while (end > start && combined[end - 1] <= 32) end--;
           if (end > start) {
-            onLine(combined.subarray(start, end).toString('utf8'));
+            if (rawSpan) onLine(combined, start, end, null, offset >= s.size && combined.indexOf(0x0a, nl + 1) < 0 ? 0 : s.size - offset);
+            else onLine(combined.subarray(start, end).toString('utf8'));
           }
           pos = nl + 1;
         }
@@ -140,7 +186,8 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine) {
       try {
         const obj = JSON.parse(trimmedCarry);
         if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
-          onLine(trimmedCarry, obj);
+          if (rawSpan) onLine(carryBuf, 0, carryBuf.length, obj, 0);
+          else onLine(trimmedCarry, obj);
           carryBuf = Buffer.alloc(0);
         }
       } catch {
@@ -435,12 +482,14 @@ export function summarizeTranscript(appData, conv) {
     () => {
       state.acc = initAcc();
     },
-    (line, preParsed) => {
+    (buf, start, end, preParsed, remBytes) => {
       const a = state.acc;
       a.lineCount++;
 
-      // Fixed 32-slot ring buffer avoids O(n) shift allocations over 50k+ lines
-      a.rawTail[a.tailCursor % TAIL_CAP] = line;
+      // Only retain tail line slices near EOF (prevents 50k string/Buffer allocations during initial scan)
+      if (remBytes <= 128 * 1024 || preParsed) {
+        a.rawTail[a.tailCursor % TAIL_CAP] = buf.subarray(start, end).toString('utf8');
+      }
       a.tailCursor++;
 
       if (preParsed) {
@@ -463,23 +512,26 @@ export function summarizeTranscript(appData, conv) {
         return;
       }
 
-      const si = extractIntField(line, '"step_index":');
+      const si = extractIntBuf(buf, start, end, B_STEP_INDEX);
       if (si >= 0) a.maxStepIndex = Math.max(a.maxStepIndex, si + 1);
 
-      const ts = extractStringField(line, '"created_at":');
-      if (ts) {
-        if (!a.startedAt) a.startedAt = ts;
-        a.lastStepAt = ts;
+      if (!a.startedAt || remBytes <= 4096) {
+        const ts = extractStrBuf(buf, start, end, B_CREATED_AT);
+        if (ts) {
+          if (!a.startedAt) a.startedAt = ts;
+          a.lastStepAt = ts;
+        }
       }
 
-      if (line.includes('"PLANNER_RESPONSE"')) {
-        const m = extractStringField(line, '"model":');
-        if (m) a.model = m;
+      if (bufIndexOfRange(buf, B_PLANNER, start, end) >= 0) {
+        if (!a.model || remBytes <= 8192) {
+          const m = extractStrBuf(buf, start, end, B_MODEL);
+          if (m) a.model = m;
+        }
 
-        // If nested usage object or non-standard shape, parse cleanly; else zero-alloc scan
-        if (line.includes('"usage":')) {
+        if (bufIndexOfRange(buf, B_USAGE, start, end) >= 0) {
           try {
-            const parsed = JSON.parse(line);
+            const parsed = JSON.parse(buf.subarray(start, end).toString('utf8'));
             const u = parsed.usage && typeof parsed.usage === 'object' ? parsed.usage : parsed;
             const inp = num(Number(u.input_tokens));
             const cac = num(Number(u.cache_read_tokens ?? u.cacheReadTokens));
@@ -492,9 +544,9 @@ export function summarizeTranscript(appData, conv) {
             // torn line skipped
           }
         } else {
-          const inp = Math.max(0, extractIntField(line, '"input_tokens":'));
-          const cac = Math.max(0, extractIntField(line, '"cache_read_tokens":'), extractIntField(line, '"cacheReadTokens":'));
-          const out = Math.max(0, extractIntField(line, '"output_tokens":'));
+          const inp = Math.max(0, extractIntBuf(buf, start, end, B_INPUT_TOK));
+          const cac = Math.max(0, extractIntBuf(buf, start, end, B_CACHE_SNAKE), extractIntBuf(buf, start, end, B_CACHE_CAMEL));
+          const out = Math.max(0, extractIntBuf(buf, start, end, B_OUTPUT_TOK));
           a.inputTokens += inp;
           a.cacheReadTokens += cac;
           a.outputTokens += out;
@@ -502,6 +554,7 @@ export function summarizeTranscript(appData, conv) {
         }
       }
     },
+    { rawSpan: true },
   );
 
   if (!res.exists) {
@@ -822,6 +875,16 @@ function channelAddressees(roster, names, msgs, channels) {
   };
 }
 
+function triageDetail(text) {
+  const cleaned = String(text || '')
+    .replace(/^\s*(?:[-*]\s*)?Screenshot:\s*`?(\/[^\s`|]+\.(?:png|jpe?g|webp))`?\s*(?:\|\s*([^\n]+?))?\s*$/gim, (_, p, cap) => {
+      const label = (cap || '').trim() || basename(p);
+      return `[Screenshot: ${label}]`;
+    })
+    .replace(/\/home\/[^/\s]+\//g, '~/');
+  return oneLine(cleaned, 160);
+}
+
 function buildTriageItems({ members, messages, sysAttention }) {
   const items = [];
   const memberMap = new Map(members.map((m) => [m.name, m]));
@@ -889,7 +952,7 @@ function buildTriageItems({ members, messages, sysAttention }) {
         conversationId: sender.conversation_id || '',
         seq: msg.seq,
         title: `${msg.agent} posted [blocked] (#${msg.seq})`,
-        detail: oneLine(msg.text, 160),
+        detail: triageDetail(msg.text),
         suggestedPrompt: `@${msg.agent} Unblock note on #${msg.seq}: `,
         timestamp: msg.ts || 0,
       });
@@ -902,7 +965,7 @@ function buildTriageItems({ members, messages, sysAttention }) {
         conversationId: sender.conversation_id || '',
         seq: msg.seq,
         title: `${msg.agent} awaits cold verification (#${msg.seq})`,
-        detail: oneLine(msg.text, 160),
+        detail: triageDetail(msg.text),
         suggestedPrompt: `@verifier Cold-verify ${msg.agent}'s #${msg.seq} deliverable and post [verified] or [blocked].`,
         timestamp: msg.ts || 0,
       });
@@ -1217,7 +1280,7 @@ export function resolveConversationSwarm(appDataDirs, conv) {
 }
 
 /** Scan all available local swarms using cached lightweight summary metadata (no AST retention). */
-export function listSwarms(appDataDirs) {
+export function listSwarms(appDataDirs, onSnapshot = null) {
   const list = [];
   const now = Date.now();
   for (const { appData, id } of scanSwarmIds(appDataDirs)) {
@@ -1246,6 +1309,7 @@ export function listSwarms(appDataDirs) {
     }
     const snap = buildSwarmSnapshot(appData, id);
     if (!snap) continue;
+    if (onSnapshot) onSnapshot(appData, id, snap, keys);
     const entry = summaryMetaCache.get(cacheKey);
     if (entry) list.push(entry.summary);
   }

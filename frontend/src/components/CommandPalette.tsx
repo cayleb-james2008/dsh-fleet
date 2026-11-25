@@ -23,6 +23,7 @@ export function CommandPalette({
   onSelectSwarm,
   onCopyDigest,
   onOpenSettings,
+  onOpenShortcuts,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -32,6 +33,7 @@ export function CommandPalette({
   onSelectSwarm: (id: string) => void;
   onCopyDigest: () => void;
   onOpenSettings: () => void;
+  onOpenShortcuts: () => void;
 }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -123,6 +125,17 @@ export function CommandPalette({
             >
               <Settings className="h-4 w-4 shrink-0" aria-hidden="true" />
               <span>Settings</span>
+            </Command.Item>
+            <Command.Item
+              value="keyboard shortcuts cheatsheet help ?"
+              onSelect={() => {
+                onOpenChange(false);
+                onOpenShortcuts();
+              }}
+              className="flex items-center justify-between gap-2 rounded-[var(--radius-chip)] px-2.5 py-2 text-[13px] text-[var(--ink)] aria-selected:bg-[var(--blue-soft)] aria-selected:text-[var(--info-foreground)] cursor-pointer"
+            >
+              <span>Keyboard shortcuts</span>
+              <span className="text-[12px] text-[var(--ink-3)] mono">?</span>
             </Command.Item>
           </Command.Group>
 

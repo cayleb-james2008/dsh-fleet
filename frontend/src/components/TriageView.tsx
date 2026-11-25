@@ -18,7 +18,13 @@ import {
   Sparkles,
   Wrench,
 } from "lucide-react";
-import { extractLocalFilePaths, openFileInAuxPane, openWorkerConversation, sendConfirmedNudge } from "../sidecar";
+import {
+  extractLocalFilePaths,
+  openFileInAuxPane,
+  openWorkerConversation,
+  parseScreenshotLines,
+  sendConfirmedNudge,
+} from "../sidecar";
 import type { SwarmMember, SwarmSnapshot, TriageItem } from "../types";
 import { Badge, Button, Card, StatusDot, Textarea, cn, fmtElapsed, fmtTimeAgo, fmtTokens, humanizeStatus, toast } from "../ui";
 
@@ -62,6 +68,7 @@ export function TriageView({
   snap,
   pinnedSeqs,
   selectedIdx = 0,
+  replyNonce = 0,
   onSelectIdx,
   onTogglePin,
   onJumpToBoardSeq,
@@ -70,6 +77,7 @@ export function TriageView({
   snap: SwarmSnapshot;
   pinnedSeqs: number[];
   selectedIdx?: number;
+  replyNonce?: number;
   onSelectIdx?: (idx: number) => void;
   onTogglePin: (seq: number) => void;
   onJumpToBoardSeq: (seq: number) => void;
@@ -100,6 +108,19 @@ export function TriageView({
     const el = cardRefs.current[selectedIdx];
     if (el) el.scrollIntoView({ block: "nearest" });
   }, [selectedIdx]);
+
+  useEffect(() => {
+    if (!replyNonce) return;
+    const item = triage[selectedIdx];
+    if (!item) return;
+    const prefix = `@${item.member}${item.seq > 0 ? ` Re #${item.seq}` : ""}: `;
+    if (canNudge && item.conversationId) {
+      setNudgeTarget(item);
+      setNudgeDraft(prefix);
+    } else {
+      handleCopy(prefix, `Copied reply prefix for @${item.member}`);
+    }
+  }, [replyNonce]);
 
   const openNudge = (item: TriageItem, customPrompt?: string) => {
     setNudgeTarget(item);
@@ -179,7 +200,8 @@ export function TriageView({
               const peeking = peekId === item.id;
               const tools = worker?.recentTools || [];
               const presets = unstickPresetFor(item);
-              const paths = extractLocalFilePaths(item.detail);
+              const { cleanText: cleanDetail, shots: detailShots } = parseScreenshotLines(item.detail);
+              const paths = extractLocalFilePaths(cleanDetail);
               const lastTs = worker?.lastStepAt
                 ? Date.parse(worker.lastStepAt)
                 : worker?.transcriptMtime || worker?.lastPostTs || 0;
@@ -231,12 +253,24 @@ export function TriageView({
                     </div>
                   </div>
 
-                  {item.detail && (
-                    <p className="text-[13px] text-[var(--ink-2)] break-words leading-snug">{item.detail}</p>
+                  {cleanDetail && (
+                    <p className="text-[13px] text-[var(--ink-2)] break-words leading-snug">{cleanDetail}</p>
                   )}
 
-                  {paths.length > 0 && (
+                  {(detailShots.length > 0 || paths.length > 0) && (
                     <div className="flex flex-wrap items-center gap-1.5">
+                      {detailShots.map((s) => (
+                        <Button
+                          key={s.path}
+                          variant="secondary"
+                          size="sm"
+                          onClick={() => handleOpenPath(s.path)}
+                          className="max-w-full"
+                        >
+                          <ImageIcon className="h-3.5 w-3.5 shrink-0 text-[var(--info-foreground)]" aria-hidden="true" />
+                          <span className="truncate">{s.caption || s.fileName}</span>
+                        </Button>
+                      ))}
                       {paths.map((fp) => (
                         <Button
                           key={fp}

@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, FileCode2, Filter, Pin, PinOff, Search, X } from "lucide-react";
-import { extractLocalFilePaths, openFileInAuxPane } from "../sidecar";
+import { ArrowDown, ClipboardCopy, FileCode2, Filter, Image as ImageIcon, Pin, PinOff, Reply, Search, Send, X } from "lucide-react";
+import { extractLocalFilePaths, openFileInAuxPane, parseScreenshotLines, sendConfirmedNudge } from "../sidecar";
 import type { BoardMessage, SwarmSnapshot } from "../types";
-import { Badge, Button, Card, Input, cn, fmtClockTime, toast } from "../ui";
+import { Badge, Button, Card, Input, Textarea, cn, fmtClockTime, toast } from "../ui";
 
 function PostBody({
   text,
@@ -93,18 +93,23 @@ export function BoardView({
   pinnedSeqs,
   onTogglePin,
   onClearHighlight,
+  onRefresh,
 }: {
   snap: SwarmSnapshot;
   highlightSeq: number | null;
   pinnedSeqs: number[];
   onTogglePin: (seq: number) => void;
   onClearHighlight: () => void;
+  onRefresh?: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [agentFilter, setAgentFilter] = useState<string>("all");
   const [showFilters, setShowFilters] = useState(false);
   const [follow, setFollow] = useState(true);
   const [visibleLimit, setVisibleLimit] = useState(80);
+  const [replyTarget, setReplyTarget] = useState<BoardMessage | null>(null);
+  const [replyDraft, setReplyDraft] = useState("");
+  const [sending, setSending] = useState(false);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const rowRefs = useRef<Map<number, HTMLDivElement>>(new Map());
@@ -170,6 +175,42 @@ export function BoardView({
       bottomRef.current?.scrollIntoView({ block: "end" });
     }
   }, [filtered.length, follow, highlightSeq]);
+
+  const canNudge = Boolean(snap.capabilities?.canSendMessage || window.sidecar?.agent?.sendMessage);
+  const memberByName = useMemo(() => new Map(members.map((m) => [m.name, m])), [members]);
+
+  const openQuoteReply = (m: BoardMessage) => {
+    setReplyTarget((cur) => (cur?.seq === m.seq ? null : m));
+    setReplyDraft(`@${m.agent} Re #${m.seq}: `);
+  };
+
+  const handleSendQuoteReply = async () => {
+    if (!replyTarget || !replyDraft.trim()) return;
+    const convId = memberByName.get(replyTarget.agent)?.conversation_id || "";
+    if (!canNudge || !convId) {
+      try {
+        await navigator.clipboard.writeText(replyDraft.trim());
+        toast.success(`Copied reply to #${replyTarget.seq}`);
+        setReplyTarget(null);
+        setReplyDraft("");
+      } catch {
+        toast.error("Clipboard unavailable");
+      }
+      return;
+    }
+    setSending(true);
+    try {
+      await sendConfirmedNudge(convId, replyDraft.trim());
+      toast.success(`Sent reply to @${replyTarget.agent} (#${replyTarget.seq})`);
+      setReplyTarget(null);
+      setReplyDraft("");
+      onRefresh?.();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to send reply");
+    } finally {
+      setSending(false);
+    }
+  };
 
   const hasActiveFilter = query.trim().length > 0 || agentFilter !== "all";
   const pinnedSet = useMemo(() => new Set(pinnedSeqs), [pinnedSeqs]);
@@ -377,9 +418,29 @@ export function BoardView({
                         {m.channel && m.channel !== "main" && <Badge tone="violet">#{m.channel}</Badge>}
                         {m.all && <Badge tone="info">@all</Badge>}
                       </div>
-                      <div className="flex items-center gap-1.5 shrink-0 text-[12px] text-[var(--ink-3)] num">
-                        <span>#{m.seq}</span>
+                      <div className="flex items-center gap-1 shrink-0 text-[12px] text-[var(--ink-3)] num">
+                        <button
+                          type="button"
+                          aria-label={`Quote reply to #${m.seq}`}
+                          onClick={() => openQuoteReply(m)}
+                          className="rounded-[4px] px-1 py-0.5 hover:bg-[var(--track)] hover:text-[var(--ink)] cursor-pointer transition"
+                        >
+                          #{m.seq}
+                        </button>
                         <span>{fmtClockTime(m.ts, m.time)}</span>
+                        <button
+                          type="button"
+                          aria-label={`Reply to #${m.seq}`}
+                          onClick={() => openQuoteReply(m)}
+                          className={cn(
+                            "p-1 rounded-[4px] cursor-pointer transition",
+                            replyTarget?.seq === m.seq
+                              ? "text-[var(--info-foreground)] bg-[var(--blue-soft)]"
+                              : "text-[var(--ink-3)] hover:text-[var(--ink)] hover:bg-[var(--track)]",
+                          )}
+                        >
+                          <Reply className="h-3 w-3" aria-hidden="true" />
+                        </button>
                         <button
                           type="button"
                           aria-label={pinnedSet.has(m.seq) ? `Unpin #${m.seq}` : `Pin #${m.seq}`}
@@ -397,37 +458,97 @@ export function BoardView({
                       </div>
                     </div>
                   )}
-                  <PostBody
-                    text={m.text}
-                    viewer={snap.member}
-                    onClickSeq={scrollToSeq}
-                    onFilterAgent={(name) => setAgentFilter(name)}
-                  />
                   {(() => {
-                    const paths = extractLocalFilePaths(m.text);
-                    if (!paths.length) return null;
+                    const { cleanText, shots } = parseScreenshotLines(m.text);
+                    const paths = extractLocalFilePaths(cleanText);
                     return (
-                      <div className="flex flex-wrap gap-1.5 pt-1.5">
-                        {paths.map((fp) => (
-                          <button
-                            key={fp}
-                            type="button"
-                            onClick={() => {
-                              if (openFileInAuxPane(fp)) {
-                                toast.success(`Opened ${fp.split("/").pop() || "file"}`);
-                              } else {
-                                navigator.clipboard.writeText(fp).then(() => toast.success("File path copied")).catch(() => {});
-                              }
-                            }}
-                            className="inline-flex items-center gap-1 rounded-[var(--radius-chip)] bg-[var(--track)] px-2 py-0.5 text-[12px] text-[var(--ink-2)] hover:text-[var(--ink)] cursor-pointer max-w-full"
-                          >
-                            <FileCode2 className="h-3 w-3 shrink-0" aria-hidden="true" />
-                            <span className="truncate mono">{fp.split("/").pop()}</span>
-                          </button>
-                        ))}
-                      </div>
+                      <>
+                        {cleanText && (
+                          <PostBody
+                            text={cleanText}
+                            viewer={snap.member}
+                            onClickSeq={scrollToSeq}
+                            onFilterAgent={(name) => setAgentFilter(name)}
+                          />
+                        )}
+                        {(shots.length > 0 || paths.length > 0) && (
+                          <div className="flex flex-wrap gap-1.5 pt-1.5">
+                            {shots.map((s) => (
+                              <button
+                                key={s.path}
+                                type="button"
+                                onClick={() => {
+                                  if (openFileInAuxPane(s.path)) {
+                                    toast.success(`Opened ${s.fileName}`);
+                                  } else {
+                                    navigator.clipboard.writeText(s.caption || s.fileName).then(() => toast.success("Screenshot label copied")).catch(() => {});
+                                  }
+                                }}
+                                className="inline-flex items-center gap-1 rounded-[var(--radius-chip)] bg-[var(--blue-soft)] px-2 py-0.5 text-[12px] text-[var(--info-foreground)] hover:opacity-90 cursor-pointer max-w-full"
+                              >
+                                <ImageIcon className="h-3 w-3 shrink-0" aria-hidden="true" />
+                                <span className="truncate">{s.caption || s.fileName}</span>
+                              </button>
+                            ))}
+                            {paths.map((fp) => (
+                              <button
+                                key={fp}
+                                type="button"
+                                onClick={() => {
+                                  if (openFileInAuxPane(fp)) {
+                                    toast.success(`Opened ${fp.split("/").pop() || "file"}`);
+                                  } else {
+                                    navigator.clipboard.writeText(fp).then(() => toast.success("File path copied")).catch(() => {});
+                                  }
+                                }}
+                                className="inline-flex items-center gap-1 rounded-[var(--radius-chip)] bg-[var(--track)] px-2 py-0.5 text-[12px] text-[var(--ink-2)] hover:text-[var(--ink)] cursor-pointer max-w-full"
+                              >
+                                <FileCode2 className="h-3 w-3 shrink-0" aria-hidden="true" />
+                                <span className="truncate mono">{fp.split("/").pop()}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </>
                     );
                   })()}
+                  {replyTarget?.seq === m.seq && (
+                    <div className="mt-2 pt-2 border-t border-[var(--hairline)] space-y-2">
+                      <label htmlFor={`board-reply-${m.seq}`} className="block text-[12px] font-medium text-[var(--ink-2)]">
+                        Quote reply to #{m.seq} (@{m.agent})
+                      </label>
+                      <Textarea
+                        id={`board-reply-${m.seq}`}
+                        rows={2}
+                        maxLength={4000}
+                        value={replyDraft}
+                        onChange={(e) => setReplyDraft(e.target.value)}
+                      />
+                      <div className="flex items-center justify-end gap-2">
+                        <Button variant="ghost" size="sm" onClick={() => setReplyTarget(null)}>
+                          Cancel
+                        </Button>
+                        <Button
+                          variant="primary"
+                          size="sm"
+                          disabled={sending || !replyDraft.trim()}
+                          onClick={handleSendQuoteReply}
+                        >
+                          {canNudge && memberByName.get(m.agent)?.conversation_id ? (
+                            <>
+                              <Send className="h-3.5 w-3.5" aria-hidden="true" />
+                              {sending ? "Sending..." : "Confirm & send"}
+                            </>
+                          ) : (
+                            <>
+                              <ClipboardCopy className="h-3.5 w-3.5" aria-hidden="true" />
+                              Copy reply
+                            </>
+                          )}
+                        </Button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             );

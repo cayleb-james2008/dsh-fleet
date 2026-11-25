@@ -99,6 +99,7 @@ export function App() {
 
   const [highlightSeq, setHighlightSeq] = useState<number | null>(null);
   const [selectedTriageIdx, setSelectedTriageIdx] = useState(0);
+  const [triageReplyNonce, setTriageReplyNonce] = useState(0);
   const [sseConnected, setSseConnected] = useState(false);
   const [pinnedMap, setPinnedMap] = useState<Record<string, number[]>>(() => {
     try {
@@ -110,6 +111,7 @@ export function App() {
   });
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
   const embedded = isEmbeddedHost();
 
@@ -278,6 +280,12 @@ export function App() {
       if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable)) {
         return;
       }
+      if (e.key === "?") {
+        e.preventDefault();
+        setShortcutsOpen((v) => !v);
+        return;
+      }
+      if (shortcutsOpen) return;
       if (e.key >= "1" && e.key <= "5") {
         const nextTab = TABS[Number(e.key) - 1];
         if (nextTab) {
@@ -293,6 +301,9 @@ export function App() {
       } else if (e.key === "k") {
         e.preventDefault();
         setSelectedTriageIdx((i) => Math.max(0, i - 1));
+      } else if (e.key === "r") {
+        e.preventDefault();
+        setTriageReplyNonce((n) => n + 1);
       } else if (e.key === "o" || (e.key === "Enter" && !target?.closest("button,a,select,input,textarea"))) {
         const item = triageItems[selectedTriageIdx];
         if (!item?.conversationId) return;
@@ -311,7 +322,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [tab, triageItems, selectedTriageIdx, paletteOpen, settingsOpen, pinnedSeqs, handleTogglePin]);
+  }, [tab, triageItems, selectedTriageIdx, paletteOpen, settingsOpen, shortcutsOpen, pinnedSeqs, handleTogglePin]);
 
   const handleSelectSwarm = (id: string) => {
     etagRef.current = "";
@@ -625,6 +636,7 @@ export function App() {
                   snap={snap!}
                   pinnedSeqs={pinnedSeqs}
                   selectedIdx={selectedTriageIdx}
+                  replyNonce={triageReplyNonce}
                   onSelectIdx={setSelectedTriageIdx}
                   onTogglePin={handleTogglePin}
                   onJumpToBoardSeq={(seq) => {
@@ -643,6 +655,7 @@ export function App() {
                   pinnedSeqs={pinnedSeqs}
                   onTogglePin={handleTogglePin}
                   onClearHighlight={() => setHighlightSeq(null)}
+                  onRefresh={() => refreshSwarm(true)}
                 />
               </div>
             )}
@@ -669,7 +682,30 @@ export function App() {
         onSelectSwarm={handleSelectSwarm}
         onCopyDigest={handleCopyDigest}
         onOpenSettings={() => setSettingsOpen(true)}
+        onOpenShortcuts={() => setShortcutsOpen(true)}
       />
+
+      {/* Keyboard Shortcuts Cheatsheet (?) */}
+      <Modal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} title="Keyboard shortcuts">
+        <dl className="divide-y divide-[var(--hairline)] text-[13px]">
+          {[
+            ["j / k", "Move across Needs-You items"],
+            ["o / Enter", "Open worker chat"],
+            ["p", "Pin or unpin selected #seq"],
+            ["r", "Reply / nudge selected item"],
+            ["1 - 5", "Jump across sidebar tabs"],
+            ["Ctrl+K / Cmd+K", "Open command palette"],
+            ["?", "Toggle keyboard shortcuts"],
+          ].map(([key, desc]) => (
+            <div key={key} className="flex items-center justify-between gap-3 py-2 first:pt-0 last:pb-0">
+              <dt className="text-[var(--ink-2)]">{desc}</dt>
+              <dd className="rounded-[4px] border border-[var(--hairline)] bg-[var(--board)] px-1.5 py-0.5 text-[12px] text-[var(--ink)] mono shrink-0">
+                {key}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      </Modal>
 
       {/* Settings Dialog (Guardrail #67: Theme switch lives strictly inside Settings) */}
       <Modal open={settingsOpen} onClose={() => setSettingsOpen(false)} title="Settings">
@@ -710,7 +746,7 @@ export function App() {
           <div className="rounded-[var(--radius-card)] bg-[var(--board)] p-3 text-[12px] text-[var(--ink-2)] space-y-1">
             <div className="flex items-center gap-1.5 font-medium text-[var(--ink)]">
               <CommandIcon className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Fleet Antigravity Plugin v1.5.0</span>
+              <span>Fleet Antigravity Plugin v1.6.0</span>
             </div>
             <p>
               Reads Antigravity native swarm boards and transcripts locally on loopback with zero external telemetry.
