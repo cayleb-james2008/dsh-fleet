@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { dirname, join } from 'node:path';
@@ -188,10 +188,11 @@ test('standalone server enforces gzip, ETag/304, security headers, Host-403, Ori
   }
 });
 
-test('install.sh --dest deploys plugin bundle cleanly when dist exists', () => {
+test('install.sh --dest deploys plugin bundle cleanly and installed main.mjs boots', async () => {
   const tmp = makeScratchDir('install-');
   const distDir = join(REPO_ROOT, 'sidecars', 'fleet_pane', 'dist');
   const hadDist = existsSync(join(distDir, 'index.html'));
+  let child = null;
   try {
     if (!hadDist) {
       mkdirSync(distDir, { recursive: true });
@@ -205,8 +206,45 @@ test('install.sh --dest deploys plugin bundle cleanly when dist exists', () => {
     assert.ok(existsSync(join(dest, 'rules', 'AGENTS.md')));
     assert.ok(existsSync(join(dest, 'sidecars', 'fleet_pane', 'sidecar.json')));
     assert.ok(existsSync(join(dest, 'sidecars', 'fleet_pane', 'main.mjs')));
+    assert.ok(existsSync(join(dest, 'sidecars', 'fleet_pane', 'channels.mjs')));
+    assert.ok(existsSync(join(dest, 'sidecars', 'fleet_pane', 'git_probe.mjs')));
+    assert.ok(existsSync(join(dest, 'sidecars', 'fleet_pane', 'swarm_store.mjs')));
     assert.ok(existsSync(join(dest, 'sidecars', 'fleet_pane', 'dist', 'index.html')));
+
+    const installedMain = join(dest, 'sidecars', 'fleet_pane', 'main.mjs');
+    child = spawn('node', [installedMain, '--port', '0', '--app-data-dir', tmp], {
+      cwd: join(dest, 'sidecars', 'fleet_pane'),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const url = await new Promise((resolve, reject) => {
+      let buf = '';
+      const timer = setTimeout(() => reject(new Error(`installed main.mjs boot timeout: ${buf}`)), 3000);
+      child.stdout.setEncoding('utf-8');
+      child.stderr.setEncoding('utf-8');
+      child.stdout.on('data', (chunk) => {
+        buf += chunk;
+        const m = /listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(buf);
+        if (m) {
+          clearTimeout(timer);
+          resolve(m[1]);
+        }
+      });
+      child.stderr.on('data', (chunk) => {
+        buf += chunk;
+      });
+      child.once('exit', (code) => {
+        clearTimeout(timer);
+        reject(new Error(`installed main.mjs exited early (${code}): ${buf}`));
+      });
+    });
+
+    const health = await fetch(`${url}/api/health`);
+    assert.equal(health.status, 200);
+    const json = await health.json();
+    assert.equal(json.ok, true);
+    assert.equal(json.name, 'fleet');
   } finally {
+    if (child && child.exitCode === null) child.kill('SIGTERM');
     if (!hadDist) rmSync(distDir, { recursive: true, force: true });
     rmSync(tmp, { recursive: true, force: true });
   }

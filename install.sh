@@ -60,6 +60,7 @@ cp "${SRC_DIR}/sidecars/fleet_pane/sidecar.json" "${STAGE_DIR}/sidecars/fleet_pa
 cp "${SRC_DIR}/sidecars/fleet_pane/main.mjs" "${STAGE_DIR}/sidecars/fleet_pane/main.mjs"
 cp "${SRC_DIR}/sidecars/fleet_pane/channels.mjs" "${STAGE_DIR}/sidecars/fleet_pane/channels.mjs"
 cp "${SRC_DIR}/sidecars/fleet_pane/git_probe.mjs" "${STAGE_DIR}/sidecars/fleet_pane/git_probe.mjs"
+cp "${SRC_DIR}/sidecars/fleet_pane/swarm_store.mjs" "${STAGE_DIR}/sidecars/fleet_pane/swarm_store.mjs"
 cp -R "${SRC_DIR}/sidecars/fleet_pane/dist" "${STAGE_DIR}/sidecars/fleet_pane/dist"
 
 BACKUP_DIR=""
