@@ -19,13 +19,11 @@ import {
 } from "../icons";
 import {
   extractLocalFilePaths,
-  openFileInAuxPane,
   openWorkerConversation,
   parseScreenshotLines,
-  sendConfirmedNudge,
 } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot, TriageItem } from "../types";
-import { ActivityPeek, Badge, Button, Card, InlineComposer, MediaPathChips, StatusDot, cn, copyText, fmtElapsed, fmtTimeAgo, fmtTokens, humanizeStatus, toast } from "../ui";
+import { ActivityPeek, Badge, Button, Card, InlineComposer, MediaPathChips, PinnedList, StatusDot, cn, copyText, fmtElapsed, fmtTimeAgo, fmtTokens, formatBlockerContext, humanizeStatus, openOrCopyPath, submitNudge } from "../ui";
 
 const SEVERITY_BADGE: Record<TriageItem["severity"], { tone: "danger" | "warning" | "info"; label: string }> = {
   urgent: { tone: "danger", label: "Urgent" },
@@ -48,18 +46,18 @@ function unstickPresetFor(item: TriageItem): Array<{ label: string; prompt: stri
   if (item.kind === "quota") {
     return [
       { label: "Resume", prompt: `@${item.member} Quota clear${ref}. Resume current task.` },
-      { label: "Handoff status", prompt: `@${item.member} Summarize remaining work${ref} for handoff.` },
+      { label: "Handoff", prompt: `@${item.member} Summarize remaining work${ref} for handoff.` },
     ];
   }
   if (item.kind === "stuck" || item.kind === "error" || item.kind === "blocked") {
     return [
       { label: "Unstick", prompt: `@${item.member} ${item.kind}${ref}: isolate failure and post [blocked] or continue.` },
-      { label: "Ask status", prompt: `@${item.member} Share exact error and files touched${ref}.` },
+      { label: "Status", prompt: `@${item.member} Share error and files touched${ref}.` },
     ];
   }
   return [
     { label: "Follow up", prompt: item.suggestedPrompt },
-    { label: "Proceed", prompt: `@${item.member} Approved${ref}. Proceed and report [done] when verified.` },
+    { label: "Proceed", prompt: `@${item.member} Approved${ref}. Proceed and post [done].` },
   ];
 }
 
@@ -101,7 +99,6 @@ export function TriageView({
   const pinnedMsgs = (snap.messages || []).filter((m) => !m.control && pinnedSet.has(m.seq));
   const memberByName = new Map((snap.members || []).map((m) => [m.name, m]));
   const canNudge = Boolean(snap.capabilities?.canSendMessage || window.sidecar?.agent?.sendMessage);
-  const canOpenAux = Boolean(window.sidecar?.ui?.toggleAuxPane);
 
   useEffect(() => {
     const el = cardRefs.current[selectedIdx];
@@ -126,33 +123,30 @@ export function TriageView({
     setNudgeDraft(customPrompt ?? item.suggestedPrompt);
   };
 
-  const handleConfirmNudge = async () => {
-    if (!nudgeTarget || !nudgeDraft.trim()) return;
-    setSending(true);
-    try {
-      await sendConfirmedNudge(nudgeTarget.conversationId, nudgeDraft.trim());
-      toast.success(`Sent nudge to ${nudgeTarget.member}`);
+  const handleConfirmNudge = () => {
+    if (!nudgeTarget) return;
+    return submitNudge(nudgeTarget.conversationId, nudgeDraft, `Sent nudge to ${nudgeTarget.member}`, setSending, () => {
       setNudgeTarget(null);
       setNudgeDraft("");
       onRefresh();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to send nudge");
-    } finally {
-      setSending(false);
-    }
+    });
   };
 
   const handleCopy = (text: string, label = "Copied") => {
     void copyText(text, label);
   };
 
-  const handleOpenPath = (filePath: string) => {
-    if (canOpenAux && openFileInAuxPane(filePath)) {
-      toast.success(`Opened ${filePath.split("/").pop() || "file"}`);
-      return;
-    }
-    handleCopy(filePath, "File path copied");
-  };
+  const liveMembers = (snap.members || []).filter((m) => !m.killed);
+  const blockedNames = new Set(
+    triage.filter((t) => t.severity === "urgent" || t.kind === "blocked" || t.kind === "stuck").map((t) => t.member),
+  );
+  const blockedCount = Math.max(blockedNames.size, triage.filter((t) => t.severity === "urgent" || t.kind === "blocked").length);
+  const workingCount = liveMembers.filter((m) => m.status === "working" && !blockedNames.has(m.name)).length;
+  const waitingCount = liveMembers.filter((m) => m.status === "waiting" && !blockedNames.has(m.name)).length;
+  const heatTotal = Math.max(1, workingCount + waitingCount + blockedCount);
+  const topBlocker =
+    triage.find((t) => (t.severity === "urgent" || t.kind === "blocked") && t.seq > 0) ||
+    triage.find((t) => t.seq > 0);
 
   return (
     <div className="space-y-4">
@@ -164,25 +158,58 @@ export function TriageView({
           </h2>
           {triage.length === 0 ? (
             <Badge tone="success">
-              <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
+              <CheckCircle2 className="h-3.5 w-3.5" />
               All clear
             </Badge>
           ) : (
             <div className="hidden sm:flex items-center gap-2 text-[12px] text-ink-3 mono">
-              <span>j/k move</span>
-              <span>o chat</span>
-              <span>p pin</span>
-              <span>r reply</span>
-              <span>? help</span>
+              {["j/k move", "o chat", "p pin", "r reply", "? help"].map((k) => <span key={k}>{k}</span>)}
             </div>
           )}
         </div>
 
+        {(liveMembers.length > 0 || triage.length > 0) && (() => {
+          const buckets = [
+            { label: "working", count: workingCount, cls: "bg-blue" },
+            { label: "waiting", count: waitingCount, cls: "bg-warn" },
+            { label: "blocked", count: blockedCount, cls: "bg-danger" },
+          ];
+          return (
+            <Card className="p-2.5 space-y-1.5" data-testid="bottleneck-heat-bar">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[12px]">
+                <div className="flex flex-wrap items-center gap-2.5 text-ink-2">
+                  {buckets.map((b) => (
+                    <span key={b.label} className="inline-flex items-center gap-1">
+                      <span className={cn("h-2 w-2 rounded-full", b.cls)} aria-hidden="true" />
+                      <span className="num">{b.count}</span> {b.label}
+                    </span>
+                  ))}
+                </div>
+                {topBlocker && (
+                  <Button
+                    data-testid="top-blocker-jump"
+                    onClick={() => onJumpToBoardSeq(topBlocker.seq)}
+                    className="bg-board num"
+                  >
+                    Top #{topBlocker.seq}
+                    <ArrowUpRight className="h-3 w-3" />
+                  </Button>
+                )}
+              </div>
+              <div
+                className="h-1.5 w-full rounded-full overflow-hidden bg-track flex gap-px"
+                role="img"
+                aria-label={`Swarm activity: ${workingCount} working, ${waitingCount} waiting, ${blockedCount} blocked`}
+              >
+                {buckets.map((b) => b.count > 0 && <div key={b.label} className={cn("h-full", b.cls)} style={{ width: `${(b.count / heatTotal) * 100}%` }} />)}
+              </div>
+            </Card>
+          );
+        })()}
+
         {triage.length === 0 ? (
-          <Card className="p-3.5 bg-board">
-            <p className="text-[14px] text-ink-2">
-              No stalled workers, failed steps, open questions, or unverified deliverables right now.
-            </p>
+          <Card className="p-3 bg-board">
+            <p className="text-[14px] text-ink-2">No blockers or unverified items.</p>
           </Card>
         ) : (
           <div className="space-y-2">
@@ -206,30 +233,25 @@ export function TriageView({
               const askStatusPrompt = `@${item.member} Quick status check${item.seq > 0 ? ` (#${item.seq})` : ""}: current step and any blockers?`;
 
               return (
-                <div
+                <Card
                   key={item.id}
                   ref={(el) => {
                     cardRefs.current[idx] = el;
                   }}
                   data-selected={isSelected ? "true" : undefined}
                   onClick={() => onSelectIdx?.(idx)}
+                  className={cn("p-3 space-y-2", isSelected && "border-blue outline-1 outline-blue")}
                 >
-                  <Card
-                    className={cn(
-                      "p-3 space-y-2",
-                      isSelected && "border-blue ring-1 ring-blue",
-                    )}
-                  >
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0 space-y-1">
                       <div className="flex flex-wrap items-center gap-1.5">
                         <Badge tone={sev.tone}>
                           {item.severity === "urgent" ? (
-                            <ShieldAlert className="h-3.5 w-3.5" aria-hidden="true" />
+                            <ShieldAlert className="h-3.5 w-3.5" />
                           ) : item.severity === "attention" ? (
-                            <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
+                            <AlertTriangle className="h-3.5 w-3.5" />
                           ) : (
-                            <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
+                            <Sparkles className="h-3.5 w-3.5" />
                           )}
                           {sev.label}
                         </Badge>
@@ -252,62 +274,80 @@ export function TriageView({
                     <p className="text-[13px] text-ink-2 break-words leading-snug">{cleanDetail}</p>
                   )}
 
-                  <MediaPathChips shots={detailShots} paths={paths} onOpen={handleOpenPath} />
+                  <MediaPathChips shots={detailShots} paths={paths} onOpen={openOrCopyPath} />
 
                   <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
                     {item.conversationId && window.sidecar?.ui?.toggleConversation && (
                       <Button
                         variant="primary"
-                        size="sm"
                         onClick={() => openWorkerConversation(item.conversationId)}
                       >
-                        <MessageSquare className="h-3.5 w-3.5" aria-hidden="true" />
+                        <MessageSquare className="h-3.5 w-3.5" />
                         Open chat
                       </Button>
                     )}
 
-                    {canNudge && item.conversationId ? (
-                      <>
-                        <Button variant="outline" size="sm" onClick={() => openNudge(item, presets[0].prompt)}>
-                          {item.severity === "urgent" ? (
-                            <Wrench className="h-3.5 w-3.5" aria-hidden="true" />
-                          ) : (
-                            <Send className="h-3.5 w-3.5" aria-hidden="true" />
-                          )}
-                          {item.severity === "urgent" ? presets[0].label : "Nudge"}
-                        </Button>
-                        <Button variant="ghost" size="sm" onClick={() => openNudge(item, askStatusPrompt)}>
-                          Ask status
-                        </Button>
-                      </>
-                    ) : (
-                      <>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => handleCopy(presets[0].prompt, "Follow-up prompt copied")}
-                        >
-                          <ClipboardCopy className="h-3.5 w-3.5" aria-hidden="true" />
-                          Copy {item.severity === "urgent" ? presets[0].label.toLowerCase() : "follow-up"}
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => handleCopy(askStatusPrompt, "Status prompt copied")}
-                        >
-                          Ask status
-                        </Button>
-                      </>
+                    {(() => {
+                      const live = Boolean(canNudge && item.conversationId);
+                      const urgent = item.severity === "urgent";
+                      return (
+                        <>
+                          <Button
+                            onClick={() =>
+                              live
+                                ? openNudge(item, presets[0].prompt)
+                                : handleCopy(presets[0].prompt, "Follow-up prompt copied")
+                            }
+                          >
+                            {!live ? (
+                              <ClipboardCopy className="h-3.5 w-3.5" />
+                            ) : urgent ? (
+                              <Wrench className="h-3.5 w-3.5" />
+                            ) : (
+                              <Send className="h-3.5 w-3.5" />
+                            )}
+                            {live
+                              ? urgent
+                                ? presets[0].label
+                                : "Nudge"
+                              : `Copy ${urgent ? presets[0].label.toLowerCase() : "follow-up"}`}
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            onClick={() =>
+                              live
+                                ? openNudge(item, askStatusPrompt)
+                                : handleCopy(askStatusPrompt, "Status prompt copied")
+                            }
+                          >
+                            Ask status
+                          </Button>
+                        </>
+                      );
+                    })()}
+
+                    {(item.severity === "urgent" ||
+                      item.kind === "blocked" ||
+                      item.kind === "error" ||
+                      item.kind === "quota" ||
+                      item.kind === "verify") && (
+                      <Button
+                        variant="ghost"
+                        data-testid={`copy-blocker-${item.id}`}
+                        onClick={() => handleCopy(formatBlockerContext(item, worker, snap), "Blocker context copied")}
+                      >
+                        <ClipboardCopy className="h-3.5 w-3.5" />
+                        Copy blocker
+                      </Button>
                     )}
 
                     {worker && (tools.length > 0 || worker.thinkingHeading) && (
                       <Button
                         variant="ghost"
-                        size="sm"
                         aria-expanded={peeking}
                         onClick={() => setPeekId(peeking ? null : item.id)}
                       >
-                        {peeking ? <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" /> : <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />}
+                        {peeking ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
                         Peek
                       </Button>
                     )}
@@ -316,22 +356,20 @@ export function TriageView({
                       <div className="flex items-center gap-1 ml-auto">
                         <Button
                           variant="ghost"
-                          size="sm"
                           aria-pressed={isPinned}
                           aria-label={isPinned ? `Unpin #${item.seq}` : `Pin #${item.seq}`}
                           onClick={() => onTogglePin(item.seq)}
                           className="px-2"
                         >
-                          {isPinned ? <PinOff className="h-3.5 w-3.5" aria-hidden="true" /> : <Pin className="h-3.5 w-3.5" aria-hidden="true" />}
+                          {isPinned ? <PinOff className="h-3.5 w-3.5" /> : <Pin className="h-3.5 w-3.5" />}
                         </Button>
                         <Button
                           variant="ghost"
-                          size="sm"
                           onClick={() => onJumpToBoardSeq(item.seq)}
                           className="num"
                         >
                           #{item.seq}
-                          <ArrowUpRight className="h-3.5 w-3.5" aria-hidden="true" />
+                          <ArrowUpRight className="h-3.5 w-3.5" />
                         </Button>
                       </div>
                     )}
@@ -342,7 +380,7 @@ export function TriageView({
                   {editingThis && (
                     <InlineComposer
                       id={`nudge-${item.id}`}
-                      label={`Confirm message to @${item.member}`}
+                      label={`@${item.member}`}
                       value={nudgeDraft}
                       onChange={setNudgeDraft}
                       onCancel={() => setNudgeTarget(null)}
@@ -365,8 +403,7 @@ export function TriageView({
                       }
                     />
                   )}
-                  </Card>
-                </div>
+                </Card>
               );
             })}
           </div>
@@ -377,33 +414,13 @@ export function TriageView({
       {pinnedMsgs.length > 0 && (
         <section aria-labelledby="pinned-triage-heading" className="space-y-2">
           <div className="flex items-center gap-1.5">
-            <Pin className="h-4 w-4 text-info" aria-hidden="true" />
+            <Pin className="h-4 w-4 text-info" />
             <h2 id="pinned-triage-heading" className="text-[14px] font-semibold text-ink">
               Pinned posts ({pinnedMsgs.length})
             </h2>
           </div>
           <Card className="p-2.5">
-            <ul className="divide-y divide-hairline">
-              {pinnedMsgs.map((pm) => (
-                <li key={pm.seq} className="flex items-center justify-between gap-2 py-1.5 first:pt-0.5 last:pb-0.5">
-                  <div className="min-w-0">
-                    <p className="text-[13px] font-medium text-ink truncate">
-                      <span className="num">#{pm.seq}</span> {pm.agent}
-                    </p>
-                    <p className="text-[12px] text-ink-2 truncate">{parseScreenshotLines(pm.text).cleanText || pm.text.replace(/\/home\/[^/\s]+\//g, "~/")}</p>
-                  </div>
-                  <div className="flex items-center gap-1 shrink-0">
-                    <Button variant="ghost" size="sm" className="num" onClick={() => onJumpToBoardSeq(pm.seq)}>
-                      #{pm.seq}
-                      <ArrowUpRight className="h-3.5 w-3.5" aria-hidden="true" />
-                    </Button>
-                    <Button variant="ghost" size="icon" aria-label={`Unpin #${pm.seq}`} onClick={() => onTogglePin(pm.seq)}>
-                      <PinOff className="h-3.5 w-3.5" aria-hidden="true" />
-                    </Button>
-                  </div>
-                </li>
-              ))}
-            </ul>
+            <PinnedList messages={pinnedMsgs} onJump={onJumpToBoardSeq} onUnpin={onTogglePin} />
           </Card>
         </section>
       )}
@@ -412,7 +429,7 @@ export function TriageView({
       {plan && (
         <section aria-labelledby="plan-heading" className="space-y-2.5">
           <div className="flex items-center gap-1.5">
-            <Layers className="h-4 w-4 text-ink-3" aria-hidden="true" />
+            <Layers className="h-4 w-4 text-ink-3" />
             <h2 id="plan-heading" className="text-[14px] font-semibold text-ink">
               Swarm plan
             </h2>
@@ -444,12 +461,15 @@ export function TriageView({
             )}
             {Array.isArray(plan.milestones) && plan.milestones.length > 0 && (
               <div className="flex flex-wrap gap-1.5 pt-1">
-                {plan.milestones.map((ms, idx) => (
-                  <Badge key={idx} tone={WORKSTREAM_TONE[String(ms.status || "").toLowerCase()] || "neutral"}>
-                    <StatusDot state={ms.status === "done" || ms.status === "completed" ? "ok" : "waiting"} />
-                    {ms.title} ({humanizeStatus(ms.status)})
-                  </Badge>
-                ))}
+                {plan.milestones.map((ms, idx) => {
+                  const tone = WORKSTREAM_TONE[String(ms.status || "").toLowerCase()] || "neutral";
+                  return (
+                    <Badge key={idx} tone={tone}>
+                      <StatusDot state={tone === "success" ? "ok" : "waiting"} />
+                      {ms.title} ({humanizeStatus(ms.status)})
+                    </Badge>
+                  );
+                })}
               </div>
             )}
           </Card>
@@ -460,7 +480,7 @@ export function TriageView({
       {frames.length > 0 && (
         <section aria-labelledby="reel-heading" className="space-y-2.5">
           <div className="flex items-center gap-1.5">
-            <ImageIcon className="h-4 w-4 text-ink-3" aria-hidden="true" />
+            <ImageIcon className="h-4 w-4 text-ink-3" />
             <h2 id="reel-heading" className="text-[14px] font-semibold text-ink">
               Verified captures ({frames.length})
             </h2>
@@ -484,17 +504,14 @@ export function TriageView({
                     </span>
                     <div className="flex items-center gap-1 shrink-0">
                       <Button
-                        variant="outline"
-                        size="sm"
                         aria-label={`Open ${frame.caption || "capture"} file`}
-                        onClick={() => handleOpenPath(frame.path)}
+                        onClick={() => openOrCopyPath(frame.path, frame.path)}
                       >
-                        <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+                        <ExternalLink className="h-3.5 w-3.5" />
                         Open file
                       </Button>
                       <Button
                         variant="ghost"
-                        size="sm"
                         className="num"
                         onClick={() => onJumpToBoardSeq(frame.seq)}
                       >

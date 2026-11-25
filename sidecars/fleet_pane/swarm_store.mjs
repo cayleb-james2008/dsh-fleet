@@ -20,9 +20,9 @@ import {
   channelRegistry,
   channelsAt,
   controlOf,
+  createMentionsMatcher,
   currentChannels,
   effectiveChannels,
-  mentionsOf,
   visibleUnread,
 } from './channels.mjs';
 
@@ -38,9 +38,9 @@ const MAX_POSTED_FRAMES = 24;
 const FRAME_EXT = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' };
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const SWARM_SCAN_TTL_MS = 2000;
-const CHUNK_BYTES = 64 * 1024;
+const CHUNK_BYTES = 32 * 1024;
 const SHARED_CHUNK_BUF = Buffer.allocUnsafe(CHUNK_BYTES);
-const TAIL_CAP = 32;
+const TAIL_CAP = 16;
 const RECENT_TOOLS_CAP = 5;
 
 function safeReaddir(path) {
@@ -154,29 +154,62 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine, { rawSpan =
   if (s.size > offset) {
     const fd = openSync(filePath, 'r');
     try {
+      let overflowCarry = carryBuf;
+      let sharedCarryLen = 0;
+      if (!overflowCarry.length) {
+        sharedCarryLen = 0;
+      } else if (overflowCarry.length < CHUNK_BYTES) {
+        overflowCarry.copy(SHARED_CHUNK_BUF, 0);
+        sharedCarryLen = overflowCarry.length;
+        overflowCarry = Buffer.alloc(0);
+      }
       while (offset < s.size) {
-        const toRead = Math.min(CHUNK_BYTES, s.size - offset);
-        const bytesRead = readSync(fd, SHARED_CHUNK_BUF, 0, toRead, offset);
-        if (bytesRead <= 0) break;
-        offset += bytesRead;
-        const chunk = SHARED_CHUNK_BUF.subarray(0, bytesRead);
-        const combined = carryBuf.length ? Buffer.concat([carryBuf, chunk]) : chunk;
+        let activeBuf;
+        let totalLen;
+        if (overflowCarry.length) {
+          const toRead = Math.min(CHUNK_BYTES, s.size - offset);
+          const bytesRead = readSync(fd, SHARED_CHUNK_BUF, 0, toRead, offset);
+          if (bytesRead <= 0) break;
+          offset += bytesRead;
+          activeBuf = Buffer.concat([overflowCarry, SHARED_CHUNK_BUF.subarray(0, bytesRead)]);
+          totalLen = activeBuf.length;
+        } else {
+          const toRead = Math.min(CHUNK_BYTES - sharedCarryLen, s.size - offset);
+          const bytesRead = readSync(fd, SHARED_CHUNK_BUF, sharedCarryLen, toRead, offset);
+          if (bytesRead <= 0) break;
+          offset += bytesRead;
+          activeBuf = SHARED_CHUNK_BUF;
+          totalLen = sharedCarryLen + bytesRead;
+        }
 
         let pos = 0;
-        for (let nl = combined.indexOf(0x0a, pos); nl >= 0; nl = combined.indexOf(0x0a, pos)) {
+        for (let nl = activeBuf.indexOf(0x0a, pos); nl >= 0 && nl < totalLen; nl = activeBuf.indexOf(0x0a, pos)) {
           let start = pos;
           let end = nl;
-          if (end > start && combined[end - 1] === 0x0d) end--;
-          while (start < end && combined[start] <= 32) start++;
-          while (end > start && combined[end - 1] <= 32) end--;
+          if (end > start && activeBuf[end - 1] === 0x0d) end--;
+          while (start < end && activeBuf[start] <= 32) start++;
+          while (end > start && activeBuf[end - 1] <= 32) end--;
           if (end > start) {
-            if (rawSpan) onLine(combined, start, end, null, offset >= s.size && combined.indexOf(0x0a, nl + 1) < 0 ? 0 : s.size - offset);
-            else onLine(combined.subarray(start, end).toString('utf8'));
+            const rem = offset >= s.size && (nl + 1 >= totalLen || activeBuf.indexOf(0x0a, nl + 1) < 0 || activeBuf.indexOf(0x0a, nl + 1) >= totalLen) ? 0 : s.size - offset;
+            if (rawSpan) onLine(activeBuf, start, end, null, rem);
+            else onLine(activeBuf.subarray(start, end).toString('utf8'));
           }
           pos = nl + 1;
         }
-        carryBuf = pos < combined.length ? Buffer.from(combined.subarray(pos)) : Buffer.alloc(0);
+        const remLen = totalLen - pos;
+        if (remLen <= 0) {
+          sharedCarryLen = 0;
+          overflowCarry = Buffer.alloc(0);
+        } else if (remLen < CHUNK_BYTES) {
+          activeBuf.copy(SHARED_CHUNK_BUF, 0, pos, totalLen);
+          sharedCarryLen = remLen;
+          overflowCarry = Buffer.alloc(0);
+        } else {
+          sharedCarryLen = 0;
+          overflowCarry = Buffer.from(activeBuf.subarray(pos, totalLen));
+        }
       }
+      carryBuf = sharedCarryLen > 0 ? Buffer.from(SHARED_CHUNK_BUF.subarray(0, sharedCarryLen)) : overflowCarry;
     } finally {
       closeSync(fd);
     }
@@ -742,7 +775,9 @@ function postedFrames(roster, msgs) {
   for (const m of msgs) {
     const who = roster?.members?.[m.agent];
     if (!who || who.role === 'coordinator' || isRoleWorker(m.agent, who)) continue;
-    for (const g of String(m.text ?? '').matchAll(SHOT_RE)) {
+    const txt = String(m.text ?? '');
+    if (!/screenshot:/i.test(txt)) continue;
+    for (const g of txt.matchAll(SHOT_RE)) {
       out.delete(g[1]);
       out.set(g[1], { path: g[1], seq: Number(m.seq) || 0, caption: String(g[2] || '').slice(0, 80) });
     }
@@ -773,7 +808,7 @@ function parseViewJson(id, f) {
       }
     }
     c = { key, error, good: parsed ? { json: parsed, mtime: f.mtime } : c?.good || null };
-    lruSet(viewJsonCache, id, c, 32);
+    lruSet(viewJsonCache, id, c, 16);
   }
   return { json: c.good?.json || null, mtime: c.good?.mtime || 0, error: c.error };
 }
@@ -1076,6 +1111,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
   const edges = new Map();
   const channels = channelRegistry(msgs);
   const byChannel = channelAddressees(roster, names, msgs, channels);
+  const matchMentions = createMentionsMatcher(names);
 
   // Transform board messages in-place so peak heap does not hold 2x 2k-object graphs
   for (let i = 0; i < msgs.length; i++) {
@@ -1087,33 +1123,63 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     const ts = boardTimeMs(time);
     const channel = channelOf(m);
     const control = controlOf(m);
-    const chanFields = { ...(channel !== MAIN ? { channel } : {}), ...(control ? { control } : {}) };
+    m.seq = seq;
+    m.agent = agent;
+    m.text = text;
+    m.time = time;
+    m.ts = ts;
+    if (channel !== MAIN) m.channel = channel;
     if (control) {
-      msgs[i] = { seq, agent, text, time, ts, mentions: [], all: false, ...chanFields };
+      m.mentions = [];
+      m.all = false;
+      m.control = control;
       continue;
     }
-    const { mentions, all } = mentionsOf(text, names);
+    const { mentions, all } = matchMentions(text);
     const ch = byChannel ? byChannel(i, text) : null;
     const viaChannel = ch ? ch.members.filter((n) => n !== agent && !mentions.includes(n)) : [];
-    const chanMentionFields = ch?.channels.length ? { channel_mentions: ch.channels, via_channel: viaChannel } : {};
     const p = posts.get(agent) || { posts: 0, lastPostSeq: 0, lastPostTime: '', lastPostTs: null };
     posts.set(agent, { posts: p.posts + 1, lastPostSeq: seq, lastPostTime: time, lastPostTs: ts });
-    if (!isRoleWorker(agent, roster.members[agent])) {
-      const direct = new Set([...mentions, ...viaChannel]);
-      const targets = new Set(all ? names : mentions);
-      for (const n of direct) targets.add(n);
-      targets.delete(agent);
-      for (const to of targets) {
-        if (isRoleWorker(to, roster.members[to])) continue;
-        const key = `${agent}\0${to}`;
-        const e = edges.get(key) || { from: agent, to, count: 0, direct: 0, viaAll: 0 };
-        e.count++;
-        if (direct.has(to)) e.direct++;
-        else e.viaAll++;
-        edges.set(key, e);
+    if (!isRoleWorker(agent, roster.members[agent]) && (all || mentions.length || viaChannel.length)) {
+      const seen = new Set();
+      if (all) {
+        for (const to of names) {
+          if (to === agent || isRoleWorker(to, roster.members[to]) || seen.has(to)) continue;
+          seen.add(to);
+          const key = `${agent}\0${to}`;
+          const e = edges.get(key) || { from: agent, to, count: 0, direct: 0, viaAll: 0 };
+          e.count++;
+          if (mentions.includes(to) || viaChannel.includes(to)) e.direct++;
+          else e.viaAll++;
+          edges.set(key, e);
+        }
+      } else {
+        for (const to of mentions) {
+          if (to === agent || isRoleWorker(to, roster.members[to]) || seen.has(to)) continue;
+          seen.add(to);
+          const key = `${agent}\0${to}`;
+          const e = edges.get(key) || { from: agent, to, count: 0, direct: 0, viaAll: 0 };
+          e.count++;
+          e.direct++;
+          edges.set(key, e);
+        }
+        for (const to of viaChannel) {
+          if (to === agent || isRoleWorker(to, roster.members[to]) || seen.has(to)) continue;
+          seen.add(to);
+          const key = `${agent}\0${to}`;
+          const e = edges.get(key) || { from: agent, to, count: 0, direct: 0, viaAll: 0 };
+          e.count++;
+          e.direct++;
+          edges.set(key, e);
+        }
       }
     }
-    msgs[i] = { seq, agent, text, time, ts, mentions, all, ...chanFields, ...chanMentionFields };
+    m.mentions = mentions;
+    m.all = all;
+    if (ch?.channels.length) {
+      m.channel_mentions = ch.channels;
+      m.via_channel = viaChannel;
+    }
   }
   const messages = msgs;
 

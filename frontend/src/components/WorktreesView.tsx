@@ -2,7 +2,7 @@ import { useState } from "react";
 import { ChevronDown, ChevronUp, ExternalLink, FileCode2, FolderGit2, GitBranch, RefreshCw } from "../icons";
 import { fetchWorktreeDiff, openFileInAuxPane } from "../sidecar";
 import type { WorktreeDiffPayload, WorktreesPayload } from "../types";
-import { Badge, Button, Card, Input, copyText, fmtTimeAgo, toast } from "../ui";
+import { Badge, Button, Card, Input, fmtTimeAgo, maskHome, openOrCopyPath, toast } from "../ui";
 
 const FILE_TONE: Record<string, "success" | "warning" | "danger" | "neutral"> = {
   "??": "neutral",
@@ -68,8 +68,8 @@ export function WorktreesView({
         <h2 className="text-[14px] font-semibold text-ink">
           Git worktrees ({worktrees.length})
         </h2>
-        <Button variant="outline" size="sm" onClick={onRefresh} disabled={loading}>
-          <RefreshCw className={`h-3.5 w-3.5 ${loading ? "motion-safe:animate-spin" : ""}`} aria-hidden="true" />
+        <Button onClick={onRefresh} disabled={loading}>
+          <RefreshCw className={`h-3.5 w-3.5 ${loading ? "motion-safe:animate-spin" : ""}`} />
           Refresh
         </Button>
       </div>
@@ -82,7 +82,7 @@ export function WorktreesView({
             value={rootInput}
             onChange={(e) => setRootInput(e.target.value)}
           />
-          <Button type="submit" variant="secondary" size="sm">
+          <Button type="submit" variant="secondary">
             Inspect
           </Button>
         </form>
@@ -92,13 +92,13 @@ export function WorktreesView({
         <Card className="p-4 space-y-1.5 bg-board">
           <p className="text-[14px] font-medium text-ink">No open workspace folder</p>
           <p className="text-[13px] text-ink-2">
-            Open a repository folder in Antigravity or enter a local repository path above to inspect worker worktrees.
+            Open a workspace folder or enter a local repository path above.
           </p>
         </Card>
       ) : worktrees.length === 0 ? (
         <Card className="p-4 bg-board">
           <p className="text-[14px] text-ink-2">
-            {loading ? "Inspecting workspace worktrees..." : "No git worktrees detected for the current workspace roots."}
+            {loading ? "Inspecting worktrees..." : "No git worktrees detected."}
           </p>
         </Card>
       ) : (
@@ -108,7 +108,7 @@ export function WorktreesView({
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0 space-y-0.5">
                   <div className="flex flex-wrap items-center gap-1.5">
-                    <GitBranch className="h-3.5 w-3.5 text-info shrink-0" aria-hidden="true" />
+                    <GitBranch className="h-3.5 w-3.5 text-info shrink-0" />
                     <span className="text-[14px] font-semibold text-ink break-all">{wt.branch}</span>
                     {wt.isMain && <Badge tone="neutral">main</Badge>}
                     <Badge tone={wt.clean ? "success" : "warning"}>
@@ -119,21 +119,19 @@ export function WorktreesView({
                   </div>
                   <p
                     className="text-[12px] text-ink-3 mono truncate"
-                    title={wt.path.replace(/^\/home\/[^/]+\//, "~/")}
+                    title={maskHome(wt.path)}
                   >
-                    <FolderGit2 className="inline h-3 w-3 mr-1 align-text-bottom" aria-hidden="true" />
-                    {wt.path.replace(/^\/home\/[^/]+\//, "~/")}
+                    <FolderGit2 className="inline h-3 w-3 mr-1 align-text-bottom" />
+                    {maskHome(wt.path)}
                   </p>
                 </div>
 
                 {wt.uri && window.sidecar?.ui?.toggleAuxPane && (
                   <Button
-                    variant="outline"
-                    size="sm"
                     onClick={() => openFileInAuxPane(wt.uri)}
                     className="shrink-0"
                   >
-                    <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+                    <ExternalLink className="h-3.5 w-3.5" />
                     Open
                   </Button>
                 )}
@@ -155,14 +153,6 @@ export function WorktreesView({
                   className="divide-y divide-hairline rounded-chip border border-hairline bg-board px-2.5 py-1"
                 >
                   {wt.files.map((f) => {
-                    const canOpenAux = Boolean(f.uri && window.sidecar?.ui?.toggleAuxPane);
-                    const handleOpenFile = async () => {
-                      if (canOpenAux && openFileInAuxPane(f.uri)) {
-                        toast.success(`Opened ${f.path.split("/").pop() || f.path}`);
-                        return;
-                      }
-                      await copyText(f.path, `Copied ${f.path}`);
-                    };
                     const key = `${wt.path}::${f.path}`;
                     const diffOpen = openDiffKey === key;
                     const diffEntry = diffByKey[key];
@@ -181,28 +171,26 @@ export function WorktreesView({
                           <div className="flex items-center gap-1 shrink-0">
                             <Button
                               variant="ghost"
-                              size="sm"
                               aria-label={`Diff peek ${f.path}`}
                               aria-expanded={diffOpen}
                               onClick={() => handleToggleDiff(wt.root, wt.path, f.path)}
                               className="h-7 px-2"
                             >
                               {diffOpen ? (
-                                <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" />
+                                <ChevronUp className="h-3.5 w-3.5" />
                               ) : (
-                                <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+                                <ChevronDown className="h-3.5 w-3.5" />
                               )}
                               <span>Diff</span>
                             </Button>
                             {f.uri && (
                               <Button
                                 variant="ghost"
-                                size="sm"
                                 aria-label={`Open file ${f.path}`}
-                                onClick={handleOpenFile}
+                                onClick={() => openOrCopyPath(f.uri, f.path)}
                                 className="h-7 px-2"
                               >
-                                <FileCode2 className="h-3.5 w-3.5" aria-hidden="true" />
+                                <FileCode2 className="h-3.5 w-3.5" />
                                 <span>Open</span>
                               </Button>
                             )}
@@ -211,7 +199,7 @@ export function WorktreesView({
                         {diffOpen && (
                           <div className="rounded-chip border border-hairline bg-canvas p-2 space-y-1">
                             {diffBusy ? (
-                              <p className="text-[12px] text-ink-2">Loading diff hunk...</p>
+                              <p className="text-[12px] text-ink-2">Loading...</p>
                             ) : diffEntry ? (
                               <>
                                 <div className="flex flex-wrap items-center justify-between gap-1 text-[12px] text-ink-2">
@@ -219,16 +207,16 @@ export function WorktreesView({
                                     +{diffEntry.added} / -{diffEntry.removed}
                                     {diffEntry.untracked ? " (untracked)" : ""}
                                   </span>
-                                  {diffEntry.truncated && <Badge tone="warning">truncated 8 KB</Badge>}
+                                  {diffEntry.truncated && <Badge tone="warning">8 KB cap</Badge>}
                                 </div>
-                                <pre className="max-h-48 overflow-y-auto overflow-x-auto text-[12px] leading-[1.45] mono">
+                                <pre className="max-h-48 overflow-auto text-[12px] leading-[1.45] mono">
                                   {(diffEntry.diff || "(empty diff)").split("\n").map((line, i) => (
                                     <div
                                       key={i}
                                       className={
-                                        line.startsWith("+") && !line.startsWith("+++")
+                                        line[0] === "+" && !line.startsWith("+++")
                                           ? "text-ok"
-                                          : line.startsWith("-") && !line.startsWith("---")
+                                          : line[0] === "-" && !line.startsWith("---")
                                             ? "text-danger"
                                             : line.startsWith("@@")
                                               ? "text-info"
@@ -248,7 +236,7 @@ export function WorktreesView({
                   })}
                   {wt.filesTruncated && (
                     <li className="py-1 text-[12px] text-ink-3">
-                      Showing first {wt.files.length} changed files
+                      {wt.files.length} files shown
                     </li>
                   )}
                 </ul>

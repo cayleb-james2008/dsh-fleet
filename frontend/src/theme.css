@@ -83,12 +83,8 @@
 :root {
   --font-sans: "Geist", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Geist Mono", ui-monospace, monospace;
-  --radius-panel: 12px;
-  --radius-dialog: 14px;
   --radius-card: 8px;
-  --radius-segment: 6px;
   --radius-chip: 6px;
-  --radius: 8px;
   --display-weight: 600;
   --tracking-display: -0.02em;
   --ease-house: cubic-bezier(0.23, 1, 0.32, 1);

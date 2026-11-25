@@ -49,20 +49,20 @@ const SWARM_PRESETS = [
   {
     id: "feature-verifier",
     title: "Feature + Verifier",
-    summary: "Isolated worktree builder + cold verifier gate",
-    prompt: "/fleet Implement feature on isolated worktree, add tests, and hand off @verifier [done] for cold check.",
+    summary: "Worktree + cold verifier",
+    prompt: "/fleet Build on isolated worktree, add tests, hand off @verifier [done].",
   },
   {
     id: "audit-harden",
     title: "Audit & Harden",
-    summary: "Security, edge-case, and UI craft review lane",
-    prompt: "/fleet Audit tests, security boundaries, and UI craft with cold verification reports.",
+    summary: "Tests, security & UI audit",
+    prompt: "/fleet Audit tests, security boundaries, and UI craft with cold verification.",
   },
   {
     id: "multi-lane",
     title: "Multi-Lane Ship",
-    summary: "Sharded parallel builders + monitor + verifier",
-    prompt: "/fleet Split across isolated worktrees with stall monitor, build gates, and plan.json.",
+    summary: "Parallel lanes + monitor",
+    prompt: "/fleet Shard across worktrees with monitor, gates, and plan.json.",
   },
 ];
 
@@ -136,12 +136,9 @@ export function App() {
 
   useEffect(() => {
     let active = true;
-    window.sidecar?.getWorkspaceUris?.().then((uris) => {
-      if (active && Array.isArray(uris)) setWorkspaceUris(uris);
-    });
-    const unsub = window.sidecar?.onWorkspaceChange?.((uris) => {
-      if (active && Array.isArray(uris)) setWorkspaceUris(uris);
-    });
+    const onUris = (uris: unknown) => active && Array.isArray(uris) && setWorkspaceUris(uris);
+    window.sidecar?.getWorkspaceUris?.().then(onUris);
+    const unsub = window.sidecar?.onWorkspaceChange?.(onUris);
     return () => {
       active = false;
       unsub?.();
@@ -339,18 +336,15 @@ export function App() {
   };
 
   const handleTabKeyDown = (e: React.KeyboardEvent, idx: number) => {
-    if (e.key === "ArrowRight") {
+    const next =
+      e.key === "ArrowRight" ? (idx + 1) % TABS.length
+      : e.key === "ArrowLeft" ? (idx - 1 + TABS.length) % TABS.length
+      : e.key === "Home" ? 0
+      : e.key === "End" ? TABS.length - 1
+      : -1;
+    if (next >= 0) {
       e.preventDefault();
-      setTab(TABS[(idx + 1) % TABS.length].id);
-    } else if (e.key === "ArrowLeft") {
-      e.preventDefault();
-      setTab(TABS[(idx - 1 + TABS.length) % TABS.length].id);
-    } else if (e.key === "Home") {
-      e.preventDefault();
-      setTab(TABS[0].id);
-    } else if (e.key === "End") {
-      e.preventDefault();
-      setTab(TABS[TABS.length - 1].id);
+      setTab(TABS[next].id);
     }
   };
 
@@ -405,7 +399,7 @@ export function App() {
                       aria-label="Active swarm"
                       value={snap?.swarm || selectedSwarmId || ""}
                       onChange={(e) => handleSelectSwarm(e.target.value)}
-                      className="h-7 max-w-[165px] min-[380px]:max-w-[190px] sm:max-w-[320px] truncate rounded-chip border border-[var(--input)] bg-board px-2 text-[14px] font-semibold text-ink focus-visible:outline-2 focus-visible:outline-[var(--ring)] cursor-pointer"
+                      className="h-7 max-w-[165px] min-[380px]:max-w-[190px] sm:max-w-[320px] truncate rounded-chip border border-[var(--input)] bg-board px-2 text-[14px] font-semibold text-ink cursor-pointer"
                     >
                       {swarms.map((sw) => (
                         <option key={sw.id} value={sw.id}>
@@ -424,53 +418,26 @@ export function App() {
 
             <div className="flex items-center gap-0.5 shrink-0">
               {hasSwarm && (
-                <span
-                  className="hidden sm:inline-flex items-center rounded-chip bg-board px-2 py-1 text-[12px] font-medium text-ink-2 num mr-0.5"
-                  title="Total tokens across swarm transcripts"
-                >
-                  {fmtTokens(snap?.usage?.totalTokens)} tok
-                </span>
-              )}
-              {hasSwarm && (
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  aria-label="Copy swarm digest"
-                  title="Copy Markdown swarm digest"
-                  onClick={handleCopyDigest}
-                >
-                  <ClipboardCopy className="h-4 w-4" aria-hidden="true" />
+                <Button variant="ghost" size="icon" aria-label="Copy swarm digest" onClick={handleCopyDigest}>
+                  <ClipboardCopy className="h-4 w-4" />
                 </Button>
               )}
-              <Button
-                variant="ghost"
-                size="icon"
-                aria-label="Open command palette"
-                title="Command palette (Cmd/Ctrl+K)"
-                onClick={() => setPaletteOpen(true)}
-              >
-                <Search className="h-4 w-4" aria-hidden="true" />
+              <Button variant="ghost" size="icon" aria-label="Open command palette" onClick={() => setPaletteOpen(true)}>
+                <Search className="h-4 w-4" />
               </Button>
               <Button
                 variant="ghost"
                 size="icon"
                 aria-label="Refresh swarm"
-                title="Refresh"
                 onClick={() => {
                   refreshSwarm(true);
                   refreshWorktrees();
                 }}
               >
-                <RefreshCw className={cn("h-4 w-4", loading && "motion-safe:animate-spin")} aria-hidden="true" />
+                <RefreshCw className={cn("h-4 w-4", loading && "motion-safe:animate-spin")} />
               </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                aria-label="Open settings"
-                title="Settings"
-                onClick={() => setSettingsOpen(true)}
-              >
-                <Settings className="h-4 w-4" aria-hidden="true" />
+              <Button variant="ghost" size="icon" aria-label="Open settings" onClick={() => setSettingsOpen(true)}>
+                <Settings className="h-4 w-4" />
               </Button>
             </div>
           </div>
@@ -487,7 +454,7 @@ export function App() {
               <div className="flex items-center gap-1.5">
                 {sseConnected && <Badge tone="success">Live</Badge>}
                 {snap?.member && <Badge tone="neutral">you: {snap.member}</Badge>}
-                <span className="sm:hidden inline-flex items-center rounded-chip bg-board px-2 py-0.5 num font-medium text-ink-2">
+                <span className="inline-flex items-center rounded-chip bg-board px-2 py-0.5 num font-medium text-ink-2">
                   {fmtTokens(snap?.usage?.totalTokens)} tok
                 </span>
               </div>
@@ -517,16 +484,15 @@ export function App() {
                     onKeyDown={(e) => handleTabKeyDown(e, idx)}
                     className={cn(
                       "relative inline-flex items-center justify-center gap-1 whitespace-nowrap px-1.5 sm:px-2.5 py-2 text-[12px] sm:text-[13px] font-medium cursor-pointer transition shrink-0",
-                      "focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[var(--ring)]",
                       selected ? "text-ink" : "text-ink-2 hover:text-ink",
                     )}
                   >
-                    <Icon className="h-3.5 w-3.5 shrink-0 hidden min-[440px]:inline-block" aria-hidden="true" />
+                    <Icon className="h-3.5 w-3.5 shrink-0 hidden min-[440px]:inline-block" />
                     <span>{label}</span>
                     {typeof count === "number" && count > 0 && (
                       <span
                         className={cn(
-                          "rounded-full px-1.5 py-0.2 text-[12px] leading-4 num",
+                          "rounded-full px-1.5 text-[12px] leading-4 num",
                           id === "triage"
                             ? "bg-bad-soft text-danger"
                             : "bg-track text-ink-2",
@@ -550,7 +516,7 @@ export function App() {
       </header>
 
       {/* Main Content */}
-      <main className="flex-1 mx-auto w-full max-w-[960px] px-3 py-3.5">
+      <main className="flex-1 mx-auto w-full max-w-[960px] px-3 py-3">
         {error && (
           <Card className="mb-3 border-danger bg-bad-soft p-3 text-[13px] text-danger">
             {error}
@@ -573,7 +539,7 @@ export function App() {
             <div className="space-y-2.5">
               <h2 className="text-[16px] font-semibold text-ink">Launch an Antigravity swarm</h2>
               <p className="text-[14px] text-ink-2">
-                No active swarm is attached to this conversation yet. Start a coordinated swarm with one click or inspect any recent swarm below.
+                No active swarm yet. Launch a preset or open a recent swarm below.
               </p>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
                 {SWARM_PRESETS.map((preset) => (
@@ -582,15 +548,15 @@ export function App() {
                       <p className="text-[14px] font-semibold text-ink">{preset.title}</p>
                       <p className="text-[13px] text-ink-2">{preset.summary}</p>
                     </div>
-                    <Button variant="primary" size="sm" onClick={() => handleLaunchPreset(preset)}>
+                    <Button variant="primary" onClick={() => handleLaunchPreset(preset)}>
                       {window.sidecar?.agent?.startConversation ? (
                         <>
-                          <Rocket className="h-3.5 w-3.5" aria-hidden="true" />
+                          <Rocket className="h-3.5 w-3.5" />
                           Launch swarm
                         </>
                       ) : (
                         <>
-                          <ClipboardCopy className="h-3.5 w-3.5" aria-hidden="true" />
+                          <ClipboardCopy className="h-3.5 w-3.5" />
                           Copy /fleet prompt
                         </>
                       )}
@@ -617,7 +583,7 @@ export function App() {
                           <span>{fmtTokens(sw.totalTokens)} tok</span>
                         </div>
                       </div>
-                      <Button variant="outline" size="sm" onClick={() => handleSelectSwarm(sw.id)}>
+                      <Button onClick={() => handleSelectSwarm(sw.id)}>
                         Open
                       </Button>
                     </Card>
@@ -627,50 +593,38 @@ export function App() {
             )}
           </div>
         ) : (
-          <>
+          <div id={`panel-${tab}`} role="tabpanel" aria-labelledby={`tab-${tab}`}>
             {tab === "triage" && (
-              <div id="panel-triage" role="tabpanel" aria-labelledby="tab-triage">
-                <TriageView
-                  snap={snap!}
-                  pinnedSeqs={pinnedSeqs}
-                  selectedIdx={selectedTriageIdx}
-                  replyNonce={triageReplyNonce}
-                  onSelectIdx={setSelectedTriageIdx}
-                  onTogglePin={handleTogglePin}
-                  onJumpToBoardSeq={(seq) => {
-                    setHighlightSeq(seq);
-                    setTab("board");
-                  }}
-                  onRefresh={() => refreshSwarm(true)}
-                />
-              </div>
+              <TriageView
+                snap={snap!}
+                pinnedSeqs={pinnedSeqs}
+                selectedIdx={selectedTriageIdx}
+                replyNonce={triageReplyNonce}
+                onSelectIdx={setSelectedTriageIdx}
+                onTogglePin={handleTogglePin}
+                onJumpToBoardSeq={(seq) => {
+                  setHighlightSeq(seq);
+                  setTab("board");
+                }}
+                onRefresh={() => refreshSwarm(true)}
+              />
             )}
             {tab === "board" && (
-              <div id="panel-board" role="tabpanel" aria-labelledby="tab-board">
-                <BoardView
-                  snap={snap!}
-                  highlightSeq={highlightSeq}
-                  pinnedSeqs={pinnedSeqs}
-                  quickFilter={boardQuickFilter}
-                  onQuickFilterChange={setBoardQuickFilter}
-                  onCopyWaveDigest={handleCopyDigest}
-                  onTogglePin={handleTogglePin}
-                  onClearHighlight={() => setHighlightSeq(null)}
-                  onRefresh={() => refreshSwarm(true)}
-                />
-              </div>
+              <BoardView
+                snap={snap!}
+                highlightSeq={highlightSeq}
+                pinnedSeqs={pinnedSeqs}
+                quickFilter={boardQuickFilter}
+                onQuickFilterChange={setBoardQuickFilter}
+                onCopyWaveDigest={handleCopyDigest}
+                onTogglePin={handleTogglePin}
+                onClearHighlight={() => setHighlightSeq(null)}
+                onRefresh={() => refreshSwarm(true)}
+              />
             )}
-            {tab === "roster" && (
-              <div id="panel-roster" role="tabpanel" aria-labelledby="tab-roster">
-                <RosterView snap={snap!} onRefresh={() => refreshSwarm(true)} />
-              </div>
-            )}
-            {tab === "graph" && (
-              <div id="panel-graph" role="tabpanel" aria-labelledby="tab-graph">
-                <GraphView snap={snap!} />
-              </div>
-            )}
-          </>
+            {tab === "roster" && <RosterView snap={snap!} onRefresh={() => refreshSwarm(true)} />}
+            {tab === "graph" && <GraphView snap={snap!} />}
+          </div>
         )}
       </main>
 
@@ -690,18 +644,18 @@ export function App() {
       <Modal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} title="Keyboard shortcuts">
         <dl className="divide-y divide-hairline text-[13px]">
           {[
-            ["j / k", "Move across Needs-You items"],
-            ["o / Enter", "Open worker chat"],
-            ["p", "Pin or unpin selected #seq"],
-            ["r", "Reply / nudge selected item"],
-            ["f", "Cycle Board quick filters"],
-            ["1 - 5", "Jump across sidebar tabs"],
-            ["Ctrl+K / Cmd+K", "Open command palette"],
-            ["?", "Toggle keyboard shortcuts"],
+            ["j / k", "Move triage"],
+            ["o / Enter", "Open chat"],
+            ["p", "Pin #seq"],
+            ["r", "Reply / nudge"],
+            ["f", "Cycle filters"],
+            ["1 - 5", "Switch tab"],
+            ["Ctrl/Cmd+K", "Command palette"],
+            ["?", "Shortcuts"],
           ].map(([key, desc]) => (
             <div key={key} className="flex items-center justify-between gap-3 py-2 first:pt-0 last:pb-0">
               <dt className="text-ink-2">{desc}</dt>
-              <dd className="rounded-[4px] border border-hairline bg-board px-1.5 py-0.5 text-[12px] text-ink mono shrink-0">
+              <dd className="rounded-chip border border-hairline bg-board px-1.5 py-0.5 text-[12px] text-ink mono shrink-0">
                 {key}
               </dd>
             </div>
@@ -732,7 +686,7 @@ export function App() {
           </div>
 
           <div className="space-y-1.5">
-            <span className="block text-[13px] font-medium text-ink">Live Poll Cadence</span>
+            <span className="block text-[13px] font-medium text-ink">Poll cadence</span>
             <SegmentControl
               label="Poll cadence"
               value={pollMs}
@@ -747,12 +701,10 @@ export function App() {
 
           <div className="rounded-card bg-board p-3 text-[12px] text-ink-2 space-y-1">
             <div className="flex items-center gap-1.5 font-medium text-ink">
-              <CommandIcon className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Fleet Antigravity Plugin v1.8.0</span>
+              <CommandIcon className="h-3.5 w-3.5" />
+              <span>Fleet Antigravity Plugin v1.9.0</span>
             </div>
-            <p>
-              Reads Antigravity native swarm boards and transcripts locally on loopback with zero external telemetry.
-            </p>
+            <p>Local swarm boards &amp; transcripts on loopback. Zero external telemetry.</p>
           </div>
         </div>
       </Modal>

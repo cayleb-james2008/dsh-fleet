@@ -9,17 +9,32 @@ export const ALL = '*';
 
 const NAME_RUNE = /[\p{L}\p{Nd}_-]/u;
 
+function isNameCharAt(s, idx) {
+  const code = s.charCodeAt(idx);
+  if (code < 128) {
+    return (code >= 97 && code <= 122) || (code >= 48 && code <= 57) || code === 95 || code === 45 || (code >= 65 && code <= 90);
+  }
+  const cp = s.codePointAt(idx);
+  return NAME_RUNE.test(String.fromCodePoint(cp));
+}
+
+function isNameCharBefore(s, idx) {
+  if (idx <= 0) return false;
+  const code = s.charCodeAt(idx - 1);
+  if (code < 128) {
+    return (code >= 97 && code <= 122) || (code >= 48 && code <= 57) || code === 95 || code === 45 || (code >= 65 && code <= 90);
+  }
+  const before = [...s.slice(Math.max(0, idx - 2), idx)].pop();
+  return NAME_RUNE.test(before);
+}
+
 function namedToken(lowerText, lowerName) {
   if (!lowerName) return false;
   for (let i = lowerText.indexOf('@'); i >= 0; i = lowerText.indexOf('@', i + 1)) {
-    if (i > 0) {
-      const before = [...lowerText.slice(Math.max(0, i - 2), i)].pop();
-      if (NAME_RUNE.test(before)) continue;
-    }
+    if (i > 0 && isNameCharBefore(lowerText, i)) continue;
     if (!lowerText.startsWith(lowerName, i + 1)) continue;
     const j = i + 1 + lowerName.length;
-    if (j >= lowerText.length) return true;
-    if (!NAME_RUNE.test(String.fromCodePoint(lowerText.codePointAt(j)))) return true;
+    if (j >= lowerText.length || !isNameCharAt(lowerText, j)) return true;
   }
   return false;
 }
@@ -30,9 +45,35 @@ function named(lowerText, lowerName) {
   return m ? namedToken(lowerText, m[1]) : false;
 }
 
+const EMPTY_MENTIONS = [];
+
+/** Precompile a zero-regex matcher for repeated `mentionsOf` scans over the same roster. */
+export function createMentionsMatcher(names) {
+  const entries = names.map((n) => {
+    const lo = String(n).toLowerCase();
+    const m = lo.match(/^(.+)-\d+$/);
+    return { name: n, lo, prefix: m ? m[1] : null };
+  });
+  return (text) => {
+    const s = typeof text === 'string' ? text : String(text || '');
+    if (!s || s.indexOf('@') === -1) return { mentions: EMPTY_MENTIONS, all: false };
+    const lower = s.toLowerCase();
+    const mentions = [];
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      if (namedToken(lower, e.lo) || (e.prefix && namedToken(lower, e.prefix))) {
+        mentions.push(e.name);
+      }
+    }
+    return { mentions, all: namedToken(lower, 'all') };
+  };
+}
+
 /** Return `{ mentions, all }` addressed by `text` among known member `names`. */
 export function mentionsOf(text, names) {
-  const lower = String(text || '').toLowerCase();
+  const s = typeof text === 'string' ? text : String(text || '');
+  if (!s || s.indexOf('@') === -1) return { mentions: [], all: false };
+  const lower = s.toLowerCase();
   return {
     mentions: names.filter((n) => named(lower, String(n).toLowerCase())),
     all: named(lower, 'all'),

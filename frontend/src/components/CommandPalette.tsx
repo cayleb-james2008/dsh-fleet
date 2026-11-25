@@ -59,19 +59,15 @@ export function CommandPalette({
 
   const items = useMemo<PaletteItem[]>(() => {
     const list: PaletteItem[] = [
-      { id: "v-triage", group: "Views", label: "Needs-you Triage & Plan", onSelect: () => onSelectTab("triage") },
-      { id: "v-board", group: "Views", label: "Swarm Board Feed", onSelect: () => onSelectTab("board") },
-      { id: "v-roster", group: "Views", label: "Worker Roster & Tokens", onSelect: () => onSelectTab("roster") },
-      { id: "v-graph", group: "Views", label: "@Mention Graph & Replay", onSelect: () => onSelectTab("graph") },
+      { id: "v-triage", group: "Views", label: "Needs-you Triage", onSelect: () => onSelectTab("triage") },
+      { id: "v-board", group: "Views", label: "Swarm Board", onSelect: () => onSelectTab("board") },
+      { id: "v-roster", group: "Views", label: "Worker Roster", onSelect: () => onSelectTab("roster") },
+      { id: "v-graph", group: "Views", label: "@Mention Graph", onSelect: () => onSelectTab("graph") },
       { id: "v-worktrees", group: "Views", label: "Git Worktrees", onSelect: () => onSelectTab("worktrees") },
-    ];
-    if (snap?.swarm) {
-      list.push({ id: "a-digest", group: "Views", label: "Copy wave digest", onSelect: onCopyDigest });
-    }
-    list.push(
+      ...(snap?.swarm ? [{ id: "a-digest", group: "Views", label: "Wave digest", onSelect: onCopyDigest }] : []),
       { id: "a-settings", group: "Views", label: "Settings", onSelect: onOpenSettings },
       { id: "a-keys", group: "Views", label: "Keyboard shortcuts", meta: "?", onSelect: onOpenShortcuts },
-    );
+    ];
     for (const sw of swarms) {
       list.push({
         id: `sw-${sw.id}`,
@@ -86,7 +82,7 @@ export function CommandPalette({
         if (!m.conversation_id) continue;
         list.push({
           id: `ch-${m.name}`,
-          group: "Open Worker Chat",
+          group: "Worker Chat",
           label: m.name,
           meta: m.status,
           onSelect: () => openWorkerConversation(m.conversation_id),
@@ -134,9 +130,9 @@ export function CommandPalette({
         if (e.target === e.currentTarget) onOpenChange(false);
       }}
     >
-      <div className="w-full max-w-[440px] overflow-hidden rounded-[var(--radius-dialog)] border border-hairline bg-surface shadow-[var(--elev-lift)]">
+      <div className="w-full max-w-[440px] overflow-hidden rounded-card border border-hairline bg-surface shadow-[var(--elev-lift)]">
         <div className="flex items-center gap-2 border-b border-hairline px-3">
-          <Search className="h-4 w-4 text-ink-3 shrink-0" aria-hidden="true" />
+          <Search className="h-4 w-4 text-ink-3 shrink-0" />
           <input
             autoFocus
             type="text"
@@ -144,7 +140,7 @@ export function CommandPalette({
             role="combobox"
             aria-expanded="true"
             aria-label="Fleet command palette"
-            placeholder="Jump to tab, swarm, or worker..."
+            placeholder="Jump to tab, swarm, or worker"
             value={query}
             onChange={(e) => {
               setQuery(e.target.value);
@@ -167,7 +163,7 @@ export function CommandPalette({
         </div>
         <div role="listbox" className="max-h-[320px] overflow-y-auto p-1.5">
           {items.length === 0 ? (
-            <p className="py-6 text-center text-[13px] text-ink-3">No matching commands.</p>
+            <p className="py-6 text-center text-[13px] text-ink-3">No matches.</p>
           ) : (
             groups.map((g) => (
               <div key={g.name}>
