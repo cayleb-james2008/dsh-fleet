@@ -12,7 +12,8 @@ Fleet lives directly in Antigravity's auxiliary side pane (`SIDECAR_UI_ENTRYPOIN
 - **Worker Activity Peek & Context Pressure Telemetry:** Incrementally tails each member's `transcript.jsonl` to display live shimmering tool/thinking activity, expandable **Activity Peek** (last 5 tool calls + thinking heading), step counts, active context saturation (`% ctx` / `High ctx` / `Quota paused`), and real `input` / `cache_read` / `output` token totals.
 - **Live SSE Push & Graceful Polling:** Streams instant board/transcript deltas over `GET /api/swarm/stream` (`text/event-stream`) in standalone mode and falls back seamlessly to interval polling inside Antigravity's `SidecarApp` gateway.
 - **Board Feed, Pinned Posts & `@mention` Graph:** Filterable, `#seq`-clickable board stream with persistent **Pin `#seq`** highlights (surfaced in both Board and Triage), unread `New` dividers, and an interactive `@mention` topology graph with timeline replay.
-- **Workspace Git Worktrees:** Subscribes to `sidecar.getWorkspaceUris()` / `onWorkspaceChange()` and probes git worktree branches, dirty/staged/untracked counts, and latest commit metadata with debounced caching.
+- **Keyboard-First Triage:** Navigate Needs-You items with `j`/`k`, jump tabs with `1`–`5`, open worker chat with `o`/`Enter`, and pin `#seq` items with `p`.
+- **Workspace Git Worktrees:** Subscribes to `sidecar.getWorkspaceUris()` / `onWorkspaceChange()` and probes git worktree branches, dirty/staged/untracked file lists with 1-click **Open file** (`toggleAuxPane`), and latest commit metadata with debounced caching.
 - **Multi-Swarm Switcher & Empty-State Presets:** Switch across active or recent swarms in `<appData>/brain/` or launch `/fleet` swarm presets (`Feature + Verifier`, `Audit & Harden`, `Multi-Lane Ship`).
 
 ## Install Into Antigravity

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowUpRight,
@@ -20,7 +20,7 @@ import {
 } from "lucide-react";
 import { extractLocalFilePaths, openFileInAuxPane, openWorkerConversation, sendConfirmedNudge } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot, TriageItem } from "../types";
-import { Badge, Button, Card, StatusDot, Textarea, fmtTimeAgo, fmtTokens, humanizeStatus, toast } from "../ui";
+import { Badge, Button, Card, StatusDot, Textarea, cn, fmtTimeAgo, fmtTokens, humanizeStatus, toast } from "../ui";
 
 const SEVERITY_BADGE: Record<TriageItem["severity"], { tone: "danger" | "warning" | "info"; label: string }> = {
   urgent: { tone: "danger", label: "Urgent" },
@@ -61,12 +61,16 @@ function unstickPresetFor(item: TriageItem): Array<{ label: string; prompt: stri
 export function TriageView({
   snap,
   pinnedSeqs,
+  selectedIdx = 0,
+  onSelectIdx,
   onTogglePin,
   onJumpToBoardSeq,
   onRefresh,
 }: {
   snap: SwarmSnapshot;
   pinnedSeqs: number[];
+  selectedIdx?: number;
+  onSelectIdx?: (idx: number) => void;
   onTogglePin: (seq: number) => void;
   onJumpToBoardSeq: (seq: number) => void;
   onRefresh: () => void;
@@ -75,6 +79,7 @@ export function TriageView({
   const [nudgeDraft, setNudgeDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [peekId, setPeekId] = useState<string | null>(null);
+  const cardRefs = useRef<Array<HTMLDivElement | null>>([]);
 
   const triage = snap.triage || [];
   const plan = snap.plan;
@@ -84,6 +89,11 @@ export function TriageView({
   const memberByName = new Map((snap.members || []).map((m) => [m.name, m]));
   const canNudge = Boolean(snap.capabilities?.canSendMessage || window.sidecar?.agent?.sendMessage);
   const canOpenAux = Boolean(window.sidecar?.ui?.toggleAuxPane);
+
+  useEffect(() => {
+    const el = cardRefs.current[selectedIdx];
+    if (el) el.scrollIntoView({ block: "nearest" });
+  }, [selectedIdx]);
 
   const openNudge = (item: TriageItem, customPrompt?: string) => {
     setNudgeTarget(item);
@@ -127,15 +137,22 @@ export function TriageView({
     <div className="space-y-4">
       {/* Needs-You Triage Inbox */}
       <section aria-labelledby="triage-heading" className="space-y-2.5">
-        <div className="flex items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <h2 id="triage-heading" className="text-[14px] font-semibold text-[var(--ink)]">
             Needs you ({triage.length})
           </h2>
-          {triage.length === 0 && (
+          {triage.length === 0 ? (
             <Badge tone="success">
               <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
               All clear
             </Badge>
+          ) : (
+            <div className="hidden sm:flex items-center gap-2 text-[12px] text-[var(--ink-3)] mono">
+              <span>j/k move</span>
+              <span>o chat</span>
+              <span>p pin</span>
+              <span>1-5 tabs</span>
+            </div>
           )}
         </div>
 
@@ -147,7 +164,9 @@ export function TriageView({
           </Card>
         ) : (
           <div className="space-y-2">
-            {triage.map((item) => {
+            {triage.map((item, idx) => {
+              const isSelected = idx === selectedIdx;
+              const isPinned = item.seq > 0 && pinnedSet.has(item.seq);
               const sev = SEVERITY_BADGE[item.severity];
               const editingThis = nudgeTarget?.id === item.id;
               const worker: SwarmMember | undefined = memberByName.get(item.member);
@@ -157,7 +176,20 @@ export function TriageView({
               const paths = extractLocalFilePaths(item.detail);
 
               return (
-                <Card key={item.id} className="p-3 space-y-2">
+                <div
+                  key={item.id}
+                  ref={(el) => {
+                    cardRefs.current[idx] = el;
+                  }}
+                  data-selected={isSelected ? "true" : undefined}
+                  onClick={() => onSelectIdx?.(idx)}
+                >
+                  <Card
+                    className={cn(
+                      "p-3 space-y-2",
+                      isSelected && "border-[var(--blue)] ring-1 ring-[var(--blue)]",
+                    )}
+                  >
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0 space-y-1">
                       <div className="flex flex-wrap items-center gap-1.5">
@@ -247,15 +279,27 @@ export function TriageView({
                     )}
 
                     {item.seq > 0 && (
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => onJumpToBoardSeq(item.seq)}
-                        className="num ml-auto"
-                      >
-                        #{item.seq}
-                        <ArrowUpRight className="h-3.5 w-3.5" aria-hidden="true" />
-                      </Button>
+                      <div className="flex items-center gap-1 ml-auto">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          aria-pressed={isPinned}
+                          aria-label={isPinned ? `Unpin #${item.seq}` : `Pin #${item.seq}`}
+                          onClick={() => onTogglePin(item.seq)}
+                          className="px-2"
+                        >
+                          {isPinned ? <PinOff className="h-3.5 w-3.5" aria-hidden="true" /> : <Pin className="h-3.5 w-3.5" aria-hidden="true" />}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => onJumpToBoardSeq(item.seq)}
+                          className="num"
+                        >
+                          #{item.seq}
+                          <ArrowUpRight className="h-3.5 w-3.5" aria-hidden="true" />
+                        </Button>
+                      </div>
                     )}
                   </div>
 
@@ -325,7 +369,8 @@ export function TriageView({
                       </div>
                     </div>
                   )}
-                </Card>
+                  </Card>
+                </div>
               );
             })}
           </div>

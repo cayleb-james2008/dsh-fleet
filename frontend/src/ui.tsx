@@ -9,10 +9,9 @@ import {
   type ReactNode,
   type TextareaHTMLAttributes,
 } from "react";
-import { AnimatePresence, m } from "motion/react";
 import { Toaster, toast } from "sonner";
 import { X } from "lucide-react";
-import { enter, glide, reveal } from "./motion";
+import { animatePanelEnter } from "./motion";
 import type { SwarmSnapshot } from "./types";
 
 export { toast };
@@ -281,7 +280,6 @@ export function SegmentControl<T extends string>({
   onChange: (v: T) => void;
   label: string;
 }) {
-  const segId = useId();
   return (
     <div
       role="radiogroup"
@@ -299,17 +297,12 @@ export function SegmentControl<T extends string>({
             onClick={() => onChange(opt.value)}
             className={cn(
               "relative h-7 px-2.5 text-[12px] font-medium rounded-[4px] cursor-pointer transition",
-              active ? "text-[var(--ink)]" : "text-[var(--ink-2)] hover:text-[var(--ink)]",
+              active
+                ? "bg-[var(--raised)] text-[var(--ink)] shadow-[var(--elev-raised)]"
+                : "text-[var(--ink-2)] hover:text-[var(--ink)]",
             )}
           >
-            {active && (
-              <m.span
-                layoutId={segId}
-                transition={glide}
-                className="absolute inset-0 rounded-[4px] bg-[var(--raised)] shadow-[var(--elev-raised)]"
-              />
-            )}
-            <span className="relative z-10">{opt.label}</span>
+            <span>{opt.label}</span>
           </button>
         );
       })}
@@ -333,6 +326,7 @@ export function Modal({
 
   useEffect(() => {
     if (!open) return;
+    animatePanelEnter(panelRef.current);
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
@@ -340,43 +334,33 @@ export function Modal({
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
+  if (!open) return null;
+
   return (
-    <AnimatePresence>
-      {open && (
-        <m.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          transition={reveal}
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-3"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) onClose();
-          }}
-        >
-          <m.div
-            ref={panelRef}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby={titleId}
-            initial={{ opacity: 0, y: 6, scale: 0.98 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 6, scale: 0.98 }}
-            transition={enter}
-            className="w-full max-w-[440px] max-h-[85vh] overflow-y-auto rounded-[var(--radius-dialog)] border border-[var(--hairline)] bg-[var(--surface)] p-4 shadow-[var(--elev-lift)]"
-          >
-            <div className="flex items-center justify-between gap-2 pb-3 border-b border-[var(--hairline)]">
-              <h2 id={titleId} className="text-[15px] font-semibold text-[var(--ink)]">
-                {title}
-              </h2>
-              <Button variant="ghost" size="icon" aria-label="Close dialog" onClick={onClose}>
-                <X className="h-4 w-4" aria-hidden="true" />
-              </Button>
-            </div>
-            <div className="pt-3">{children}</div>
-          </m.div>
-        </m.div>
-      )}
-    </AnimatePresence>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-3"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        className="w-full max-w-[440px] max-h-[85vh] overflow-y-auto rounded-[var(--radius-dialog)] border border-[var(--hairline)] bg-[var(--surface)] p-4 shadow-[var(--elev-lift)]"
+      >
+        <div className="flex items-center justify-between gap-2 pb-3 border-b border-[var(--hairline)]">
+          <h2 id={titleId} className="text-[15px] font-semibold text-[var(--ink)]">
+            {title}
+          </h2>
+          <Button variant="ghost" size="icon" aria-label="Close dialog" onClick={onClose}>
+            <X className="h-4 w-4" aria-hidden="true" />
+          </Button>
+        </div>
+        <div className="pt-3">{children}</div>
+      </div>
+    </div>
   );
 }
 

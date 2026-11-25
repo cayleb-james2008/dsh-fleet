@@ -38,6 +38,9 @@ export function CommandPalette({
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         onOpenChange(!open);
+      } else if (open && e.key === "Escape") {
+        e.preventDefault();
+        onOpenChange(false);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -45,18 +48,26 @@ export function CommandPalette({
   }, [open, onOpenChange]);
 
   const members = snap?.members || [];
+  if (!open) return null;
 
   return (
-    <Command.Dialog
-      open={open}
-      onOpenChange={onOpenChange}
-      label="Fleet command palette"
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Fleet command palette"
       className="fixed inset-0 z-50 flex items-start justify-center bg-black/45 p-3 pt-[12vh]"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onOpenChange(false);
+      }}
     >
-      <div className="w-full max-w-[440px] overflow-hidden rounded-[var(--radius-dialog)] border border-[var(--hairline)] bg-[var(--surface)] shadow-[var(--elev-lift)]">
+      <Command
+        label="Fleet command palette"
+        className="w-full max-w-[440px] overflow-hidden rounded-[var(--radius-dialog)] border border-[var(--hairline)] bg-[var(--surface)] shadow-[var(--elev-lift)]"
+      >
         <div className="flex items-center gap-2 border-b border-[var(--hairline)] px-3">
           <Search className="h-4 w-4 text-[var(--ink-3)] shrink-0" aria-hidden="true" />
           <Command.Input
+            autoFocus
             placeholder="Jump to tab, swarm, or worker..."
             className="h-11 w-full bg-transparent text-[14px] text-[var(--ink)] placeholder:text-[var(--ink-3)] focus:outline-none"
           />
@@ -160,7 +171,7 @@ export function CommandPalette({
             </Command.Group>
           )}
         </Command.List>
-      </div>
-    </Command.Dialog>
+      </Command>
+    </div>
   );
 }
