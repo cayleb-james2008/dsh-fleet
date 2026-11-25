@@ -13,7 +13,7 @@ html, body {
 }
 
 @utility transition {
-  transition-property: color, background-color, border-color, outline-color, text-decoration-color, fill, stroke, opacity, transform;
+  transition-property: color, background-color, border-color, text-decoration-color, fill, stroke, opacity, transform;
   transition-timing-function: var(--ease-house);
   transition-duration: var(--dur-press);
 }
@@ -28,7 +28,24 @@ h1, h2, h3 {
   text-wrap: balance;
 }
 
+@keyframes fleet-live-shimmer {
+  0%, 100% {
+    opacity: 0.95;
+  }
+  50% {
+    opacity: 0.52;
+  }
+}
+
+.fleet-live-shimmer {
+  animation: fleet-live-shimmer 2s linear infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
+  .fleet-live-shimmer {
+    animation: none !important;
+    opacity: 1 !important;
+  }
   *, ::before, ::after {
     animation: none !important;
     transition: none !important;

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, motion } from "motion/react";
 import {
   Command as CommandIcon,
   Cpu,
@@ -15,6 +16,7 @@ import {
   Sparkles,
   Sun,
 } from "lucide-react";
+import { enter, glide } from "./motion";
 import {
   Badge,
   Button,
@@ -156,6 +158,7 @@ export function App() {
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
+    document.documentElement.dataset.world = "codex";
     try {
       localStorage.setItem(THEME_KEY, theme);
     } catch {
@@ -346,6 +349,11 @@ export function App() {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setPaletteOpen((prev) => !prev);
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key === "\\") {
+        e.preventDefault();
+        setRightOpen((prev) => !prev);
         return;
       }
       const active = document.activeElement as HTMLElement | null;
@@ -626,14 +634,22 @@ export function App() {
                 setLaunchpadOpen(false);
               }}
               className={cn(
-                "inline-flex items-center gap-1.5 rounded-[var(--radius-segment)] px-2.5 h-8 text-[13px] font-medium cursor-pointer transition active:bg-[var(--board)]",
+                "relative inline-flex items-center gap-1.5 rounded-[var(--radius-segment)] px-2.5 h-8 text-[13px] font-medium cursor-pointer transition motion-safe:active:scale-[0.97]",
                 viewMode === "board" && !launchpadOpen
-                  ? "bg-[var(--raised)] text-[var(--ink)] border border-[var(--hairline)]"
-                  : "text-[var(--ink-2)] border border-transparent hover:text-[var(--ink)]",
+                  ? "text-[var(--ink)]"
+                  : "text-[var(--ink-2)] hover:text-[var(--ink)]",
               )}
             >
-              <LayoutGrid className="size-3.5" strokeWidth={1.5} aria-hidden />
-              <span>Workbench</span>
+              {viewMode === "board" && !launchpadOpen && (
+                <motion.span
+                  layoutId="fleet-view-pill"
+                  transition={glide}
+                  aria-hidden="true"
+                  className="absolute inset-0 rounded-[var(--radius-segment)] bg-[var(--raised)] border border-[var(--hairline)] shadow-[var(--elev-raised)]"
+                />
+              )}
+              <LayoutGrid className="relative z-10 size-3.5" strokeWidth={1.5} aria-hidden />
+              <span className="relative z-10">Workbench</span>
             </button>
             <button
               type="button"
@@ -641,14 +657,20 @@ export function App() {
               aria-pressed={viewMode === "dag"}
               onClick={() => setViewMode("dag")}
               className={cn(
-                "inline-flex items-center gap-1.5 rounded-[var(--radius-segment)] px-2.5 h-8 text-[13px] font-medium cursor-pointer transition active:bg-[var(--board)]",
-                viewMode === "dag"
-                  ? "bg-[var(--raised)] text-[var(--ink)] border border-[var(--hairline)]"
-                  : "text-[var(--ink-2)] border border-transparent hover:text-[var(--ink)]",
+                "relative inline-flex items-center gap-1.5 rounded-[var(--radius-segment)] px-2.5 h-8 text-[13px] font-medium cursor-pointer transition motion-safe:active:scale-[0.97]",
+                viewMode === "dag" ? "text-[var(--ink)]" : "text-[var(--ink-2)] hover:text-[var(--ink)]",
               )}
             >
-              <Network className="size-3.5" strokeWidth={1.5} aria-hidden />
-              <span>DAG</span>
+              {viewMode === "dag" && (
+                <motion.span
+                  layoutId="fleet-view-pill"
+                  transition={glide}
+                  aria-hidden="true"
+                  className="absolute inset-0 rounded-[var(--radius-segment)] bg-[var(--raised)] border border-[var(--hairline)] shadow-[var(--elev-raised)]"
+                />
+              )}
+              <Network className="relative z-10 size-3.5" strokeWidth={1.5} aria-hidden />
+              <span className="relative z-10">DAG</span>
             </button>
           </div>
 
@@ -759,7 +781,7 @@ export function App() {
       <UpdateStrip u={upd} />
 
       {unreachable && sessions !== null && (
-        <p role="status" className="border-b border-[var(--hairline)] bg-[var(--bad-soft)] px-4 py-2 text-[13px] text-[var(--destructive-foreground)]">
+        <p role="status" className="border-b border-[var(--hairline)] border-l-2 border-l-[var(--unread)] bg-[var(--surface)] px-4 py-2 text-[13px] text-[var(--ink)]">
           {lastGood
             ? `Cannot reach Fleet. Showing the last list from ${lastGood.toLocaleTimeString()}. Retrying.`
             : "Cannot reach Fleet. Retrying."}
@@ -857,22 +879,30 @@ export function App() {
           </main>
         )}
 
-        {((xl && rightOpen && showWorkspaceInCenter && Boolean(current) && !launchpadOpen) ||
-          (!md && mobilePane === "inspector")) && (
-          <div className={cn("flex flex-col h-full min-h-0 shrink-0 overflow-hidden", md ? "w-[300px] border-l border-[var(--hairline)]" : "w-full pb-16")}>
-            <RightInspectorRail
-              session={current}
-              mergeCheck={mergeCheck}
-              checkingMerge={checkingMerge}
-              supportsServerV050={hasServerV050}
-              onRecheckMerge={recheckMerge}
-              onOpenTab={(tab) => {
-                if (current) openSession(current.id, tab);
-              }}
-              onOpenPrPreview={(s) => setPrSession(s)}
-            />
-          </div>
-        )}
+        <AnimatePresence initial={false}>
+          {((xl && rightOpen && showWorkspaceInCenter && Boolean(current) && !launchpadOpen) ||
+            (!md && mobilePane === "inspector")) && (
+            <motion.div
+              key="right-inspector"
+              initial={{ opacity: 0, x: 6 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: 6 }}
+              transition={enter}
+              className={cn("flex flex-col h-full min-h-0 shrink-0 overflow-hidden", md ? "w-[300px] border-l border-[var(--hairline)]" : "w-full pb-16")}
+            >
+              <RightInspectorRail
+                session={current}
+                mergeCheck={mergeCheck}
+                checkingMerge={checkingMerge}
+                supportsServerV050={hasServerV050}
+                onRecheckMerge={recheckMerge}
+                onOpenTab={(tab) => {
+                  if (current) openSession(current.id, tab);
+                }}
+              />
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
 
       {md && (
@@ -1121,7 +1151,7 @@ export function App() {
         onCreated={refresh}
       />
 
-      <ToastRegion />
+      <ToastRegion theme={theme} />
     </div>
   );
 }

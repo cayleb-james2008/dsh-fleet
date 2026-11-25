@@ -129,8 +129,8 @@ try {
     (await inspector.locator('[data-testid="inspector-heal-badge"]').innerText()).includes("Healed on attempt 1/2"),
   );
 
-  // Open PR Preview modal from Inspector -> verify Markdown + confirmation gate + dry-run submit
-  await inspector.locator('[data-testid="open-pr-preview"]').click();
+  // Open PR Preview modal from Workspace header -> verify Markdown + confirmation gate + dry-run submit
+  await p.locator('[data-testid="open-pr-preview"]').click();
   await p.waitForTimeout(300);
   const prModal = p.locator('[data-testid="pr-preview-modal"]');
   const prBodyVal = await prModal.locator("#pr-preview-body").inputValue();

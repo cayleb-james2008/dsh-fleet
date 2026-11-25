@@ -366,7 +366,7 @@ export function DagWaveGraph({
                   height: `${NODE_H}px`,
                 }}
                 className={cn(
-                  "absolute flex cursor-pointer flex-col justify-between rounded-card border border-l-[3px] border-hairline bg-surface p-3 text-left outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:border-ink-3 hover:bg-raised focus-visible:ring-2 focus-visible:ring-ring",
+                  "absolute flex cursor-pointer flex-col justify-between rounded-card border border-l-[3px] border-hairline bg-surface p-3 text-left outline-none transition hover:border-ink-3 hover:bg-raised focus-visible:ring-2 focus-visible:ring-ring",
                   statusRailClass(s),
                   isSelected && "ring-2 ring-accent",
                   isDimmed && "opacity-45",

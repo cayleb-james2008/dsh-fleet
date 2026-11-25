@@ -1,39 +1,40 @@
-/* Fleet v0.9.0 Desktop Workbench palette: Neutral Slate + Electric Blue, light default + full dark parity.
-   Roles: --blue is the primary accent (primary actions, active selection, focus); semantic green/red/amber are state only. */
+/* Fleet v0.9.0 Material World: Codex Desktop + Linear DNA (data-world="codex").
+   Tonal surface layering with monochrome ink primary actions (#111318 light / #F3F4F6 dark).
+   Indigo accent (--blue / --ring) is reserved strictly for focus rings, active selection tints, links, and running indicators. */
 :root,
 :root[data-theme="light"] {
   color-scheme: light;
   --canvas: #f6f7f9;
-  --board: #eff2f6;
+  --board: #eff1f5;
   --surface: #ffffff;
-  --hairline: #dfe3ea;
+  --hairline: #e2e5ec;
   --hairline-s: #cbd2de;
-  --edge: #757e91;
-  --input: #757e91;
-  --track: #e5e9f0;
+  --edge: #747c8e;
+  --input: #747c8e;
+  --track: #eaecef;
   --raised: #ffffff;
   --ink: #111318;
   --ink-2: #434b5c;
   --ink-3: #576072;
   --icon: #5c6578;
   --disabled: #50596b;
-  --blue: #1d5ef6;
+  --blue: #4f46e5;
   --blue-fg: #ffffff;
-  --blue-hover: #154dd1;
-  --blue-soft: #ebf1ff;
-  --ring: #1d5ef6;
-  --info-foreground: #1649c4;
+  --blue-hover: #4338ca;
+  --blue-soft: #eef2ff;
+  --ring: #4f46e5;
+  --info-foreground: #4338ca;
   --ink-button: #111318;
   --ink-button-fg: #ffffff;
   --dot-green: #147a41;
   --success-foreground: #106936;
   --ok-soft: #e8f6ee;
-  --dot-blue: #1d5ef6;
+  --dot-blue: #4f46e5;
   --dot-red: #c62828;
   --destructive-foreground: #b42224;
   --bad-soft: #fdeced;
   --unread: #c62828;
-  --dot-clay: #1d5ef6;
+  --dot-clay: #4f46e5;
   --dot-amber: #a85e00;
   --warning-foreground: #8a4b00;
   --warn-soft: #fef5e6;
@@ -44,13 +45,13 @@
   --diff-add-fg: #0d5a2e;
   --diff-del-bg: #fdeced;
   --diff-del-fg: #9f1a1a;
-  --diff-hunk-bg: #edf2fc;
-  --diff-hunk-fg: #1e4ca8;
+  --diff-hunk-bg: #eef2ff;
+  --diff-hunk-fg: #3730a3;
   --elev-shell: none;
   --elev-card: none;
-  --elev-raised: none;
+  --elev-raised: 0 1px 2px rgba(17, 19, 24, 0.06);
   --elev-lift: 0 10px 28px rgba(17, 19, 24, 0.12);
-  --elev-primary: none;
+  --elev-primary: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 1px 2px rgba(17, 19, 24, 0.18);
   --background: var(--surface);
   --foreground: var(--ink);
   --border: var(--hairline);
@@ -59,37 +60,37 @@
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --canvas: #0d0f13;
-  --board: #12151c;
-  --surface: #161a22;
-  --hairline: #272d3a;
-  --hairline-s: #353e50;
+  --canvas: #0b0c0e;
+  --board: #111317;
+  --surface: #16181d;
+  --hairline: #262a34;
+  --hairline-s: #343a48;
   --edge: #6d778c;
   --input: #6d778c;
-  --track: #202531;
-  --raised: #29303f;
+  --track: #1d2129;
+  --raised: #292f3b;
   --ink: #eef1f6;
   --ink-2: #b4bccb;
   --ink-3: #939cb0;
   --icon: #939cb0;
   --disabled: #96a0b5;
-  --blue: #568cff;
-  --blue-fg: #071127;
-  --blue-hover: #74a0ff;
-  --blue-soft: #1b2948;
-  --ring: #568cff;
-  --info-foreground: #93b6ff;
-  --ink-button: #eef1f6;
-  --ink-button-fg: #0d0f13;
+  --blue: #818cf8;
+  --blue-fg: #0b0c0e;
+  --blue-hover: #a5b4fc;
+  --blue-soft: rgba(129, 140, 248, 0.16);
+  --ring: #818cf8;
+  --info-foreground: #a5b4fc;
+  --ink-button: #f3f4f6;
+  --ink-button-fg: #111318;
   --dot-green: #4ad682;
   --success-foreground: #5ad98c;
   --ok-soft: #11281c;
-  --dot-blue: #568cff;
+  --dot-blue: #818cf8;
   --dot-red: #f87171;
   --destructive-foreground: #f87171;
   --bad-soft: #2f1417;
   --unread: #f87171;
-  --dot-clay: #568cff;
+  --dot-clay: #818cf8;
   --dot-amber: #f2b046;
   --warning-foreground: #f2b046;
   --warn-soft: #2a1f0c;
@@ -100,13 +101,13 @@
   --diff-add-fg: #7be3a4;
   --diff-del-bg: #2e1518;
   --diff-del-fg: #fca5a5;
-  --diff-hunk-bg: #152238;
-  --diff-hunk-fg: #8cb4ff;
+  --diff-hunk-bg: #1b1e36;
+  --diff-hunk-fg: #a5b4fc;
   --elev-shell: none;
   --elev-card: none;
-  --elev-raised: none;
+  --elev-raised: 0 1px 2px rgba(0, 0, 0, 0.38);
   --elev-lift: 0 14px 32px rgba(0, 0, 0, 0.55);
-  --elev-primary: none;
+  --elev-primary: inset 0 1px 0 rgba(255, 255, 255, 0.55), 0 1px 2px rgba(0, 0, 0, 0.35);
   --background: var(--surface);
   --foreground: var(--ink);
   --border: var(--hairline);
@@ -118,7 +119,7 @@
   --font-heading: "Geist", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Geist Mono", ui-monospace, monospace;
   --radius-panel: 12px;
-  --radius-dialog: 12px;
+  --radius-dialog: 14px;
   --radius-card: 8px;
   --radius-segment: 6px;
   --radius-chip: 6px;
@@ -127,9 +128,10 @@
   --display-weight: 600;
   --tracking-display: -0.02em;
   --ease-house: cubic-bezier(0.23, 1, 0.32, 1);
-  --dur-press: 120ms;
-  --dur-reveal: 150ms;
-  --dur-swap: 180ms;
+  --dur-press: 150ms;
+  --dur-reveal: 180ms;
+  --dur-swap: 200ms;
+  --dur-enter: 220ms;
   --dur-sheet: 220ms;
 }
 
@@ -154,7 +156,42 @@ h1, h2, h3, .font-heading {
 }
 
 ::selection {
-  background: color-mix(in oklab, var(--blue) 24%, transparent);
+  background: var(--blue-soft);
+  color: var(--ink);
+}
+
+input, textarea, [contenteditable] {
+  caret-color: var(--blue);
+}
+
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--hairline-s) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--hairline-s);
+  border-radius: 9999px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  *::-webkit-scrollbar-thumb:hover {
+    background: var(--icon);
+  }
 }
 
 @theme inline {

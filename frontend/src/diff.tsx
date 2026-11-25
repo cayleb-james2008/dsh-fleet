@@ -375,7 +375,7 @@ export function RichDiffViewer({
                   aria-expanded={!isCollapsed}
                   aria-label={`Toggle diff for ${file.path}`}
                   onClick={() => setCollapsed((prev) => ({ ...prev, [file.id]: !prev[file.id] }))}
-                  className="flex w-full cursor-pointer items-center gap-2 border-b border-hairline bg-board px-3 py-2 text-left font-mono text-xs text-ink outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:bg-raised focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring max-md:min-h-11"
+                  className="flex w-full cursor-pointer items-center gap-2 border-b border-hairline bg-board px-3 py-2 text-left font-mono text-xs text-ink outline-none transition hover:bg-raised focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring max-md:min-h-11"
                 >
                   {isCollapsed ? (
                     <ChevronRight className="size-3.5 shrink-0 text-icon" strokeWidth={1.5} aria-hidden />

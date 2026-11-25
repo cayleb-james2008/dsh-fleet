@@ -114,12 +114,12 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
     `sessions=${inboxCount}`)
 
   // Collapsible left & right rails
-  await p.getByRole('button', { name: 'Toggle inbox rail' }).click(); await p.waitForTimeout(150)
+  await p.getByRole('button', { name: 'Toggle inbox rail' }).click(); await p.waitForTimeout(280)
   const leftCollapsed = (await p.locator('div[aria-label="Session lanes"]').count()) === 0
-  await p.getByRole('button', { name: 'Toggle inbox rail' }).click(); await p.waitForTimeout(150)
-  await p.getByRole('button', { name: 'Toggle inspector rail' }).click(); await p.waitForTimeout(150)
+  await p.getByRole('button', { name: 'Toggle inbox rail' }).click(); await p.waitForTimeout(280)
+  await p.getByRole('button', { name: 'Toggle inspector rail' }).click(); await p.waitForTimeout(280)
   const rightCollapsed = (await inspector.count()) === 0
-  await p.getByRole('button', { name: 'Toggle inspector rail' }).click(); await p.waitForTimeout(150)
+  await p.getByRole('button', { name: 'Toggle inspector rail' }).click(); await p.waitForTimeout(280)
   ok('left inbox rail and right inspector rail toggle cleanly', leftCollapsed && rightCollapsed)
 
   // Live streaming tail on running session in inbox

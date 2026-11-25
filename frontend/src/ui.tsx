@@ -9,7 +9,12 @@ import {
   type ReactNode,
   type TextareaHTMLAttributes,
 } from "react";
+import { AnimatePresence, motion } from "motion/react";
+import { Toaster, toast } from "sonner";
 import { ChevronDown, ChevronRight, X } from "lucide-react";
+import { enter, glide, instant, reveal } from "./motion";
+
+export { toast };
 
 export function cn(...parts: Array<string | false | null | undefined>): string {
   return parts.filter(Boolean).join(" ");
@@ -25,7 +30,7 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 
 const BUTTON_VARIANTS: Record<ButtonVariant, string> = {
   primary:
-    "bg-[var(--blue)] text-[var(--blue-fg)] border border-transparent hover:bg-[var(--blue-hover)] active:translate-y-px font-medium",
+    "bg-[var(--ink-button)] text-[var(--ink-button-fg)] border border-[color-mix(in_oklab,var(--ink-button)_82%,transparent)] shadow-[var(--elev-primary)] hover:opacity-90 font-medium",
   secondary:
     "bg-[var(--track)] text-[var(--ink)] border border-[var(--hairline-s)] hover:bg-[var(--board)] active:bg-[var(--hairline)] font-medium",
   outline:
@@ -33,7 +38,7 @@ const BUTTON_VARIANTS: Record<ButtonVariant, string> = {
   ghost:
     "bg-transparent text-[var(--ink-2)] border border-transparent hover:bg-[var(--track)] hover:text-[var(--ink)] active:bg-[var(--hairline)] font-medium",
   danger:
-    "bg-[var(--bad-soft)] text-[var(--destructive-foreground)] border border-[color-mix(in_oklab,var(--destructive-foreground)_35%,transparent)] hover:bg-[color-mix(in_oklab,var(--destructive-foreground)_14%,transparent)] active:translate-y-px font-medium",
+    "bg-[var(--surface)] text-[var(--destructive-foreground)] border border-[color-mix(in_oklab,var(--destructive-foreground)_40%,var(--hairline))] hover:bg-[var(--bad-soft)] font-medium",
 };
 
 const BUTTON_SIZES: Record<ButtonSize, string> = {
@@ -51,9 +56,9 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       ref={ref}
       type={type}
       className={cn(
-        "inline-flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer select-none transition",
+        "inline-flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer select-none transition motion-safe:active:scale-[0.97]",
         "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--ring)]",
-        "disabled:bg-[var(--track)] disabled:text-[var(--disabled)] disabled:border-[var(--hairline)] disabled:cursor-not-allowed",
+        "disabled:bg-[var(--track)] disabled:text-[var(--disabled)] disabled:border-[var(--hairline)] disabled:shadow-none disabled:cursor-not-allowed disabled:active:scale-100",
         BUTTON_VARIANTS[variant],
         BUTTON_SIZES[size],
         className,
@@ -154,14 +159,18 @@ export function SegmentedControl<T extends string>({
   onChange,
   options,
   label,
+  layoutId,
   className,
 }: {
   value: T;
   onChange: (value: T) => void;
   options: Array<{ value: T; label: string; count?: number; testId?: string; ariaLabel?: string }>;
   label: string;
+  layoutId?: string;
   className?: string;
 }) {
+  const [byKeyboard, setByKeyboard] = useState(false);
+
   return (
     <div
       role="group"
@@ -180,19 +189,34 @@ export function SegmentedControl<T extends string>({
             data-testid={opt.testId}
             aria-label={opt.ariaLabel}
             aria-pressed={active}
+            onPointerDown={() => setByKeyboard(false)}
+            onKeyDown={() => setByKeyboard(true)}
             onClick={() => onChange(opt.value)}
             className={cn(
-              "inline-flex items-center gap-1.5 rounded-[var(--radius-segment)] px-2.5 h-8 text-[13px] font-medium cursor-pointer transition active:bg-[var(--board)]",
+              "relative inline-flex items-center gap-1.5 rounded-[var(--radius-segment)] px-2.5 h-8 text-[13px] font-medium cursor-pointer transition motion-safe:active:scale-[0.97]",
               "max-md:min-h-11 max-md:px-3",
               "focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--ring)]",
-              active
-                ? "bg-[var(--raised)] text-[var(--ink)] border border-[var(--hairline)]"
-                : "bg-transparent text-[var(--ink-2)] border border-transparent hover:text-[var(--ink)]",
+              active ? "text-[var(--ink)]" : "text-[var(--ink-2)] hover:text-[var(--ink)]",
             )}
           >
-            <span>{opt.label}</span>
+            {active && layoutId ? (
+              <motion.span
+                layoutId={layoutId}
+                transition={byKeyboard ? instant : glide}
+                aria-hidden="true"
+                className="absolute inset-0 rounded-[var(--radius-segment)] bg-[var(--raised)] border border-[var(--hairline)] shadow-[var(--elev-raised)]"
+              />
+            ) : (
+              active && (
+                <span
+                  aria-hidden="true"
+                  className="absolute inset-0 rounded-[var(--radius-segment)] bg-[var(--raised)] border border-[var(--hairline)] shadow-[var(--elev-raised)]"
+                />
+              )
+            )}
+            <span className="relative z-10">{opt.label}</span>
             {opt.count !== undefined && (
-              <span className="num text-[12px] text-[var(--ink-3)]">{opt.count}</span>
+              <span className="relative z-10 num text-[12px] text-[var(--ink-3)]">{opt.count}</span>
             )}
           </button>
         );
@@ -292,42 +316,53 @@ export function Dialog({
     };
   }, [open]);
 
-  if (!open) return null;
-
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4 max-md:p-2"
-      role="presentation"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div
-        ref={panelRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={titleId}
-        data-testid={testId}
-        style={{ boxShadow: "var(--elev-lift)" }}
-        className={cn(
-          "w-full rounded-[var(--radius-dialog)] border border-[var(--hairline-s)] bg-[var(--surface)] text-[var(--ink)] flex flex-col max-h-[90dvh]",
-          maxWidth,
-        )}
-      >
-        <div className="flex items-start justify-between gap-3 px-5 py-4 border-b border-[var(--hairline)]">
-          <div className="min-w-0">
-            <h2 id={titleId} className="text-[17px] font-semibold text-[var(--ink)]">
-              {title}
-            </h2>
-            {description && <p className="mt-0.5 text-[13px] text-[var(--ink-2)]">{description}</p>}
-          </div>
-          <Button variant="ghost" size="icon" aria-label={`Close ${title}`} onClick={onClose}>
-            <X className="size-4" strokeWidth={1.5} />
-          </Button>
-        </div>
-        <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4">{children}</div>
-      </div>
-    </div>
+    <AnimatePresence>
+      {open && (
+        <motion.div
+          key="dialog-backdrop"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={reveal}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4 max-md:p-2"
+          role="presentation"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) onClose();
+          }}
+        >
+          <motion.div
+            ref={panelRef}
+            initial={{ opacity: 0, y: 6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 4 }}
+            transition={enter}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={titleId}
+            data-testid={testId}
+            style={{ boxShadow: "var(--elev-lift)" }}
+            className={cn(
+              "w-full rounded-[var(--radius-dialog)] border border-[var(--hairline-s)] bg-[var(--surface)] text-[var(--ink)] flex flex-col max-h-[90dvh]",
+              maxWidth,
+            )}
+          >
+            <div className="flex items-start justify-between gap-3 px-5 py-4 border-b border-[var(--hairline)]">
+              <div className="min-w-0">
+                <h2 id={titleId} className="text-[17px] font-semibold text-[var(--ink)]">
+                  {title}
+                </h2>
+                {description && <p className="mt-0.5 text-[13px] text-[var(--ink-2)]">{description}</p>}
+              </div>
+              <Button variant="ghost" size="icon" aria-label={`Close ${title}`} onClick={onClose}>
+                <X className="size-4" strokeWidth={1.5} />
+              </Button>
+            </div>
+            <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4">{children}</div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 
@@ -376,37 +411,48 @@ export function Drawer({
     };
   }, [open]);
 
-  if (!open) return null;
-
   return (
-    <div
-      className="fixed inset-0 z-50 flex justify-end bg-black/40"
-      role="presentation"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div
-        ref={panelRef}
-        id={id}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={titleId}
-        data-testid={testId}
-        style={{ boxShadow: "var(--elev-lift)" }}
-        className="w-full max-w-[540px] h-full bg-[var(--surface)] text-[var(--ink)] border-l border-[var(--hairline-s)] flex flex-col"
-      >
-        <div className="flex items-center justify-between gap-3 px-5 py-3.5 border-b border-[var(--hairline)]">
-          <h2 id={titleId} className="text-[17px] font-semibold text-[var(--ink)]">
-            {title}
-          </h2>
-          <Button variant="ghost" size="icon" aria-label={closeLabel} onClick={onClose}>
-            <X className="size-4" strokeWidth={1.5} />
-          </Button>
-        </div>
-        <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4">{children}</div>
-      </div>
-    </div>
+    <AnimatePresence>
+      {open && (
+        <motion.div
+          key="drawer-backdrop"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={reveal}
+          className="fixed inset-0 z-50 flex justify-end bg-black/40"
+          role="presentation"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) onClose();
+          }}
+        >
+          <motion.div
+            ref={panelRef}
+            id={id}
+            initial={{ opacity: 0, x: 16 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: 16 }}
+            transition={enter}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={titleId}
+            data-testid={testId}
+            style={{ boxShadow: "var(--elev-lift)" }}
+            className="w-full max-w-[540px] h-full bg-[var(--surface)] text-[var(--ink)] border-l border-[var(--hairline-s)] flex flex-col"
+          >
+            <div className="flex items-center justify-between gap-3 px-5 py-3.5 border-b border-[var(--hairline)]">
+              <h2 id={titleId} className="text-[17px] font-semibold text-[var(--ink)]">
+                {title}
+              </h2>
+              <Button variant="ghost" size="icon" aria-label={closeLabel} onClick={onClose}>
+                <X className="size-4" strokeWidth={1.5} />
+              </Button>
+            </div>
+            <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4">{children}</div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 
@@ -444,74 +490,25 @@ export function Spinner({ className }: { className?: string }) {
   );
 }
 
-type ToastItem = { id: number; kind: "info" | "success" | "warning" | "error"; text: string };
-let nextToastId = 1;
-const toastListeners = new Set<(items: ToastItem[]) => void>();
-let toastQueue: ToastItem[] = [];
-
-function pushToast(kind: ToastItem["kind"], text: string) {
-  const item: ToastItem = { id: nextToastId++, kind, text };
-  toastQueue = [...toastQueue.slice(-3), item];
-  for (const fn of toastListeners) fn(toastQueue);
-  window.setTimeout(() => {
-    toastQueue = toastQueue.filter((t) => t.id !== item.id);
-    for (const fn of toastListeners) fn(toastQueue);
-  }, 4200);
-}
-
-export const toast = Object.assign((text: string) => pushToast("info", text), {
-  info: (text: string) => pushToast("info", text),
-  success: (text: string) => pushToast("success", text),
-  warning: (text: string) => pushToast("warning", text),
-  error: (text: string) => pushToast("error", text),
-});
-
-export function ToastRegion() {
-  const [items, setItems] = useState<ToastItem[]>(toastQueue);
-  useEffect(() => {
-    toastListeners.add(setItems);
-    return () => {
-      toastListeners.delete(setItems);
-    };
-  }, []);
-  if (items.length === 0) return null;
+export function ToastRegion({ theme }: { theme: "light" | "dark" }) {
   return (
-    <div
-      aria-live="polite"
-      aria-atomic="false"
-      className="fixed bottom-10 right-4 z-[70] flex flex-col gap-2 max-w-sm pointer-events-none max-md:right-2 max-md:left-2 max-md:max-w-none"
-    >
-      {items.map((t) => (
-        <div
-          key={t.id}
-          role="status"
-          style={{ boxShadow: "var(--elev-lift)" }}
-          className={cn(
-            "pointer-events-auto flex items-center justify-between gap-3 rounded-[var(--radius)] border px-3.5 py-2.5 text-[13px] font-medium bg-[var(--surface)] text-[var(--ink)]",
-            t.kind === "error"
-              ? "border-[var(--destructive-foreground)] text-[var(--destructive-foreground)]"
-              : t.kind === "warning"
-                ? "border-[var(--warning-foreground)] text-[var(--warning-foreground)]"
-                : t.kind === "success"
-                  ? "border-[var(--success-foreground)]"
-                  : "border-[var(--hairline-s)]",
-          )}
-        >
-          <span>{t.text}</span>
-          <button
-            type="button"
-            aria-label="Dismiss notification"
-            onClick={() => {
-              toastQueue = toastQueue.filter((x) => x.id !== t.id);
-              for (const fn of toastListeners) fn(toastQueue);
-            }}
-            className="inline-flex size-8 items-center justify-center rounded-[var(--radius-chip)] text-[var(--ink-3)] hover:text-[var(--ink)] active:bg-[var(--track)] cursor-pointer max-md:min-h-11 max-md:min-w-11"
-          >
-            <X className="size-3.5" strokeWidth={1.5} />
-          </button>
-        </div>
-      ))}
-    </div>
+    <Toaster
+      theme={theme}
+      position="bottom-right"
+      offset={36}
+      closeButton
+      toastOptions={{
+        style: {
+          background: "var(--surface)",
+          color: "var(--ink)",
+          border: "1px solid var(--hairline-s)",
+          boxShadow: "var(--elev-lift)",
+          fontFamily: "var(--font-sans)",
+          fontSize: "13px",
+          borderRadius: "var(--radius)",
+        },
+      }}
+    />
   );
 }
 
@@ -533,13 +530,16 @@ export function PopoverPanel({
   children: ReactNode;
 }) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) onClose();
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) onCloseRef.current();
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") onCloseRef.current();
     };
     window.addEventListener("mousedown", onDown);
     window.addEventListener("keydown", onKey);
@@ -547,24 +547,31 @@ export function PopoverPanel({
       window.removeEventListener("mousedown", onDown);
       window.removeEventListener("keydown", onKey);
     };
-  }, [open, onClose]);
+  }, [open]);
 
   return (
     <div ref={wrapRef} className="relative inline-flex">
       {trigger}
-      {open && (
-        <div
-          style={{ boxShadow: "var(--elev-lift)" }}
-          className={cn(
-            "absolute z-40 rounded-[var(--radius-menu)] border border-[var(--hairline-s)] bg-[var(--surface)] p-2 text-[var(--ink)]",
-            side === "top" ? "bottom-full mb-2" : "top-full mt-2",
-            align === "start" ? "left-0" : "right-0",
-            className,
-          )}
-        >
-          {children}
-        </div>
-      )}
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            key="popover"
+            initial={{ opacity: 0, y: side === "top" ? 4 : -4 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: side === "top" ? 4 : -4 }}
+            transition={reveal}
+            style={{ boxShadow: "var(--elev-lift)" }}
+            className={cn(
+              "absolute z-40 rounded-[var(--radius-menu)] border border-[var(--hairline-s)] bg-[var(--surface)] p-2 text-[var(--ink)]",
+              side === "top" ? "bottom-full mb-2" : "top-full mt-2",
+              align === "start" ? "left-0" : "right-0",
+              className,
+            )}
+          >
+            {children}
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
