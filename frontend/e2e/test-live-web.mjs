@@ -3,10 +3,8 @@ import { chromium } from "playwright-core";
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import { CHROME_LAUNCH_OPTS } from "./fixture.mjs";
 
-const CHROME =
-  process.env.E2E_CHROME ||
-  `${process.env.HOME}/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome`;
 const ROOT = path.resolve(import.meta.dirname, "../..");
 const LIVE_HTML = path.join(ROOT, "dist-live-web/index.html");
 
@@ -17,7 +15,7 @@ const srv = http.createServer((req, res) => {
 await new Promise((r) => srv.listen(0, "127.0.0.1", r));
 const BASE = `http://127.0.0.1:${srv.address().port}`;
 
-const browser = await chromium.launch({ executablePath: CHROME, headless: true });
+const browser = await chromium.launch(CHROME_LAUNCH_OPTS);
 const ctx = await browser.newContext({ viewport: { width: 380, height: 900 } });
 const page = await ctx.newPage();
 

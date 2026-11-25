@@ -8,6 +8,8 @@ IMPECCABLE=${IMPECCABLE:-$HOME/refskills/impeccable/.claude/skills/impeccable/sc
 HALLMARK=${HALLMARK:-$HOME/.agents/skills/hallmark/scripts/sloplint.mjs}
 export CHROME_PATH=${E2E_CHROME:-$HOME/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome}
 export HALLMARK_PUPPETEER=${HALLMARK_PUPPETEER:-$HOME/.npm/_npx/17406ab935e1f629}
+export LIBGL_ALWAYS_SOFTWARE=1
+export VK_ICD_FILENAMES=/dev/null
 have() { [ -e "$1" ] || { echo "SKIP $2: $1 not found"; return 1; }; }
 cd "$G"
 cp "$ROOT/sidecars/fleet_pane/dist/index.html" "$G/index.html"
