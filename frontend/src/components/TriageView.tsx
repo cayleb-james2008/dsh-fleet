@@ -11,6 +11,8 @@ import {
   Image as ImageIcon,
   Layers,
   MessageSquare,
+  Pin,
+  PinOff,
   Send,
   ShieldAlert,
   Sparkles,
@@ -58,10 +60,14 @@ function unstickPresetFor(item: TriageItem): Array<{ label: string; prompt: stri
 
 export function TriageView({
   snap,
+  pinnedSeqs,
+  onTogglePin,
   onJumpToBoardSeq,
   onRefresh,
 }: {
   snap: SwarmSnapshot;
+  pinnedSeqs: number[];
+  onTogglePin: (seq: number) => void;
   onJumpToBoardSeq: (seq: number) => void;
   onRefresh: () => void;
 }) {
@@ -73,6 +79,8 @@ export function TriageView({
   const triage = snap.triage || [];
   const plan = snap.plan;
   const frames = snap.frames || [];
+  const pinnedSet = new Set(pinnedSeqs);
+  const pinnedMsgs = (snap.messages || []).filter((m) => !m.control && pinnedSet.has(m.seq));
   const memberByName = new Map((snap.members || []).map((m) => [m.name, m]));
   const canNudge = Boolean(snap.capabilities?.canSendMessage || window.sidecar?.agent?.sendMessage);
   const canOpenAux = Boolean(window.sidecar?.ui?.toggleAuxPane);
@@ -243,7 +251,7 @@ export function TriageView({
                         variant="ghost"
                         size="sm"
                         onClick={() => onJumpToBoardSeq(item.seq)}
-                        className="num"
+                        className="num ml-auto"
                       >
                         #{item.seq}
                         <ArrowUpRight className="h-3.5 w-3.5" aria-hidden="true" />
@@ -323,6 +331,41 @@ export function TriageView({
           </div>
         )}
       </section>
+
+      {/* Pinned Board Posts */}
+      {pinnedMsgs.length > 0 && (
+        <section aria-labelledby="pinned-triage-heading" className="space-y-2">
+          <div className="flex items-center gap-1.5">
+            <Pin className="h-4 w-4 text-[var(--info-foreground)]" aria-hidden="true" />
+            <h2 id="pinned-triage-heading" className="text-[14px] font-semibold text-[var(--ink)]">
+              Pinned posts ({pinnedMsgs.length})
+            </h2>
+          </div>
+          <Card className="p-2.5">
+            <ul className="divide-y divide-[var(--hairline)]">
+              {pinnedMsgs.map((pm) => (
+                <li key={pm.seq} className="flex items-center justify-between gap-2 py-1.5 first:pt-0.5 last:pb-0.5">
+                  <div className="min-w-0">
+                    <p className="text-[13px] font-medium text-[var(--ink)] truncate">
+                      <span className="num">#{pm.seq}</span> {pm.agent}
+                    </p>
+                    <p className="text-[12px] text-[var(--ink-2)] truncate">{pm.text}</p>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <Button variant="ghost" size="sm" className="num" onClick={() => onJumpToBoardSeq(pm.seq)}>
+                      #{pm.seq}
+                      <ArrowUpRight className="h-3.5 w-3.5" aria-hidden="true" />
+                    </Button>
+                    <Button variant="ghost" size="icon" aria-label={`Unpin #${pm.seq}`} onClick={() => onTogglePin(pm.seq)}>
+                      <PinOff className="h-3.5 w-3.5" aria-hidden="true" />
+                    </Button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </Card>
+        </section>
+      )}
 
       {/* Coordinator Plan & Workstreams (single tonal card, hairline dividers) */}
       {plan && (

@@ -157,6 +157,7 @@ export interface SwarmSnapshot {
   capabilities?: {
     canSendMessage: boolean;
     isSidecar: boolean;
+    sseStream?: boolean;
   };
 }
 

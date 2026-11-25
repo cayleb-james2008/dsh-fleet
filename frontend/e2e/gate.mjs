@@ -18,7 +18,11 @@ await runChecks("gate", async (check) => {
     if (msg.type() === "error") consoleErrors.push(msg.text());
   });
   page.on("pageerror", (err) => pageErrors.push(err.message));
-  page.on("requestfailed", (req) => failedRequests.push(`${req.url()} (${req.failure()?.errorText})`));
+  page.on("requestfailed", (req) => {
+    const errText = req.failure()?.errorText || "";
+    if (req.url().includes("/api/swarm/stream") && errText === "net::ERR_ABORTED") return;
+    failedRequests.push(`${req.url()} (${errText})`);
+  });
   page.on("request", (req) => {
     const u = req.url();
     if (!u.startsWith(BASE) && !u.startsWith("data:") && !u.startsWith("blob:")) {
@@ -113,9 +117,12 @@ await runChecks("gate", async (check) => {
     return (await page.locator('#tab-board[aria-selected="true"]').count()) === 1;
   });
 
-  await check("board renders messages with @mentions and #seq pills", async () => {
+  await check("board renders messages with @mentions, #seq pills, and Pin #seq", async () => {
     const txt = await page.locator("#panel-board").textContent();
-    return txt.includes("Sidecar ready for cold check") && txt.includes("#2");
+    if (!txt.includes("Sidecar ready for cold check") || !txt.includes("#2")) return false;
+    await page.locator('button[aria-label="Pin #4"]').click();
+    const after = await page.locator("#panel-board").textContent();
+    return after.includes("Pinned (1)") && (await page.locator('header :text("Live")').count()) >= 1;
   });
 
   await page.fill('input[aria-label="Search board messages"]', "no-such-query-xyz");
@@ -246,6 +253,13 @@ await runChecks("gate", async (check) => {
   await check("zero user-facing Rune or RHL strings in rendered DOM", async () => {
     const body = await page.locator("body").textContent();
     return !/\bRune\b/i.test(body) && !/\bRHL\b/.test(body);
+  });
+
+  await check("pinned post also surfaces cleanly on Triage tab", async () => {
+    await page.selectOption('select[aria-label="Active swarm"]', "11111111-1111-1111-1111-111111111111");
+    await page.locator("#tab-triage").click();
+    const txt = await page.locator("#panel-triage").textContent();
+    return txt.includes("Pinned posts (1)");
   });
 
   // 26-28: Clean runtime guarantees

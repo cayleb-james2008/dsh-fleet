@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -247,5 +247,55 @@ test('install.sh --dest deploys plugin bundle cleanly and installed main.mjs boo
     if (child && child.exitCode === null) child.kill('SIGTERM');
     if (!hadDist) rmSync(distDir, { recursive: true, force: true });
     rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('GET /api/swarm/stream sustains 5 concurrent SSE clients and pushes live deltas on append', async () => {
+  const fx = setupFixtureAppData();
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+  });
+
+  const socks = [];
+  try {
+    const buffers = Array.from({ length: 5 }, () => '');
+    await Promise.all(
+      Array.from({ length: 5 }, (_, idx) => {
+        return new Promise((resolve, reject) => {
+          const s = net.connect(srv.port, '127.0.0.1', () => {
+            s.write(`GET /api/swarm/stream?conversationId=${fx.coord} HTTP/1.1\r\nHost: 127.0.0.1:${srv.port}\r\nAccept: text/event-stream\r\n\r\n`);
+          });
+          socks.push(s);
+          s.setEncoding('utf-8');
+          s.on('data', (chunk) => {
+            buffers[idx] += chunk;
+            if (buffers[idx].includes('event: swarm\ndata:')) resolve();
+          });
+          s.on('error', reject);
+        });
+      }),
+    );
+
+    const initialCounts = buffers.map((b) => (b.match(/event: swarm/g) || []).length);
+    assert.deepEqual(initialCounts, [1, 1, 1, 1, 1]);
+
+    const boardFile = join(fx.appData, 'brain', fx.coord, '.system_generated', 'swarm', 'board.jsonl');
+    appendFileSync(boardFile, JSON.stringify({ seq: 2, agent: 'coordinator', text: '@worker new delta' }) + '\n');
+
+    const deadline = Date.now() + 2500;
+    while (Date.now() < deadline) {
+      if (buffers.every((b) => (b.match(/event: swarm/g) || []).length >= 2)) break;
+      await new Promise((r) => setTimeout(r, 40));
+    }
+
+    const finalCounts = buffers.map((b) => (b.match(/event: swarm/g) || []).length);
+    assert.ok(finalCounts.every((c) => c >= 2), `Expected >=2 SSE events on all 5 clients, got ${JSON.stringify(finalCounts)}`);
+  } finally {
+    for (const s of socks) s.destroy();
+    await srv.close();
+    rmSync(fx.dir, { recursive: true, force: true });
   }
 });

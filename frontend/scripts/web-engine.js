@@ -439,7 +439,7 @@
       frames: sw.frames,
       triage: triage,
       usage: usage,
-      capabilities: { canSendMessage: true, isSidecar: false },
+      capabilities: { canSendMessage: true, isSidecar: false, sseStream: false },
     };
   }
 
@@ -515,7 +515,7 @@
     };
 
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.2.0", mode: "live-web", canSendMessage: true });
+      return jsonResp({ ok: true, name: "fleet", version: "1.3.0", mode: "live-web", canSendMessage: true, sseStream: false });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });

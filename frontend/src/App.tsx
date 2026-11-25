@@ -99,6 +99,15 @@ export function App() {
   const [wtLoading, setWtLoading] = useState(false);
 
   const [highlightSeq, setHighlightSeq] = useState<number | null>(null);
+  const [sseConnected, setSseConnected] = useState(false);
+  const [pinnedMap, setPinnedMap] = useState<Record<string, number[]>>(() => {
+    try {
+      const raw = localStorage.getItem("fleet-pinned-v1");
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
@@ -169,11 +178,44 @@ export function App() {
   useEffect(() => {
     const ms = Number(pollMs);
     if (!ms) return;
+    const effectiveMs = sseConnected ? Math.max(ms, 15000) : ms;
     const id = setInterval(() => {
       if (!document.hidden) refreshSwarm(false);
-    }, ms);
+    }, effectiveMs);
     return () => clearInterval(id);
-  }, [pollMs, refreshSwarm]);
+  }, [pollMs, sseConnected, refreshSwarm]);
+
+  // Live SSE push stream when running on standalone HTTP server (graceful poll fallback inside SidecarApp).
+  const refreshRef = useRef(refreshSwarm);
+  refreshRef.current = refreshSwarm;
+  const canSse = Boolean(snap?.capabilities?.sseStream);
+  const activeConvId = selectedSwarmId || snap?.swarm || "";
+  useEffect(() => {
+    if (!canSse || pollMs === "0" || !activeConvId || typeof EventSource === "undefined") {
+      setSseConnected(false);
+      return;
+    }
+    const q = `?conversationId=${encodeURIComponent(activeConvId)}`;
+    const es = new EventSource(`/api/swarm/stream${q}`);
+    es.onopen = () => setSseConnected(true);
+    es.addEventListener("swarm", (ev) => {
+      try {
+        const d = JSON.parse((ev as MessageEvent).data || "{}");
+        if (d?.etag && d.etag !== etagRef.current) {
+          refreshRef.current(false);
+        }
+      } catch {
+        refreshRef.current(false);
+      }
+    });
+    es.onerror = () => {
+      setSseConnected(false);
+    };
+    return () => {
+      setSseConnected(false);
+      es.close();
+    };
+  }, [canSse, pollMs, activeConvId]);
 
   const allRoots = useMemo(
     () => [...new Set([...workspaceUris, ...manualRoots])],
@@ -205,6 +247,24 @@ export function App() {
   const waitingCount = members.filter((m) => !m.killed && m.status === "waiting").length;
   const triageCount = snap?.triage?.length || 0;
   const hasSwarm = Boolean(snap?.swarm);
+
+  const activeSwarmKey = snap?.swarm || selectedSwarmId || "default";
+  const pinnedSeqs = pinnedMap[activeSwarmKey] || [];
+
+  const handleTogglePin = useCallback(
+    (seq: number) => {
+      setPinnedMap((prev) => {
+        const cur = prev[activeSwarmKey] || [];
+        const nextList = cur.includes(seq) ? cur.filter((x) => x !== seq) : [...cur, seq].sort((a, b) => a - b);
+        const next = { ...prev, [activeSwarmKey]: nextList };
+        try {
+          localStorage.setItem("fleet-pinned-v1", JSON.stringify(next));
+        } catch {}
+        return next;
+      });
+    },
+    [activeSwarmKey],
+  );
 
   const handleSelectSwarm = (id: string) => {
     etagRef.current = "";
@@ -359,7 +419,7 @@ export function App() {
             </div>
           </div>
 
-          {/* Row 2: Compact Status Telemetry (clean spaced tokens, zero middle dots) */}
+          {/* Row 2: Compact Status Telemetry (balanced padding on 380px tok pill) */}
           {hasSwarm && (
             <div className="flex flex-wrap items-center justify-between gap-2 pb-2 text-[12px] text-[var(--ink-2)]">
               <div className="flex flex-wrap items-center gap-2 min-w-0">
@@ -369,8 +429,9 @@ export function App() {
                 <span className="num text-[var(--ink-3)]">#{snap?.head || 0}</span>
               </div>
               <div className="flex items-center gap-1.5">
+                {sseConnected && <Badge tone="success">Live</Badge>}
                 {snap?.member && <Badge tone="neutral">you: {snap.member}</Badge>}
-                <span className="sm:hidden num font-medium text-[var(--ink-2)]">
+                <span className="sm:hidden inline-flex items-center rounded-[var(--radius-chip)] bg-[var(--board)] px-2 py-0.5 num font-medium text-[var(--ink-2)]">
                   {fmtTokens(snap?.usage?.totalTokens)} tok
                 </span>
               </div>
@@ -516,6 +577,8 @@ export function App() {
               <div id="panel-triage" role="tabpanel" aria-labelledby="tab-triage">
                 <TriageView
                   snap={snap!}
+                  pinnedSeqs={pinnedSeqs}
+                  onTogglePin={handleTogglePin}
                   onJumpToBoardSeq={(seq) => {
                     setHighlightSeq(seq);
                     setTab("board");
@@ -529,6 +592,8 @@ export function App() {
                 <BoardView
                   snap={snap!}
                   highlightSeq={highlightSeq}
+                  pinnedSeqs={pinnedSeqs}
+                  onTogglePin={handleTogglePin}
                   onClearHighlight={() => setHighlightSeq(null)}
                 />
               </div>
@@ -597,7 +662,7 @@ export function App() {
           <div className="rounded-[var(--radius-card)] bg-[var(--board)] p-3 text-[12px] text-[var(--ink-2)] space-y-1">
             <div className="flex items-center gap-1.5 font-medium text-[var(--ink)]">
               <CommandIcon className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Fleet Antigravity Plugin v1.2.0</span>
+              <span>Fleet Antigravity Plugin v1.3.0</span>
             </div>
             <p>
               Reads Antigravity native swarm boards and transcripts locally on loopback with zero external telemetry.

@@ -81,11 +81,13 @@ await check("confirmed nudge posts live message to Board feed", async () => {
   return txt.includes("Vary: Accept-Encoding");
 });
 
-await check("Board #seq pill & agent filter work", async () => {
+await check("Board #seq pill, Pin #seq, & agent filter work", async () => {
+  await page.locator('button[aria-label="Pin #4"]').click();
+  const pinnedOk = (await page.locator("#panel-board").textContent()).includes("Pinned (1)");
   await page.locator('#panel-board button[aria-label="Toggle board filters"]').click();
   await page.locator("#panel-board").getByRole("button", { name: "ui-dev", exact: true }).click();
   const txt = await page.locator("#panel-board").textContent();
-  return txt.includes("Adapting Needs-You triage cards");
+  return pinnedOk && txt.includes("Adapting Needs-You triage cards");
 });
 
 await check("Roster shows live token totals and shimmering activity", async () => {

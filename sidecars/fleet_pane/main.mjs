@@ -136,9 +136,10 @@ export function createFleetHandlers({
       healthPacked = packJsonPayload({
         ok: true,
         name: 'fleet',
-        version: '1.2.0',
+        version: '1.3.0',
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
+        sseStream: !isSidecar,
         appDataDirs,
         conversationId: defaultConversationId || null,
       });
@@ -275,7 +276,7 @@ export function createFleetHandlers({
         ...snap,
         ...unseenBy(snap, res.member),
         etag,
-        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar },
+        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, sseStream: !isSidecar },
       },
       `"${createHash('sha256').update(etag).digest('hex').slice(0, 16)}"`,
     );
@@ -358,6 +359,27 @@ export function createFleetHandlers({
     return { status: 200, json: { ok: true, result } };
   }
 
+  function resolveStreamTarget(query = {}) {
+    const appDataDirs = getAppDirs();
+    const requestedConv = typeof query.conversationId === 'string' ? query.conversationId.trim() : '';
+    let conv = requestedConv || defaultConversationId;
+    if (!conv) {
+      const swarmsData = getSwarmsEntry().swarms;
+      if (swarmsData.length) conv = swarmsData[0].id;
+    }
+    if (!conv || !ID_RE.test(conv)) return null;
+    const res = resolveConversationSwarm(appDataDirs, conv);
+    if (!res.swarm || !res.appData) return null;
+    const fp = computeSwarmFingerprint(res.appData, res.swarm);
+    return {
+      conversationId: conv,
+      appData: res.appData,
+      swarm: res.swarm,
+      member: res.member || '',
+      etag: fp ? `${res.swarm}|${res.member || ''}|${fp.etag}` : '',
+    };
+  }
+
   return {
     assets,
     getHealthPacked,
@@ -366,6 +388,7 @@ export function createFleetHandlers({
     getWorktreesPacked,
     getFrame,
     postNudge,
+    resolveStreamTarget,
   };
 }
 
@@ -387,6 +410,70 @@ export async function startStandaloneServer({
   });
 
   const preloadBuf = Buffer.from(STANDALONE_PRELOAD_JS);
+  const MAX_SSE_CLIENTS = 64;
+  const SSE_POLL_MS = 150;
+  const SSE_PING_MS = 15000;
+  const sseClients = new Set();
+  let sseTimer = null;
+
+  function stopSseTimerIfIdle() {
+    if (sseClients.size === 0 && sseTimer) {
+      clearInterval(sseTimer);
+      sseTimer = null;
+    }
+  }
+
+  function ensureSseTimer() {
+    if (sseTimer || sseClients.size === 0) return;
+    sseTimer = setInterval(() => {
+      if (sseClients.size === 0) {
+        stopSseTimerIfIdle();
+        return;
+      }
+      const now = Date.now();
+      const fpCache = new Map();
+      for (const client of sseClients) {
+        if (client.res.writableEnded || client.res.destroyed) {
+          sseClients.delete(client);
+          continue;
+        }
+        const key = `${client.appData}\0${client.swarm}`;
+        let fp = fpCache.get(key);
+        if (fp === undefined) {
+          fp = computeSwarmFingerprint(client.appData, client.swarm);
+          fpCache.set(key, fp);
+        }
+        if (fp) {
+          const nextEtag = `${client.swarm}|${client.member}|${fp.etag}`;
+          if (nextEtag !== client.lastEtag) {
+            client.lastEtag = nextEtag;
+            client.lastPingAt = now;
+            const payload = JSON.stringify({
+              conversationId: client.conversationId,
+              swarm: client.swarm,
+              etag: nextEtag,
+            });
+            try {
+              client.res.write(`event: swarm\ndata: ${payload}\n\n`);
+            } catch {
+              sseClients.delete(client);
+            }
+            continue;
+          }
+        }
+        if (now - client.lastPingAt >= SSE_PING_MS) {
+          client.lastPingAt = now;
+          try {
+            client.res.write(': ping\n\n');
+          } catch {
+            sseClients.delete(client);
+          }
+        }
+      }
+      stopSseTimerIfIdle();
+    }, SSE_POLL_MS);
+    sseTimer.unref();
+  }
 
   function sendPacked(req, res, status, packed, extraHeaders = {}) {
     const baseHeaders = {
@@ -495,6 +582,53 @@ export async function startStandaloneServer({
     if (req.method === 'GET' && pathname === '/api/swarm') {
       return sendPacked(req, res, 200, handlers.getSwarmPacked(parseQueryFast(search)));
     }
+    if (req.method === 'GET' && pathname === '/api/swarm/stream') {
+      if (sseClients.size >= MAX_SSE_CLIENTS) {
+        res.writeHead(503, { 'Content-Type': 'application/json', Connection: 'close', ...SECURITY_HEADERS });
+        res.end(JSON.stringify({ error: 'too many stream clients' }));
+        return;
+      }
+      const target = handlers.resolveStreamTarget(parseQueryFast(search));
+      if (!target) {
+        res.writeHead(404, { 'Content-Type': 'application/json', ...SECURITY_HEADERS });
+        res.end(JSON.stringify({ error: 'swarm not found' }));
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+        ...SECURITY_HEADERS,
+      });
+      if (typeof res.flushHeaders === 'function') res.flushHeaders();
+      const client = {
+        req,
+        res,
+        conversationId: target.conversationId,
+        appData: target.appData,
+        swarm: target.swarm,
+        member: target.member,
+        lastEtag: target.etag,
+        lastPingAt: Date.now(),
+      };
+      sseClients.add(client);
+      res.write(
+        `: connected\nevent: swarm\ndata: ${JSON.stringify({
+          conversationId: target.conversationId,
+          swarm: target.swarm,
+          etag: target.etag,
+        })}\n\n`,
+      );
+      ensureSseTimer();
+      const cleanup = () => {
+        sseClients.delete(client);
+        stopSseTimerIfIdle();
+      };
+      req.on('close', cleanup);
+      res.on('error', cleanup);
+      return;
+    }
     if (req.method === 'GET' && pathname === '/api/worktrees') {
       return sendPacked(req, res, 200, await handlers.getWorktreesPacked(parseQueryFast(search)));
     }
@@ -564,7 +698,16 @@ export async function startStandaloneServer({
     server,
     port: addr.port,
     url: `http://${host}:${addr.port}`,
-    close: () => new Promise((resolve) => server.close(() => resolve())),
+    close: () => {
+      for (const client of sseClients) {
+        try {
+          client.res.end();
+        } catch {}
+      }
+      sseClients.clear();
+      stopSseTimerIfIdle();
+      return new Promise((resolve) => server.close(() => resolve()));
+    },
   };
 }
 
