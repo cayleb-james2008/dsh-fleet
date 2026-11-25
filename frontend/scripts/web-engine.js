@@ -88,6 +88,7 @@
             transcriptMtime: t(22),
             startedAt: new Date(t(850)).toISOString(),
             lastStepAt: new Date(t(22)).toISOString(),
+            lastContextTokens: 96000,
             thinkingHeading: "Verifying Host-403 and CWE-59 frame guard",
             recentTools: [
               { name: "run_command", summary: "Run unit and security tests", time: new Date(t(30)).toISOString() },
@@ -514,7 +515,7 @@
     };
 
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.1.0", mode: "live-web", canSendMessage: true });
+      return jsonResp({ ok: true, name: "fleet", version: "1.2.0", mode: "live-web", canSendMessage: true });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });

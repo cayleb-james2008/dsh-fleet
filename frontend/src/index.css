@@ -28,6 +28,10 @@ h1, h2, h3 {
   text-wrap: balance;
 }
 
+p {
+  text-wrap: pretty;
+}
+
 @keyframes fleet-live-shimmer {
   0%, 100% {
     opacity: 0.95;

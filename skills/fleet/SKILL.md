@@ -46,3 +46,4 @@ When the **Fleet** sidecar pane is enabled (`fleet/fleet_pane`), surface a singl
 4. **Land, verify, and clean up.**
    - Never kill a `share`/`branch` worker before landing or merging its changes.
    - Kill finished helpers (`swarm{action: "kill", name}`) and update `plan.json` statuses before posting the final response to the user.
+   - Use Fleet's **Peek**, confirmation-gated **Unstick / Nudge** presets, **Open file** (`toggleAuxPane` `fileView`), and **Copy swarm digest** controls inside the sidecar pane to triage workers rapidly without switching contexts.

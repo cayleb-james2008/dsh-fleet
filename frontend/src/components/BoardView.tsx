@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, Filter, Search, X } from "lucide-react";
+import { ArrowDown, FileCode2, Filter, Search, X } from "lucide-react";
+import { extractLocalFilePaths, openFileInAuxPane } from "../sidecar";
 import type { BoardMessage, SwarmSnapshot } from "../types";
-import { Badge, Button, Card, Input, cn, fmtClockTime } from "../ui";
+import { Badge, Button, Card, Input, cn, fmtClockTime, toast } from "../ui";
 
 function PostBody({
   text,
@@ -318,6 +319,31 @@ export function BoardView({
                     onClickSeq={scrollToSeq}
                     onFilterAgent={(name) => setAgentFilter(name)}
                   />
+                  {(() => {
+                    const paths = extractLocalFilePaths(m.text);
+                    if (!paths.length) return null;
+                    return (
+                      <div className="flex flex-wrap gap-1.5 pt-1.5">
+                        {paths.map((fp) => (
+                          <button
+                            key={fp}
+                            type="button"
+                            onClick={() => {
+                              if (openFileInAuxPane(fp)) {
+                                toast.success(`Opened ${fp.split("/").pop() || "file"}`);
+                              } else {
+                                navigator.clipboard.writeText(fp).then(() => toast.success("File path copied")).catch(() => {});
+                              }
+                            }}
+                            className="inline-flex items-center gap-1 rounded-[var(--radius-chip)] bg-[var(--track)] px-2 py-0.5 text-[12px] text-[var(--ink-2)] hover:text-[var(--ink)] cursor-pointer max-w-full"
+                          >
+                            <FileCode2 className="h-3 w-3 shrink-0" aria-hidden="true" />
+                            <span className="truncate mono">{fp.split("/").pop()}</span>
+                          </button>
+                        ))}
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
             );

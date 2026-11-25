@@ -82,12 +82,13 @@ await runChecks("gate", async (check) => {
     return hasDigestBtn && txt.includes("Run sidecar security tests");
   });
 
-  await check("screenshot frame loads cleanly with naturalWidth > 0", async () => {
-    const ok = await page.evaluate(() => {
+  await check("screenshot frame loads cleanly with naturalWidth > 0 and Open file action", async () => {
+    const okImg = await page.evaluate(() => {
       const img = document.querySelector("#panel-triage img");
       return Boolean(img && img.complete && img.naturalWidth > 0);
     });
-    return ok;
+    const hasOpenBtn = (await page.locator('#panel-triage button:has-text("Open file")').count()) >= 1;
+    return okImg && hasOpenBtn;
   });
 
   // 5-6: Fonts loaded + zero horizontal overflow at 380x900 on Triage
@@ -132,9 +133,9 @@ await runChecks("gate", async (check) => {
   await page.locator("#tab-roster").click();
   await page.waitForSelector("#panel-roster");
 
-  await check("roster shows active shimmering activity, Peek drawer, and real tokens", async () => {
+  await check("roster shows active shimmering activity, Peek drawer, context pressure, and real tokens", async () => {
     const txt = await page.locator("#panel-roster").textContent();
-    if (!txt.includes("builder") || !txt.includes("23.4k tok") || !txt.includes("Read main.mjs")) return false;
+    if (!txt.includes("builder") || !txt.includes("23.4k tok") || !txt.includes("Read main.mjs") || !txt.includes("% ctx")) return false;
     await page.locator('button[aria-label="Peek activity for builder"]').click();
     const after = await page.locator("#panel-roster").textContent();
     return after.includes("Recent worker activity") && after.includes("Run sidecar security tests");

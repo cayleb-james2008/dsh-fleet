@@ -37,6 +37,7 @@ export interface SwarmMember {
   lastStepAt: string;
   thinkingHeading?: string;
   recentTools?: Array<{ name: string; summary: string; time: string }>;
+  lastContextTokens?: number;
   usage: TokenUsage;
   workspace_mode?: string;
   workspace?: string;
