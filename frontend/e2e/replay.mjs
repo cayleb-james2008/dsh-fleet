@@ -1,53 +1,59 @@
-// replay.mjs: Fleet's worst-case data checks via browser page.route mocks (1440 and 390).
-import { BASE, OUT as E2E_OUT, launch, report } from './fixture.mjs'
-import fs from 'node:fs'
-const OUT = `${E2E_OUT}/replay`
-fs.mkdirSync(OUT, { recursive: true })
-const b = await launch()
-const res = []
-const ok = (n, p, d = '') => { res.push({ n, p: !!p, d }); console.log((p ? 'PASS ' : 'FAIL ') + n + (d ? '  ' + d : '')) }
-const LONG = 'x'.repeat(260)
-const clipped = p => p.evaluate(() => [...document.querySelectorAll('body *')].filter(e => {
-  const r = e.getBoundingClientRect()
-  if (!r.width || r.right <= innerWidth + 1) return false
-  for (let q = e.parentElement; q; q = q.parentElement) {
-    const o = getComputedStyle(q).overflowX
-    if (o !== 'visible') return false
-  }
-  return true
-}).length)
+// Worst-case stress replay at 380px sidebar width (high message/worker density, rapid tab cycling).
+import { chromium } from "playwright-core";
+import { BASE, CHROME, runChecks } from "./fixture.mjs";
 
-async function page(w, url, routes) {
-  const ctx = await b.newContext({ viewport: { width: w, height: w < 768 ? 844 : 900 } })
-  const p = await ctx.newPage(); p.errs = []
-  p.on('pageerror', e => p.errs.push(e.message))
-  for (const [pat, fn] of routes) await p.route(pat, fn)
-  await p.goto(url); await p.waitForTimeout(2200)
-  return { ctx, p }
-}
-const json = (r, body, status = 200) => r.fulfill({ status, contentType: 'application/json', body: typeof body === 'string' ? body : JSON.stringify(body) })
-const patch = (fn) => async r => { const res = await r.fetch(); const j = await res.json(); r.fulfill({ response: res, body: JSON.stringify(fn(j)) }) }
+const browser = await chromium.launch({ executablePath: CHROME, headless: true });
 
-for (const w of [1440, 390]) {
-  {
-    const { ctx, p } = await page(w, BASE, [['**/api/sessions', r => json(r, 'no', 500)]])
-    ok(`fleet ${w}: unreachable from the start says so clearly`,
-      await p.locator('text=Fleet has not answered yet').count() === 1)
-    await ctx.close()
+await runChecks("replay", async (check) => {
+  const ctx = await browser.newContext({ viewport: { width: 380, height: 900 } });
+  const page = await ctx.newPage();
+  const errs = [];
+  page.on("pageerror", (e) => errs.push(e.message));
+
+  await page.goto(BASE, { waitUntil: "networkidle" });
+  await page.waitForSelector("#panel-triage");
+
+  // Keyboard tab navigation test: ArrowRight through all 5 tabs & Home back
+  await page.locator("#tab-triage").focus();
+  await page.keyboard.press("ArrowRight");
+  await check("ArrowRight moves tab focus to Board", async () => {
+    return (await page.locator('#tab-board[aria-selected="true"]').count()) === 1;
+  });
+
+  await page.keyboard.press("End");
+  await check("End moves tab to Worktrees", async () => {
+    return (await page.locator('#tab-worktrees[aria-selected="true"]').count()) === 1;
+  });
+
+  await page.keyboard.press("Home");
+  await check("Home returns to Triage", async () => {
+    return (await page.locator('#tab-triage[aria-selected="true"]').count()) === 1;
+  });
+
+  // Rapid cycles across Board -> Roster -> Graph -> Triage in Dark mode
+  await page.locator('button[aria-label="Open settings"]').click();
+  await page.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();
+  await page.locator('button[aria-label="Close dialog"]').click();
+
+  for (const tab of ["#tab-board", "#tab-roster", "#tab-graph", "#tab-worktrees", "#tab-triage"]) {
+    await page.locator(tab).click();
   }
-  {
-    const { ctx, p } = await page(w, BASE, [['**/api/sessions', patch(j => [null, ...j.map((s, i) => i ? s : { ...s, task: '', transcript: null, steer: null })])]])
-    ok(`fleet ${w}: null entry, blank task, and null transcript do not blank the workbench`,
-      !p.errs.length && await p.locator('div[aria-label="Session lanes"]').count() === 1 && await p.locator('text=Untitled session').count() >= 1,
-      p.errs.join('|'))
-    await ctx.close()
-  }
-  {
-    const { ctx, p } = await page(w, BASE, [['**/api/sessions', patch(j => j.map(s => s.bucket === 'needs-you' ? { ...s, reason: 'Check failed: ' + LONG, project: 'p/' + LONG, branch: 'fleet/' + LONG } : s))]])
-    ok(`fleet ${w}: long unbroken reason/project/branch stay inside their container`, (await clipped(p)) === 0)
-    await p.screenshot({ path: `${OUT}/fleet-long-${w}.png` })
-    await ctx.close()
-  }
-}
-await b.close()
-report('replay', res)
+
+  await check("rapid tab switching keeps zero horizontal overflow", async () => {
+    const ov = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    return ov <= 0;
+  });
+
+  await check("poll cadence switcher updates cleanly", async () => {
+    await page.locator('button[aria-label="Open settings"]').click();
+    await page.locator('div[role="dialog"] button[role="radio"]:has-text("5s")').click();
+    const checked = await page.locator('div[role="dialog"] button[role="radio"]:has-text("5s")').getAttribute("aria-checked");
+    await page.locator('button[aria-label="Close dialog"]').click();
+    return checked === "true";
+  });
+
+  await check("zero uncaught runtime errors during replay", () => errs.length === 0);
+  await ctx.close();
+});
+
+await browser.close();

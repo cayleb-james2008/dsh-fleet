@@ -1,10 +1,9 @@
 name: release
 
-# Every push to main that carries a NEW version in Cargo.toml (and its CHANGELOG.md
-# entry) is built for each platform and published as a GitHub Release `vX.Y.Z` with
-# the binaries and a SHA256SUMS file. Pushing a tag `vX.Y.Z` by hand does the same.
-# The running app reads that release to offer (or install) the update; see the
-# README, "Versions and updates". A push that does not change the version does nothing.
+# Every push to main that carries a NEW version in plugin.json (and its CHANGELOG.md
+# entry) runs backend tests + frontend build, packages the Antigravity plugin tarball
+# & zip with SHA256SUMS, and publishes GitHub Release vX.Y.Z. Pushing tag vX.Y.Z
+# does the same.
 on:
   push:
     branches: [main]
@@ -18,9 +17,6 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  BIN: fleet
-
 jobs:
   plan:
     runs-on: ubuntu-latest
@@ -33,49 +29,60 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          crate="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
-          echo "version=$crate" >> "$GITHUB_OUTPUT"
-          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "v$crate" != "$GITHUB_REF_NAME" ]; then
-            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"; exit 1
+          ver="$(node -e "console.log(JSON.parse(require('fs').readFileSync('plugin.json','utf8')).version)")"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "v$ver" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match plugin.json version $ver"; exit 1
           fi
-          if gh release view "v$crate" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release v$crate already exists: nothing to publish"
+          if gh release view "v$ver" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release v$ver already exists: nothing to publish"
             echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          grep -qE "^## \[?$crate\]?( |$)" CHANGELOG.md || { echo "CHANGELOG.md has no entry for version $crate"; exit 1; }
+          grep -qE "^## \[?$ver\]?( |$)" CHANGELOG.md || { echo "CHANGELOG.md has no entry for version $ver"; exit 1; }
           echo "publish=true" >> "$GITHUB_OUTPUT"
 
   build:
     needs: plan
     if: ${{ needs.plan.outputs.publish == 'true' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: '' }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, ext: '' }
-          - { os: macos-latest, target: aarch64-apple-darwin, ext: '' }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: '.exe' }
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        shell: bash
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Toolchain
-        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
-      - name: Build
-        run: cargo build --release --locked --bin "$BIN" --target ${{ matrix.target }}
-      - name: Stage and check the asset
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test sidecar backend
+        run: cd sidecars/fleet_pane && npm test
+      - name: Build sidecar UI and live-web preview
         run: |
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/${BIN}${{ matrix.ext }}" "dist/${BIN}-${{ matrix.target }}${{ matrix.ext }}"
-          out="$("./dist/${BIN}-${{ matrix.target }}${{ matrix.ext }}" --version)"
-          echo "$out"
-          case "$out" in *"${{ needs.plan.outputs.version }}"*) ;; *) echo "binary does not report version ${{ needs.plan.outputs.version }}"; exit 1;; esac
+          cd frontend
+          npm ci
+          npm run build:live-web
+      - name: Smoke test atomic installer
+        run: |
+          ./install.sh --dest "${{ runner.temp }}/fleet-plugin-smoke"
+          test -f "${{ runner.temp }}/fleet-plugin-smoke/plugin.json"
+          test -f "${{ runner.temp }}/fleet-plugin-smoke/sidecars/fleet_pane/dist/index.html"
+      - name: Package plugin archives
+        run: |
+          ver="${{ needs.plan.outputs.version }}"
+          stage="fleet-antigravity-plugin-v${ver}"
+          mkdir -p dist "$stage"
+          cp plugin.json install.sh README.md CHANGELOG.md "$stage/"
+          cp -R assets skills rules "$stage/"
+          mkdir -p "$stage/sidecars/fleet_pane"
+          cp sidecars/fleet_pane/package.json sidecars/fleet_pane/sidecar.json \
+             sidecars/fleet_pane/main.mjs sidecars/fleet_pane/channels.mjs \
+             sidecars/fleet_pane/git_probe.mjs sidecars/fleet_pane/swarm_store.mjs \
+             "$stage/sidecars/fleet_pane/"
+          cp -R sidecars/fleet_pane/dist "$stage/sidecars/fleet_pane/"
+          tar -czf "dist/${stage}.tar.gz" "$stage"
+          zip -rq "dist/${stage}.zip" "$stage"
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          awk -v v="$ver" '$0 ~ "^## \\[?"v"\\]?( |$)" {f=1; next} /^## / {f=0} f' CHANGELOG.md > dist/notes.md
+          test -s dist/notes.md || echo "Release $ver." > dist/notes.md
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.BIN }}-${{ matrix.target }}
+          name: fleet-plugin-dist
           path: dist/*
 
   release:
@@ -83,19 +90,17 @@ jobs:
     if: ${{ !cancelled() && needs.plan.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          name: fleet-plugin-dist
           path: dist
-          merge-multiple: true
-      - name: Checksums and notes
-        run: |
-          test -n "$(ls dist)" || { echo "no build succeeded"; exit 1; }
-          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
-          ver="${{ needs.plan.outputs.version }}"
-          awk -v v="$ver" '$0 ~ "^## \\[?"v"\\]?( |$)" {f=1; next} /^## / {f=0} f' CHANGELOG.md > notes.md
-          test -s notes.md || echo "Release $ver." > notes.md
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "v${{ needs.plan.outputs.version }}" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Fleet v${{ needs.plan.outputs.version }}" --notes-file notes.md
+        run: |
+          ver="${{ needs.plan.outputs.version }}"
+          gh release create "v$ver" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Fleet v$ver" \
+            --notes-file dist/notes.md \
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS
