@@ -10,7 +10,6 @@
 import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, sep } from 'node:path';
-import { StringDecoder } from 'node:string_decoder';
 import { pathToFileURL } from 'node:url';
 import {
   ALL,
@@ -84,7 +83,8 @@ function readSmallCached(path, cache, maxBytes = VIEW_MAX_BYTES) {
 
 /**
  * Incrementally stream lines from a growing JSONL file using bounded 64 KB chunks.
- * Calls `onLine(rawLine)` for each complete line without forcing JSON.parse on old history.
+ * Scans 0x0A newlines directly on Buffer bytes and decodes one line at a time so
+ * V8 never creates ConsString trees or SlicedString parent-buffer leaks.
  */
 function streamLinesIncremental(filePath, prevMeta, onReset, onLine) {
   const s = statOf(filePath);
@@ -96,52 +96,58 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine) {
 
   const isAppend = Boolean(prevMeta && prevMeta.ino === s.ino && s.size >= prevMeta.size);
   let offset = isAppend ? prevMeta.size : 0;
-  let carry = isAppend ? prevMeta.carry : '';
+  let carryBuf = isAppend && prevMeta.carryBuf ? prevMeta.carryBuf : Buffer.alloc(0);
   if (!isAppend) onReset();
 
   if (s.size > offset) {
     const fd = openSync(filePath, 'r');
-    const decoder = new StringDecoder('utf8');
     try {
       while (offset < s.size) {
         const toRead = Math.min(CHUNK_BYTES, s.size - offset);
         const bytesRead = readSync(fd, SHARED_CHUNK_BUF, 0, toRead, offset);
         if (bytesRead <= 0) break;
         offset += bytesRead;
-        carry += decoder.write(SHARED_CHUNK_BUF.subarray(0, bytesRead));
-        let start = 0;
-        for (let nl = carry.indexOf('\n'); nl >= 0; nl = carry.indexOf('\n', start)) {
-          const line = carry.slice(start, nl).trim();
-          start = nl + 1;
-          if (line) onLine(line);
+        const chunk = SHARED_CHUNK_BUF.subarray(0, bytesRead);
+        const combined = carryBuf.length ? Buffer.concat([carryBuf, chunk]) : chunk;
+
+        let pos = 0;
+        for (let nl = combined.indexOf(0x0a, pos); nl >= 0; nl = combined.indexOf(0x0a, pos)) {
+          let end = nl;
+          if (end > pos && combined[end - 1] === 0x0d) end--;
+          if (end > pos) {
+            const line = combined.subarray(pos, end).toString('utf8').trim();
+            if (line) onLine(line);
+          }
+          pos = nl + 1;
         }
-        carry = carry.slice(start);
+        carryBuf = pos < combined.length ? Buffer.from(combined.subarray(pos)) : Buffer.alloc(0);
       }
-      carry += decoder.end();
     } finally {
       closeSync(fd);
     }
   }
 
-  const trimmedCarry = carry.trim();
-  if (trimmedCarry) {
-    try {
-      const obj = JSON.parse(trimmedCarry);
-      if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
-        onLine(trimmedCarry, obj);
-        carry = '';
+  if (carryBuf.length) {
+    const trimmedCarry = carryBuf.toString('utf8').trim();
+    if (trimmedCarry) {
+      try {
+        const obj = JSON.parse(trimmedCarry);
+        if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+          onLine(trimmedCarry, obj);
+          carryBuf = Buffer.alloc(0);
+        }
+      } catch {
+        // Torn trailing line kept in `carryBuf` until next write completes it.
       }
-    } catch {
-      // Torn trailing line kept in `carry` until next write completes it.
+    } else {
+      carryBuf = Buffer.alloc(0);
     }
-  } else {
-    carry = '';
   }
 
   return {
     exists: true,
     changed: true,
-    meta: { ino: s.ino, size: s.size, mtime: s.mtime, carry },
+    meta: { ino: s.ino, size: s.size, mtime: s.mtime, carryBuf },
   };
 }
 
@@ -890,6 +896,38 @@ function buildTriageItems({ members, messages, sysAttention }) {
 // Stores ONLY compact metadata (never 2k+ message arrays or raw file strings).
 const summaryMetaCache = new Map(); // `${appData}\0${id}` -> { checkedAt, membersKey, boardKey, etag, summary }
 const SNAPSHOT_TRANSCRIPT_TTL_MS = 250;
+
+/**
+ * Compute lightweight snapshot fingerprint (`etag`) + stat keys using ONLY file stats
+ * and incremental transcript checks, WITHOUT reading or parsing `board.jsonl`.
+ */
+export function computeSwarmFingerprint(appData, id) {
+  const dir = swarmDir(appData, id);
+  const membersFile = readSmallCached(join(dir, 'members.json'), smallFileCache, 1024 * 1024);
+  if (membersFile.text == null) return null;
+  const boardStat = statOf(join(dir, 'board.jsonl'));
+  const membersKey = `${membersFile.ino}:${membersFile.mtime}:${membersFile.size}`;
+  const boardKey = `${boardStat.ino}:${boardStat.mtime}:${boardStat.size}`;
+  const roster = parseRoster(membersFile.text) || { title: '', members: {} };
+  const title = roster.title || id;
+  const names = Object.keys(roster.members).filter((n) => roster.members[n] && typeof roster.members[n] === 'object');
+  const transcripts = names.map((n) => [n, summarizeTranscript(appData, roster.members[n].conversation_id)]);
+  const trKeys = transcripts.map(([n, t]) => `${n}:${t.key}`).join(',');
+  const narratorName = pickNarrator(roster);
+  const vf = readView(appData, id, dir, narratorName ? roster.members[narratorName] : null);
+  const { key: planKey } = readPlan(dir);
+  const now = Date.now();
+  const stuckKeys = transcripts
+    .map(([, t]) => {
+      const f = stepFailure(t.summary, now);
+      const mt = t.summary?.mtime || 0;
+      return `${f ? f.kind : ''}${mt && now - mt > STUCK_MS ? 's' : ''}`;
+    })
+    .join(',');
+  const etag = `${membersKey}|${boardKey}|${title}|${trKeys}|${vf.etag}|${planKey}|${stuckKeys}`;
+  const member = roster.members ? Object.entries(roster.members).find(([, m]) => m?.conversation_id === id)?.[0] || null : null;
+  return { membersKey, boardKey, etag, member };
+}
 
 export function getSwarmMetaKeys(appData, id) {
   const dir = swarmDir(appData, id);
