@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState } from "../hooks";
 import { ChevronDown, ChevronUp, ExternalLink, FileCode2, FolderGit2, GitBranch, RefreshCw } from "../icons";
 import { fetchWorktreeDiff, openFileInAuxPane } from "../sidecar";
 import type { WorktreeDiffPayload, WorktreesPayload } from "../types";
@@ -62,20 +62,21 @@ export function WorktreesView({
     setRootInput("");
   };
 
+  const diffLineCls = (l: string) =>
+    l[0] === "+" && !l.startsWith("+++") ? "text-ok" : l[0] === "-" && !l.startsWith("---") ? "text-danger" : l.startsWith("@@") ? "text-info" : "text-ink-2";
+
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-between gap-2">
-        <h2 className="text-[14px] font-semibold text-ink">
-          Git worktrees ({worktrees.length})
-        </h2>
+      <div className="row">
+        <h2 className="text-[14px] font-semibold text-ink">Git worktrees ({worktrees.length})</h2>
         <Button onClick={onRefresh} disabled={loading}>
-          <RefreshCw className={`h-3.5 w-3.5 ${loading ? "motion-safe:animate-spin" : ""}`} />
+          <RefreshCw className={loading ? "motion-safe:animate-spin" : ""} />
           Refresh
         </Button>
       </div>
 
       {workspaceUris.length === 0 && (
-        <form onSubmit={handleAdd} className="flex items-center gap-1.5">
+        <form onSubmit={handleAdd} className="flex items-center gap-1">
           <Input
             aria-label="Workspace repository path"
             placeholder="/path/to/repo"
@@ -89,7 +90,7 @@ export function WorktreesView({
       )}
 
       {allRoots.length === 0 ? (
-        <Card className="p-4 space-y-1.5 bg-board">
+        <Card className="p-4 space-y-1 bg-board">
           <p className="text-[14px] font-medium text-ink">No open workspace folder</p>
           <p className="text-[13px] text-ink-2">
             Open a workspace folder or enter a local repository path above.
@@ -106,8 +107,8 @@ export function WorktreesView({
           {worktrees.map((wt) => (
             <Card key={wt.id} className="p-3 space-y-2">
               <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0 space-y-0.5">
-                  <div className="flex flex-wrap items-center gap-1.5">
+                <div className="min-w-0 space-y-1">
+                  <div className="wrap">
                     <GitBranch className="h-3.5 w-3.5 text-info shrink-0" />
                     <span className="text-[14px] font-semibold text-ink break-all">{wt.branch}</span>
                     {wt.isMain && <Badge tone="neutral">main</Badge>}
@@ -138,7 +139,7 @@ export function WorktreesView({
               </div>
 
               {(wt.lastCommitSubject || wt.lastCommitSha) && (
-                <div className="flex items-center justify-between gap-2 rounded-chip bg-board px-2.5 py-1.5 text-[12px] text-ink-2">
+                <div className="row rounded-chip bg-board px-2 py-1 text-[12px] text-ink-2">
                   <span className="truncate">{wt.lastCommitSubject || "No commits yet"}</span>
                   <span className="shrink-0 mono num text-ink-3 flex items-center gap-2">
                     <span>{wt.lastCommitSha}</span>
@@ -150,48 +151,32 @@ export function WorktreesView({
               {wt.files && wt.files.length > 0 && (
                 <ul
                   aria-label={`Changed files in ${wt.branch}`}
-                  className="divide-y divide-hairline rounded-chip border border-hairline bg-board px-2.5 py-1"
+                  className="divide-y divide-hairline rounded-chip border border-hairline bg-board px-2 py-1"
                 >
                   {wt.files.map((f) => {
                     const key = `${wt.path}::${f.path}`;
                     const diffOpen = openDiffKey === key;
                     const diffEntry = diffByKey[key];
                     const diffBusy = diffLoadingKey === key;
-                    return (
-                      <li key={f.path} className="py-1.5 first:pt-1 last:pb-1 space-y-1.5">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div className="flex items-center gap-1.5 min-w-0 flex-1">
-                            <Badge tone={FILE_TONE[f.state] || "neutral"} className="mono px-1.5 py-0 text-[12px]">
-                              {f.state}
-                            </Badge>
-                            <span className="text-[12px] text-ink mono truncate" title={f.path}>
-                              {f.path}
-                            </span>
+                    const diffLineCls = (l: string) =>
+    l[0] === "+" && !l.startsWith("+++") ? "text-ok" : l[0] === "-" && !l.startsWith("---") ? "text-danger" : l.startsWith("@@") ? "text-info" : "text-ink-2";
+
+  return (
+                      <li key={f.path} className="py-1 space-y-1">
+                        <div className="row flex-wrap">
+                          <div className="flex items-center gap-1 min-w-0 flex-1">
+                            <Badge tone={FILE_TONE[f.state] || "neutral"} className="mono px-1 py-0">{f.state}</Badge>
+                            <span className="text-[12px] text-ink mono truncate" title={f.path}>{f.path}</span>
                           </div>
                           <div className="flex items-center gap-1 shrink-0">
-                            <Button
-                              variant="ghost"
-                              aria-label={`Diff peek ${f.path}`}
-                              aria-expanded={diffOpen}
-                              onClick={() => handleToggleDiff(wt.root, wt.path, f.path)}
-                              className="h-7 px-2"
-                            >
-                              {diffOpen ? (
-                                <ChevronUp className="h-3.5 w-3.5" />
-                              ) : (
-                                <ChevronDown className="h-3.5 w-3.5" />
-                              )}
-                              <span>Diff</span>
+                            <Button variant="ghost" aria-label={`Diff peek ${f.path}`} aria-expanded={diffOpen} onClick={() => handleToggleDiff(wt.root, wt.path, f.path)} className="h-7 px-2">
+                              {diffOpen ? <ChevronUp /> : <ChevronDown />}
+                              Diff
                             </Button>
                             {f.uri && (
-                              <Button
-                                variant="ghost"
-                                aria-label={`Open file ${f.path}`}
-                                onClick={() => openOrCopyPath(f.uri, f.path)}
-                                className="h-7 px-2"
-                              >
-                                <FileCode2 className="h-3.5 w-3.5" />
-                                <span>Open</span>
+                              <Button variant="ghost" aria-label={`Open file ${f.path}`} onClick={() => openOrCopyPath(f.uri, f.path)} className="h-7 px-2">
+                                <FileCode2 />
+                                Open
                               </Button>
                             )}
                           </div>
@@ -202,29 +187,13 @@ export function WorktreesView({
                               <p className="text-[12px] text-ink-2">Loading...</p>
                             ) : diffEntry ? (
                               <>
-                                <div className="flex flex-wrap items-center justify-between gap-1 text-[12px] text-ink-2">
-                                  <span className="mono num">
-                                    +{diffEntry.added} / -{diffEntry.removed}
-                                    {diffEntry.untracked ? " (untracked)" : ""}
-                                  </span>
+                                <div className="row flex-wrap gap-1 text-[12px] text-ink-2">
+                                  <span className="mono num">+{diffEntry.added} / -{diffEntry.removed}{diffEntry.untracked ? " (untracked)" : ""}</span>
                                   {diffEntry.truncated && <Badge tone="warning">8 KB cap</Badge>}
                                 </div>
-                                <pre className="max-h-48 overflow-auto text-[12px] leading-[1.45] mono">
+                                <pre className="max-h-48 overflow-auto text-[12px] leading-snug mono">
                                   {(diffEntry.diff || "(empty diff)").split("\n").map((line, i) => (
-                                    <div
-                                      key={i}
-                                      className={
-                                        line[0] === "+" && !line.startsWith("+++")
-                                          ? "text-ok"
-                                          : line[0] === "-" && !line.startsWith("---")
-                                            ? "text-danger"
-                                            : line.startsWith("@@")
-                                              ? "text-info"
-                                              : "text-ink-2"
-                                      }
-                                    >
-                                      {line || " "}
-                                    </div>
+                                    <div key={i} className={diffLineCls(line)}>{line || " "}</div>
                                   ))}
                                 </pre>
                               </>

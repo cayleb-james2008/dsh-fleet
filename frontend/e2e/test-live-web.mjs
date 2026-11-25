@@ -88,10 +88,18 @@ await check("Board #seq pill, Pin #seq, & agent filter work", async () => {
   return pinnedOk && txt.includes("Adapting Needs-You triage cards");
 });
 
-await check("Roster shows live token totals and shimmering activity", async () => {
+await check("Roster shows live token totals, shimmering activity, and confirmed Broadcast", async () => {
   await page.locator("#tab-roster").click();
   const txt = await page.locator("#panel-roster").textContent();
-  return txt.includes("Polishing 380px sidebar responsive grid") && txt.includes("46.5k tok");
+  if (!txt.includes("Polishing 380px sidebar responsive grid") || !txt.includes("46.5k tok")) return false;
+  await page.locator('[data-testid="toggle-broadcast"]').click();
+  const box = page.locator('[data-testid="broadcast-composer"]');
+  await box.locator("textarea").fill("@all Wave sync check");
+  await box.locator('[data-testid="composer-submit"]').click();
+  await page.waitForTimeout(150);
+  await page.locator("#tab-board").click();
+  const boardTxt = await page.locator("#panel-board").textContent();
+  return boardTxt.includes("Wave sync check");
 });
 
 await check("Graph renders nodes/edges and toggles", async () => {

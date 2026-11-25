@@ -1,41 +1,84 @@
 import {
   useEffect,
-  useId,
   useRef,
   useState,
-  type ButtonHTMLAttributes,
-  type HTMLAttributes,
-  type InputHTMLAttributes,
-  type ReactNode,
-  type Ref,
-  type TextareaHTMLAttributes,
+} from "./hooks";
+import type {
+  ButtonHTMLAttributes,
+  HTMLAttributes,
+  InputHTMLAttributes,
+  ReactNode,
+  Ref,
+  TextareaHTMLAttributes,
 } from "react";
 import { ArrowUpRight, ClipboardCopy, FileCode2, Image as ImageIcon, Pin, PinOff, Send, X } from "./icons";
-import { animatePanelEnter } from "./motion";
 import { openFileInAuxPane, parseScreenshotLines, sendConfirmedNudge } from "./sidecar";
 import type { BoardMessage, SwarmMember, SwarmSnapshot, TriageItem, WorktreesPayload } from "./types";
 
-export async function copyText(text: string, okMsg = "Copied"): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(text);
-    toast.success(okMsg);
-  } catch {
-    toast.error("Copy failed");
-  }
+export const canLiveNudge = (snap: SwarmSnapshot): boolean =>
+  Boolean(snap.capabilities?.canSendMessage || window.sidecar?.agent?.sendMessage);
+
+export function Pill({
+  active = false,
+  className,
+  ...props
+}: ButtonHTMLAttributes<HTMLButtonElement> & { active?: boolean }) {
+  return (
+    <button
+      type="button"
+      className={cn(
+        "pill transition",
+        active ? "bg-[var(--ink-button)] text-[var(--ink-button-fg)]" : "bg-track text-ink-2 hover:text-ink",
+        className,
+      )}
+      {...props}
+    />
+  );
 }
 
+export function useNowMs(): number {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, []);
+  return nowMs;
+}
+
+export const memberLastTs = (m?: SwarmMember, fallback = 0): number =>
+  m?.lastStepAt ? Date.parse(m.lastStepAt) : m?.transcriptMtime || m?.lastPostTs || fallback;
+
+export function memberMeta(m?: SwarmMember, nowMs = Date.now()): { elapsed: string; isStalled: boolean } {
+  const ts = memberLastTs(m);
+  const elapsedMs = ts > 0 ? Math.max(0, nowMs - ts) : 0;
+  return {
+    elapsed: ts > 0 ? fmtElapsed(ts, nowMs) : "",
+    isStalled: Boolean(m && !m.killed && m.status === "working" && !m.failure && elapsedMs >= 600_000),
+  };
+}
+
+export const copyText = (text: string, okMsg = "Copied"): Promise<void> =>
+  navigator.clipboard.writeText(text).then(() => toast.success(okMsg), () => toast.error("Copy failed"));
+
+export const hasControlChars = (s: string): boolean => /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(s);
+
 export async function submitNudge(
-  convId: string,
+  target: string | string[],
   text: string,
   okMsg: string,
   setSending: (b: boolean) => void,
   onDone: () => void,
 ): Promise<void> {
+  if (hasControlChars(text)) {
+    toast.error("Control characters not permitted");
+    return;
+  }
   const msg = text.trim();
-  if (!msg || !convId) return;
+  const hasTarget = Array.isArray(target) ? target.length > 0 : Boolean(target);
+  if (!msg || msg.length > 4000 || !hasTarget) return;
   setSending(true);
   try {
-    await sendConfirmedNudge(convId, msg);
+    await sendConfirmedNudge(target, msg);
     toast.success(okMsg);
     onDone();
   } catch (err) {
@@ -43,6 +86,56 @@ export async function submitNudge(
   } finally {
     setSending(false);
   }
+}
+
+export function formatFilteredBoardExport(
+  snap: SwarmSnapshot,
+  messages: BoardMessage[],
+  filter: { quickFilter: string; agentFilter: string; query: string },
+  format: "md" | "json",
+): string {
+  const title = maskHome(snap.title || "Fleet");
+  if (format === "json") {
+    return JSON.stringify(
+      {
+        swarm: snap.id,
+        title,
+        head: snap.head || 0,
+        filter,
+        count: messages.length,
+        messages: messages.map((m) => ({
+          seq: m.seq,
+          agent: m.agent,
+          time: m.time || "",
+          mentions: m.mentions || [],
+          text: maskHome(m.text),
+        })),
+      },
+      null,
+      2,
+    );
+  }
+  const q = filter.query.trim();
+  const tags = [filter.quickFilter, filter.agentFilter !== "all" && `@${filter.agentFilter}`, q && `"${q}"`].filter(Boolean).join(", ");
+  return [
+    `# ${title} — Board (${tags})`,
+    `- Swarm: ${snap.id} | Showing: ${messages.length} | Head: #${snap.head || 0}`,
+    "",
+    ...messages.map((m) => `- **#${m.seq}**${m.time ? ` \`${m.time}\`` : ""} **@${m.agent}**: ${cleanDigestLine(m.text, 400)}`),
+  ].join("\n");
+}
+
+export function downloadTextFile(filename: string, content: string, mime: string, okMsg: string): void {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast.success(okMsg);
 }
 
 export function openOrCopyPath(target: string, fallbackCopy = target): void {
@@ -96,17 +189,16 @@ export const maskHome = (s: string): string => s.replace(/\/home\/[^/\s]+\//g, "
 const cleanDigestLine = (s: string, max = 140) => maskHome(s).replace(/\s+/g, " ").trim().slice(0, max);
 
 export function formatBlockerContext(item: TriageItem, member?: SwarmMember, snap?: SwarmSnapshot): string {
-  const ts = member?.lastStepAt ? Date.parse(member.lastStepAt) : member?.transcriptMtime || member?.lastPostTs || item.timestamp || 0;
+  const ts = memberLastTs(member, item.timestamp || 0);
   const state = member ? `${member.status}${ts > 0 ? `, ${fmtElapsed(ts)}` : ""}` : item.kind;
-  const lines = [
+  const tools = (member?.recentTools || []).slice(0, 3);
+  return [
     `### Blocker: ${maskHome(item.title)}`,
     `- ${snap?.title || "Fleet"} | @${item.member} (${state})${item.seq > 0 ? ` | #${item.seq}` : ""}`,
     item.detail && `- Detail: ${cleanDigestLine(item.detail, 240)}`,
     member?.thinkingHeading && `- Thinking: ${maskHome(member.thinkingHeading)}`,
-  ].filter(Boolean) as string[];
-  const tools = (member?.recentTools || []).slice(0, 3);
-  if (tools.length) lines.push("- Tools:", ...tools.map((t) => `  - ${t.name}: ${cleanDigestLine(t.summary, 140)}`));
-  return lines.join("\n");
+    ...(tools.length ? ["- Tools:", ...tools.map((t) => `  - ${t.name}: ${cleanDigestLine(t.summary, 140)}`)] : []),
+  ].filter(Boolean).join("\n");
 }
 
 export function formatSwarmDigest(
@@ -116,20 +208,19 @@ export function formatSwarmDigest(
 ): string {
   const members = snap.members || [];
   const live = members.filter((m) => !m.killed);
-  const working = live.filter((m) => m.status === "working").length;
-  const waiting = live.filter((m) => m.status === "waiting").length;
+  const cnt = (st: string) => live.filter((m) => m.status === st).length;
   const lines = [
     `# ${snap.title || "Fleet"}`,
-    `- ${working} working, ${waiting} waiting, ${members.length} members, #${snap.head || 0}, ${fmtTokens(snap.usage?.totalTokens)} tok`,
+    `- ${cnt("working")} working, ${cnt("waiting")} waiting, ${members.length} members, #${snap.head || 0}, ${fmtTokens(snap.usage?.totalTokens)} tok`,
     snap.plan?.goal && `- Goal: ${snap.plan.goal}`,
     snap.plan?.gate && `- Gate: \`${snap.plan.gate}\``,
   ].filter(Boolean) as string[];
-  const sec = (title: string, rows: string[]) => { if (rows.length) lines.push("", `## ${title}`, ...rows); };
+  const sec = (title: string, rows: string[]) => rows.length && lines.push("", `## ${title}`, ...rows);
   const pinSet = new Set(pinnedSeqs);
   sec("Pinned", (snap.messages || []).filter((m) => !m.control && pinSet.has(m.seq)).map((pm) => `- #${pm.seq} @${pm.agent}: ${cleanDigestLine(pm.text)}`));
   sec("Workers", live.map((m) => {
-    const ts = m.lastStepAt ? Date.parse(m.lastStepAt) : m.transcriptMtime || m.lastPostTs || 0;
-    return `- @${m.name}: ${m.status}${ts > 0 ? ` ${fmtElapsed(ts)}` : ""} (${m.steps} steps, ${fmtTokens(m.usage.totalTokens)} tok)`;
+    const ts = memberLastTs(m);
+    return `- @${m.name}: ${m.status}${ts ? ` ${fmtElapsed(ts)}` : ""} (${m.steps} steps, ${fmtTokens(m.usage.totalTokens)} tok)`;
   }));
   sec("Workstreams", (snap.plan?.workstreams || []).map((ws) => `- [${humanizeStatus(ws.status)}] ${ws.title}${ws.owner ? ` (@${ws.owner})` : ""}`));
   sec("Needs you", (snap.triage || []).map((it) => `- **${it.title}**: ${maskHome(it.detail)}`));
@@ -180,12 +271,12 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 const BUTTON_VARIANTS: Record<ButtonVariant, string> = {
   primary: "bg-[var(--ink-button)] text-[var(--ink-button-fg)] border-[var(--ink-button)] shadow-[var(--elev-primary)] hover:opacity-90",
   secondary: "bg-track text-ink border-hairline-s hover:bg-board active:bg-hairline",
-  outline: "bg-surface text-ink border-[var(--input)] hover:bg-board active:bg-track",
-  ghost: "bg-transparent text-ink-2 border-transparent hover:bg-track hover:text-ink active:bg-hairline",
+  outline: "bg-surface text-ink border-[var(--edge)] hover:bg-board active:bg-track",
+  ghost: "bg-transparent text-ink-2 hover:bg-track hover:text-ink active:bg-hairline",
 };
 
 const BUTTON_SIZES: Record<ButtonSize, string> = {
-  sm: "h-8 min-w-8 px-2.5 text-[12px]",
+  sm: "h-8 min-w-8 px-2 text-[12px]",
   icon: "h-8 w-8 min-w-8 min-h-8 p-0",
 };
 
@@ -200,13 +291,7 @@ export function Button({
   return (
     <button
       type={type}
-      className={cn(
-        "inline-flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer select-none transition border rounded-chip font-medium motion-safe:active:scale-[0.97]",
-        "disabled:bg-track disabled:text-[var(--disabled)] disabled:border-hairline disabled:shadow-none disabled:cursor-not-allowed disabled:active:scale-100",
-        BUTTON_VARIANTS[variant],
-        BUTTON_SIZES[size],
-        className,
-      )}
+      className={cn("btn", BUTTON_VARIANTS[variant], BUTTON_SIZES[size], className)}
       {...props}
     >
       {children}
@@ -218,11 +303,11 @@ export type BadgeTone = "neutral" | "info" | "success" | "warning" | "danger" | 
 
 const BADGE_TONES: Record<BadgeTone, string> = {
   neutral: "bg-track text-ink-2 border-hairline",
-  info: "bg-blue-soft text-info border-transparent",
-  success: "bg-ok-soft text-ok border-transparent",
-  warning: "bg-warn-soft text-warn border-transparent",
-  danger: "bg-bad-soft text-danger border-transparent",
-  violet: "bg-violet-soft text-violet border-transparent",
+  info: "bg-blue-soft text-info",
+  success: "bg-ok-soft text-ok",
+  warning: "bg-warn-soft text-warn",
+  danger: "bg-bad-soft text-danger",
+  violet: "bg-violet-soft text-violet",
 };
 
 export function Badge({
@@ -236,14 +321,7 @@ export function Badge({
   children: ReactNode;
 } & HTMLAttributes<HTMLSpanElement>) {
   return (
-    <span
-      className={cn(
-        "inline-flex items-center gap-1.5 rounded-chip border px-2 py-0.5 text-[12px] font-medium leading-5 whitespace-nowrap",
-        BADGE_TONES[tone],
-        className,
-      )}
-      {...props}
-    >
+    <span className={cn("bdg", BADGE_TONES[tone], className)} {...props}>
       {children}
     </span>
   );
@@ -256,33 +334,16 @@ export function StatusDot({
   state: "working" | "waiting" | "killed" | "danger" | "ok" | "warn";
   className?: string;
 }) {
-  if (state === "waiting") {
-    return (
-      <span
-        aria-hidden="true"
-        className={cn("inline-block h-2 w-2 rounded-full border-[1.5px] border-ink-3 shrink-0", className)}
-      />
-    );
-  }
-  const color =
-    state === "working" || state === "ok"
+  const cls = state === "waiting"
+    ? "border-[1.5px] border-ink-3"
+    : state === "working" || state === "ok"
       ? "bg-[var(--dot-green)]"
       : state === "danger"
         ? "bg-[var(--dot-red)]"
         : state === "warn"
           ? "bg-[var(--dot-amber)]"
           : "bg-[var(--edge)]";
-  return (
-    <span
-      aria-hidden="true"
-      className={cn(
-        "inline-block h-2 w-2 rounded-full shrink-0",
-        color,
-        state === "working" && "motion-safe:animate-pulse",
-        className,
-      )}
-    />
-  );
+  return <span aria-hidden="true" className={cn("inline-block h-2 w-2 rounded-full shrink-0", cls, state === "working" && "motion-safe:animate-pulse", className)} />;
 }
 
 export function Card({
@@ -291,37 +352,18 @@ export function Card({
   ...props
 }: HTMLAttributes<HTMLDivElement> & { ref?: Ref<HTMLDivElement> }) {
   return (
-    <div
-      className={cn("rounded-card border border-hairline bg-surface", className)}
-      {...props}
-    >
+    <div className={cn("crd", className)} {...props}>
       {children}
     </div>
   );
 }
 
 export function Input({ className, ...props }: InputHTMLAttributes<HTMLInputElement>) {
-  return (
-    <input
-      className={cn(
-        "h-8 w-full min-w-0 rounded-chip border border-hairline-s bg-surface px-2.5 text-[14px] text-ink placeholder:text-ink-3",
-        className,
-      )}
-      {...props}
-    />
-  );
+  return <input className={cn("inp h-8 rounded-chip px-2", className)} {...props} />;
 }
 
 export function Textarea({ className, ...props }: TextareaHTMLAttributes<HTMLTextAreaElement>) {
-  return (
-    <textarea
-      className={cn(
-        "w-full min-w-0 rounded-card border border-hairline-s bg-surface px-3 py-2 text-[14px] text-ink placeholder:text-ink-3",
-        className,
-      )}
-      {...props}
-    />
-  );
+  return <textarea className={cn("inp rounded-card px-3 py-2", className)} {...props} />;
 }
 
 export function SegmentControl<T extends string>({
@@ -339,7 +381,7 @@ export function SegmentControl<T extends string>({
     <div
       role="radiogroup"
       aria-label={label}
-      className="inline-flex rounded-chip border border-hairline bg-track p-0.5"
+      className="inline-flex rounded-chip border border-hairline bg-track p-1"
     >
       {options.map((opt) => {
         const active = opt.value === value;
@@ -351,13 +393,11 @@ export function SegmentControl<T extends string>({
             aria-checked={active}
             onClick={() => onChange(opt.value)}
             className={cn(
-              "relative h-7 px-2.5 text-[12px] font-medium rounded-chip cursor-pointer transition",
-              active
-                ? "bg-[var(--raised)] text-ink shadow-[var(--elev-raised)]"
-                : "text-ink-2 hover:text-ink",
+              "relative h-7 px-2 text-[12px] font-medium rounded-chip cursor-pointer transition",
+              active ? "bg-[var(--raised)] text-ink shadow-[var(--elev-raised)]" : "text-ink-2 hover:text-ink",
             )}
           >
-            <span>{opt.label}</span>
+            {opt.label}
           </button>
         );
       })}
@@ -376,12 +416,18 @@ export function Modal({
   title: string;
   children: ReactNode;
 }) {
-  const titleId = useId();
   const panelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!open) return;
-    animatePanelEnter(panelRef.current);
+    const el = panelRef.current;
+    if (el && typeof el.animate === "function" && !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      el.animate([{ opacity: 0, transform: "translateY(6px) scale(0.98)" }, { opacity: 1, transform: "none" }], {
+        duration: 220,
+        easing: "cubic-bezier(0.23,1,0.32,1)",
+        fill: "both",
+      });
+    }
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
@@ -393,7 +439,7 @@ export function Modal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-3"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--scrim)] p-3"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
@@ -402,11 +448,11 @@ export function Modal({
         ref={panelRef}
         role="dialog"
         aria-modal="true"
-        aria-labelledby={titleId}
+        aria-labelledby="fleet-modal-title"
         className="w-full max-w-[440px] max-h-[85vh] overflow-y-auto rounded-card border border-hairline bg-surface p-4 shadow-[var(--elev-lift)]"
       >
-        <div className="flex items-center justify-between gap-2 pb-3 border-b border-hairline">
-          <h2 id={titleId} className="text-[15px] font-semibold text-ink">
+        <div className="row pb-3 border-b border-hairline">
+          <h2 id="fleet-modal-title" className="text-[14px] font-semibold text-ink">
             {title}
           </h2>
           <Button variant="ghost" size="icon" aria-label="Close dialog" onClick={onClose}>
@@ -435,14 +481,14 @@ export function FleetToaster({ theme }: { theme: "light" | "dark" }) {
     <div
       data-theme={theme}
       aria-live="polite"
-      className="pointer-events-none fixed bottom-3 right-3 z-50 flex max-w-[340px] flex-col gap-1.5"
+      className="pointer-events-none fixed bottom-3 right-3 z-50 flex max-w-[340px] flex-col gap-1"
     >
       {items.map((item) => (
         <div
           key={item.id}
           role="status"
           className={cn(
-            "pointer-events-auto flex items-center justify-between gap-2 rounded-card border px-3 py-2 text-[13px] shadow-[var(--elev-lift)]",
+            "pointer-events-auto row rounded-card border px-3 py-2 text-[13px] shadow-[var(--elev-lift)]",
             item.kind === "error"
               ? "border-danger bg-bad-soft text-danger"
               : item.kind === "success"
@@ -455,9 +501,9 @@ export function FleetToaster({ theme }: { theme: "light" | "dark" }) {
             type="button"
             aria-label="Dismiss notification"
             onClick={() => setToasts(toastQueue.filter((t) => t.id !== item.id))}
-            className="shrink-0 rounded p-0.5 text-ink-3 hover:text-ink cursor-pointer"
+            className="shrink-0 rounded p-1 text-ink-3 hover:text-ink cursor-pointer"
           >
-            <X className="h-3.5 w-3.5" />
+            <X />
           </button>
         </div>
       ))}
@@ -495,26 +541,18 @@ export function InlineComposer({
 }) {
   return (
     <div className={cn("pt-2 border-t border-hairline space-y-2", className)}>
-      <div className="flex flex-wrap items-center justify-between gap-1.5">
-        <label htmlFor={id} className="text-[12px] font-medium text-ink-2">
-          {label}
-        </label>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <label htmlFor={id} className="text-[12px] font-medium text-ink-2">{label}</label>
         {headerRight}
       </div>
       <Textarea id={id} rows={2} maxLength={4000} value={value} onChange={(e) => onChange(e.target.value)} />
-      <div className="flex items-center justify-between gap-2">
-        {showCounter ? (
-          <span className="text-[12px] text-ink-3 num">{value.length}/4000</span>
-        ) : (
-          <span />
-        )}
+      <div className="row">
+        <span className="text-[12px] text-ink-3 num">{showCounter ? `${value.length}/4000` : ""}</span>
         <div className="flex items-center gap-2">
-          <Button variant="ghost" onClick={onCancel}>
-            Cancel
-          </Button>
-          <Button variant="primary" disabled={disabled || !value.trim()} onClick={onSubmit}>
-            {copyOnly ? <ClipboardCopy className="h-3.5 w-3.5" /> : <Send className="h-3.5 w-3.5" />}
-            <span>{submitLabel}</span>
+          <Button variant="ghost" onClick={onCancel}>Cancel</Button>
+          <Button variant="primary" data-testid="composer-submit" disabled={disabled || !value.trim()} onClick={onSubmit}>
+            {copyOnly ? <ClipboardCopy /> : <Send />}
+            {submitLabel}
           </Button>
         </div>
       </div>
@@ -534,35 +572,28 @@ export function MediaPathChips({
   onOpen: (target: string, fallbackCopy?: string) => void;
   compact?: boolean;
 }) {
-  if (shots.length === 0 && paths.length === 0) return null;
+  if (!shots.length && !paths.length) return null;
   const items = [
     ...shots.map((s) => ({ key: s.path, label: s.caption || s.fileName, fallback: s.caption || s.fileName, shot: true })),
     ...paths.map((fp) => ({ key: fp, label: fp.split("/").pop() || fp, fallback: fp, shot: false })),
   ];
   return (
-    <div className={cn("flex flex-wrap items-center gap-1.5", compact && "pt-1.5")}>
+    <div className={cn("wrap", compact && "pt-1")}>
       {items.map((it) => {
-        const icon = it.shot
-          ? <ImageIcon className={cn(compact ? "h-3 w-3" : "h-3.5 w-3.5 text-info", "shrink-0")} />
-          : <FileCode2 className={cn(compact ? "h-3 w-3" : "h-3.5 w-3.5", "shrink-0")} />;
-        const labelEl = <span className={cn("truncate", !it.shot && "mono")}>{it.label}</span>;
+        const Icon = it.shot ? ImageIcon : FileCode2;
+        const inner = (
+          <>
+            <Icon className={cn(compact ? "h-3 w-3" : it.shot ? "text-info" : "", "shrink-0")} />
+            <span className={cn("truncate", !it.shot && "mono")}>{it.label}</span>
+          </>
+        );
         return compact ? (
-          <button
-            key={it.key}
-            type="button"
-            onClick={() => onOpen(it.key, it.fallback)}
-            className={cn(
-              "inline-flex items-center gap-1 rounded-chip px-2 py-0.5 text-[12px] cursor-pointer max-w-full",
-              it.shot ? "bg-blue-soft text-info hover:opacity-90" : "bg-track text-ink-2 hover:text-ink",
-            )}
-          >
-            {icon}
-            {labelEl}
-          </button>
+          <Pill key={it.key} onClick={() => onOpen(it.key, it.fallback)} className={cn("inline-flex items-center gap-1 max-w-full", it.shot && "bg-blue-soft text-info")}>
+            {inner}
+          </Pill>
         ) : (
           <Button key={it.key} variant="secondary" onClick={() => onOpen(it.key)} className="max-w-full">
-            {icon}
-            {labelEl}
+            {inner}
           </Button>
         );
       })}
@@ -575,27 +606,24 @@ export function ActivityPeek({ member, mode = "roster" }: { member: SwarmMember;
   const tools = member.recentTools || [];
   const roster = mode === "roster";
   return (
-    <div className="rounded-chip bg-board px-2.5 py-2 space-y-1.5 text-[12px]">
+    <div className="rounded-chip bg-board px-2 py-2 space-y-1 text-[12px]">
       {roster ? (
         <p className="font-semibold text-ink">Recent worker activity</p>
       ) : (
         <div className="flex flex-wrap items-center justify-between gap-2 text-ink-2 num">
           <span className="font-medium text-ink">{member.steps} steps</span>
           <span>
-            {fmtTokens(member.usage.totalTokens)} tok (in {fmtTokens(member.usage.inputTokens)} / cache{" "}
-            {fmtTokens(member.usage.cacheReadTokens)} / out {fmtTokens(member.usage.outputTokens)})
+            {fmtTokens(member.usage.totalTokens)} tok ({fmtTokens(member.usage.inputTokens)}/{fmtTokens(member.usage.cacheReadTokens)}/{fmtTokens(member.usage.outputTokens)})
           </span>
         </div>
       )}
       {member.thinkingHeading && (
-        <p className="text-ink-2 truncate">
-          {roster ? "Thought" : "Thinking"}: {member.thinkingHeading}
-        </p>
+        <p className="text-ink-2 truncate">{roster ? "Thought" : "Thinking"}: {member.thinkingHeading}</p>
       )}
       {tools.length > 0 ? (
         <ul className={roster ? "divide-y divide-hairline" : "space-y-1 text-ink-2"} aria-label={`Tool calls for ${member.name}`}>
           {tools.map((tc, i) => (
-            <li key={i} className={cn("flex items-center justify-between gap-2", roster && "py-1 first:pt-0 last:pb-0")}>
+            <li key={i} className={cn("row", roster && "py-1 first:pt-0 last:pb-0")}>
               <span className={cn("truncate", roster && "text-ink")}>{tc.summary}</span>
               <span className="text-ink-3 shrink-0 mono">{tc.name}</span>
             </li>
@@ -625,33 +653,24 @@ export function PinnedList({
       {messages.map((pm) => {
         const preview = parseScreenshotLines(pm.text).cleanText || maskHome(pm.text);
         return (
-          <li key={pm.seq} className="flex items-center justify-between gap-2 py-1.5 first:pt-0.5 last:pb-0.5">
-            {compact ? (
-              <button
-                type="button"
-                onClick={() => onJump(pm.seq)}
-                className="min-w-0 flex-1 text-left text-[12px] text-ink hover:underline cursor-pointer truncate"
-              >
-                <span className="font-semibold num">#{pm.seq}</span> <span className="font-medium">{pm.agent}:</span>{" "}
-                <span className="text-ink-2">{preview}</span>
-              </button>
-            ) : (
-              <div className="min-w-0">
-                <p className="text-[13px] font-medium text-ink truncate">
-                  <span className="num">#{pm.seq}</span> {pm.agent}
-                </p>
-                <p className="text-[12px] text-ink-2 truncate">{preview}</p>
-              </div>
-            )}
+          <li key={pm.seq} className="row py-1">
+            <button
+              type="button"
+              onClick={() => onJump(pm.seq)}
+              className="min-w-0 flex-1 text-left text-[12px] text-ink hover:underline cursor-pointer truncate"
+            >
+              <span className="font-semibold num">#{pm.seq}</span> <span className="font-medium">{pm.agent}:</span>{" "}
+              <span className="text-ink-2">{preview}</span>
+            </button>
             <div className="flex items-center gap-1 shrink-0">
               {!compact && (
                 <Button variant="ghost" className="num" onClick={() => onJump(pm.seq)}>
                   #{pm.seq}
-                  <ArrowUpRight className="h-3.5 w-3.5" />
+                  <ArrowUpRight />
                 </Button>
               )}
               <Button variant="ghost" size="icon" aria-label={`Unpin #${pm.seq}`} onClick={() => onUnpin(pm.seq)}>
-                <PinOff className="h-3.5 w-3.5" />
+                <PinOff />
               </Button>
             </div>
           </li>

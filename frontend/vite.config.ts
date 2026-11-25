@@ -1,6 +1,7 @@
 // Builds single-file React + Tailwind 4 HTML -> ../sidecars/fleet_pane/dist/index.html
 // while copying Geist/Geist Mono .woff2 assets to ../sidecars/fleet_pane/dist/fonts/ so
 // sidecar index.html stays compact (<500 KB raw / <160 KB gzip) with zero external requests.
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
@@ -10,7 +11,7 @@ import tailwindcss from "@tailwindcss/vite";
 
 const root = import.meta.dirname;
 const STAMP =
-  "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v1.9.0 */";
+  "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v1.10.0 */";
 
 function sidecarSingleFile(): Plugin {
   return {
@@ -31,7 +32,10 @@ function sidecarSingleFile(): Plugin {
           .replaceAll("../fonts/", "./fonts/")
           .replace(/\/\*![\s\S]*?\*\//g, "")
           .replace(/@layer properties\{[\s\S]*?\}\}\}/g, "")
-          .replace(/@property --tw-(?!border-)[^}]+\}/g, "")
+          .replace(/@property --tw-[^}]+\}/g, "")
+          .replace(/@layer theme\{:root,:host\{[^}]+\}\}/g, "")
+          .replace(/var\(--animate-spin\)/g, "spin 1s linear infinite")
+          .replace(/var\(--animate-pulse\)/g, "pulse 2s cubic-bezier(.4,0,.6,1) infinite")
           .replace(/-apple-system, BlinkMacSystemFont,[^;)]+/g, "system-ui,sans-serif")
           .replace(/ui-monospace, SFMono-Regular,[^;)]+/g, "monospace")
           .replace(/(-webkit-text-decoration:inherit;)+/g, "")
@@ -39,7 +43,27 @@ function sidecarSingleFile(): Plugin {
           .replace(/--lightningcss-(?:light|dark):[^;]*;/g, "")
           .replace(/--tw-shadow:([^;]+);box-shadow:var\(--tw-inset-shadow\)[^;}]+/g, "box-shadow:$1")
           .replace(/--tw-space-y-reverse:0;margin-block-start:calc\([^;]+\);margin-block-end:calc\(([^;}]+)\s*\*\s*calc\(1 - var\(--tw-space-y-reverse\)\)\)/g, "margin-bottom:$1")
-          .replace(/--tw-divide-y-reverse:0;border-bottom-style:var\(--tw-border-style\);border-bottom-width:calc\(([^;]+)\);border-top-style:var\(--tw-border-style\);border-top-width:calc\([^;]+\)/g, "border-bottom:1px solid")
+          .replace(/--tw-divide-y-reverse:0;border-bottom-style:var\(--tw-border-style\);border-top-style:var\(--tw-border-style\);border-top-width:calc\([^;]+\);border-bottom-width:calc\([^;]+\)/g, "border-bottom:1px solid")
+          .replace(/var\(--tw-border-style\)/g, "solid")
+          .replace(/--tw-outline-style:none;/g, "")
+          .replace(/--tw-scale-x:100%;--tw-scale-y:100%;--tw-scale-z:100%;scale:var\(--tw-scale-x\) var\(--tw-scale-y\)/g, "scale:1")
+          .replace(/\.transform\{[^}]*\}/g, "")
+          .replace(/,video,canvas,audio,iframe,embed,object|,optgroup|,menu/g, "")
+          .replace(/--tw-(?:leading|font-weight|tracking):[^;]+;/g, "")
+          .replace(/\.visible\{[^}]+\}|\.isolate\{[^}]+\}|\.filter\{[^}]+\}/g, "")
+          .replace(/var\(--tw-outline-style\)/g, "solid")
+          .replace(/\[hidden\]:where\([^)]+\)\{[^}]*\}/g, "")
+          .replace(/font-synthesis:none;|text-wrap:(?:balance|pretty);|scrollbar-width:thin;scrollbar-color:[^;}]+;?/g, "")
+          .replace(/@media \(hover:hover\)\{([\s\S]*?)\}\}/g, "$1}")
+          .replace(/border-style:solid;border-width:1px/g, "border:1px solid")
+          .replace(/outline-style:solid;outline-width:1px/g, "outline:1px solid")
+          .replace(/-webkit-text-size-adjust:100%;tab-size:4;|;-webkit-tap-highlight-color:transparent|button,input:where\(\[type=button\],\[type=reset\],\[type=submit\]\)\{appearance:button\}|,h4,h5,h6|ol,/g, "")
+          .replace(/\s+\}/g, "}")
+          .replace(/font-size:inherit;font-weight:inherit/g, "font:inherit")
+          .replace(/border-top-style:solid;border-top-width:1px/g, "border-top:1px solid")
+          .replace(/border-bottom-style:solid;border-bottom-width:1px/g, "border-bottom:1px solid")
+          .replace(/border-left-style:solid;border-left-width:2px/g, "border-left:2px solid")
+          .replace(/cubic-bezier\(\.4,0,\.6,1\)/g, "ease")
           .replace(/calc\(var\(--spacing\)\s*\*\s*([\d.]+)\)/g, (_, n) => `${Number(n) * 0.25}rem`)
           .replace(/var\(--spacing\)/g, ".25rem")
           .replace(/--spacing:\.25rem;/g, "")
@@ -64,14 +88,64 @@ function sidecarSingleFile(): Plugin {
           .replace(/var\(--tracking-display\)/g, "-.02em")
           .replace(/var\(--ease-house\)/g, "cubic-bezier(.23,1,.32,1)")
           .replace(/var\(--dur-press\)/g, ".15s")
+          .replace(/2147483647px/g, "999px")
           .replace(/#ffffff(?![0-9a-f])/gi, "#fff")
           .replace(/#000000(?![0-9a-f])/gi, "#000")
           .replace(/::backdrop\{[^}]*\}|::file-selector-button\{[^}]*\}|abbr:where\(\[title\]\)\{[^}]*\}|:-moz-[^}]+}|::-(?:webkit|moz)-[^{]+\{[^}]*}|small\{[^}]*\}|sub,sup\{[^}]*\}sub\{[^}]*\}sup\{[^}]*\}|progress\{[^}]*\}|summary\{[^}]*\}|hr\{[^}]*\}|table\{[^}]*\}|\[hidden\]:where\([^)]+\)\{[^}]*\}|@layer components;|\/\*\$vite\$:\d+\*\/|:where\(select:is[\s\S]*?20px\}|@supports \(not \(\(-webkit-appearance:[\s\S]*?\}\}\}/g, "")
+          .replace(/\*\s*\{\s*\}/g, "")
           .replace(/\b0(\.\d+)/g, "$1");
-        return `<style>${STAMP}\n${css}</style>`;
+        let minCss = "";
+        for (let i = 0; i < css.length; ) {
+          if (css.startsWith("@layer base{", i) || css.startsWith("@layer utilities{", i)) {
+            i = css.indexOf("{", i) + 1;
+            let depth = 1;
+            const start = i;
+            while (i < css.length && depth > 0) {
+              if (css[i] === "{") depth++;
+              else if (css[i] === "}") depth--;
+              i++;
+            }
+            minCss += css.slice(start, i - 1);
+          } else {
+            minCss += css[i++];
+          }
+        }
+        return `<style>${STAMP}\n${minCss}</style>`;
       });
+      const varRe = /--(?:destructive-foreground|warning-foreground|success-foreground|info-foreground|ink-button-fg|ink-button|elev-primary|elev-raised|elev-lift|violet-soft|warn-soft|blue-soft|bad-soft|ok-soft|disabled|dot-green|dot-amber|dot-red|hairline-s|hairline|surface|track|raised|canvas|board|violet|ink-2|ink-3)(?![a-z0-9-])/g;
+      const varMap: Record<string, string> = {
+        "--destructive-foreground": "--bf",
+        "--warning-foreground": "--wf",
+        "--success-foreground": "--of",
+        "--info-foreground": "--if",
+        "--ink-button-fg": "--ig",
+        "--ink-button": "--ib",
+        "--elev-primary": "--ep",
+        "--elev-raised": "--er",
+        "--elev-lift": "--el",
+        "--violet-soft": "--vs",
+        "--warn-soft": "--ws",
+        "--blue-soft": "--bs",
+        "--bad-soft": "--es",
+        "--ok-soft": "--os",
+        "--disabled": "--ds",
+        "--dot-green": "--dg",
+        "--dot-amber": "--da",
+        "--dot-red": "--dr",
+        "--hairline-s": "--hs",
+        "--hairline": "--hl",
+        "--surface": "--sf",
+        "--track": "--tr",
+        "--raised": "--rs",
+        "--canvas": "--cv",
+        "--board": "--bd",
+        "--violet": "--vl",
+        "--ink-2": "--i2",
+        "--ink-3": "--i3",
+      };
       html = html
         .replace(/--tw-ring-offset-color:#fff/g, "--tw-ring-offset-color:var(--surface)")
+        .replace(varRe, (m) => varMap[m] || m)
         .replace(/\.transition\{[^}]*\}/g, "")
         .replace(/>\s+</g, "><");
 
@@ -86,7 +160,12 @@ function sidecarSingleFile(): Plugin {
 
       const outHtml = path.join(outDir, "index.html");
       fs.writeFileSync(outHtml, html);
-      const gz = zlib.gzipSync(html, { level: 9, memLevel: 9 });
+      let gz: Buffer;
+      try {
+        gz = execFileSync("gzip", ["-9", "-n", "-c", outHtml]);
+      } catch {
+        gz = zlib.gzipSync(html, { level: 9, memLevel: 9 });
+      }
       fs.writeFileSync(`${outHtml}.gz`, gz);
       console.log(`sidecar bundle: ${outHtml} (${(html.length / 1024).toFixed(1)} kB raw, ${(gz.length / 1024).toFixed(1)} kB gz)`);
     },
@@ -95,6 +174,7 @@ function sidecarSingleFile(): Plugin {
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), sidecarSingleFile()],
+  resolve: { alias: { "react/jsx-runtime": path.resolve(root, "src/jsx-rt.js") } },
   base: "./",
   build: {
     target: "es2022",
@@ -103,11 +183,11 @@ export default defineConfig({
     chunkSizeWarningLimit: 2000,
     modulePreload: false,
     rolldownOptions: {
-      treeshake: true,
+      treeshake: { moduleSideEffects: (id) => id.endsWith(".css") },
       output: {
         comments: { legal: false },
         minify: {
-          compress: { dropConsole: true, dropDebugger: true, maxIterations: 4, target: "es2022" },
+          compress: { dropConsole: true, dropDebugger: true, maxIterations: 8, target: "es2022" },
           mangle: { toplevel: true },
         },
         assetFileNames: (assetInfo) =>

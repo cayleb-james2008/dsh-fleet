@@ -10,7 +10,6 @@
   --hairline: #e2e5ec;
   --hairline-s: #cbd2de;
   --edge: #747c8e;
-  --input: #747c8e;
   --track: #eaecef;
   --raised: #ffffff;
   --ink: #111318;
@@ -19,7 +18,6 @@
   --disabled: #50596b;
   --blue: #4f46e5;
   --blue-soft: #eef2ff;
-  --ring: #4f46e5;
   --info-foreground: #4338ca;
   --ink-button: #111318;
   --ink-button-fg: #ffffff;
@@ -29,7 +27,6 @@
   --dot-red: #c62828;
   --destructive-foreground: #b42224;
   --bad-soft: #fdeced;
-  --unread: #c62828;
   --dot-amber: #a85e00;
   --warning-foreground: #8a4b00;
   --warn-soft: #fef5e6;
@@ -38,7 +35,7 @@
   --elev-raised: 0 1px 2px rgba(17, 19, 24, 0.06);
   --elev-lift: 0 10px 28px rgba(17, 19, 24, 0.12);
   --elev-primary: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 1px 2px rgba(17, 19, 24, 0.18);
-  --background: var(--surface);
+  --scrim: rgba(0, 0, 0, 0.45);
 }
 
 :root[data-theme="dark"] {
@@ -49,7 +46,6 @@
   --hairline: #262a34;
   --hairline-s: #343a48;
   --edge: #6d778c;
-  --input: #6d778c;
   --track: #1d2129;
   --raised: #292f3b;
   --ink: #eef1f6;
@@ -58,7 +54,6 @@
   --disabled: #96a0b5;
   --blue: #818cf8;
   --blue-soft: rgba(129, 140, 248, 0.16);
-  --ring: #818cf8;
   --info-foreground: #a5b4fc;
   --ink-button: #f3f4f6;
   --ink-button-fg: #111318;
@@ -68,7 +63,6 @@
   --dot-red: #f87171;
   --destructive-foreground: #f87171;
   --bad-soft: #2f1417;
-  --unread: #f87171;
   --dot-amber: #f2b046;
   --warning-foreground: #f2b046;
   --warn-soft: #2a1f0c;
@@ -77,7 +71,6 @@
   --elev-raised: 0 1px 2px rgba(0, 0, 0, 0.38);
   --elev-lift: 0 14px 32px rgba(0, 0, 0, 0.55);
   --elev-primary: inset 0 1px 0 rgba(255, 255, 255, 0.55), 0 1px 2px rgba(0, 0, 0, 0.35);
-  --background: var(--surface);
 }
 
 :root {
@@ -100,8 +93,7 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-h1, h2, h3, .font-heading {
-  font-family: var(--font-sans);
+h1, h2, h3 {
   font-weight: var(--display-weight);
   letter-spacing: var(--tracking-display);
 }
@@ -121,7 +113,7 @@ input, textarea, [contenteditable] {
 }
 
 :focus-visible {
-  outline: 2px solid var(--ring);
+  outline: 2px solid var(--blue);
   outline-offset: 2px;
 }
 

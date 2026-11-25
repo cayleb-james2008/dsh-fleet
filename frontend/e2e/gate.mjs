@@ -196,6 +196,30 @@ await runChecks("gate", async (check) => {
     );
   });
 
+  await check("filtered board export (.md and .json) exports filtered posts without /home/ leaks", async () => {
+    const readDownload = async (btn) => {
+      const [dl] = await Promise.all([page.waitForEvent("download"), btn.click()]);
+      const chunks = [];
+      for await (const c of await dl.createReadStream()) chunks.push(c);
+      return { name: dl.suggestedFilename(), body: Buffer.concat(chunks).toString("utf8") };
+    };
+    await page.locator('[aria-label="Board quick filters"] button:has-text("[done]")').click();
+    const md = await readDownload(page.locator('[data-testid="export-board-md"]'));
+    const js = await readDownload(page.locator('[data-testid="export-board-json"]'));
+    await page.locator('[aria-label="Board quick filters"] button:has-text("All")').click();
+    const parsed = JSON.parse(js.body);
+    return (
+      md.name.endsWith(".md") &&
+      js.name.endsWith(".json") &&
+      md.body.includes("#4") &&
+      !md.body.includes("/home/") &&
+      !js.body.includes("/home/") &&
+      parsed.filter?.quickFilter === "done" &&
+      parsed.count === parsed.messages.length &&
+      parsed.count >= 1
+    );
+  });
+
   await page.fill('input[aria-label="Search board messages"]', "no-such-query-xyz");
   await check("empty search filter shows Clear filters action", async () => {
     return (await page.locator('#panel-board button:has-text("Clear filters")').count()) === 1;
@@ -235,6 +259,19 @@ await runChecks("gate", async (check) => {
     await page.locator('#panel-roster button:has-text("Show killed")').click();
     const after = await page.locator("#panel-roster").textContent();
     return after.includes("old-helper");
+  });
+
+  await check("roster broadcast composer switches target chips and rejects control characters", async () => {
+    await page.locator('[data-testid="toggle-broadcast"]').click();
+    const box = page.locator('[data-testid="broadcast-composer"]');
+    await box.waitFor();
+    await box.getByRole("button", { name: "working", exact: true }).click();
+    const workingCount = await box.locator('button[aria-pressed="true"]').count();
+    await box.locator("textarea").fill("ping\u0007bad");
+    const errVisible = (await box.textContent()).includes("Control characters are not allowed.");
+    const disabled = await box.locator('[data-testid="composer-submit"]').isDisabled();
+    await page.locator('[data-testid="toggle-broadcast"]').click();
+    return workingCount >= 1 && errVisible && disabled;
   });
 
   await check("zero horizontal overflow on Roster at 380px", async () => {

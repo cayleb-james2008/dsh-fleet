@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "../hooks";
 import { ArrowDown, ClipboardCopy, Filter, Pin, Reply, Search, X } from "../icons";
 import { extractLocalFilePaths, parseScreenshotLines } from "../sidecar";
 import type { BoardMessage, SwarmSnapshot } from "../types";
-import { Badge, Button, Card, InlineComposer, Input, MediaPathChips, PinnedList, cn, copyText, fmtClockTime, openOrCopyPath, submitNudge } from "../ui";
+import { Badge, Button, Card, InlineComposer, Input, MediaPathChips, Pill, PinnedList, canLiveNudge, cn, copyText, downloadTextFile, fmtClockTime, formatFilteredBoardExport, openOrCopyPath, submitNudge } from "../ui";
 
 function PostBody({
   text,
@@ -22,10 +22,11 @@ function PostBody({
   const tokens = visibleText.split(/(@[a-z0-9_-]+|#[0-9]+\b|\[(?:done|verified|blocked)\])/gi);
 
   return (
-    <div className="space-y-1.5">
-      <p className="text-[14px] text-ink whitespace-pre-wrap break-words leading-[1.48]">
+    <div className="space-y-1">
+      <p className="text-[14px] text-ink whitespace-pre-wrap break-words leading-snug">
         {tokens.map((tok, i) => {
-          if (tok[0] === "@" && /^@[a-z0-9_-]+$/i.test(tok)) {
+          if (i % 2 === 0 || !tok) return tok;
+          if (tok[0] === "@") {
             const name = tok.slice(1);
             const isViewer = viewer && name.toLowerCase() === viewer.toLowerCase();
             return (
@@ -33,42 +34,25 @@ function PostBody({
                 key={i}
                 type="button"
                 onClick={() => (name.toLowerCase() !== "all" ? onFilterAgent(name) : undefined)}
-                className={cn(
-                  "inline rounded-chip px-1 font-medium cursor-pointer transition",
-                  isViewer ? "bg-blue-soft text-info" : "bg-track text-ink hover:bg-hairline",
-                )}
+                className={cn("inline rounded-chip px-1 font-medium cursor-pointer", isViewer ? "bg-blue-soft text-info" : "bg-track text-ink hover:bg-hairline")}
               >
                 {tok}
               </button>
             );
           }
-          if (tok[0] === "#" && /^#[0-9]+$/.test(tok)) {
+          if (tok[0] === "#") {
             return (
-              <button
-                key={i}
-                type="button"
-                onClick={() => onClickSeq(Number(tok.slice(1)))}
-                className="inline rounded-chip bg-blue-soft px-1 text-[12px] font-medium text-info num cursor-pointer hover:underline"
-              >
+              <button key={i} type="button" onClick={() => onClickSeq(Number(tok.slice(1)))} className="inline rounded-chip bg-blue-soft px-1 text-[12px] font-medium text-info num cursor-pointer hover:underline">
                 {tok}
               </button>
             );
           }
-          if (tok[0] === "[" && /^\[(?:done|verified|blocked)\]$/i.test(tok)) {
-            const lo = tok.toLowerCase();
-            return (
-              <span
-                key={i}
-                className={cn(
-                  "inline-block rounded-chip px-1.5 text-[12px] font-semibold",
-                  lo === "[verified]" ? "bg-ok-soft text-ok" : lo === "[blocked]" ? "bg-bad-soft text-danger" : "bg-blue-soft text-info",
-                )}
-              >
-                {tok}
-              </span>
-            );
-          }
-          return tok;
+          const lo = tok.toLowerCase();
+          return (
+            <span key={i} className={cn("inline-block rounded-chip px-1 text-[12px] font-semibold", lo === "[verified]" ? "bg-ok-soft text-ok" : lo === "[blocked]" ? "bg-bad-soft text-danger" : "bg-blue-soft text-info")}>
+              {tok}
+            </span>
+          );
         })}
       </p>
       {needsFold && (
@@ -128,15 +112,14 @@ export function BoardView({
   );
   const lastReadSeq = viewerMember?.last_read_seq ?? 0;
 
+  const isNeedsReply = (m: BoardMessage) => m.text.includes("?") || Boolean(snap.member && m.mentions.includes(snap.member));
+
   const quickCounts = useMemo(() => {
-    let all = 0;
-    let needs_reply = 0;
-    let done = 0;
-    let blocked = 0;
+    let all = 0, needs_reply = 0, done = 0, blocked = 0;
     for (const m of messages) {
       if (m.control || unseenSet.has(m.seq)) continue;
       all++;
-      if (m.text.includes("?") || (snap.member && m.mentions.includes(snap.member))) needs_reply++;
+      if (isNeedsReply(m)) needs_reply++;
       if (/\[(done|verified)\]/i.test(m.text)) done++;
       if (/\[blocked\]/i.test(m.text)) blocked++;
     }
@@ -146,17 +129,12 @@ export function BoardView({
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return messages.filter((m) => {
-      if (m.control) return false;
-      if (unseenSet.has(m.seq)) return false;
-      if (quickFilter === "needs_reply" && !m.text.includes("?") && !(snap.member && m.mentions.includes(snap.member))) {
-        return false;
-      }
+      if (m.control || unseenSet.has(m.seq)) return false;
+      if (quickFilter === "needs_reply" && !isNeedsReply(m)) return false;
       if (quickFilter === "done" && !/\[(done|verified)\]/i.test(m.text)) return false;
       if (quickFilter === "blocked" && !/\[blocked\]/i.test(m.text)) return false;
       if (agentFilter !== "all" && m.agent !== agentFilter && !m.mentions.includes(agentFilter)) return false;
-      if (q && !m.text.toLowerCase().includes(q) && !m.agent.toLowerCase().includes(q) && !`#${m.seq}`.includes(q)) {
-        return false;
-      }
+      if (q && !m.text.toLowerCase().includes(q) && !m.agent.toLowerCase().includes(q) && !`#${m.seq}`.includes(q)) return false;
       return true;
     });
   }, [messages, agentFilter, query, unseenSet, quickFilter, snap.member]);
@@ -168,41 +146,32 @@ export function BoardView({
   }, [filtered, viewerMember, lastReadSeq]);
 
   const hiddenCount = Math.max(0, filtered.length - visibleLimit);
-  const visible = useMemo(
-    () => (hiddenCount > 0 ? filtered.slice(hiddenCount) : filtered),
-    [filtered, hiddenCount],
-  );
+  const visible = hiddenCount > 0 ? filtered.slice(hiddenCount) : filtered;
 
   const scrollToSeq = (seq: number) => {
     setFollow(false);
     const idx = filtered.findIndex((m) => m.seq === seq);
     if (idx >= 0 && idx < filtered.length - visibleLimit) {
       setVisibleLimit(filtered.length - idx + 20);
-      requestAnimationFrame(() => {
-        rowRefs.current.get(seq)?.scrollIntoView({ behavior: "smooth", block: "center" });
-      });
+      requestAnimationFrame(() => rowRefs.current.get(seq)?.scrollIntoView({ behavior: "smooth", block: "center" }));
       return;
     }
-    const el = rowRefs.current.get(seq);
-    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+    rowRefs.current.get(seq)?.scrollIntoView({ behavior: "smooth", block: "center" });
   };
 
   useEffect(() => {
-    if (highlightSeq) {
-      scrollToSeq(highlightSeq);
-      const t = setTimeout(onClearHighlight, 2600);
-      return () => clearTimeout(t);
-    }
+    if (!highlightSeq) return;
+    scrollToSeq(highlightSeq);
+    const t = setTimeout(onClearHighlight, 2600);
+    return () => clearTimeout(t);
   }, [highlightSeq, onClearHighlight]);
 
   useEffect(() => {
-    if (follow && !highlightSeq) {
-      bottomRef.current?.scrollIntoView({ block: "end" });
-    }
+    if (follow && !highlightSeq) bottomRef.current?.scrollIntoView({ block: "end" });
   }, [filtered.length, follow, highlightSeq]);
 
-  const canNudge = Boolean(snap.capabilities?.canSendMessage || window.sidecar?.agent?.sendMessage);
-  const memberByName = useMemo(() => new Map(members.map((m) => [m.name, m])), [members]);
+  const canNudge = canLiveNudge(snap);
+  const memberByName = new Map(members.map((m) => [m.name, m]));
 
   const openQuoteReply = (m: BoardMessage) => {
     setReplyTarget((cur) => (cur?.seq === m.seq ? null : m));
@@ -212,46 +181,37 @@ export function BoardView({
   const handleSendQuoteReply = async () => {
     if (!replyTarget || !replyDraft.trim()) return;
     const convId = memberByName.get(replyTarget.agent)?.conversation_id || "";
+    const clear = () => { setReplyTarget(null); setReplyDraft(""); };
     if (!canNudge || !convId) {
       await copyText(replyDraft.trim(), `Copied reply to #${replyTarget.seq}`);
-      setReplyTarget(null);
-      setReplyDraft("");
-      return;
+      return clear();
     }
     await submitNudge(convId, replyDraft, `Sent reply to @${replyTarget.agent} (#${replyTarget.seq})`, setSending, () => {
-      setReplyTarget(null);
-      setReplyDraft("");
+      clear();
       onRefresh?.();
     });
   };
 
   const hasActiveFilter = query.trim().length > 0 || agentFilter !== "all" || quickFilter !== "all";
-  const pinnedSet = useMemo(() => new Set(pinnedSeqs), [pinnedSeqs]);
-  const pinnedMessages = useMemo(
-    () => messages.filter((m) => !m.control && pinnedSet.has(m.seq)),
-    [messages, pinnedSet],
-  );
+  const pinnedSet = new Set(pinnedSeqs);
+  const pinnedMessages = messages.filter((m) => !m.control && pinnedSet.has(m.seq));
 
   return (
     <div className="space-y-3">
       {pinnedMessages.length > 0 && (
-        <Card className="p-2.5 space-y-1.5 bg-board" aria-label="Pinned board posts">
-          <div className="flex items-center justify-between gap-2">
-            <span className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-ink">
-              <Pin className="h-3.5 w-3.5 text-info" />
-              Pinned ({pinnedMessages.length})
-            </span>
+        <Card className="p-2 space-y-1 bg-board" aria-label="Pinned board posts">
+          <div className="flex items-center gap-1 text-[12px] font-semibold text-ink">
+            <Pin className="text-info" />
+            Pinned ({pinnedMessages.length})
           </div>
           <PinnedList messages={pinnedMessages} onJump={scrollToSeq} onUnpin={onTogglePin} compact />
         </Card>
       )}
       {/* Pinned Search & Filter Bar */}
-      <div className="sticky top-0 z-10 -mx-1 px-1 py-1.5 bg-canvas space-y-2">
-        <div className="flex items-center gap-1.5">
+      <div className="sticky top-0 z-10 -mx-1 px-1 py-1 bg-canvas space-y-2">
+        <div className="flex items-center gap-1">
           <div className="relative flex-1 min-w-0">
-            <Search
-              className="pointer-events-none absolute left-2.5 top-2 h-4 w-4 text-ink-3"
-            />
+            <Search className="pointer-events-none absolute left-2 top-2 h-4 w-4 text-ink-3" />
             <Input
               aria-label="Search board messages"
               placeholder="Search #seq, @agent, text..."
@@ -260,13 +220,8 @@ export function BoardView({
               className="pl-8 pr-7"
             />
             {query && (
-              <button
-                type="button"
-                aria-label="Clear board search"
-                onClick={() => setQuery("")}
-                className="absolute right-1.5 top-1.5 p-1 text-ink-3 hover:text-ink cursor-pointer"
-              >
-                <X className="h-3.5 w-3.5" />
+              <button type="button" aria-label="Clear board search" onClick={() => setQuery("")} className="absolute right-1 top-1 p-1 text-ink-3 hover:text-ink cursor-pointer">
+                <X />
               </button>
             )}
           </div>
@@ -281,7 +236,7 @@ export function BoardView({
           >
             <Filter className="h-4 w-4" />
             {hasActiveFilter && (
-              <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-blue" aria-hidden="true" />
+              <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-blue" aria-hidden="true" />
             )}
           </Button>
 
@@ -292,14 +247,14 @@ export function BoardView({
               if (!follow) bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
             }}
           >
-            <ArrowDown className="h-3.5 w-3.5" />
+            <ArrowDown />
             {follow ? "Following" : "Latest"}
           </Button>
         </div>
 
         {/* Quick-filter strip + 1-click Wave Digest */}
-        <div className="flex flex-wrap items-center justify-between gap-1.5">
-          <div className="flex flex-wrap items-center gap-1" role="group" aria-label="Board quick filters">
+        <div className="flex flex-wrap items-center justify-between gap-1">
+          <div className="wrap gap-1" role="group" aria-label="Board quick filters">
             {(
               [
                 ["all", "All", quickCounts.all],
@@ -308,46 +263,62 @@ export function BoardView({
                 ["blocked", "[blocked]", quickCounts.blocked],
               ] as const
             ).map(([id, label, count]) => (
-              <button
+              <Pill
                 key={id}
-                type="button"
+                active={quickFilter === id}
                 aria-pressed={quickFilter === id}
                 onClick={() => onQuickFilterChange?.(id)}
-                className={cn(
-                  "rounded-chip px-2 py-0.5 text-[12px] font-medium cursor-pointer transition num",
-                  quickFilter === id
-                    ? "bg-[var(--ink-button)] text-[var(--ink-button-fg)]"
-                    : "bg-track text-ink-2 hover:text-ink",
-                )}
+                className="num"
               >
                 {label} ({count})
-              </button>
+              </Pill>
             ))}
           </div>
-          {onCopyWaveDigest && (
-            <Button variant="ghost" onClick={onCopyWaveDigest} className="h-7 px-2">
-              <ClipboardCopy className="h-3.5 w-3.5" />
-              Wave digest
-            </Button>
-          )}
+          <div className="flex items-center gap-1">
+            {([
+              ["md", "text/markdown;charset=utf-8", "Markdown", "export-board-md"],
+              ["json", "application/json;charset=utf-8", "JSON", "export-board-json"],
+            ] as const).map(([ext, mime, label, tid]) => (
+              <Button
+                key={ext}
+                variant="ghost"
+                data-testid={tid}
+                aria-label={`Export filtered board ${label}`}
+                onClick={() =>
+                  downloadTextFile(
+                    `fleet-board-${quickFilter}.${ext}`,
+                    formatFilteredBoardExport(snap, filtered, { quickFilter, agentFilter, query }, ext),
+                    mime,
+                    `Exported ${filtered.length} posts (.${ext})`,
+                  )
+                }
+                className="h-7 px-2"
+              >
+                .{ext}
+              </Button>
+            ))}
+            {onCopyWaveDigest && (
+              <Button variant="ghost" onClick={onCopyWaveDigest} className="h-7 px-2">
+                <ClipboardCopy />
+                Wave digest
+              </Button>
+            )}
+          </div>
         </div>
 
         {showFilters && (
-          <Card className="p-2.5 flex flex-wrap items-center gap-1.5">
+          <Card className="p-2 wrap">
             {["all", ...members.map((m) => m.name)].map((name) => {
               const active = agentFilter === name;
               return (
-                <button
+                <Pill
                   key={name}
-                  type="button"
+                  active={active}
                   onClick={() => setAgentFilter(name === "all" || active ? "all" : name)}
-                  className={cn(
-                    "rounded-chip px-2 py-1 text-[12px] font-medium cursor-pointer transition",
-                    active ? "bg-[var(--ink-button)] text-[var(--ink-button-fg)]" : "bg-track text-ink-2 hover:text-ink",
-                  )}
+                  className="py-1"
                 >
                   {name === "all" ? `All (${messages.filter((m) => !m.control).length})` : name}
-                </button>
+                </Pill>
               );
             })}
           </Card>
@@ -396,10 +367,10 @@ export function BoardView({
             return (
               <div key={m.seq}>
                 {m.seq === firstNewSeq && (
-                  <div className="flex items-center gap-2 py-1.5" role="separator">
-                    <span className="h-px flex-1 bg-[var(--unread)] opacity-45" />
+                  <div className="flex items-center gap-2 py-1" role="separator">
+                    <span className="h-px flex-1 bg-[var(--dot-red)] opacity-45" />
                     <span className="text-[12px] font-semibold text-danger">New</span>
-                    <span className="h-px flex-1 bg-[var(--unread)] opacity-45" />
+                    <span className="h-px flex-1 bg-[var(--dot-red)] opacity-45" />
                   </div>
                 )}
 
@@ -418,8 +389,8 @@ export function BoardView({
                   )}
                 >
                   {!grouped && (
-                    <div className="flex items-center justify-between gap-2 pb-1">
-                      <div className="flex items-center gap-1.5 min-w-0">
+                    <div className="row pb-1">
+                      <div className="flex items-center gap-1 min-w-0">
                         <span className="text-[13px] font-semibold text-ink truncate">{m.agent}</span>
                         {m.channel && m.channel !== "main" && <Badge tone="violet">#{m.channel}</Badge>}
                         {m.all && <Badge tone="info">@all</Badge>}
@@ -429,38 +400,26 @@ export function BoardView({
                           type="button"
                           aria-label={`Quote reply to #${m.seq}`}
                           onClick={() => openQuoteReply(m)}
-                          className="rounded-chip px-1 py-0.5 hover:bg-track hover:text-ink cursor-pointer transition"
+                          className="rounded-chip px-1 hover:bg-track hover:text-ink cursor-pointer transition"
                         >
                           #{m.seq}
                         </button>
                         <span>{fmtClockTime(m.ts, m.time)}</span>
-                        <button
-                          type="button"
-                          aria-label={`Reply to #${m.seq}`}
-                          onClick={() => openQuoteReply(m)}
-                          className={cn(
-                            "p-1 rounded-chip cursor-pointer transition",
-                            replyTarget?.seq === m.seq
-                              ? "text-info bg-blue-soft"
-                              : "text-ink-3 hover:text-ink hover:bg-track",
-                          )}
-                        >
-                          <Reply className="h-3 w-3" />
-                        </button>
-                        <button
-                          type="button"
-                          aria-label={pinnedSet.has(m.seq) ? `Unpin #${m.seq}` : `Pin #${m.seq}`}
-                          aria-pressed={pinnedSet.has(m.seq)}
-                          onClick={() => onTogglePin(m.seq)}
-                          className={cn(
-                            "p-1 rounded-chip cursor-pointer transition",
-                            pinnedSet.has(m.seq)
-                              ? "text-info bg-blue-soft"
-                              : "text-ink-3 hover:text-ink hover:bg-track",
-                          )}
-                        >
-                          <Pin className="h-3 w-3" />
-                        </button>
+                        {([
+                          [`Reply to #${m.seq}`, () => openQuoteReply(m), replyTarget?.seq === m.seq, <Reply className="h-3 w-3" />, undefined],
+                          [pinnedSet.has(m.seq) ? `Unpin #${m.seq}` : `Pin #${m.seq}`, () => onTogglePin(m.seq), pinnedSet.has(m.seq), <Pin className="h-3 w-3" />, pinnedSet.has(m.seq)],
+                        ] as const).map(([lbl, fn, on, icon, pressed]) => (
+                          <button
+                            key={lbl}
+                            type="button"
+                            aria-label={lbl}
+                            aria-pressed={pressed}
+                            onClick={fn}
+                            className={cn("p-1 rounded-chip cursor-pointer transition", on ? "text-info bg-blue-soft" : "text-ink-3 hover:text-ink hover:bg-track")}
+                          >
+                            {icon}
+                          </button>
+                        ))}
                       </div>
                     </div>
                   )}

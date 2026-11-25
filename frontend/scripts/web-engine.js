@@ -514,8 +514,39 @@
       });
     };
 
+    if (url.pathname === "/api/nudge" && init && String(init.method || "").toUpperCase() === "POST") {
+      var body = {};
+      try { body = JSON.parse(String(init.body || "{}")); } catch {}
+      var msg = typeof body.message === "string" ? body.message.trim() : "";
+      if (!body.confirm || !msg || msg.length > 4000 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(String(body.message || ""))) {
+        return jsonResp({ error: "Invalid nudge payload" }, 400);
+      }
+      var targets = Array.isArray(body.conversationIds) ? body.conversationIds : body.conversationId ? [body.conversationId] : [];
+      if (!targets.length) return jsonResp({ error: "Target required" }, 400);
+      var sw = state.swarms[COORD_ID];
+      var hitNames = [];
+      for (var ti = 0; ti < targets.length; ti++) {
+        var m = sw.members.find(function (x) { return x.conversation_id === targets[ti]; });
+        if (m) {
+          m.replyAsk = "";
+          m.status = "working";
+          hitNames.push(m.name);
+        }
+      }
+      sw.head += 1;
+      sw.messages.push({
+        seq: sw.head,
+        agent: "coordinator",
+        text: msg,
+        time: new Date().toTimeString().slice(0, 8),
+        ts: Date.now(),
+        mentions: hitNames,
+        all: /@all\b/i.test(msg),
+      });
+      return jsonResp({ ok: true, delivered: targets.length });
+    }
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.9.0", mode: "live-web", canSendMessage: true, sseStream: false });
+      return jsonResp({ ok: true, name: "fleet", version: "1.10.0", mode: "live-web", canSendMessage: true, sseStream: false });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });

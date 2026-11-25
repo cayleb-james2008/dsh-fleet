@@ -23,20 +23,18 @@ declare global {
   }
 }
 
+const sc = () => (typeof window !== "undefined" ? window.sidecar : undefined);
+
 export function isEmbeddedHost(): boolean {
   try {
-    return typeof window !== "undefined" && window.parent !== window && !window.sidecar?.standalone;
+    return typeof window !== "undefined" && window.parent !== window && !sc()?.standalone;
   } catch {
     return false;
   }
 }
 
-function sidecarFetch(url: string, init?: RequestInit): Promise<Response> {
-  if (typeof window !== "undefined" && window.sidecar?.fetch) {
-    return window.sidecar.fetch(url, init);
-  }
-  return fetch(url, init);
-}
+const sidecarFetch = (url: string, init?: RequestInit): Promise<Response> =>
+  sc()?.fetch?.(url, init) ?? fetch(url, init);
 
 async function apiJson<T>(url: string, errLabel: string): Promise<T> {
   const res = await sidecarFetch(url);
@@ -44,65 +42,71 @@ async function apiJson<T>(url: string, errLabel: string): Promise<T> {
   return res.json();
 }
 
+const qs = (path: string, params: Record<string, string | null | undefined>) => {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) if (v) q.set(k, v);
+  const s = q.toString();
+  return `${path}${s ? `?${s}` : ""}`;
+};
+
 export const fetchSwarms = (): Promise<{ swarms: SwarmSummary[]; defaultConversationId: string | null }> =>
   apiJson("/api/swarms", "List swarms failed");
 
-export function fetchSwarmSnapshot(conversationId?: string | null, etag?: string): Promise<SwarmSnapshot> {
-  const q = new URLSearchParams();
-  if (conversationId) q.set("conversationId", conversationId);
-  if (etag) q.set("etag", etag);
-  const qs = q.toString();
-  return apiJson(`/api/swarm${qs ? `?${qs}` : ""}`, "Load swarm failed");
-}
+export const fetchSwarmSnapshot = (conversationId?: string | null, etag?: string): Promise<SwarmSnapshot> =>
+  apiJson(qs("/api/swarm", { conversationId, etag }), "Load swarm failed");
 
-export function fetchWorktrees(roots: string[]): Promise<WorktreesPayload> {
-  const q = new URLSearchParams();
-  if (roots.length) q.set("roots", roots.join(","));
-  return apiJson(`/api/worktrees?${q.toString()}`, "Worktrees failed");
-}
+export const fetchWorktrees = (roots: string[]): Promise<WorktreesPayload> =>
+  apiJson(qs("/api/worktrees", { roots: roots.join(",") }), "Worktrees failed");
 
 export async function fetchWorktreeDiff(root: string, worktree: string, file: string): Promise<WorktreeDiffPayload> {
-  const q = new URLSearchParams({ root, worktree, file });
-  const res = await sidecarFetch(`/api/worktrees/diff?${q.toString()}`);
+  const res = await sidecarFetch(qs("/api/worktrees/diff", { root, worktree, file }));
   const data = (await res.json().catch(() => ({}))) as Partial<WorktreeDiffPayload>;
   if (!res.ok) throw new Error(data.error || `Diff peek failed (${res.status})`);
   return data as WorktreeDiffPayload;
 }
 
-export async function sendConfirmedNudge(conversationId: string, message: string): Promise<void> {
-  if (window.sidecar?.agent?.sendMessage) {
-    await window.sidecar.agent.sendMessage(message, conversationId);
+export async function sendConfirmedNudge(target: string | string[], message: string): Promise<void> {
+  const ids = Array.isArray(target) ? [...new Set(target.filter(Boolean))] : target ? [target] : [];
+  if (!ids.length) throw new Error("No target");
+  const send = sc()?.agent?.sendMessage;
+  if (ids.length === 1 && send) {
+    await send(message, ids[0]);
     return;
   }
+  if (ids.length > 1 && !window.__FLEET_LIVE_WEB__ && send) {
+    await Promise.all(ids.map((id) => send(message, id)));
+    return;
+  }
+  const body = ids.length === 1 ? { confirm: true, conversationId: ids[0], message } : { confirm: true, conversationIds: ids, message };
   const res = await sidecarFetch("/api/nudge", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ confirm: true, conversationId, message }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `Nudge failed (${res.status})`);
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Nudge failed (${res.status})`);
   }
 }
 
 export async function startSwarmPreset(prompt: string, title: string): Promise<boolean> {
-  if (window.sidecar?.agent?.startConversation) {
-    await window.sidecar.agent.startConversation(prompt, title);
-    return true;
-  }
-  return false;
+  const start = sc()?.agent?.startConversation;
+  if (!start) return false;
+  await start(prompt, title);
+  return true;
 }
 
 export function openWorkerConversation(conversationId: string): boolean {
-  if (!conversationId || !window.sidecar?.ui?.toggleConversation) return false;
-  window.sidecar.ui.toggleConversation(conversationId);
+  const fn = sc()?.ui?.toggleConversation;
+  if (!conversationId || !fn) return false;
+  fn(conversationId);
   return true;
 }
 
 export function openFileInAuxPane(uriOrPath: string): boolean {
-  if (!uriOrPath || !window.sidecar?.ui?.toggleAuxPane) return false;
-  const uri = uriOrPath.startsWith("file://") ? uriOrPath : `file://${uriOrPath}`;
-  window.sidecar.ui.toggleAuxPane({ tabType: "fileView", uri });
+  const fn = sc()?.ui?.toggleAuxPane;
+  if (!uriOrPath || !fn) return false;
+  fn({ tabType: "fileView", uri: uriOrPath.startsWith("file://") ? uriOrPath : `file://${uriOrPath}` });
   return true;
 }
 
@@ -145,21 +149,13 @@ export function inferThemeFromCssColor(color: string): ThemeMode | null {
 
 export function applyTheme(theme: ThemeMode, persist = true): void {
   document.documentElement.setAttribute("data-theme", theme);
-  if (persist) {
-    try {
-      localStorage.setItem("fleet-theme", theme);
-    } catch {
-      // ignore storage failure
-    }
-  }
+  if (persist) try { localStorage.setItem("fleet-theme", theme); } catch {}
 }
 
 export function readStoredTheme(): ThemeMode {
   try {
-    const v = localStorage.getItem("fleet-theme");
-    if (v === "dark" || v === "light") return v;
+    return localStorage.getItem("fleet-theme") === "dark" ? "dark" : "light";
   } catch {
-    // ignore
+    return "light";
   }
-  return "light";
 }
