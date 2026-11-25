@@ -1,14 +1,15 @@
 import { useState } from "react";
+import { motion } from "motion/react";
 import {
   BookMarked,
   CheckCircle2,
   CheckSquare,
+  ChevronRight,
   Clock,
   Download,
   FileDiff,
   FolderGit2,
   GitBranch,
-  GitPullRequest,
   Layers,
   Play,
   RefreshCw,
@@ -20,6 +21,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { Badge, Button, Input, StatusDot, Textarea, cn, toast } from "./ui";
+import { glide } from "./motion";
 import {
   diffStat,
   dispatchBatchSessions,
@@ -232,15 +234,20 @@ export function SessionInboxRail({
                 <article
                   key={s.id}
                   aria-label={s.task || "Untitled session"}
+                  onClick={(e) => {
+                    if (!(e.target as HTMLElement).closest("button,input")) onOpen(s.id, "tr");
+                  }}
                   className={cn(
-                    "group relative px-3 py-2 transition",
-                    isSelected ? "bg-[var(--blue-soft)]" : "hover:bg-[var(--surface)]/80",
+                    "group relative px-3 py-2 cursor-pointer transition",
+                    isSelected ? "bg-[var(--surface)]" : "hover:bg-[var(--surface)]/75",
                   )}
                 >
                   {isSelected && (
-                    <span
+                    <motion.span
+                      layoutId="fleet-inbox-active"
+                      transition={glide}
                       aria-hidden="true"
-                      className="absolute inset-y-1 left-0 w-[3px] rounded-r bg-[var(--blue)]"
+                      className="absolute inset-y-1.5 left-0 w-[3px] rounded-r bg-[var(--blue)]"
                     />
                   )}
 
@@ -283,7 +290,7 @@ export function SessionInboxRail({
                       )}
 
                       <div className="pt-0.5 flex flex-wrap items-center gap-2 mono text-[12px]">
-                        <span className="text-[var(--ink-3)]">
+                        <span className={cn("text-[var(--ink-3)]", running && "fleet-live-shimmer text-[var(--info-foreground)]")}>
                           {verified ? (s.status === "merged" ? "merged" : "verified") : statusText(s)}
                         </span>
                         {heal && (
@@ -299,14 +306,21 @@ export function SessionInboxRail({
                         )}
                         <Button
                           type="button"
-                          size="sm"
-                          variant={isSelected ? "primary" : "ghost"}
+                          size="icon"
+                          variant="ghost"
                           data-open={s.id}
                           aria-label={`Open ${s.task}`}
                           onClick={() => onOpen(s.id, "tr")}
                           className="ml-auto font-sans"
                         >
-                          {isSelected ? "Active" : "Open"}
+                          <ChevronRight
+                            className={cn(
+                              "size-3.5 transition",
+                              isSelected ? "text-[var(--blue)]" : "text-[var(--ink-3)] opacity-60 group-hover:opacity-100",
+                            )}
+                            strokeWidth={1.5}
+                            aria-hidden
+                          />
                         </Button>
                       </div>
                     </div>
@@ -521,22 +535,21 @@ export function GoalLaunchpad({
             <BookMarked className="size-4 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
             <span>Playbooks</span>
           </div>
-          <div className="grid gap-2.5 sm:grid-cols-2">
+          <div className="flex flex-wrap gap-2">
             {playbooks.slice(0, 4).map((tpl) => (
-              <button
+              <Button
                 key={tpl.id}
                 type="button"
+                variant="outline"
+                size="md"
                 onClick={() => onApplyPlaybook(tpl)}
-                className="flex flex-col items-start gap-1 rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--board)] p-3 text-left cursor-pointer transition hover:border-[var(--hairline-s)] hover:bg-[var(--surface)] max-md:min-h-11"
+                className="justify-between gap-2 bg-[var(--surface)]"
               >
-                <div className="flex w-full items-center justify-between gap-2">
-                  <span className="text-[14px] font-medium text-[var(--ink)]">{tpl.name}</span>
-                  <Badge tone="neutral" className="mono">
-                    {(tpl.tasks?.length ?? 1) > 1 ? `${tpl.tasks!.length} waves` : "single"}
-                  </Badge>
-                </div>
-                <p className="text-[12px] text-[var(--ink-2)] line-clamp-2">{tpl.description}</p>
-              </button>
+                <span className="text-[13px] font-medium text-[var(--ink)]">{tpl.name}</span>
+                <span className="mono text-[12px] text-[var(--ink-3)]">
+                  {(tpl.tasks?.length ?? 1) > 1 ? `${tpl.tasks!.length} waves` : "single"}
+                </span>
+              </Button>
             ))}
           </div>
         </section>
@@ -552,7 +565,6 @@ export function RightInspectorRail({
   supportsServerV050,
   onRecheckMerge,
   onOpenTab,
-  onOpenPrPreview,
 }: {
   session: Session | null;
   mergeCheck: MergeCheckResult | null;
@@ -560,7 +572,6 @@ export function RightInspectorRail({
   supportsServerV050: boolean;
   onRecheckMerge: () => void;
   onOpenTab: (tab: TabId) => void;
-  onOpenPrPreview: (s: Session) => void;
 }) {
   if (!session) {
     return (
@@ -721,20 +732,7 @@ export function RightInspectorRail({
             </div>
           )}
 
-          <div className="flex flex-col gap-2 pt-1">
-            {session.branch && (
-              <Button
-                type="button"
-                variant="primary"
-                size="sm"
-                data-testid="open-pr-preview"
-                onClick={() => onOpenPrPreview(session)}
-                className="w-full"
-              >
-                <GitPullRequest className="size-3.5" strokeWidth={1.5} aria-hidden />
-                <span>PR preview</span>
-              </Button>
-            )}
+          <div className="pt-1">
             <Button
               type="button"
               variant="outline"

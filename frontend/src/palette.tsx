@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Command } from "cmdk";
 import {
   BookMarked,
   CheckSquare,
@@ -18,7 +19,7 @@ import {
   Terminal,
   X,
 } from "lucide-react";
-import { Badge, Dialog, Input, Kbd, cn } from "./ui";
+import { Badge, Dialog, Kbd, cn } from "./ui";
 import {
   isFailed,
   isVerified,
@@ -96,13 +97,11 @@ export function CommandPalette({
   onRetrySession: (id: string) => void;
 }) {
   const [query, setQuery] = useState("");
-  const [activeIdx, setActiveIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (open) {
       setQuery("");
-      setActiveIdx(0);
       setTimeout(() => inputRef.current?.focus(), 20);
     }
   }, [open]);
@@ -335,27 +334,15 @@ export function CommandPalette({
     viewMode,
   ]);
 
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return allItems;
-    const words = q.split(/\s+/);
-    return allItems.filter((it) => {
-      const hay = `${it.label} ${it.searchText}`.toLowerCase();
-      return words.every((w) => hay.includes(w));
-    });
-  }, [allItems, query]);
-
   const grouped = useMemo(() => {
-    const map = new Map<string, Array<{ item: CmdItem; flatIdx: number }>>();
-    filtered.forEach((item, flatIdx) => {
+    const map = new Map<string, CmdItem[]>();
+    for (const item of allItems) {
       const list = map.get(item.group) ?? [];
-      list.push({ item, flatIdx });
+      list.push(item);
       map.set(item.group, list);
-    });
+    }
     return Array.from(map.entries());
-  }, [filtered]);
-
-  const clampedIdx = filtered.length === 0 ? -1 : Math.min(activeIdx, filtered.length - 1);
+  }, [allItems]);
 
   return (
     <Dialog
@@ -365,73 +352,58 @@ export function CommandPalette({
       description="Jump to sessions, dispatch tasks, filter runs, or control the workspace."
       maxWidth="max-w-xl"
     >
-      <div cmdk-root="" className="space-y-3">
+      <Command label="Command palette" className="space-y-3">
         <div className="relative">
           <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 size-4 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
-          <Input
+          <Command.Input
             ref={inputRef}
-            cmdk-input=""
-            type="search"
             aria-label="Search commands and sessions"
             placeholder="Jump to session, playbook, filter repo, or run action..."
             value={query}
-            onChange={(e) => {
-              setQuery(e.target.value);
-              setActiveIdx(0);
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "ArrowDown") {
-                e.preventDefault();
-                if (filtered.length > 0) setActiveIdx((i) => (i + 1) % filtered.length);
-              } else if (e.key === "ArrowUp") {
-                e.preventDefault();
-                if (filtered.length > 0) setActiveIdx((i) => (i - 1 + filtered.length) % filtered.length);
-              } else if (e.key === "Enter" && clampedIdx >= 0) {
-                e.preventDefault();
-                filtered[clampedIdx]?.onSelect();
-              }
-            }}
-            className="pl-9"
+            onValueChange={setQuery}
+            className={cn(
+              "w-full min-h-9 rounded-[var(--radius)] border border-[var(--input)] bg-[var(--surface)] pl-9 pr-3 py-1.5 text-[14px] text-[var(--ink)]",
+              "placeholder:text-[var(--ink-3)] max-md:min-h-11",
+              "focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--ring)] focus-visible:border-[var(--ring)]",
+            )}
           />
         </div>
 
-        <div className="max-h-[50dvh] overflow-y-auto space-y-3 pr-1">
-          {filtered.length === 0 ? (
-            <p className="py-8 text-center text-[14px] text-[var(--ink-3)]">No matching commands or sessions.</p>
-          ) : (
-            grouped.map(([group, rows]) => (
-              <div key={group} className="space-y-1">
-                <p className="px-2 text-[12px] font-medium text-[var(--ink-3)]">{group}</p>
-                {rows.map(({ item, flatIdx }) => {
-                  const active = flatIdx === clampedIdx;
-                  return (
-                    <button
-                      key={item.id}
-                      type="button"
-                      onMouseEnter={() => setActiveIdx(flatIdx)}
-                      onClick={item.onSelect}
-                      className={cn(
-                        "w-full flex items-center gap-2.5 rounded-[var(--radius)] px-2.5 py-2 text-left text-[14px] cursor-pointer max-md:min-h-11",
-                        active ? "bg-[var(--blue-soft)] text-[var(--ink)]" : "text-[var(--ink)] hover:bg-[var(--track)]",
-                      )}
-                    >
-                      <span className="shrink-0" aria-hidden>{item.icon}</span>
-                      <span className="min-w-0 flex-1 truncate">{item.label}</span>
-                      {item.badge && <Badge tone={item.badge.tone}>{item.badge.text}</Badge>}
-                      {item.shortcut && <Kbd>{item.shortcut}</Kbd>}
-                    </button>
-                  );
-                })}
-              </div>
-            ))
-          )}
-        </div>
+        <Command.List className="max-h-[50dvh] overflow-y-auto space-y-2 pr-1">
+          <Command.Empty className="py-8 text-center text-[14px] text-[var(--ink-3)]">
+            No matching commands or sessions.
+          </Command.Empty>
+          {grouped.map(([group, rows]) => (
+            <Command.Group
+              key={group}
+              heading={group}
+              className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[12px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:text-[var(--ink-3)]"
+            >
+              {rows.map((item) => (
+                <Command.Item
+                  key={item.id}
+                  value={`${item.group} ${item.label} ${item.searchText}`}
+                  onSelect={item.onSelect}
+                  className={cn(
+                    "w-full flex items-center gap-2.5 rounded-[var(--radius)] px-2.5 py-2 text-left text-[14px] text-[var(--ink)] cursor-pointer select-none max-md:min-h-11",
+                    "data-[selected=true]:bg-[var(--blue-soft)] data-[selected=true]:text-[var(--ink)]",
+                  )}
+                >
+                  <span className="shrink-0" aria-hidden>{item.icon}</span>
+                  <span className="min-w-0 flex-1 truncate">{item.label}</span>
+                  {item.badge && <Badge tone={item.badge.tone}>{item.badge.text}</Badge>}
+                  {item.shortcut && <Kbd>{item.shortcut}</Kbd>}
+                </Command.Item>
+              ))}
+            </Command.Group>
+          ))}
+        </Command.List>
 
         <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--hairline)] pt-2.5 mono text-[12px] text-[var(--ink-3)]">
           <span>j/k sessions, t/d/r/g views, n new, / search</span>
           <span>Enter select, Esc close</span>
         </div>
-      </div>
+      </Command>
     </Dialog>
   );
 }

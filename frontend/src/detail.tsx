@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { motion } from "motion/react";
 import {
   CheckCircle2,
   Clock,
@@ -24,6 +25,7 @@ import {
   cn,
   toast,
 } from "./ui";
+import { glide, instant } from "./motion";
 import {
   formatDurationMs,
   getWebEngine,
@@ -443,6 +445,7 @@ export function DetailBody({
         ? "Sending reopens this session: the agent gets your message and the work is re-checked before it can be merged."
         : "Delivered when the current run ends, before anything is committed or checked.";
 
+  const [tabByKey, setTabByKey] = useState(false);
   const order: TabId[] = ["tr", "df", "rc"];
   function onTabKey(e: React.KeyboardEvent<HTMLElement>) {
     const i = order.indexOf(tab);
@@ -453,6 +456,7 @@ export function DetailBody({
     else if (e.key === "End") j = 2;
     if (j === null) return;
     e.preventDefault();
+    setTabByKey(true);
     setActiveTab(order[j]);
     const host = e.currentTarget;
     host.querySelector<HTMLElement>(`[data-id="${order[j]}"]`)?.focus();
@@ -567,7 +571,12 @@ export function DetailBody({
             </Button>
           )}
           {s.branch && (s.status === "done" || s.status === "merged" || s.status === "needs-you") && (
-            <Button variant="outline" size="sm" onClick={() => onOpenPrPreview(s)}>
+            <Button
+              variant={s.status === "merged" ? "primary" : "outline"}
+              size="sm"
+              data-testid="open-pr-preview"
+              onClick={() => onOpenPrPreview(s)}
+            >
               <GitPullRequest className="size-3.5" strokeWidth={1.5} aria-hidden />
               <span>PR preview</span>
             </Button>
@@ -602,9 +611,9 @@ export function DetailBody({
       </div>
 
       {honest && (
-        <div role="status" className="rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--warn-soft)] p-3 text-[13px]">
+        <div role="status" className="rounded-[var(--radius)] border border-[var(--hairline)] border-l-2 border-l-[var(--dot-amber)] bg-[var(--surface)] px-3.5 py-2.5 text-[13px]">
           <p className="font-medium text-[var(--warning-foreground)]">{HONEST}</p>
-          <p className="mt-1 text-[var(--ink)] [overflow-wrap:anywhere]">{s.reason || ""}</p>
+          <p className="mt-1 text-[var(--ink-2)] [overflow-wrap:anywhere]">{s.reason || ""}</p>
         </div>
       )}
 
@@ -612,8 +621,8 @@ export function DetailBody({
         <p
           role="status"
           className={cn(
-            "rounded-[var(--radius)] p-3 text-[13px] leading-relaxed [overflow-wrap:anywhere]",
-            isFailed(s) ? "bg-[var(--bad-soft)] text-[var(--destructive-foreground)]" : "bg-[var(--blue-soft)] text-[var(--info-foreground)]",
+            "rounded-[var(--radius)] border border-[var(--hairline)] border-l-2 bg-[var(--surface)] px-3.5 py-2.5 text-[13px] leading-relaxed text-[var(--ink)] [overflow-wrap:anywhere]",
+            isFailed(s) ? "border-l-[var(--unread)]" : "border-l-[var(--blue)]",
           )}
         >
           {s.reason}
@@ -662,7 +671,7 @@ export function DetailBody({
       )}
 
       {s.merge_error && (
-        <div className="rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--bad-soft)] p-3 text-[var(--destructive-foreground)]">
+        <div className="rounded-[var(--radius)] border border-[var(--hairline)] border-l-2 border-l-[var(--unread)] bg-[var(--surface)] px-3.5 py-2.5">
           <p className="text-[13px] font-medium text-[var(--ink)] [overflow-wrap:anywhere]">
             {s.merge_error.message || "The merge was refused."}
           </p>
@@ -705,16 +714,23 @@ export function DetailBody({
                 role="tab"
                 aria-selected={active}
                 tabIndex={active ? 0 : -1}
+                onPointerDown={() => setTabByKey(false)}
                 onClick={() => setActiveTab(id)}
                 className={cn(
-                  "inline-flex items-center justify-center rounded-[var(--radius-segment)] px-3 h-8 text-[13px] font-medium cursor-pointer transition active:bg-[var(--board)] max-md:min-h-11",
+                  "relative inline-flex items-center justify-center rounded-[var(--radius-segment)] px-3 h-8 text-[13px] font-medium cursor-pointer transition motion-safe:active:scale-[0.97] max-md:min-h-11",
                   "focus-visible:outline-2 focus-visible:outline-[var(--ring)]",
-                  active
-                    ? "bg-[var(--raised)] text-[var(--ink)] border border-[var(--hairline)]"
-                    : "text-[var(--ink-2)] border border-transparent hover:text-[var(--ink)]",
+                  active ? "text-[var(--ink)]" : "text-[var(--ink-2)] hover:text-[var(--ink)]",
                 )}
               >
-                {label}
+                {active && (
+                  <motion.span
+                    layoutId="fleet-workspace-tab"
+                    transition={tabByKey ? instant : glide}
+                    aria-hidden="true"
+                    className="absolute inset-0 rounded-[var(--radius-segment)] bg-[var(--raised)] border border-[var(--hairline)] shadow-[var(--elev-raised)]"
+                  />
+                )}
+                <span className="relative z-10">{label}</span>
               </button>
             );
           })}
