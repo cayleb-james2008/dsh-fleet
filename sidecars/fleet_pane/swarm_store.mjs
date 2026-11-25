@@ -117,11 +117,13 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine) {
 
         let pos = 0;
         for (let nl = combined.indexOf(0x0a, pos); nl >= 0; nl = combined.indexOf(0x0a, pos)) {
+          let start = pos;
           let end = nl;
-          if (end > pos && combined[end - 1] === 0x0d) end--;
-          if (end > pos) {
-            const line = combined.subarray(pos, end).toString('utf8').trim();
-            if (line) onLine(line);
+          if (end > start && combined[end - 1] === 0x0d) end--;
+          while (start < end && combined[start] <= 32) start++;
+          while (end > start && combined[end - 1] <= 32) end--;
+          if (end > start) {
+            onLine(combined.subarray(start, end).toString('utf8'));
           }
           pos = nl + 1;
         }
@@ -418,7 +420,11 @@ export function summarizeTranscript(appData, conv) {
     startedAt: '',
     lastStepAt: '',
     rawTail: [],
+    tailSteps: [],
+    recentTools: [],
+    latestThinking: '',
     tailCursor: 0,
+    parsedTailCursor: 0,
   });
 
   if (!state.acc) state.acc = initAcc();
@@ -507,49 +513,56 @@ export function summarizeTranscript(appData, conv) {
   state.meta = res.meta;
   const a = state.acc;
 
-  // Parse ONLY the 32-line tail window in chronological ring order
-  const tailSteps = [];
-  const recentTools = [];
-  let latestThinking = '';
-  const tailCount = a.rawTail.length;
-  const tailStart = a.tailCursor >= TAIL_CAP ? a.tailCursor % TAIL_CAP : 0;
-  for (let ti = 0; ti < tailCount; ti++) {
-    const line = a.rawTail[(tailStart + ti) % tailCount];
+  // Parse ONLY newly arrived lines within the 32-line tail window and release raw JSON strings
+  const parseFrom = Math.max(a.parsedTailCursor, a.tailCursor - TAIL_CAP);
+  for (let ti = parseFrom; ti < a.tailCursor; ti++) {
+    const line = a.rawTail[ti % TAIL_CAP];
     let step;
     try {
       step = JSON.parse(line);
     } catch {
-      tailSteps.push(null);
+      a.tailSteps[ti % TAIL_CAP] = null;
       continue;
     }
     if (!step || typeof step !== 'object' || Array.isArray(step)) {
-      tailSteps.push(null);
+      a.tailSteps[ti % TAIL_CAP] = null;
       continue;
     }
     if (typeof step.model === 'string' && step.model) a.model = step.model;
     const th = step.type === 'PLANNER_RESPONSE' ? thinkingHeading(step.thinking) : '';
-    if (th) latestThinking = th;
+    if (th) a.latestThinking = th;
     const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
-    if (step.type === 'PLANNER_RESPONSE') {
-      for (const tc of calls) {
-        const summary = describeToolCall(tc);
-        if (!summary) continue;
-        recentTools.push({
-          name: String(tc?.name || 'tool'),
+    const compactCalls = [];
+    for (const tc of calls) {
+      const summary = describeToolCall(tc);
+      const name = String(tc?.name || '');
+      compactCalls.push({ name, summary });
+      if (step.type === 'PLANNER_RESPONSE' && summary) {
+        a.recentTools.push({
+          name: name || 'tool',
           summary,
           time: typeof step.created_at === 'string' ? step.created_at : '',
         });
-        if (recentTools.length > RECENT_TOOLS_CAP) recentTools.shift();
+        if (a.recentTools.length > RECENT_TOOLS_CAP) a.recentTools.shift();
       }
     }
-    tailSteps.push({
+    a.tailSteps[ti % TAIL_CAP] = {
       type: String(step.type || ''),
       status: String(step.status || ''),
       error: typeof step.error === 'string' ? oneLine(step.error, 240) : '',
-      tool_calls: calls,
+      tool_calls: compactCalls,
       thinkingHeading: th,
-      content: step.type === 'PLANNER_RESPONSE' && calls.length === 0 ? String(step.content || '') : '',
-    });
+      content: step.type === 'PLANNER_RESPONSE' && calls.length === 0 ? String(step.content || '').slice(0, 1200) : '',
+    };
+  }
+  a.parsedTailCursor = a.tailCursor;
+  a.rawTail.length = 0;
+
+  const tailSteps = [];
+  const tailCount = a.tailSteps.length;
+  const tailStart = a.tailCursor >= TAIL_CAP ? a.tailCursor % TAIL_CAP : 0;
+  for (let i = 0; i < tailCount; i++) {
+    tailSteps.push(a.tailSteps[(tailStart + i) % tailCount]);
   }
 
   let activity = '';
@@ -562,8 +575,8 @@ export function summarizeTranscript(appData, conv) {
     if (step.type === 'USER_INPUT') break;
     if (step.type !== 'PLANNER_RESPONSE') continue;
     if (step.tool_calls.some((tc) => tc?.name === 'swarm_wait')) break;
-    const labeled = step.tool_calls.filter((tc) => describeToolCall(tc)).pop();
-    const label = labeled ? describeToolCall(labeled) : '';
+    const labeled = step.tool_calls.filter((tc) => tc?.summary).pop();
+    const label = labeled ? labeled.summary : '';
     const heading = step.thinkingHeading;
     if (label) {
       activity = label;
@@ -598,8 +611,8 @@ export function summarizeTranscript(appData, conv) {
       model: a.model,
       startedAt: a.startedAt,
       lastStepAt: a.lastStepAt,
-      thinkingHeading: latestThinking,
-      recentTools: recentTools.slice().reverse(),
+      thinkingHeading: a.latestThinking,
+      recentTools: a.recentTools.slice().reverse(),
       lastContextTokens: a.lastContextTokens,
       usage: {
         inputTokens: a.inputTokens,
@@ -994,7 +1007,9 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
   const channels = channelRegistry(msgs);
   const byChannel = channelAddressees(roster, names, msgs, channels);
 
-  const messages = msgs.map((m, i) => {
+  // Transform board messages in-place so peak heap does not hold 2x 2k-object graphs
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
     const seq = Number(m.seq) || 0;
     const agent = String(m.agent ?? '');
     const text = String(m.text ?? '');
@@ -1003,7 +1018,10 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     const channel = channelOf(m);
     const control = controlOf(m);
     const chanFields = { ...(channel !== MAIN ? { channel } : {}), ...(control ? { control } : {}) };
-    if (control) return { seq, agent, text, time, ts, mentions: [], all: false, ...chanFields };
+    if (control) {
+      msgs[i] = { seq, agent, text, time, ts, mentions: [], all: false, ...chanFields };
+      continue;
+    }
     const { mentions, all } = mentionsOf(text, names);
     const ch = byChannel ? byChannel(i, text) : null;
     const viaChannel = ch ? ch.members.filter((n) => n !== agent && !mentions.includes(n)) : [];
@@ -1025,8 +1043,9 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
         edges.set(key, e);
       }
     }
-    return { seq, agent, text, time, ts, mentions, all, ...chanFields, ...chanMentionFields };
-  });
+    msgs[i] = { seq, agent, text, time, ts, mentions, all, ...chanFields, ...chanMentionFields };
+  }
+  const messages = msgs;
 
   let totalInputTokens = 0;
   let totalCacheReadTokens = 0;

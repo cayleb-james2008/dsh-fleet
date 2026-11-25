@@ -136,7 +136,7 @@ export function createFleetHandlers({
       healthPacked = packJsonPayload({
         ok: true,
         name: 'fleet',
-        version: '1.4.0',
+        version: '1.5.0',
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
         sseStream: !isSidecar,
@@ -343,7 +343,11 @@ export function createFleetHandlers({
     if (!body || body.confirm !== true) {
       return { status: 400, json: { error: 'Confirmation required (confirm: true)' } };
     }
-    const message = typeof body.message === 'string' ? body.message.trim() : '';
+    const rawMsg = typeof body.message === 'string' ? body.message : '';
+    if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(rawMsg)) {
+      return { status: 400, json: { error: 'Control characters are not permitted in nudge message' } };
+    }
+    const message = rawMsg.trim();
     const targetConv = typeof body.conversationId === 'string' ? body.conversationId.trim() : '';
     if (!message || message.length > 4000) {
       return { status: 400, json: { error: 'Non-empty message (<= 4000 chars) required' } };

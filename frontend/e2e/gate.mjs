@@ -148,6 +148,16 @@ await runChecks("gate", async (check) => {
     return after.includes("Recent worker activity") && after.includes("Run sidecar security tests");
   });
 
+  await check("roster shows live duration badge and Ask status quick-action chip", async () => {
+    const txt = await page.locator("#panel-roster").textContent();
+    const hasElapsed = /Working\s+(<\d+m|\d+[mhd])/.test(txt);
+    const hasChip = (await page.locator('#panel-roster button:has-text("Ask status")').count()) >= 1;
+    if (hasChip) {
+      await page.locator('#panel-roster button:has-text("Ask status")').first().click();
+    }
+    return hasElapsed && hasChip;
+  });
+
   await check("killed members hidden by default and revealed by Show killed toggle", async () => {
     const before = await page.locator("#panel-roster").textContent();
     if (before.includes("old-helper")) return false;

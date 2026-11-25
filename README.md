@@ -80,8 +80,8 @@ Fleet scales from `340px–380px` Antigravity auxiliary sidebars up to wide `144
 ```mermaid
 flowchart LR
     Host["Antigravity Host<br/>(Aux Side Pane + /preload.js)"] <-->|"SidecarApp RPC + theme-change<br/>toggleConversation / toggleAuxPane"| Backend["Fleet Sidecar Backend<br/>(sidecars/fleet_pane/main.mjs)"]
-    UI["Embedded Sidebar SPA<br/>(406.4 KB raw / 120.0 KB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>ETag / 304 + Gzip JSON"| Backend
-    Backend -->|"Bounded 64 KB Chunks + 32-Slot Tail Ring"| Store["swarm_store.mjs"]
+    UI["Embedded Sidebar SPA<br/>(377.7 KB raw / 112.5 KB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>ETag / 304 + Gzip JSON"| Backend
+    Backend -->|"Bounded 64 KB Chunks + Zero-Retain Tail Ring"| Store["swarm_store.mjs"]
     Backend -->|"Debounced TTL + CWE-59 Confinement"| Git["git_probe.mjs"]
     Store -.->|"Read-Only"| Brain["~/.gemini/antigravity/brain/&lt;conv&gt;<br/>.system_generated/{swarm,logs}"]
     Git -.->|"git status --porcelain=v1 -z"| WT["Workspace Git Worktrees"]
@@ -91,16 +91,16 @@ flowchart LR
 
 ## Verified Benchmarks
 
-Measured on a 20-worker / 2,000-board-post / 50,000-transcript-line stress fixture (`30` concurrent polling workers):
+Measured on a 20-worker / 2,000-board-post / 50,000-transcript-line stress fixture (`v1.4.0` & `v1.5.0` measured under `taskset -c 24-31`, `16` concurrent polling workers):
 
-| Metric | v1.3.0 | **v1.4.0** | Delta |
+| Metric | v1.3.0 | v1.4.0 | **v1.5.0** |
 | --- | --- | --- | --- |
-| Embedded Sidecar UI (`/`) | `491,828 B` raw / `148,817 B` gz | **`416,186 B` raw / `122,916 B` gz** | **`-15.4%` raw / `-17.4%` wire** |
-| Peak RSS (`VmHWM`, 2k/50k) | `122.84 MB` | **`94.29 MB`** | **`-23.2%`** |
-| Throughput (`req/s`) | `1,914.6 req/s` | **`3,711 req/s`** | **`+93.8%`** |
-| Latency (`p50` / `p95`) | `14.80 ms` / `25.79 ms` | **`3.62 ms` / `21.25 ms`** | **`-75.5%` p50** |
-| Simultaneous SSE (`/api/swarm/stream` x5) | `5/5` (`0` drops) | **`5/5` (`0` drops)** | Pass |
-| E2E Gate + Replay + Sloplint | `31/31` + `6/6` | **`32/32` + `7/7` + `0 FAIL / 0 WARN`** | Pass |
+| Embedded Sidecar UI (`/`) | `491,828 B` raw / `148,817 B` gz | `416,186 B` raw / `122,803 B` gz | **`386,823 B` raw / `115,244 B` gz** |
+| Peak RSS (`VmHWM`, 2k/50k) | `122.84 MB` | `109.54 MB` | **`93.29 MB`** |
+| Throughput (`req/s`) | `1,914.6 req/s` (`30w`) | `1,324.0 req/s` (`16w`) | **`3,565.4 req/s` (`16w`)** |
+| Latency (`p50` / `p95`) | `14.80 ms` / `25.79 ms` | `11.82 ms` / `17.17 ms` | **`1.86 ms` / `12.85 ms`** |
+| Simultaneous SSE (`/api/swarm/stream` x5) | `5/5` (`0` drops) | `5/5` (`0` drops) | **`5/5` (`0` drops)** |
+| E2E Gate + Replay + Sloplint | `31/31` + `6/6` | `32/32` + `7/7` + `0 FAIL` | **`33/33` + `7/7` + `0 FAIL / 0 WARN`** |
 
 ---
 

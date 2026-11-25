@@ -169,6 +169,14 @@ test('standalone server enforces gzip, ETag/304, security headers, Host-403, Ori
     assert.equal(yesConfirm.status, 200);
     assert.equal(nudged.length, 1);
 
+    const badCtrl = await fetch(`${srv.url}/api/nudge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: true, conversationId: fx.worker, message: 'hi\x00there' }),
+    });
+    assert.equal(badCtrl.status, 400);
+    assert.equal(nudged.length, 1);
+
     // 6. CWE-22 & CWE-59 /api/frame hardening
     const fGood = await fetch(`${srv.url}/api/frame?conversationId=${fx.coord}&path=${encodeURIComponent(fx.goodPng)}`);
     assert.equal(fGood.status, 200);

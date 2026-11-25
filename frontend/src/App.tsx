@@ -710,7 +710,7 @@ export function App() {
           <div className="rounded-[var(--radius-card)] bg-[var(--board)] p-3 text-[12px] text-[var(--ink-2)] space-y-1">
             <div className="flex items-center gap-1.5 font-medium text-[var(--ink)]">
               <CommandIcon className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Fleet Antigravity Plugin v1.4.0</span>
+              <span>Fleet Antigravity Plugin v1.5.0</span>
             </div>
             <p>
               Reads Antigravity native swarm boards and transcripts locally on loopback with zero external telemetry.
