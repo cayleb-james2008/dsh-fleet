@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { Command } from "cmdk";
 import {
   Activity,
+  ClipboardCopy,
   GitBranch,
   Inbox,
   MessageSquare,
@@ -20,6 +21,7 @@ export function CommandPalette({
   swarms,
   onSelectTab,
   onSelectSwarm,
+  onCopyDigest,
   onOpenSettings,
 }: {
   open: boolean;
@@ -28,6 +30,7 @@ export function CommandPalette({
   swarms: SwarmSummary[];
   onSelectTab: (tab: TabId) => void;
   onSelectSwarm: (id: string) => void;
+  onCopyDigest: () => void;
   onOpenSettings: () => void;
 }) {
   useEffect(() => {
@@ -66,11 +69,11 @@ export function CommandPalette({
           <Command.Group heading="Views" className="px-2 py-1 text-[12px] font-medium text-[var(--ink-3)]">
             {(
               [
-                ["triage", "Needs-You Triage & Plan", Inbox],
+                ["triage", "Needs-you Triage & Plan", Inbox],
                 ["board", "Swarm Board Feed", Activity],
                 ["roster", "Worker Roster & Tokens", Users],
                 ["graph", "@Mention Graph & Replay", Network],
-                ["worktrees", "Workspace Git Worktrees", GitBranch],
+                ["worktrees", "Git Worktrees", GitBranch],
               ] as const
             ).map(([id, label, Icon]) => (
               <Command.Item
@@ -86,6 +89,19 @@ export function CommandPalette({
                 <span>{label}</span>
               </Command.Item>
             ))}
+            {snap?.swarm && (
+              <Command.Item
+                value="copy swarm digest markdown summary"
+                onSelect={() => {
+                  onCopyDigest();
+                  onOpenChange(false);
+                }}
+                className="flex items-center gap-2 rounded-[var(--radius-chip)] px-2.5 py-2 text-[13px] text-[var(--ink)] aria-selected:bg-[var(--blue-soft)] aria-selected:text-[var(--info-foreground)] cursor-pointer"
+              >
+                <ClipboardCopy className="h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>Copy swarm digest</span>
+              </Command.Item>
+            )}
             <Command.Item
               value="settings theme preferences"
               onSelect={() => {

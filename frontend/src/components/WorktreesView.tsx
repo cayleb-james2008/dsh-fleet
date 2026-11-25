@@ -34,8 +34,8 @@ export function WorktreesView({
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-2">
-        <h2 className="text-[13px] font-semibold uppercase tracking-wide text-[var(--ink-2)]">
-          Git Worktrees ({worktrees.length})
+        <h2 className="text-[14px] font-semibold text-[var(--ink)]">
+          Git worktrees ({worktrees.length})
         </h2>
         <Button variant="outline" size="sm" onClick={onRefresh} disabled={loading}>
           <RefreshCw className={`h-3.5 w-3.5 ${loading ? "motion-safe:animate-spin" : ""}`} aria-hidden="true" />
@@ -108,8 +108,9 @@ export function WorktreesView({
               {(wt.lastCommitSubject || wt.lastCommitSha) && (
                 <div className="flex items-center justify-between gap-2 rounded-[var(--radius-chip)] bg-[var(--board)] px-2.5 py-1.5 text-[12px] text-[var(--ink-2)]">
                   <span className="truncate">{wt.lastCommitSubject || "No commits yet"}</span>
-                  <span className="shrink-0 mono num text-[var(--ink-3)]">
-                    {wt.lastCommitSha} · {wt.lastCommitAt ? fmtTimeAgo(wt.lastCommitAt) : "n/a"}
+                  <span className="shrink-0 mono num text-[var(--ink-3)] flex items-center gap-2">
+                    <span>{wt.lastCommitSha}</span>
+                    <span>{wt.lastCommitAt ? fmtTimeAgo(wt.lastCommitAt) : "n/a"}</span>
                   </span>
                 </div>
               )}

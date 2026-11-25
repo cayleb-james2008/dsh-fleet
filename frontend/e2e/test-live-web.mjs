@@ -55,12 +55,12 @@ await page.waitForSelector('h1:has-text("Fleet v1.0 Antigravity Sidecar")');
 
 await check("loads simulated Antigravity swarm in 380px sidebar", async () => {
   const txt = await page.locator("#panel-triage").textContent();
-  return txt.includes("Needs You") && txt.includes("builder asked a question");
+  return txt.includes("Needs you") && txt.includes("builder asked a question");
 });
 
-await check("plan.json goal & workstreams visible", async () => {
+await check("plan.json goal & humanized workstreams visible", async () => {
   const txt = await page.locator("#panel-triage").textContent();
-  return txt.includes("Deliver native aux-pane Swarm Command Center") && txt.includes("npm test && npm run check:ui");
+  return txt.includes("Deliver native aux-pane Swarm Command Center") && txt.includes("In progress");
 });
 
 await check("Geist woff2 fonts embedded & loaded with zero network font requests", async () => {

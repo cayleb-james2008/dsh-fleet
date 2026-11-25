@@ -1,12 +1,14 @@
 /**
  * Antigravity native swarm & transcript store for Fleet sidecar.
- * Reads <appData>/brain/<conv>/.system_generated/{swarm,logs}/ read-only with
- * mtime:size memoization and streaming line scanning to keep Peak RSS low and
- * concurrent polling fast at 50k+ transcript lines.
+ * Reads <appData>/brain/<conv>/.system_generated/{swarm,logs}/ read-only using
+ * bounded 128 KB chunked incremental byte-offset tailing for board.jsonl and
+ * transcript.jsonl so Peak RSS stays low even at 50k+ lines and incremental
+ * appends process in sub-millisecond time.
  */
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, sep } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import { pathToFileURL } from 'node:url';
 import {
   ALL,
@@ -35,6 +37,7 @@ const MAX_POSTED_FRAMES = 24;
 const FRAME_EXT = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' };
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const SWARM_SCAN_TTL_MS = 2000;
+const CHUNK_BYTES = 128 * 1024;
 
 function safeReaddir(path) {
   try {
@@ -47,9 +50,9 @@ function safeReaddir(path) {
 function statOf(path) {
   try {
     const s = statSync(path);
-    return { mtime: s.mtimeMs, size: s.size };
+    return { ino: s.ino, mtime: s.mtimeMs, size: s.size };
   } catch {
-    return { mtime: 0, size: -1 };
+    return { ino: 0, mtime: 0, size: -1 };
   }
 }
 
@@ -60,7 +63,7 @@ function readSmallCached(path, cache, maxBytes = VIEW_MAX_BYTES) {
     return { text: null, ...s };
   }
   if (s.size > maxBytes) return { text: null, tooLarge: true, ...s };
-  const key = `${s.mtime}:${s.size}`;
+  const key = `${s.ino}:${s.mtime}:${s.size}`;
   const hit = cache.get(path);
   if (hit && hit.key === key) return { text: hit.text, ...s };
   let text = null;
@@ -74,18 +77,90 @@ function readSmallCached(path, cache, maxBytes = VIEW_MAX_BYTES) {
   return { text, ...s };
 }
 
-/** Iterate non-empty lines over a string without allocating a full split array. */
-function forEachLine(text, fn) {
-  let start = 0;
-  const len = text.length;
-  while (start < len) {
-    const nl = text.indexOf('\n', start);
-    const end = nl === -1 ? len : nl;
-    const raw = text.slice(start, end).trim();
-    if (raw) fn(raw);
-    if (nl === -1) break;
-    start = nl + 1;
+/**
+ * Incrementally stream complete JSON objects from a growing JSONL file using
+ * bounded 128 KB chunks (`openSync`/`readSync`). Resets cleanly on truncate/inode change.
+ */
+function streamJsonlIncremental(filePath, prevMeta, onReset, onObject, onTorn) {
+  const s = statOf(filePath);
+  if (s.size < 0) return { exists: false, meta: null, changed: Boolean(prevMeta) };
+
+  if (prevMeta && prevMeta.ino === s.ino && prevMeta.size === s.size && prevMeta.mtime === s.mtime) {
+    return { exists: true, meta: prevMeta, changed: false };
   }
+
+  const isAppend = Boolean(prevMeta && prevMeta.ino === s.ino && s.size >= prevMeta.size);
+  let offset = isAppend ? prevMeta.size : 0;
+  let carry = isAppend ? prevMeta.carry : '';
+  if (!isAppend) onReset();
+
+  if (s.size > offset) {
+    const fd = openSync(filePath, 'r');
+    const buf = Buffer.allocUnsafe(Math.min(CHUNK_BYTES, s.size - offset));
+    const decoder = new StringDecoder('utf8');
+    try {
+      while (offset < s.size) {
+        const toRead = Math.min(buf.length, s.size - offset);
+        const bytesRead = readSync(fd, buf, 0, toRead, offset);
+        if (bytesRead <= 0) break;
+        offset += bytesRead;
+        carry += decoder.write(buf.subarray(0, bytesRead));
+        let start = 0;
+        for (let nl = carry.indexOf('\n'); nl >= 0; nl = carry.indexOf('\n', start)) {
+          const line = carry.slice(start, nl).trim();
+          start = nl + 1;
+          if (!line) continue;
+          try {
+            const obj = JSON.parse(line);
+            if (obj && typeof obj === 'object' && !Array.isArray(obj)) onObject(obj);
+          } catch {
+            if (onTorn) onTorn();
+          }
+        }
+        carry = carry.slice(start);
+      }
+      carry += decoder.end();
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  const trimmedCarry = carry.trim();
+  if (trimmedCarry) {
+    try {
+      const obj = JSON.parse(trimmedCarry);
+      if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+        onObject(obj);
+        carry = '';
+      }
+    } catch {
+      // Torn trailing line kept in `carry` until next write completes it.
+    }
+  } else {
+    carry = '';
+  }
+
+  return {
+    exists: true,
+    changed: true,
+    meta: { ino: s.ino, size: s.size, mtime: s.mtime, carry },
+  };
+}
+
+/** Parse a JSONL string (used cleanly by tests or one-shot callers). */
+export function parseBoard(text) {
+  const out = [];
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    try {
+      const m = JSON.parse(line);
+      if (m && typeof m === 'object' && !Array.isArray(m)) out.push(m);
+    } catch {
+      // ignore torn line
+    }
+  }
+  return out;
 }
 
 /** Locate Antigravity appData roots containing `brain/`. */
@@ -159,19 +234,6 @@ export function parseRoster(text) {
   } catch {
     return null;
   }
-}
-
-export function parseBoard(text) {
-  const out = [];
-  forEachLine(String(text || ''), (line) => {
-    try {
-      const m = JSON.parse(line);
-      if (m && typeof m === 'object' && !Array.isArray(m)) out.push(m);
-    } catch {
-      // Torn trailing line is ignored until next poll.
-    }
-  });
-  return out;
 }
 
 const BOARD_ACTIVITY = {
@@ -268,105 +330,132 @@ function replyQuestion(text) {
 
 const transcriptCache = new Map();
 const NO_TRANSCRIPT = { key: '-', summary: null };
+const TAIL_CAP = 32;
+const RECENT_TOOLS_CAP = 5;
 
 function num(v) {
   return Number.isFinite(v) && v >= 0 ? v : 0;
 }
 
 /**
- * Parse a member's `transcript.jsonl` into steps, activity, state, and real token usage.
- * Keeps only a 32-step sliding tail in RAM so 50k-line transcripts use near-zero heap.
+ * Incrementally parse a member's `transcript.jsonl` into steps, live activity,
+ * last 5 tool calls (`recentTools`), thinking heading, state, and real token usage.
  */
 export function summarizeTranscript(appData, conv) {
   if (!appData || !conv || !ID_RE.test(conv)) return NO_TRANSCRIPT;
   const path = transcriptPath(appData, conv);
-  const s = statOf(path);
-  if (s.size < 0) return NO_TRANSCRIPT;
-  const key = `${s.mtime}:${s.size}`;
-  const hit = transcriptCache.get(path);
-  if (hit && hit.key === key) return hit;
-
-  let text;
-  try {
-    text = readFileSync(path, 'utf-8');
-  } catch {
-    return NO_TRANSCRIPT;
+  let state = transcriptCache.get(path);
+  if (!state) {
+    state = {
+      meta: null,
+      acc: null,
+      result: NO_TRANSCRIPT,
+    };
   }
 
-  let lineCount = 0;
-  let maxStepIndex = 0;
-  let inputTokens = 0;
-  let cacheReadTokens = 0;
-  let outputTokens = 0;
-  let model = '';
-  let startedAt = '';
-  let lastStepAt = '';
-  const tailSteps = [];
-  const TAIL_CAP = 32;
-
-  forEachLine(text, (line) => {
-    lineCount++;
-    let step;
-    try {
-      step = JSON.parse(line);
-    } catch {
-      tailSteps.push(null);
-      if (tailSteps.length > TAIL_CAP) tailSteps.shift();
-      return;
-    }
-    if (!step || typeof step !== 'object' || Array.isArray(step)) {
-      tailSteps.push(null);
-      if (tailSteps.length > TAIL_CAP) tailSteps.shift();
-      return;
-    }
-    if (Number.isFinite(step.step_index)) {
-      maxStepIndex = Math.max(maxStepIndex, step.step_index + 1);
-    }
-    if (typeof step.created_at === 'string' && step.created_at) {
-      if (!startedAt) startedAt = step.created_at;
-      lastStepAt = step.created_at;
-    }
-    if (typeof step.model === 'string' && step.model) {
-      model = step.model;
-    }
-    if (step.type === 'PLANNER_RESPONSE') {
-      const u = step.usage && typeof step.usage === 'object' ? step.usage : step;
-      inputTokens += num(Number(u.input_tokens));
-      cacheReadTokens += num(Number(u.cache_read_tokens ?? u.cacheReadTokens));
-      outputTokens += num(Number(u.output_tokens));
-    }
-    // Store minimal projection in the tail window (drop giant content/thinking except what tail needs)
-    const isLastCandidate = step.type === 'PLANNER_RESPONSE' || step.type === 'GENERIC' || step.type === 'ERROR_MESSAGE' || step.type === 'USER_INPUT';
-    if (isLastCandidate) {
-      tailSteps.push({
-        type: String(step.type || ''),
-        status: String(step.status || ''),
-        error: typeof step.error === 'string' ? oneLine(step.error, 240) : '',
-        tool_calls: Array.isArray(step.tool_calls) ? step.tool_calls : [],
-        thinkingHeading: step.type === 'PLANNER_RESPONSE' ? thinkingHeading(step.thinking) : '',
-        content: step.type === 'PLANNER_RESPONSE' && (!Array.isArray(step.tool_calls) || step.tool_calls.length === 0) ? String(step.content || '') : '',
-      });
-    } else {
-      tailSteps.push({ type: String(step.type || ''), status: String(step.status || ''), error: '', tool_calls: [], thinkingHeading: '', content: '' });
-    }
-    if (tailSteps.length > TAIL_CAP) tailSteps.shift();
+  const initAcc = () => ({
+    lineCount: 0,
+    maxStepIndex: 0,
+    inputTokens: 0,
+    cacheReadTokens: 0,
+    outputTokens: 0,
+    model: '',
+    startedAt: '',
+    lastStepAt: '',
+    thinkingHeading: '',
+    recentTools: [],
+    tailSteps: [],
   });
 
-  // Drop retained raw string immediately
-  text = '';
+  if (!state.acc) state.acc = initAcc();
+
+  const res = streamJsonlIncremental(
+    path,
+    state.meta,
+    () => {
+      state.acc = initAcc();
+    },
+    (step) => {
+      const a = state.acc;
+      a.lineCount++;
+      if (Number.isFinite(step.step_index)) {
+        a.maxStepIndex = Math.max(a.maxStepIndex, step.step_index + 1);
+      }
+      if (typeof step.created_at === 'string' && step.created_at) {
+        if (!a.startedAt) a.startedAt = step.created_at;
+        a.lastStepAt = step.created_at;
+      }
+      if (typeof step.model === 'string' && step.model) {
+        a.model = step.model;
+      }
+      if (step.type === 'PLANNER_RESPONSE') {
+        const u = step.usage && typeof step.usage === 'object' ? step.usage : step;
+        a.inputTokens += num(Number(u.input_tokens));
+        a.cacheReadTokens += num(Number(u.cache_read_tokens ?? u.cacheReadTokens));
+        a.outputTokens += num(Number(u.output_tokens));
+
+        const th = thinkingHeading(step.thinking);
+        if (th) a.thinkingHeading = th;
+
+        const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+        for (const tc of calls) {
+          const summary = describeToolCall(tc);
+          if (!summary) continue;
+          a.recentTools.push({
+            name: String(tc?.name || 'tool'),
+            summary,
+            time: typeof step.created_at === 'string' ? step.created_at : '',
+          });
+          if (a.recentTools.length > RECENT_TOOLS_CAP) a.recentTools.shift();
+        }
+      }
+      const isTailCandidate =
+        step.type === 'PLANNER_RESPONSE' ||
+        step.type === 'GENERIC' ||
+        step.type === 'ERROR_MESSAGE' ||
+        step.type === 'USER_INPUT';
+      if (isTailCandidate) {
+        a.tailSteps.push({
+          type: String(step.type || ''),
+          status: String(step.status || ''),
+          error: typeof step.error === 'string' ? oneLine(step.error, 240) : '',
+          tool_calls: Array.isArray(step.tool_calls) ? step.tool_calls : [],
+          thinkingHeading: step.type === 'PLANNER_RESPONSE' ? thinkingHeading(step.thinking) : '',
+          content:
+            step.type === 'PLANNER_RESPONSE' && (!Array.isArray(step.tool_calls) || step.tool_calls.length === 0)
+              ? String(step.content || '')
+              : '',
+        });
+      } else {
+        a.tailSteps.push({ type: String(step.type || ''), status: String(step.status || ''), error: '', tool_calls: [], thinkingHeading: '', content: '' });
+      }
+      if (a.tailSteps.length > TAIL_CAP) a.tailSteps.shift();
+    },
+    () => {
+      const a = state.acc;
+      a.lineCount++;
+      a.tailSteps.push(null);
+      if (a.tailSteps.length > TAIL_CAP) a.tailSteps.shift();
+    },
+  );
+
+  if (!res.exists) {
+    transcriptCache.delete(path);
+    return NO_TRANSCRIPT;
+  }
+  if (!res.changed) return state.result;
+
+  state.meta = res.meta;
+  const a = state.acc;
 
   let activity = '';
   let activityKind = '';
   let last = null;
-  for (let i = tailSteps.length - 1; i >= 0; i--) {
-    const step = tailSteps[i];
+  for (let i = a.tailSteps.length - 1; i >= 0; i--) {
+    const step = a.tailSteps[i];
     if (!step) continue;
     if (!last) {
-      last = {
-        type: step.type,
-        status: step.status,
-        error: step.error,
-      };
+      last = { type: step.type, status: step.status, error: step.error };
     }
     if (step.type === 'USER_INPUT') break;
     if (step.type !== 'PLANNER_RESPONSE') continue;
@@ -386,37 +475,69 @@ export function summarizeTranscript(appData, conv) {
     break;
   }
 
-  const idle = turnEnded(tailSteps);
-  const reply = finalReply(tailSteps);
+  const idle = turnEnded(a.tailSteps);
+  const reply = finalReply(a.tailSteps);
   const replied = reply !== null;
   const replyAsk = replied ? replyQuestion(reply) : '';
-  const totalTokens = inputTokens + cacheReadTokens + outputTokens;
+  const totalTokens = a.inputTokens + a.cacheReadTokens + a.outputTokens;
+  const key = `${res.meta.ino}:${res.meta.mtime}:${res.meta.size}:${a.lineCount}`;
 
-  const entry = {
+  state.result = {
     key,
     summary: {
-      steps: Math.max(lineCount, maxStepIndex),
+      steps: Math.max(a.lineCount, a.maxStepIndex),
       activity,
       activityKind,
       last,
       idle,
       replied,
       replyAsk,
-      mtime: s.mtime,
-      model,
-      startedAt,
-      lastStepAt,
+      mtime: res.meta.mtime,
+      model: a.model,
+      startedAt: a.startedAt,
+      lastStepAt: a.lastStepAt,
+      thinkingHeading: a.thinkingHeading,
+      recentTools: a.recentTools.slice().reverse(),
       usage: {
-        inputTokens,
-        cacheReadTokens,
-        outputTokens,
+        inputTokens: a.inputTokens,
+        cacheReadTokens: a.cacheReadTokens,
+        outputTokens: a.outputTokens,
         totalTokens,
       },
     },
   };
+
   if (transcriptCache.size > 500) transcriptCache.clear();
-  transcriptCache.set(path, entry);
-  return entry;
+  transcriptCache.set(path, state);
+  return state.result;
+}
+
+const boardFileCache = new Map(); // boardPath -> { meta, msgs }
+function readBoardIncremental(boardPath) {
+  let state = boardFileCache.get(boardPath);
+  if (!state) state = { meta: null, msgs: [] };
+
+  const res = streamJsonlIncremental(
+    boardPath,
+    state.meta,
+    () => {
+      state.msgs = [];
+    },
+    (m) => {
+      state.msgs.push(m);
+    },
+  );
+  if (!res.exists) {
+    boardFileCache.delete(boardPath);
+    return { key: '-', msgs: [] };
+  }
+  state.meta = res.meta;
+  if (boardFileCache.size > 128) boardFileCache.clear();
+  boardFileCache.set(boardPath, state);
+  return {
+    key: `${res.meta.ino}:${res.meta.mtime}:${res.meta.size}:${state.msgs.length}`,
+    msgs: state.msgs,
+  };
 }
 
 function statusOf(m, tr) {
@@ -720,8 +841,8 @@ export function buildSwarmSnapshot(appData, id) {
   }
   const boardPath = join(dir, 'board.jsonl');
   const boardStat = statOf(boardPath);
-  const membersKey = `${membersFile.mtime}:${membersFile.size}`;
-  const boardKey = `${boardStat.mtime}:${boardStat.size}`;
+  const membersKey = `${membersFile.ino}:${membersFile.mtime}:${membersFile.size}`;
+  const boardKey = `${boardStat.ino}:${boardStat.mtime}:${boardStat.size}`;
   const prev = snapshotCache.get(cacheKey);
   if (
     prev &&
@@ -756,17 +877,7 @@ export function buildSwarmSnapshot(appData, id) {
     return prev.snap;
   }
 
-  let boardText = '';
-  if (boardStat.size > 0) {
-    try {
-      boardText = readFileSync(boardPath, 'utf-8');
-    } catch {
-      boardText = '';
-    }
-  }
-  const msgs = parseBoard(boardText);
-  boardText = '';
-
+  const { msgs } = readBoardIncremental(boardPath);
   const head = msgs.length ? Number(msgs[msgs.length - 1].seq) || msgs.length : 0;
   const frames = postedFrames(roster, msgs);
   const posts = new Map();
@@ -852,6 +963,8 @@ export function buildSwarmSnapshot(appData, id) {
       transcriptMtime: tr?.mtime || 0,
       startedAt: tr?.startedAt || '',
       lastStepAt: tr?.lastStepAt || '',
+      thinkingHeading: tr?.thinkingHeading || '',
+      recentTools: tr?.recentTools || [],
       usage,
       ...(typeof m.workspace_mode === 'string' && m.workspace_mode ? { workspace_mode: m.workspace_mode } : {}),
       ...(typeof m.workspace === 'string' && m.workspace ? { workspace: m.workspace } : {}),

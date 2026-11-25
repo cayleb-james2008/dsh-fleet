@@ -306,9 +306,8 @@ export function BoardView({
                         {m.channel && m.channel !== "main" && <Badge tone="violet">#{m.channel}</Badge>}
                         {m.all && <Badge tone="info">@all</Badge>}
                       </div>
-                      <div className="flex items-center gap-1.5 shrink-0 text-[12px] text-[var(--ink-3)] num">
+                      <div className="flex items-center gap-2 shrink-0 text-[12px] text-[var(--ink-3)] num">
                         <span>#{m.seq}</span>
-                        <span>·</span>
                         <span>{fmtClockTime(m.ts, m.time)}</span>
                       </div>
                     </div>

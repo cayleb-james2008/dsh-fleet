@@ -97,8 +97,8 @@ export function GraphView({ snap }: { snap: SwarmSnapshot }) {
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-[13px] font-semibold uppercase tracking-wide text-[var(--ink-2)]">
-          @Mention Graph ({nodes.length} nodes)
+        <h2 className="text-[14px] font-semibold text-[var(--ink)]">
+          @Mention graph ({nodes.length} nodes)
         </h2>
         <div className="flex flex-wrap items-center gap-1.5">
           <Button
