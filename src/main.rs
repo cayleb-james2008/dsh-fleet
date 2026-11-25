@@ -11,7 +11,8 @@ mod update;
 
 use fleet::autoheal::{
     FailedCheckContext, HealAttempt, HealDecision, HealSessionContext, HealStopReason,
-    MAX_AUTO_HEAL_BUDGET, build_heal_prompt, evaluate_auto_heal, heal_badge_label,
+    MAX_AUTO_HEAL_BUDGET, build_heal_prompt, evaluate_auto_heal,
+    extract_changed_files_and_diff_excerpt, heal_badge_label,
 };
 use fleet::budget::{BudgetConfig, BudgetError, BudgetStatus, BudgetTracker};
 use fleet::checks::{
@@ -19,6 +20,7 @@ use fleet::checks::{
     verify_git_scope,
 };
 use fleet::dag::{BatchSpec, BatchTaskSpec, DagGraph, DagNodeState, TaskNode};
+use fleet::http_assets::{EmbeddedHtmlCache, SECURITY_HEADERS};
 use fleet::merge_check::{
     MergeStrategy, PatchFormat, dry_run_merge, execute_merge, export_patch,
 };
@@ -39,6 +41,55 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+
+#[inline]
+fn contains_icase_ascii_bytes(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle_lower.len() {
+        return false;
+    }
+    let first = needle_lower[0];
+    let last_start = haystack.len() - needle_lower.len();
+    let mut i = 0;
+    while i <= last_start {
+        if haystack[i].to_ascii_lowercase() == first
+            && haystack[i..i + needle_lower.len()].eq_ignore_ascii_case(needle_lower)
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+#[inline]
+fn starts_with_icase_ascii(haystack: &str, prefix_lower: &[u8]) -> bool {
+    let h = haystack.as_bytes();
+    h.len() >= prefix_lower.len() && h[..prefix_lower.len()].eq_ignore_ascii_case(prefix_lower)
+}
+
+#[inline]
+fn contains_icase(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() && needle_lower.is_ascii() {
+        return contains_icase_ascii_bytes(haystack.as_bytes(), needle_lower.as_bytes());
+    }
+    haystack.to_lowercase().contains(needle_lower)
+}
+
+#[inline]
+fn is_valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.contains("..")
+        && !id.contains('\0')
+}
 
 fn bytes_to_os_string(bytes: &[u8]) -> std::ffi::OsString {
     #[cfg(unix)]
@@ -482,7 +533,27 @@ struct Session {
     /// Total transcript lines logged to disk (may exceed in-memory `TRANSCRIPT_CAP`).
     #[serde(default)]
     transcript_total: usize,
+    /// Unix epoch milliseconds when the session was queued/created.
+    #[serde(default)]
+    created_at_ms: u64,
+    /// Unix epoch milliseconds when execution began for the current attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started_at_ms: Option<u64>,
+    /// Unix epoch milliseconds when the current attempt settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    finished_at_ms: Option<u64>,
+    /// Total elapsed execution + verification wall-clock duration in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_elapsed_ms: Option<u64>,
     transcript: Vec<String>,
+}
+
+#[inline]
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl SessionMetricView for Session {
@@ -599,6 +670,21 @@ fn merge_target(repo: &str) -> Option<String> {
     if repo.is_empty() {
         return None;
     }
+    // Fast path: read `.git/HEAD` directly without spawning `git` when `.git` is a directory.
+    let dot_git = Path::new(repo).join(".git");
+    if dot_git.is_dir() {
+        if let Ok(head) = std::fs::read_to_string(dot_git.join("HEAD")) {
+            let trimmed = head.trim();
+            if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
+                if !branch.is_empty() {
+                    return Some(branch.to_string());
+                }
+            } else if !trimmed.is_empty() {
+                // Detached HEAD
+                return None;
+            }
+        }
+    }
     Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -676,13 +762,16 @@ struct App {
     /// never shells out to git on every poll.
     merge_target_cache: Mutex<std::collections::HashMap<String, (Option<String>, std::time::Instant)>>,
     /// Cached serialized GET /api/sessions payload keyed by (state_rev, cached_at).
-    sessions_cache: Mutex<Option<(u64, std::time::Instant, String)>>,
+    #[allow(clippy::type_complexity)]
+    sessions_cache: Mutex<Option<(u64, std::time::Instant, String, Arc<Vec<u8>>)>>,
     /// Cached GET /api/repos discovery result keyed by (state_rev, FLEET_REPOS_DIR, cached_at).
     #[allow(clippy::type_complexity)]
-    repos_cache: Mutex<Option<(u64, String, std::time::Instant, Vec<RepoInfo>)>>,
+    repos_cache: Mutex<Option<(u64, String, std::time::Instant, Vec<RepoInfo>, Arc<Vec<u8>>)>>,
+    /// Single-flight lock serializing cold repo discovery cache fills under concurrent polling.
+    repos_refresh_lock: Mutex<()>,
     /// Cached serialized GET /api/metrics payload keyed by (state_rev, budget_rev, max_parallel, cached_at).
     #[allow(clippy::type_complexity)]
-    metrics_cache: Mutex<Option<(u64, u64, i64, std::time::Instant, String)>>,
+    metrics_cache: Mutex<Option<(u64, u64, i64, std::time::Instant, String, Arc<Vec<u8>>)>>,
     /// Cached serialized GET /api/repos/worktrees responses keyed by explicit_repo -> (state_rev, env_key, cached_at, payload).
     #[allow(clippy::type_complexity)]
     worktrees_cache: Mutex<std::collections::HashMap<Option<String>, (u64, String, std::time::Instant, String)>>,
@@ -1222,7 +1311,11 @@ impl App {
                             .output();
                     }
                 }
-                if p.exists() {
+                if p.exists()
+                    && std::fs::symlink_metadata(&p)
+                        .map(|m| !m.file_type().is_symlink())
+                        .unwrap_or(false)
+                {
                     let _ = std::fs::remove_dir_all(&p);
                 }
                 if !p.exists() {
@@ -1279,7 +1372,15 @@ impl App {
     }
 
     fn discover_repos(&self) -> Vec<RepoInfo> {
-        const REPOS_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+        self.discover_repos_cached().0
+    }
+
+    fn discover_repos_http_cached(&self) -> Arc<Vec<u8>> {
+        self.discover_repos_cached().1
+    }
+
+    fn discover_repos_cached(&self) -> (Vec<RepoInfo>, Arc<Vec<u8>>) {
+        const REPOS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
         const MAX_REPOS: usize = 60;
         let rev = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
         let env_dirs_opt = std::env::var("FLEET_REPOS_DIR").ok();
@@ -1287,12 +1388,31 @@ impl App {
         let now = std::time::Instant::now();
         {
             let guard = self.repos_cache.lock().unwrap();
-            if let Some((cached_rev, ref cached_env, at, ref cached_repos)) = *guard {
+            if let Some((cached_rev, ref cached_env, at, ref cached_repos, ref cached_http)) =
+                *guard
+            {
                 if cached_rev == rev
                     && *cached_env == env_key
                     && now.duration_since(at) < REPOS_TTL
                 {
-                    return cached_repos.clone();
+                    return (cached_repos.clone(), Arc::clone(cached_http));
+                }
+            }
+        }
+
+        let _refresh_guard = self.repos_refresh_lock.lock().unwrap();
+        let rev = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
+        let now = std::time::Instant::now();
+        {
+            let guard = self.repos_cache.lock().unwrap();
+            if let Some((cached_rev, ref cached_env, at, ref cached_repos, ref cached_http)) =
+                *guard
+            {
+                if cached_rev == rev
+                    && *cached_env == env_key
+                    && now.duration_since(at) < REPOS_TTL
+                {
+                    return (cached_repos.clone(), Arc::clone(cached_http));
                 }
             }
         }
@@ -1439,11 +1559,16 @@ impl App {
                 .cmp(&b.name.to_lowercase())
                 .then(a.path.cmp(&b.path))
         });
+        let http = Arc::new(
+            json_response(200, &serde_json::to_string(&repos).unwrap_or_else(|_| "[]".to_string()))
+                .into_bytes(),
+        );
         let rev_after = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
         if rev_after == rev {
-            *self.repos_cache.lock().unwrap() = Some((rev, env_key, now, repos.clone()));
+            *self.repos_cache.lock().unwrap() =
+                Some((rev, env_key, now, repos.clone(), Arc::clone(&http)));
         }
-        repos
+        (repos, http)
     }
 
     /// Snapshot all session state to disk (atomic rename), so a server
@@ -1508,11 +1633,32 @@ impl App {
     }
 
     fn set_status(&self, id: &str, status: Status) {
+        let now = now_unix_ms();
         {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
                 s.status = status.label().to_string();
                 s.bucket = status.bucket().to_string();
+                match status {
+                    Status::Working => {
+                        if s.started_at_ms.is_none() {
+                            s.started_at_ms = Some(now);
+                        }
+                        s.finished_at_ms = None;
+                        s.run_elapsed_ms = None;
+                    }
+                    Status::Done | Status::Merged => {
+                        if s.finished_at_ms.is_none() {
+                            s.finished_at_ms = Some(now);
+                        }
+                        if s.run_elapsed_ms.is_none() {
+                            if let Some(st) = s.started_at_ms {
+                                s.run_elapsed_ms = Some(now.saturating_sub(st));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         self.mark_dirty(id);
@@ -1536,6 +1682,7 @@ impl App {
     /// Mark a session needs-you with the reason recorded on the session
     /// itself (the inbox aggregates these) and in its transcript.
     fn set_needs_you(&self, id: &str, reason: &str) {
+        let now = now_unix_ms();
         {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
@@ -1543,6 +1690,10 @@ impl App {
                 s.bucket = Status::NeedsYou.bucket().to_string();
                 s.reason = Some(reason.to_string());
                 s.verified_commit = None;
+                s.finished_at_ms = Some(now);
+                if let Some(st) = s.started_at_ms {
+                    s.run_elapsed_ms = Some(now.saturating_sub(st));
+                }
             }
         }
         self.mark_dirty(id);
@@ -1675,28 +1826,46 @@ impl App {
     /// Cached JSON string for unfiltered `GET /api/sessions`, reused across
     /// concurrent HTTP clients while `state_rev` is unchanged (<1ms p95 at 2,000+ sessions).
     fn sessions_view_cached(&self) -> String {
+        self.sessions_cache_pair().0
+    }
+
+    fn sessions_http_cached(&self) -> Arc<Vec<u8>> {
+        self.sessions_cache_pair().1
+    }
+
+    fn sessions_cache_pair(&self) -> (String, Arc<Vec<u8>>) {
         const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
         let rev = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
         let now = std::time::Instant::now();
         {
             let guard = self.sessions_cache.lock().unwrap();
-            if let Some((cached_rev, at, ref body)) = *guard {
+            if let Some((cached_rev, at, ref body, ref http)) = *guard {
                 if cached_rev == rev && now.duration_since(at) < CACHE_TTL {
-                    return body.clone();
+                    return (body.clone(), Arc::clone(http));
                 }
             }
         }
         let body = self.sessions_view().to_string();
+        let http = Arc::new(json_response(200, &body).into_bytes());
         let rev_after = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
         if rev_after == rev {
-            *self.sessions_cache.lock().unwrap() = Some((rev, now, body.clone()));
+            *self.sessions_cache.lock().unwrap() =
+                Some((rev, now, body.clone(), Arc::clone(&http)));
         }
-        body
+        (body, http)
     }
 
     /// Cached JSON string for `GET /api/metrics`, invalidated automatically whenever
     /// `state_rev`, `budget_rev`, or `effective_max_parallel()` changes (O(1) cache hit, single O(N) pass on miss).
     fn metrics_json_cached(&self) -> String {
+        self.metrics_cache_pair().0
+    }
+
+    fn metrics_http_cached(&self) -> Arc<Vec<u8>> {
+        self.metrics_cache_pair().1
+    }
+
+    fn metrics_cache_pair(&self) -> (String, Arc<Vec<u8>>) {
         const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
         let rev = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
         let brev = self.budget_rev.load(std::sync::atomic::Ordering::SeqCst);
@@ -1704,13 +1873,13 @@ impl App {
         let now = std::time::Instant::now();
         {
             let guard = self.metrics_cache.lock().unwrap();
-            if let Some((cached_rev, cached_brev, cached_max, at, ref payload)) = *guard {
+            if let Some((cached_rev, cached_brev, cached_max, at, ref payload, ref http)) = *guard {
                 if cached_rev == rev
                     && cached_brev == brev
                     && cached_max == max_parallel
                     && now.duration_since(at) < CACHE_TTL
                 {
-                    return payload.clone();
+                    return (payload.clone(), Arc::clone(http));
                 }
             }
         }
@@ -1723,13 +1892,14 @@ impl App {
         val["max_parallel"] = serde_json::json!(max_parallel);
         val["budget"] = budget_val;
         let payload = val.to_string();
+        let http = Arc::new(json_response(200, &payload).into_bytes());
         let rev_after = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
         let brev_after = self.budget_rev.load(std::sync::atomic::Ordering::SeqCst);
         if rev_after == rev && brev_after == brev {
             *self.metrics_cache.lock().unwrap() =
-                Some((rev, brev, max_parallel, now, payload.clone()));
+                Some((rev, brev, max_parallel, now, payload.clone(), Arc::clone(&http)));
         }
-        payload
+        (payload, http)
     }
 
     /// Fast filtered / paginated query over sessions (supports `q`, `status`,
@@ -1810,11 +1980,11 @@ impl App {
                     }
                 }
                 if let Some(ref needle) = q {
-                    let hit = s.task.to_lowercase().contains(needle)
-                        || s.project.to_lowercase().contains(needle)
-                        || s.branch.to_lowercase().contains(needle)
-                        || s.id.to_lowercase().contains(needle)
-                        || s.repo.to_lowercase().contains(needle);
+                    let hit = contains_icase(&s.task, needle)
+                        || contains_icase(&s.project, needle)
+                        || contains_icase(&s.branch, needle)
+                        || contains_icase(&s.id, needle)
+                        || contains_icase(&s.repo, needle);
                     if !hit {
                         continue;
                     }
@@ -1896,31 +2066,35 @@ impl App {
         id: &str,
         params: &std::collections::HashMap<String, String>,
     ) -> Option<serde_json::Value> {
+        if !is_valid_session_id(id) {
+            return None;
+        }
         let mem_lines: Vec<String> = {
             let sessions = self.sessions.lock().unwrap();
             sessions.iter().find(|s| s.id == id)?.transcript.clone()
         };
         let log_path = self.data_dir.join("logs").join(format!("{id}.log"));
-        let disk_lines = std::fs::read_to_string(&log_path)
-            .ok()
-            .map(|t| transcript_lines_from_log(&t))
+        let disk_text = std::fs::read_to_string(&log_path).ok();
+        let disk_slices: Vec<&str> = disk_text
+            .as_deref()
+            .map(transcript_slices_from_log)
             .unwrap_or_default();
-        let all_lines = if disk_lines.len() >= mem_lines.len() && !disk_lines.is_empty() {
-            disk_lines
+        let use_disk = disk_slices.len() >= mem_lines.len() && !disk_slices.is_empty();
+        let all_lines: Vec<&str> = if use_disk {
+            disk_slices
         } else {
-            mem_lines
+            mem_lines.iter().map(String::as_str).collect()
         };
         let is_err_line = |l: &str| {
-            let low = l.to_lowercase();
-            low.starts_with("stderr:")
-                || low.contains("error")
-                || low.contains("fail")
-                || low.contains("panic")
-                || low.contains("exception")
-                || low.contains("assertion")
+            starts_with_icase_ascii(l, b"stderr:")
+                || contains_icase_ascii_bytes(l.as_bytes(), b"error")
+                || contains_icase_ascii_bytes(l.as_bytes(), b"fail")
+                || contains_icase_ascii_bytes(l.as_bytes(), b"panic")
+                || contains_icase_ascii_bytes(l.as_bytes(), b"exception")
+                || contains_icase_ascii_bytes(l.as_bytes(), b"assertion")
         };
         let total = all_lines.len();
-        let first_error_index = all_lines.iter().position(|l| is_err_line(l));
+        let mut first_error_index: Option<usize> = None;
         let q = params.get("q").map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
         let errors_only = matches!(
             params.get("errors_only").map(String::as_str),
@@ -1940,18 +2114,21 @@ impl App {
         let mut page = Vec::with_capacity(limit.min(500));
         for (idx, line) in all_lines.iter().enumerate() {
             let err = is_err_line(line);
+            if err && first_error_index.is_none() {
+                first_error_index = Some(idx);
+            }
             if errors_only && !err {
                 continue;
             }
             if let Some(ref needle) = q {
-                if !line.to_lowercase().contains(needle) {
+                if !contains_icase(line, needle) {
                     continue;
                 }
             }
             if filtered_total >= offset && page.len() < limit {
                 page.push(serde_json::json!({
                     "index": idx,
-                    "text": line,
+                    "text": *line,
                     "is_error": err,
                 }));
             }
@@ -3073,6 +3250,18 @@ impl App {
                 ) {
                     HealDecision::Proceed { next_attempt, .. } => {
                         let effective_budget = budget.min(MAX_AUTO_HEAL_BUDGET);
+                        let (changed_files, diff_excerpt) =
+                            extract_changed_files_and_diff_excerpt(&diff, 20, 2200);
+                        let prior_attempts_summary: Vec<String> = prev_attempts
+                            .iter()
+                            .map(|a| {
+                                let code = a
+                                    .exit_code
+                                    .map(|c| format!("exit {c}"))
+                                    .unwrap_or_else(|| "failed".to_string());
+                                format!("attempt {} ({}): {code}", a.attempt, a.trigger_step)
+                            })
+                            .collect();
                         let heal_ctx = HealSessionContext {
                             session_id: id.to_string(),
                             task: session.task.clone(),
@@ -3082,6 +3271,9 @@ impl App {
                             forbidden_globs: effective_scope.forbidden_globs.clone(),
                             attempt: next_attempt,
                             budget: effective_budget,
+                            changed_files,
+                            diff_excerpt,
+                            prior_attempts_summary,
                         };
                         let heal_prompt = build_heal_prompt(&heal_ctx, failed_ctx);
                         let trigger_step = if failed_ctx.step_name.trim().is_empty() {
@@ -3577,6 +3769,9 @@ fn retry_prompt_text(
             s.reason = None;
             s.diff = String::new();
             s.verified_commit = None;
+            s.started_at_ms = None;
+            s.finished_at_ms = None;
+            s.run_elapsed_ms = None;
             let initial = if s.depends_on.is_empty() {
                 Status::Queued
             } else {
@@ -3621,6 +3816,9 @@ fn retry_prompt_text(
                 s.reason = None;
                 s.diff = String::new();
                 s.verified_commit = None;
+                s.started_at_ms = None;
+                s.finished_at_ms = None;
+                s.run_elapsed_ms = None;
                 let initial = if s.depends_on.is_empty() {
                     Status::Queued
                 } else {
@@ -3709,6 +3907,10 @@ fn retry_prompt_text(
                 auto_steer_budget: parent.auto_steer_budget,
                 heal_attempts: Vec::new(),
                 transcript_total: 0,
+                created_at_ms: now_unix_ms(),
+                started_at_ms: None,
+                finished_at_ms: None,
+                run_elapsed_ms: None,
                 transcript: Vec::new(),
             };
             sessions.push(child);
@@ -3977,7 +4179,11 @@ fn retry_prompt_text(
                     .args(["worktree", "remove", "--force"])
                     .arg(wt_path)
                     .output();
-                if wt_path.exists() {
+                if wt_path.exists()
+                    && std::fs::symlink_metadata(wt_path)
+                        .map(|m| !m.file_type().is_symlink())
+                        .unwrap_or(false)
+                {
                     let _ = std::fs::remove_dir_all(wt_path);
                 }
                 let _ = Command::new("git")
@@ -4018,14 +4224,14 @@ struct MergeError {
 
 fn json_response(status: u16, body: &str) -> String {
     format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{SECURITY_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }
 
 fn html_response(body: &str) -> String {
     format!(
-        "HTTP/1.1 200\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{SECURITY_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }
@@ -4035,141 +4241,238 @@ fn html_response(body: &str) -> String {
 /// dribbles a byte at a time under it, parking its handler thread
 /// forever.
 const READ_DEADLINE_SECS: u64 = 30;
+const INDEX_HTML_BYTES: &[u8] = include_bytes!("../assets/index.html");
+
+struct ParsedRequest {
+    method: String,
+    path: String,
+    body: String,
+    content_type: String,
+    origin: String,
+    host: String,
+    last_event_id: Option<u64>,
+    accept_encoding: String,
+    if_none_match: String,
+}
 
 #[cfg(test)]
 fn read_request(
     stream: &mut std::net::TcpStream,
 ) -> Option<(String, String, String, String, String, String)> {
-    let (m, p, b, ct, o, h, _) = read_request_full(stream)?;
-    Some((m, p, b, ct, o, h))
+    let req = read_parsed_request(stream)?;
+    Some((
+        req.method,
+        req.path,
+        req.body,
+        req.content_type,
+        req.origin,
+        req.host,
+    ))
 }
 
+#[cfg(test)]
 #[allow(clippy::type_complexity)]
 fn read_request_full(
     stream: &mut std::net::TcpStream,
 ) -> Option<(String, String, String, String, String, String, Option<u64>)> {
+    let req = read_parsed_request(stream)?;
+    Some((
+        req.method,
+        req.path,
+        req.body,
+        req.content_type,
+        req.origin,
+        req.host,
+        req.last_event_id,
+    ))
+}
+
+fn read_parsed_request(stream: &mut std::net::TcpStream) -> Option<ParsedRequest> {
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(READ_DEADLINE_SECS);
-    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    // Borrow `&*stream` directly instead of `try_clone()` to eliminate `dup()` + `close()` syscalls.
+    let mut reader = BufReader::with_capacity(8192, &*stream);
     let arm = |stream: &std::net::TcpStream| -> Option<()> {
         let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
         let t = remaining.min(std::time::Duration::from_secs(READ_TIMEOUT_SECS));
         stream.set_read_timeout(Some(t)).ok()?;
         Some(())
     };
-    let read_line_by_byte =
-        |reader: &mut BufReader<std::net::TcpStream>,
-         stream: &std::net::TcpStream|
-         -> Option<String> {
-            let mut line = String::new();
+    let read_line_buffered =
+        |reader: &mut BufReader<&std::net::TcpStream>,
+         stream: &std::net::TcpStream,
+         out: &mut Vec<u8>|
+         -> Option<bool> {
+            out.clear();
             loop {
-                arm(stream)?;
-                let mut b = [0u8; 1];
-                let n = reader.read(&mut b).ok()?;
-                if n == 0 {
-                    return if line.is_empty() { None } else { Some(line) };
+                if reader.buffer().is_empty() {
+                    arm(stream)?;
                 }
-                line.push(b[0] as char);
-                if b[0] == b'\n' || line.len() > 16384 {
-                    return Some(line);
+                let avail = reader.fill_buf().ok()?;
+                if avail.is_empty() {
+                    return if out.is_empty() { None } else { Some(true) };
                 }
+                if let Some(nl) = avail.iter().position(|&b| b == b'\n') {
+                    let take = nl + 1;
+                    if out.len() + take > 16384 {
+                        reader.consume(take);
+                        return Some(false);
+                    }
+                    out.extend_from_slice(&avail[..take]);
+                    reader.consume(take);
+                    return Some(true);
+                }
+                let len = avail.len();
+                if out.len() + len > 16384 {
+                    reader.consume(len);
+                    return Some(false);
+                }
+                out.extend_from_slice(avail);
+                reader.consume(len);
             }
         };
-    let request_line = read_line_by_byte(&mut reader, stream)?;
-    if request_line.len() > 16384 {
-        return Some((
-            "__headers_too_large__".to_string(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            None,
-        ));
+
+    let mut line_buf = Vec::with_capacity(256);
+    if !read_line_buffered(&mut reader, stream, &mut line_buf)? {
+        return Some(ParsedRequest {
+            method: "__headers_too_large__".to_string(),
+            path: String::new(),
+            body: String::new(),
+            content_type: String::new(),
+            origin: String::new(),
+            host: String::new(),
+            last_event_id: None,
+            accept_encoding: String::new(),
+            if_none_match: String::new(),
+        });
     }
+    let request_line = String::from_utf8_lossy(&line_buf);
     let mut parts = request_line.split_whitespace();
     let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
     let mut content_length: Option<usize> = None;
+    let mut too_large = false;
     let mut content_type = String::new();
     let mut origin = String::new();
     let mut host = String::new();
     let mut last_event_id: Option<u64> = None;
+    let mut accept_encoding = String::new();
+    let mut if_none_match = String::new();
     let mut header_count = 0usize;
     let mut header_bytes = 0usize;
     loop {
-        let line = read_line_by_byte(&mut reader, stream)?;
-        if line == "\r\n" || line.is_empty() {
+        if !read_line_buffered(&mut reader, stream, &mut line_buf)? {
+            return Some(ParsedRequest {
+                method: "__headers_too_large__".to_string(),
+                path: String::new(),
+                body: String::new(),
+                content_type: String::new(),
+                origin: String::new(),
+                host: String::new(),
+                last_event_id: None,
+                accept_encoding: String::new(),
+                if_none_match: String::new(),
+            });
+        }
+        if line_buf == b"\r\n" || line_buf == b"\n" || line_buf.is_empty() {
             break;
         }
         header_count += 1;
-        header_bytes += line.len();
+        header_bytes += line_buf.len();
         if header_count > MAX_HEADERS || header_bytes > MAX_HEADER_BYTES {
-            return Some((
-                "__headers_too_large__".to_string(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                None,
-            ));
+            return Some(ParsedRequest {
+                method: "__headers_too_large__".to_string(),
+                path: String::new(),
+                body: String::new(),
+                content_type: String::new(),
+                origin: String::new(),
+                host: String::new(),
+                last_event_id: None,
+                accept_encoding: String::new(),
+                if_none_match: String::new(),
+            });
         }
-        let lower = line.to_lowercase();
-        if let Some(v) = lower.strip_prefix("content-length:") {
-            let trimmed = v.trim();
-            let Ok(parsed) = trimmed.parse::<usize>() else {
-                return Some((
-                    "__bad_request__".to_string(),
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    String::new(),
+        let line = String::from_utf8_lossy(&line_buf);
+        let Some((hdr_name, hdr_val)) = line.split_once(':') else {
+            continue;
+        };
+        let hdr_val = hdr_val.trim();
+        if hdr_name.eq_ignore_ascii_case("content-length") {
+            if hdr_val.is_empty() || !hdr_val.bytes().all(|b| b.is_ascii_digit()) {
+                return Some(ParsedRequest {
+                    method: "__bad_request__".to_string(),
+                    path: String::new(),
+                    body: String::new(),
+                    content_type: String::new(),
+                    origin: String::new(),
                     host,
-                    None,
-                ));
-            };
-            if let Some(prev) = content_length {
-                if prev != parsed {
-                    return Some((
-                        "__bad_request__".to_string(),
-                        String::new(),
-                        String::new(),
-                        String::new(),
-                        String::new(),
-                        host,
-                        None,
-                    ));
+                    last_event_id: None,
+                    accept_encoding: String::new(),
+                    if_none_match: String::new(),
+                });
+            }
+            match hdr_val.parse::<usize>() {
+                Ok(parsed) => {
+                    if let Some(prev) = content_length {
+                        if prev != parsed {
+                            return Some(ParsedRequest {
+                                method: "__bad_request__".to_string(),
+                                path: String::new(),
+                                body: String::new(),
+                                content_type: String::new(),
+                                origin: String::new(),
+                                host,
+                                last_event_id: None,
+                                accept_encoding: String::new(),
+                                if_none_match: String::new(),
+                            });
+                        }
+                    }
+                    content_length = Some(parsed);
+                    if parsed > MAX_BODY_BYTES {
+                        too_large = true;
+                    }
+                }
+                Err(_) => {
+                    too_large = true;
                 }
             }
-            content_length = Some(parsed);
-        } else if let Some(v) = lower.strip_prefix("content-type:") {
-            content_type = v.trim().to_string();
-        } else if let Some(v) = lower.strip_prefix("origin:") {
-            origin = v.trim().to_string();
-        } else if let Some(v) = lower.strip_prefix("host:") {
-            host = v.trim().to_string();
-        } else if let Some(v) = lower.strip_prefix("last-event-id:") {
-            last_event_id = v.trim().parse::<u64>().ok();
+        } else if hdr_name.eq_ignore_ascii_case("content-type") {
+            content_type = hdr_val.to_ascii_lowercase();
+        } else if hdr_name.eq_ignore_ascii_case("origin") {
+            origin = hdr_val.to_ascii_lowercase();
+        } else if hdr_name.eq_ignore_ascii_case("host") {
+            host = hdr_val.to_ascii_lowercase();
+        } else if hdr_name.eq_ignore_ascii_case("last-event-id") {
+            last_event_id = hdr_val.parse::<u64>().ok();
+        } else if hdr_name.eq_ignore_ascii_case("accept-encoding") {
+            accept_encoding = hdr_val.to_string();
+        } else if hdr_name.eq_ignore_ascii_case("if-none-match") {
+            if_none_match = hdr_val.to_string();
         }
     }
     let content_length = content_length.unwrap_or(0);
-    if content_length > MAX_BODY_BYTES {
-        return Some((
-            "__too_large__".to_string(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
+    if too_large || content_length > MAX_BODY_BYTES {
+        // Return promptly with write half still open so clients receive 413 cleanly.
+        return Some(ParsedRequest {
+            method: "__too_large__".to_string(),
+            path: String::new(),
+            body: String::new(),
+            content_type: String::new(),
+            origin: String::new(),
             host,
-            None,
-        ));
+            last_event_id: None,
+            accept_encoding: String::new(),
+            if_none_match: String::new(),
+        });
     }
     let mut body: Vec<u8> = Vec::with_capacity(content_length);
     if content_length > 0 {
         let mut chunk = [0u8; 8192];
         while body.len() < content_length {
-            arm(stream)?;
+            if reader.buffer().is_empty() {
+                arm(stream)?;
+            }
             let want = (content_length - body.len()).min(chunk.len());
             match reader.read(&mut chunk[..want]) {
                 Ok(0) => return None,
@@ -4178,15 +4481,17 @@ fn read_request_full(
             }
         }
     }
-    Some((
+    Some(ParsedRequest {
         method,
         path,
-        String::from_utf8_lossy(&body).to_string(),
+        body: String::from_utf8_lossy(&body).to_string(),
         content_type,
         origin,
         host,
         last_event_id,
-    ))
+        accept_encoding,
+        if_none_match,
+    })
 }
 
 fn url_decode(raw: &str) -> String {
@@ -4377,6 +4682,7 @@ const READ_TIMEOUT_SECS: u64 = 10;
 
 /// Answers one request: the Host, body-size, content-type and origin rules
 /// first, then the update routes, then the API.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn respond(
     app: &Arc<App>,
@@ -4411,6 +4717,87 @@ fn respond(
         update_route(app, method, route, path, body, host)
             .unwrap_or_else(|| handle(app, method, path, body))
     }
+}
+
+enum HttpReply {
+    Static(&'static [u8]),
+    Shared(Arc<Vec<u8>>),
+    Owned(Vec<u8>),
+}
+
+impl HttpReply {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Static(b) => b,
+            Self::Shared(b) => b,
+            Self::Owned(b) => b,
+        }
+    }
+}
+
+/// Fast byte-level dispatcher for the TCP listener: serves pre-compressed gzip + ETag/304
+/// HTML slices with zero heap allocation and reuses `Arc<Vec<u8>>` HTTP buffers on hot caches.
+fn respond_bytes(app: &Arc<App>, allowed_hosts: &str, req: &ParsedRequest) -> HttpReply {
+    if req.method == "__headers_too_large__" {
+        return HttpReply::Owned(error_response(431, "request headers are too large").into_bytes());
+    }
+    if !host_allowed(&req.host, allowed_hosts) {
+        return HttpReply::Owned(
+            error_response(403, "this board answers only to its own host name").into_bytes(),
+        );
+    }
+    if req.method == "__bad_request__" {
+        return HttpReply::Owned(error_response(400, "malformed HTTP request").into_bytes());
+    }
+    if req.method == "__too_large__" {
+        return HttpReply::Owned(error_response(413, "request body too large").into_bytes());
+    }
+    if req.method == "POST" && !req.content_type.starts_with("application/json") {
+        return HttpReply::Owned(
+            error_response(415, "POST requires Content-Type: application/json").into_bytes(),
+        );
+    }
+    if matches!(req.method.as_str(), "POST" | "DELETE" | "PUT" | "PATCH")
+        && !req.origin.is_empty()
+        && !origin_is_local(&req.origin)
+    {
+        return HttpReply::Owned(
+            error_response(403, "cross-origin requests are refused").into_bytes(),
+        );
+    }
+
+    let route = req.path.split('?').next().unwrap_or("");
+    if matches!(req.method.as_str(), "GET" | "HEAD") && route == "/" {
+        let cache = EmbeddedHtmlCache::global(INDEX_HTML_BYTES);
+        let bytes = cache.response_bytes(
+            req.method == "HEAD",
+            &req.accept_encoding,
+            &req.if_none_match,
+        );
+        return HttpReply::Static(bytes);
+    }
+    if req.method == "GET" && route == "/api/sessions" && !req.path.contains('?') {
+        return HttpReply::Shared(app.sessions_http_cached());
+    }
+    if req.method == "GET" && route == "/api/metrics" {
+        return HttpReply::Shared(app.metrics_http_cached());
+    }
+    if req.method == "GET" && route == "/api/repos" {
+        if !host_allowed(&req.host, "") {
+            return HttpReply::Owned(
+                error_response(
+                    403,
+                    "repo discovery is only allowed from this machine, not through a shared address",
+                )
+                .into_bytes(),
+            );
+        }
+        return HttpReply::Shared(app.discover_repos_http_cached());
+    }
+
+    let text = update_route(app, &req.method, route, &req.path, &req.body, &req.host)
+        .unwrap_or_else(|| handle(app, &req.method, &req.path, &req.body));
+    HttpReply::Owned(text.into_bytes())
 }
 
 /// Validate a model identifier submitted via config or session hand-out.
@@ -5046,6 +5433,17 @@ fn session_to_api_value(
     v["check_ran"] = serde_json::json!(s.check_ran);
     v["check_exit"] = serde_json::json!(s.check_exit);
     v["auto_steer_budget"] = serde_json::json!(s.auto_steer_budget);
+    v["heal_budget_total"] = serde_json::json!(s.auto_steer_budget);
+    v["heal_budget_remaining"] =
+        serde_json::json!(s.auto_steer_budget.saturating_sub(s.heal_attempts.len() as u32));
+    let duration_ms = s.run_elapsed_ms.or_else(|| {
+        if matches!(s.status.as_str(), "working" | "checking") {
+            s.started_at_ms.map(|st| now_unix_ms().saturating_sub(st))
+        } else {
+            None
+        }
+    });
+    v["duration_ms"] = serde_json::json!(duration_ms);
     v["heal_attempts"] = serde_json::json!(&s.heal_attempts);
     let auto_healed = s.heal_attempts.iter().any(|a| a.healed)
         && matches!(s.status.as_str(), "done" | "merged");
@@ -5172,7 +5570,7 @@ fn patch_response(filename: &str, body: &str) -> String {
         safe_name
     };
     format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/x-patch; charset=utf-8\r\nContent-Disposition: attachment; filename=\"{name}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/x-patch; charset=utf-8\r\nContent-Disposition: attachment; filename=\"{name}\"\r\n{SECURITY_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }
@@ -5429,6 +5827,13 @@ fn handle_upsert_template(app: &Arc<App>, body: &str) -> String {
 }
 
 fn validate_git_repo(repo: &str) -> Result<(), String> {
+    if repo.contains('\0')
+        || Path::new(repo)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("repository path cannot contain '..' traversal or NUL bytes".to_string());
+    }
     if !Path::new(repo).is_dir() {
         return Err(format!("There is no folder at {repo}."));
     }
@@ -6035,6 +6440,10 @@ fn handle_batch_sessions(app: &Arc<App>, body: &str) -> String {
                 auto_steer_budget: rs.auto_steer_budget,
                 heal_attempts: Vec::new(),
                 transcript_total: 0,
+                created_at_ms: now_unix_ms(),
+                started_at_ms: None,
+                finished_at_ms: None,
+                run_elapsed_ms: None,
                 transcript: Vec::new(),
             };
             created_ids.push(id);
@@ -6079,6 +6488,209 @@ fn handle_batch_sessions(app: &Arc<App>, body: &str) -> String {
     )
 }
 
+/// 1-click "Batch Merge Verified Wave" with non-destructive conflict preflight check.
+/// Supports `dry_run: true` (preflight only) and `dry_run: false` (preflight + merge clean verified sessions).
+fn handle_batch_merge(app: &Arc<App>, body: &str) -> String {
+    let req: serde_json::Value = if body.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_str(body) {
+            Ok(v) => v,
+            Err(e) => return error_response(400, &format!("bad json: {e}")),
+        }
+    };
+    let Some(obj) = req.as_object() else {
+        return error_response(400, "batch-merge payload must be a JSON object");
+    };
+    let dry_run = obj
+        .get("dry_run")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let strategy = match obj.get("strategy").and_then(serde_json::Value::as_str) {
+        Some(raw) => match MergeStrategy::parse(raw) {
+            Ok(st) => st,
+            Err(e) => return error_response(400, &e),
+        },
+        None => MergeStrategy::MergeCommit,
+    };
+    let repo_filter = obj
+        .get("repo")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let explicit_ids = match parse_string_list_field(
+        obj.get("ids").unwrap_or(&serde_json::Value::Null),
+        "ids",
+    ) {
+        Ok(v) => v,
+        Err(e) => return error_response(400, &e),
+    };
+
+    let candidates: Vec<Session> = {
+        let sessions = app.sessions.lock().unwrap();
+        if explicit_ids.is_empty() {
+            sessions
+                .iter()
+                .filter(|s| {
+                    s.status == "done"
+                        && s.verified_commit.is_some()
+                        && !s.repo.is_empty()
+                        && repo_filter.as_deref().is_none_or(|r| s.repo == r)
+                })
+                .cloned()
+                .collect()
+        } else {
+            let mut list = Vec::with_capacity(explicit_ids.len());
+            for id in &explicit_ids {
+                if let Some(s) = sessions.iter().find(|x| x.id == *id) {
+                    list.push(s.clone());
+                }
+            }
+            list
+        }
+    };
+
+    let mut clean_count = 0usize;
+    let mut conflict_count = 0usize;
+    let mut merged_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut failed_count = 0usize;
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(candidates.len());
+
+    for s in candidates {
+        if s.status != "done" || s.verified_commit.is_none() || s.repo.is_empty() {
+            skipped_count += 1;
+            results.push(serde_json::json!({
+                "id": s.id,
+                "task": s.task,
+                "repo": s.repo,
+                "branch": s.branch,
+                "status": "skipped",
+                "clean": false,
+                "can_apply": false,
+                "conflicting_files": [],
+                "error": format!("session is '{}' (only verified done sessions can merge)", s.status),
+            }));
+            continue;
+        }
+        let target = merge_target(&s.repo).unwrap_or_else(|| "HEAD".to_string());
+        let source = s.verified_commit.as_deref().unwrap_or(&s.branch);
+        match dry_run_merge(Path::new(&s.repo), &target, source) {
+            Ok(chk) => {
+                let apply_err = chk.can_apply_strategy(strategy).err();
+                let can_apply = apply_err.is_none();
+                if chk.clean && can_apply {
+                    clean_count += 1;
+                } else {
+                    conflict_count += 1;
+                }
+                if dry_run {
+                    results.push(serde_json::json!({
+                        "id": s.id,
+                        "task": s.task,
+                        "repo": s.repo,
+                        "branch": s.branch,
+                        "target": target,
+                        "status": if chk.clean && can_apply { "ready" } else { "conflict" },
+                        "clean": chk.clean,
+                        "can_apply": can_apply,
+                        "conflicting_files": chk.conflicting_files,
+                        "commits_ahead": chk.commits_ahead,
+                        "commits_behind": chk.commits_behind,
+                        "error": apply_err,
+                    }));
+                } else if !chk.clean || !can_apply {
+                    skipped_count += 1;
+                    results.push(serde_json::json!({
+                        "id": s.id,
+                        "task": s.task,
+                        "repo": s.repo,
+                        "branch": s.branch,
+                        "target": target,
+                        "status": "skipped",
+                        "clean": chk.clean,
+                        "can_apply": can_apply,
+                        "conflicting_files": chk.conflicting_files,
+                        "commits_ahead": chk.commits_ahead,
+                        "commits_behind": chk.commits_behind,
+                        "error": apply_err,
+                    }));
+                } else {
+                    match app.merge_with_strategy(&s.id, strategy) {
+                        Ok((commit, branch, landed_commit, strat)) => {
+                            merged_count += 1;
+                            results.push(serde_json::json!({
+                                "id": s.id,
+                                "task": s.task,
+                                "repo": s.repo,
+                                "branch": branch,
+                                "status": "merged",
+                                "clean": true,
+                                "can_apply": true,
+                                "commit": commit,
+                                "landed_commit": landed_commit,
+                                "strategy": strat.label(),
+                                "conflicting_files": [],
+                            }));
+                        }
+                        Err(e) => {
+                            failed_count += 1;
+                            results.push(serde_json::json!({
+                                "id": s.id,
+                                "task": s.task,
+                                "repo": s.repo,
+                                "branch": s.branch,
+                                "target": target,
+                                "status": "failed",
+                                "clean": chk.clean,
+                                "can_apply": false,
+                                "conflicting_files": chk.conflicting_files,
+                                "error": e.message,
+                                "detail": e.detail,
+                            }));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                conflict_count += 1;
+                if !dry_run {
+                    skipped_count += 1;
+                }
+                results.push(serde_json::json!({
+                    "id": s.id,
+                    "task": s.task,
+                    "repo": s.repo,
+                    "branch": s.branch,
+                    "target": target,
+                    "status": if dry_run { "conflict" } else { "skipped" },
+                    "clean": false,
+                    "can_apply": false,
+                    "conflicting_files": [],
+                    "error": e,
+                }));
+            }
+        }
+    }
+
+    json_response(
+        200,
+        &serde_json::json!({
+            "dry_run": dry_run,
+            "strategy": strategy.label(),
+            "total": results.len(),
+            "clean_count": clean_count,
+            "conflict_count": conflict_count,
+            "merged_count": merged_count,
+            "skipped_count": skipped_count,
+            "failed_count": failed_count,
+            "results": results,
+        })
+        .to_string(),
+    )
+}
+
 fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
     let (route, query) = match path.split_once('?') {
         Some((r, q)) => (r, q),
@@ -6087,6 +6699,10 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
     let params = parse_query(query);
     match (method, route) {
         ("GET", "/") => html_response(include_str!("../assets/index.html")),
+        ("HEAD", "/") => {
+            let bytes = EmbeddedHtmlCache::global(INDEX_HTML_BYTES).response_bytes(true, "", "");
+            String::from_utf8_lossy(bytes).to_string()
+        }
         ("GET", "/api/policy") => {
             let default_agent = app.effective_default_agent();
             let opencode_model = app.effective_model_for("opencode");
@@ -6121,6 +6737,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                     "features": {
                         "sse": true,
                         "batch": true,
+                        "batch_merge": true,
                         "merge_check": true,
                         "policy_test": true,
                         "prune_worktrees": true,
@@ -6176,6 +6793,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 json_response(200, &app.sessions_query(&params).to_string())
             }
         }
+        ("POST", "/api/sessions/batch-merge") => handle_batch_merge(app, body),
         ("POST", "/api/sessions/batch") => handle_batch_sessions(app, body),
         ("POST", "/api/sessions") => {
             let req: serde_json::Value = match serde_json::from_str(body) {
@@ -6372,6 +6990,10 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 auto_steer_budget,
                 heal_attempts: Vec::new(),
                 transcript_total: 0,
+                created_at_ms: now_unix_ms(),
+                started_at_ms: None,
+                finished_at_ms: None,
+                run_elapsed_ms: None,
                 transcript: Vec::new(),
             };
             app.sessions.lock().unwrap().push(session.clone());
@@ -6402,6 +7024,9 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
         }
         ("GET", route) if route.starts_with("/api/sessions/") && route.ends_with("/transcript") => {
             let id = &route["/api/sessions/".len()..route.len() - "/transcript".len()];
+            if !is_valid_session_id(id) {
+                return error_response(404, "no such session");
+            }
             match app.transcript_query(id, &params) {
                 Some(v) => json_response(200, &v.to_string()),
                 None => error_response(404, "no such session"),
@@ -6409,6 +7034,9 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
         }
         ("GET", route) if route.starts_with("/api/sessions/") && route.ends_with("/merge-check") => {
             let id = &route["/api/sessions/".len()..route.len() - "/merge-check".len()];
+            if !is_valid_session_id(id) {
+                return error_response(404, "no such session");
+            }
             let session = {
                 let sessions = app.sessions.lock().unwrap();
                 sessions.iter().find(|s| s.id == id).cloned()
@@ -6480,6 +7108,9 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
         }
         ("GET", route) if route.starts_with("/api/sessions/") => {
             let id = &route["/api/sessions/".len()..];
+            if !is_valid_session_id(id) {
+                return error_response(404, "no such session");
+            }
             match app.session_json_single(id) {
                 Some(v) => json_response(200, &v.to_string()),
                 None => error_response(404, "no such session"),
@@ -6580,15 +7211,12 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
 /// check-output blocks the runner appends to the same file are not
 /// transcript (they sit between the markers; older logs have no end
 /// marker, so their block runs to the end of the file).
-fn transcript_lines_from_log(text: &str) -> Vec<String> {
+fn transcript_slices_from_log(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut in_check_block = false;
     for line in text.lines() {
         if line == " --- check output ---" || line == " --- end check output ---" {
-            // A line the agent itself printed that happens to equal a
-            // check-block marker — escaped with a leading space when
-            // written to the log, so it cannot forge a block boundary.
-            out.push(line[1..].to_string());
+            out.push(&line[1..]);
             continue;
         }
         if line == "--- check output ---" {
@@ -6600,10 +7228,17 @@ fn transcript_lines_from_log(text: &str) -> Vec<String> {
             continue;
         }
         if !in_check_block {
-            out.push(line.to_string());
+            out.push(line);
         }
     }
     out
+}
+
+fn transcript_lines_from_log(text: &str) -> Vec<String> {
+    transcript_slices_from_log(text)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 /// Cap a restored transcript exactly as log() caps a live one — BOTH
@@ -6738,6 +7373,10 @@ fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
             auto_steer_budget: 0,
             heal_attempts: Vec::new(),
             transcript_total: lines.len(),
+            created_at_ms: 0,
+            started_at_ms: None,
+            finished_at_ms: None,
+            run_elapsed_ms: None,
             transcript: cap_transcript(lines),
         });
     }
@@ -7083,6 +7722,7 @@ fn main() {
         merge_target_cache: Mutex::new(std::collections::HashMap::new()),
         sessions_cache: Mutex::new(None),
         repos_cache: Mutex::new(None),
+        repos_refresh_lock: Mutex::new(()),
         metrics_cache: Mutex::new(None),
         worktrees_cache: Mutex::new(std::collections::HashMap::new()),
         worktrees_refresh_lock: Mutex::new(()),
@@ -7204,56 +7844,82 @@ fn main() {
         std::env::var("FLEET_UPDATE_MODE").unwrap_or_else(|_| "notify".to_string())
     );
     open_in_browser(&format!("http://127.0.0.1:{port}/"));
-    const MAX_HTTP_WORKERS: usize = 128;
-    let active_workers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    struct WorkerGuard(Arc<std::sync::atomic::AtomicUsize>);
-    impl Drop for WorkerGuard {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        }
+    // Pre-warm embedded HTML gzip + ETag cache asynchronously so `/api/version` answers instantaneously.
+    std::thread::spawn(|| {
+        let _ = EmbeddedHtmlCache::global(INDEX_HTML_BYTES);
+    });
+
+    const HTTP_POOL_WORKERS: usize = 64;
+    const MAX_PENDING_CONNS: usize = 256;
+    let queue: Arc<(Mutex<std::collections::VecDeque<std::net::TcpStream>>, std::sync::Condvar)> =
+        Arc::new((
+            Mutex::new(std::collections::VecDeque::with_capacity(64)),
+            std::sync::Condvar::new(),
+        ));
+
+    for _ in 0..HTTP_POOL_WORKERS {
+        let q = Arc::clone(&queue);
+        let app = app.clone();
+        let allowed_hosts = allowed_hosts.clone();
+        std::thread::spawn(move || {
+            loop {
+                let mut stream = {
+                    let (lock, cv) = &*q;
+                    let mut guard = lock.lock().unwrap();
+                    while guard.is_empty() {
+                        guard = cv.wait(guard).unwrap();
+                    }
+                    guard.pop_front().unwrap()
+                };
+                let _ = stream.set_nodelay(true);
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(
+                    READ_TIMEOUT_SECS,
+                )));
+                if let Some(req) = read_parsed_request(&mut stream) {
+                    let route = req.path.split('?').next().unwrap_or("");
+                    if req.method == "GET" && route == "/api/events/stream" {
+                        if !host_allowed(&req.host, &allowed_hosts) {
+                            let resp = error_response(403, "this board answers only to its own host name");
+                            let _ = stream.write_all(resp.as_bytes());
+                            let _ = stream.flush();
+                            continue;
+                        }
+                        let query = req.path.split_once('?').map(|(_, q)| q).unwrap_or("");
+                        let since = req.last_event_id.or_else(|| {
+                            parse_query(query)
+                                .get("since")
+                                .and_then(|v| v.parse::<u64>().ok())
+                        });
+                        // Hand long-lived SSE stream off to a dedicated thread (subscriber cap enforced inside serve_sse)
+                        // so HTTP pool workers stay 100% free for concurrent REST traffic.
+                        let app_sse = app.clone();
+                        std::thread::spawn(move || {
+                            serve_sse(&app_sse, &mut stream, since);
+                        });
+                        continue;
+                    }
+                    let reply = respond_bytes(&app, &allowed_hosts, &req);
+                    let _ = stream.write_all(reply.as_bytes());
+                    let _ = stream.flush();
+                }
+            }
+        });
     }
+
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                if active_workers.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_HTTP_WORKERS {
-                    active_workers.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                let (lock, cv) = &*queue;
+                let mut guard = lock.lock().unwrap();
+                if guard.len() >= MAX_PENDING_CONNS {
+                    drop(guard);
                     let resp = error_response(503, "server busy");
                     let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
                     continue;
                 }
-                let guard = WorkerGuard(active_workers.clone());
-                let app = app.clone();
-                let allowed_hosts = allowed_hosts.clone();
-                std::thread::spawn(move || {
-                    let _guard = guard;
-                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(
-                        READ_TIMEOUT_SECS,
-                    )));
-                    if let Some((method, path, body, content_type, origin, host, last_event_id)) =
-                        read_request_full(&mut stream)
-                    {
-                        let (route, query) = match path.split_once('?') {
-                            Some((r, q)) => (r, q),
-                            None => (path.as_str(), ""),
-                        };
-                        if method == "GET" && route == "/api/events/stream" {
-                            if !host_allowed(&host, &allowed_hosts) {
-                                let resp = error_response(403, "this board answers only to its own host name");
-                                let _ = stream.write_all(resp.as_bytes());
-                                return;
-                            }
-                            let since = last_event_id.or_else(|| {
-                                parse_query(query)
-                                    .get("since")
-                                    .and_then(|v| v.parse::<u64>().ok())
-                            });
-                            serve_sse(&app, &mut stream, since);
-                            return;
-                        }
-                        let response = respond(&app, &allowed_hosts, &method, &path, &body, &content_type, &origin, &host);
-                        let _ = stream.write_all(response.as_bytes());
-                    }
-                });
+                guard.push_back(stream);
+                cv.notify_one();
             }
             Err(_) => continue,
         }
@@ -7404,6 +8070,7 @@ mod tests {
             merge_target_cache: Mutex::new(std::collections::HashMap::new()),
             sessions_cache: Mutex::new(None),
             repos_cache: Mutex::new(None),
+            repos_refresh_lock: Mutex::new(()),
             metrics_cache: Mutex::new(None),
         worktrees_cache: Mutex::new(std::collections::HashMap::new()),
         worktrees_refresh_lock: Mutex::new(()),
@@ -7463,6 +8130,10 @@ mod tests {
             auto_steer_budget: 0,
             heal_attempts: Vec::new(),
             transcript_total: 0,
+            created_at_ms: 0,
+            started_at_ms: None,
+            finished_at_ms: None,
+            run_elapsed_ms: None,
             transcript: Vec::new(),
         };
         app.sessions.lock().unwrap().push(session);
@@ -7492,6 +8163,7 @@ mod tests {
             merge_target_cache: Mutex::new(std::collections::HashMap::new()),
             sessions_cache: Mutex::new(None),
             repos_cache: Mutex::new(None),
+            repos_refresh_lock: Mutex::new(()),
             metrics_cache: Mutex::new(None),
         worktrees_cache: Mutex::new(std::collections::HashMap::new()),
         worktrees_refresh_lock: Mutex::new(()),
@@ -7553,6 +8225,10 @@ mod tests {
             auto_steer_budget: 0,
             heal_attempts: Vec::new(),
             transcript_total: 0,
+            created_at_ms: 0,
+            started_at_ms: None,
+            finished_at_ms: None,
+            run_elapsed_ms: None,
             transcript: Vec::new(),
         }
     }
@@ -8324,6 +9000,7 @@ mod tests {
             merge_target_cache: Mutex::new(std::collections::HashMap::new()),
             sessions_cache: Mutex::new(None),
             repos_cache: Mutex::new(None),
+            repos_refresh_lock: Mutex::new(()),
             metrics_cache: Mutex::new(None),
         worktrees_cache: Mutex::new(std::collections::HashMap::new()),
         worktrees_refresh_lock: Mutex::new(()),
@@ -9825,6 +10502,146 @@ fi
 
         let r2 = handle(&app, "POST", "/api/plan", r#"{"goal":""}"#);
         assert!(r2.starts_with("HTTP/1.1 400"), "{r2}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v0100_batch_merge_gzip_etag_413_and_duration() {
+        let dir = std::env::temp_dir().join(format!("fleet-v0100-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir);
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        Command::new("git").arg("-C").arg(&repo).args(["add", "shared.txt"]).output().unwrap();
+        Command::new("git").arg("-C").arg(&repo).args(["commit", "-m", "base"]).output().unwrap();
+
+        let make_branch_commit = |branch: &str, file: &str, content: &str| -> String {
+            Command::new("git").arg("-C").arg(&repo).args(["checkout", "-b", branch, "main"]).output().unwrap();
+            std::fs::write(repo.join(file), content).unwrap();
+            Command::new("git").arg("-C").arg(&repo).args(["add", file]).output().unwrap();
+            Command::new("git").arg("-C").arg(&repo).args(["commit", "-m", branch]).output().unwrap();
+            let oid = Command::new("git").arg("-C").arg(&repo).args(["rev-parse", "HEAD"]).output().unwrap();
+            let pin = String::from_utf8_lossy(&oid.stdout).trim().to_string();
+            Command::new("git").arg("-C").arg(&repo).args(["checkout", "main"]).output().unwrap();
+            pin
+        };
+
+        let pin1 = make_branch_commit("fleet/s1", "clean_a.txt", "alpha\n");
+        let pin2 = make_branch_commit("fleet/s2", "shared.txt", "branch2\n");
+        let pin3 = make_branch_commit("fleet/s3", "shared.txt", "branch3\n");
+
+        let mut s1 = test_session("s1", Status::Done, &dir);
+        s1.repo = repo.to_string_lossy().to_string();
+        s1.verified_commit = Some(pin1);
+        s1.auto_steer_budget = 3;
+        s1.started_at_ms = Some(1000);
+        s1.finished_at_ms = Some(3500);
+        s1.run_elapsed_ms = Some(2500);
+
+        let mut s2 = test_session("s2", Status::Done, &dir);
+        s2.repo = repo.to_string_lossy().to_string();
+        s2.verified_commit = Some(pin2);
+
+        let mut s3 = test_session("s3", Status::Done, &dir);
+        s3.repo = repo.to_string_lossy().to_string();
+        s3.verified_commit = Some(pin3);
+
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let app = test_app(data, vec![s1, s2, s3]);
+
+        // 1. Duration & heal budget headroom telemetry
+        let got_s1 = response_body(&handle(&app, "GET", "/api/sessions/s1", ""));
+        assert_eq!(got_s1["duration_ms"], 2500);
+        assert_eq!(got_s1["heal_budget_total"], 3);
+        assert_eq!(got_s1["heal_budget_remaining"], 3);
+
+        // 2. Preflight dry_run batch-merge
+        let dry = response_body(&handle(
+            &app,
+            "POST",
+            "/api/sessions/batch-merge",
+            r#"{"dry_run":true}"#,
+        ));
+        assert_eq!(dry["dry_run"], true);
+        assert_eq!(dry["clean_count"], 3);
+        assert_eq!(dry["conflict_count"], 0);
+
+        // 3. Execute batch-merge: s1 & s2 merge cleanly, then s3 conflicts against updated main and is skipped!
+        let merged = response_body(&handle(
+            &app,
+            "POST",
+            "/api/sessions/batch-merge",
+            r#"{"dry_run":false,"strategy":"merge"}"#,
+        ));
+        assert_eq!(merged["merged_count"], 2, "merged={merged}");
+        assert_eq!(merged["skipped_count"], 1, "merged={merged}");
+        assert_eq!(merged["results"][0]["status"], "merged");
+        assert_eq!(merged["results"][1]["status"], "merged");
+        assert_eq!(merged["results"][2]["status"], "skipped");
+        assert!(
+            merged["results"][2]["conflicting_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f == "shared.txt"),
+            "results={merged}"
+        );
+
+        // 4. respond_bytes serves gzip + ETag + 304 + security headers
+        let req_gz = ParsedRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            body: String::new(),
+            content_type: String::new(),
+            origin: String::new(),
+            host: "127.0.0.1:8471".to_string(),
+            last_event_id: None,
+            accept_encoding: "gzip, deflate".to_string(),
+            if_none_match: String::new(),
+        };
+        let r_gz = respond_bytes(&app, "", &req_gz);
+        let hdr_end = r_gz.as_bytes().windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let hdrs = std::str::from_utf8(&r_gz.as_bytes()[..hdr_end]).unwrap();
+        assert!(hdrs.contains("Content-Encoding: gzip\r\n"));
+        assert!(hdrs.contains("Vary: Accept-Encoding\r\n"));
+        assert!(hdrs.contains("X-Content-Type-Options: nosniff\r\n"));
+        let etag = hdrs
+            .lines()
+            .find_map(|l| l.strip_prefix("ETag: "))
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let req_304 = ParsedRequest {
+            if_none_match: etag,
+            ..req_gz
+        };
+        let r_304 = respond_bytes(&app, "", &req_304);
+        assert!(r_304.as_bytes().starts_with(b"HTTP/1.1 304 Not Modified\r\n"));
+
+        // 5. Raw-TCP oversized Content-Length yields prompt 413 with write half kept open
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            let mut client = std::net::TcpStream::connect(addr).unwrap();
+            client
+                .write_all(b"POST /api/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 9999999\r\n\r\n")
+                .unwrap();
+            // Do NOT shut down write half — server must still parse and respond 413 promptly!
+            let mut resp = String::new();
+            client.read_to_string(&mut resp).unwrap();
+            resp
+        });
+        let (mut srv, _) = listener.accept().unwrap();
+        let parsed = read_parsed_request(&mut srv).unwrap();
+        let reply = respond_bytes(&app, "", &parsed);
+        srv.write_all(reply.as_bytes()).unwrap();
+        srv.flush().unwrap();
+        drop(srv);
+        let client_resp = t.join().unwrap();
+        assert!(client_resp.starts_with("HTTP/1.1 413"), "{client_resp}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

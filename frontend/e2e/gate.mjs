@@ -1,4 +1,4 @@
-// gate.mjs: Fleet v0.9.0 Desktop-Workbench E2E gate.
+// gate.mjs: Fleet v0.10.0 Desktop-Workbench E2E gate.
 // Verifies 1440/1280/768/390/320 in light & dark, DOM Range text clipping, 3-pane collapsible workbench,
 // Goal-to-DAG planner, virtualized 55k transcript, Unified/Split diff, Check/Auto-heal timeline, DAG graph,
 // PR confirmation gate, Settings-only Light/Dark (#67), zero Rune jargon (#155), and prefers-reduced-motion.
@@ -211,7 +211,7 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
 {
   const { ctx, p } = await open(1440, 900, 'light', { acceptDownloads: true })
   let sseHits = 0
-  await p.route('**/api/version', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ name: 'fleet', version: '0.9.0' }) }))
+  await p.route('**/api/version', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ name: 'fleet', version: '0.10.0' }) }))
   await p.route('**/api/metrics', r => r.fulfill({
     status: 200,
     contentType: 'application/json',
@@ -380,9 +380,9 @@ for (const theme of ['light', 'dark']) for (const [vn, w, h] of [['1440', 1440, 
   const pageTitle = await p.title()
   const versionHref = (await p.locator('header a[href*="/releases/tag/"]').first().getAttribute('href')) || ''
   ok('Zero user-facing Rune jargon rendered (#155)', !/\brune\b/i.test(visibleBodyText))
-  ok('Fleet v0.9.0 rebrand clean across title, board, and release URL',
+  ok('Fleet v0.10.0 rebrand clean across title, board, and release URL',
     !/\bdsh[-_ ]?fleet\b|deepseek\s+harness|\bfleet-rs\b/i.test(`${pageTitle}\n${visibleBodyText}\n${versionHref}`) &&
-      versionHref.includes('cayleb-james2008/fleet/releases/tag/v0.9.0'),
+      versionHref.includes('cayleb-james2008/fleet/releases/tag/v0.10.0'),
     `href=${versionHref}`)
 
   // Multi-select bulk controls

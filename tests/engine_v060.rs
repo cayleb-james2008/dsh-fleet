@@ -96,6 +96,7 @@ fn autoheal_end_to_end_pipeline_recovers_and_formats_badge() {
         forbidden_globs: vec![".env".to_string()],
         attempt: next_attempt,
         budget: 2,
+        ..Default::default()
     };
     let prompt = build_heal_prompt(&ctx, &failed);
     assert!(prompt.contains("FAIL test_invoice: expected 42 got 0"), "{prompt}");

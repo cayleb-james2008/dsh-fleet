@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { motion } from "motion/react";
+import { m } from "motion/react";
 import {
   CheckCircle2,
   Clock,
@@ -35,6 +35,7 @@ import {
   isFailed,
   isHonest,
   isVerified,
+  liveSessionDurationMs,
   postJson,
   receiptLine,
   statusText,
@@ -373,6 +374,7 @@ export function DetailBody({
   supportsServerV050,
   mergeCheck,
   checkingMerge,
+  nowMs,
   onRecheckMerge,
   onTabChange,
   onClose,
@@ -388,6 +390,7 @@ export function DetailBody({
   supportsServerV050: boolean;
   mergeCheck: MergeCheckResult | null;
   checkingMerge: boolean;
+  nowMs: number;
   onRecheckMerge: () => void;
   onTabChange?: (tab: TabId) => void;
   onClose?: () => void;
@@ -430,6 +433,7 @@ export function DetailBody({
   const verified = isVerified(s);
   const honest = isHonest(s);
   const healBadge = healBadgeInfo(s);
+  const durMs = liveSessionDurationMs(s, nowMs);
   const ranCheck = s.check_ran !== undefined ? Boolean(s.check_ran) : s.check_passed === true || s.check_passed === false;
   const agent = s.test_mode ? "test script" : s.engine || s.agent || "default";
 
@@ -544,6 +548,12 @@ export function DetailBody({
             <span className="mono text-[12px] text-[var(--ink-3)]">{s.id}</span>
             <span className="text-[13px] font-medium text-[var(--ink-2)]">{s.project}</span>
             <span className="mono text-[12px] text-[var(--ink-3)]">{agent}</span>
+            {durMs !== null && (
+              <span className="inline-flex items-center gap-1 rounded-[var(--radius-chip)] bg-[var(--track)] px-2 py-0.5 mono text-[12px] text-[var(--ink-2)]">
+                <Clock className="size-3 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
+                <span>{formatDurationMs(durMs)}</span>
+              </span>
+            )}
             {healBadge && (
               <Badge
                 tone={healBadge.tone === "healed" ? "success" : healBadge.tone === "healing" ? "warning" : "danger"}
@@ -723,7 +733,7 @@ export function DetailBody({
                 )}
               >
                 {active && (
-                  <motion.span
+                  <m.span
                     layoutId="fleet-workspace-tab"
                     transition={tabByKey ? instant : glide}
                     aria-hidden="true"

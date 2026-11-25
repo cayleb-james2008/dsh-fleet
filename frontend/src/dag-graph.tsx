@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   Clock,
   GitBranch,
+  GitMerge,
   Layers,
   Network,
   Wrench,
@@ -175,11 +176,17 @@ function statusRailClass(s: Session): string {
 export function DagWaveGraph({
   sessions,
   selectedId,
+  waveMergeableCount = 0,
+  waveMergeBusy = false,
+  onBatchMergeWave,
   onOpen,
   onNewBatch,
 }: {
   sessions: Session[];
   selectedId: string | null;
+  waveMergeableCount?: number;
+  waveMergeBusy?: boolean;
+  onBatchMergeWave?: () => void;
   onOpen: (id: string) => void;
   onNewBatch: () => void;
 }) {
@@ -255,6 +262,19 @@ export function DagWaveGraph({
             <span className="size-2 rounded-full bg-unread" aria-hidden />
             <span>Needs you</span>
           </span>
+          {waveMergeableCount > 0 && onBatchMergeWave && (
+            <Button
+              type="button"
+              size="sm"
+              variant="primary"
+              disabled={waveMergeBusy}
+              onClick={onBatchMergeWave}
+              className="h-8 px-2.5 text-xs max-md:min-h-11 max-md:px-3"
+            >
+              <GitMerge className="size-3.5" strokeWidth={1.5} aria-hidden />
+              <span>{waveMergeBusy ? "Merging..." : `Merge verified (${waveMergeableCount})`}</span>
+            </Button>
+          )}
           <Button
             type="button"
             size="sm"

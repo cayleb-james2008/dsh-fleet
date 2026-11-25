@@ -67,6 +67,12 @@ pub struct HealSessionContext {
     pub attempt: u32,
     #[serde(default)]
     pub budget: u32,
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+    #[serde(default)]
+    pub diff_excerpt: String,
+    #[serde(default)]
+    pub prior_attempts_summary: Vec<String>,
 }
 
 /// Failing verification step details supplied to [`build_heal_prompt`] and [`evaluate_auto_heal`].
@@ -330,6 +336,29 @@ pub fn build_heal_prompt(
     prompt.push_str(&tail_block);
     prompt.push_str("\n```\n");
 
+    if !session.prior_attempts_summary.is_empty() {
+        prompt.push_str("\nPrevious failed repair passes (try a different fix):\n");
+        for item in &session.prior_attempts_summary {
+            let clean = item.trim();
+            if !clean.is_empty() {
+                prompt.push_str(&format!("- {clean}\n"));
+            }
+        }
+    }
+
+    if !session.changed_files.is_empty() {
+        prompt.push_str(&format!(
+            "\nModified files in this worktree: {}\n",
+            session.changed_files.join(", ")
+        ));
+    }
+    let diff_trimmed = session.diff_excerpt.trim();
+    if !diff_trimmed.is_empty() {
+        prompt.push_str("\nCurrent diff excerpt:\n```diff\n");
+        prompt.push_str(diff_trimmed);
+        prompt.push_str("\n```\n");
+    }
+
     let allowed: Vec<&str> = session
         .allowed_globs
         .iter()
@@ -361,6 +390,48 @@ pub fn build_heal_prompt(
          3. Re-run the failing check locally if possible to confirm exit 0 before finishing.",
     );
     prompt
+}
+
+/// Extract modified file paths and a bounded diff excerpt from unified `git diff` output
+/// so auto-heal steering prompts give the agent immediate edit context without extra `git diff` calls.
+pub fn extract_changed_files_and_diff_excerpt(
+    diff: &str,
+    max_files: usize,
+    max_chars: usize,
+) -> (Vec<String>, String) {
+    let mut files: Vec<String> = Vec::new();
+    let mut excerpt_lines: Vec<&str> = Vec::new();
+    let mut chars_used = 0usize;
+    let mut truncated = false;
+
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if let Some((_, b_part)) = rest.split_once(" b/") {
+                let path = b_part.trim();
+                if !path.is_empty()
+                    && files.len() < max_files
+                    && !files.iter().any(|f| f == path)
+                {
+                    files.push(path.to_string());
+                }
+            }
+        }
+        if !truncated && max_chars > 0 {
+            let line_chars = line.chars().count() + 1;
+            if chars_used + line_chars <= max_chars {
+                excerpt_lines.push(line);
+                chars_used += line_chars;
+            } else {
+                truncated = true;
+            }
+        }
+    }
+
+    let mut excerpt = excerpt_lines.join("\n");
+    if truncated && !excerpt.is_empty() {
+        excerpt.push_str("\n... (diff truncated)");
+    }
+    (files, excerpt)
 }
 
 /// Produce a short human-readable badge label summarizing a session's auto-heal history.
@@ -615,6 +686,7 @@ mod tests {
             forbidden_globs: vec![".env".to_string()],
             attempt: 1,
             budget: 2,
+            ..Default::default()
         };
         let failed = FailedCheckContext {
             step_name: "unit-tests".to_string(),
@@ -635,5 +707,38 @@ mod tests {
         assert!(!p1.contains("\x1b["), "ANSI codes must be stripped");
         assert!(p1.contains("Allowed paths: src/**"));
         assert!(p1.contains("Forbidden paths: .env"));
+    }
+
+    #[test]
+    fn build_heal_prompt_enriches_diff_files_and_prior_attempts() {
+        let diff = "\
+diff --git a/src/math.rs b/src/math.rs
+index 111..222 100644
+--- a/src/math.rs
++++ b/src/math.rs
+@@ -1,3 +1,3 @@
+-pub fn add(a: i32, b: i32) -> i32 { a - b }
++pub fn add(a: i32, b: i32) -> i32 { a + b }
+";
+        let (files, excerpt) = extract_changed_files_and_diff_excerpt(diff, 10, 500);
+        assert_eq!(files, vec!["src/math.rs"]);
+        assert!(excerpt.contains("+pub fn add"));
+
+        let session = HealSessionContext {
+            session_id: "s2".to_string(),
+            task: "Fix math".to_string(),
+            attempt: 2,
+            budget: 3,
+            changed_files: files,
+            diff_excerpt: excerpt,
+            prior_attempts_summary: vec!["attempt 1 (unit-tests): exit 101".to_string()],
+            ..Default::default()
+        };
+        let failed = FailedCheckContext::from_legacy("cargo test", Some(101), "expected 5 got 4");
+        let prompt = build_heal_prompt(&session, &failed);
+        assert!(prompt.contains("Modified files in this worktree: src/math.rs"));
+        assert!(prompt.contains("Current diff excerpt:"));
+        assert!(prompt.contains("Previous failed repair passes"));
+        assert!(prompt.contains("attempt 1 (unit-tests): exit 101"));
     }
 }

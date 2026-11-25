@@ -69,6 +69,8 @@ export function CommandPalette({
   onClearFilters,
   onDownloadPatch,
   onRetrySession,
+  onBatchMergeWave,
+  verifiedDoneCount = 0,
 }: {
   open: boolean;
   onOpenChange: (o: boolean) => void;
@@ -95,6 +97,8 @@ export function CommandPalette({
   onClearFilters: () => void;
   onDownloadPatch: (s: Session) => void;
   onRetrySession: (id: string) => void;
+  onBatchMergeWave?: () => void;
+  verifiedDoneCount?: number;
 }) {
   const [query, setQuery] = useState("");
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -176,6 +180,17 @@ export function CommandPalette({
       },
     ];
 
+    if (verifiedDoneCount > 0 && onBatchMergeWave) {
+      items.push({
+        id: "act-batch-merge",
+        group: "Orchestration",
+        label: `Merge verified wave (${verifiedDoneCount})`,
+        searchText: "batch merge verified wave preflight clean",
+        icon: <GitMerge className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+        onSelect: () => act(onBatchMergeWave),
+      });
+    }
+
     for (const tpl of playbooks) {
       const count = tpl.tasks?.length ?? 1;
       items.push({
@@ -245,25 +260,27 @@ export function CommandPalette({
           label: `Retry ${selectedSession.id}`,
           searchText: "retry selected session",
           icon: <RotateCcw className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+          shortcut: "Y",
           onSelect: () => act(() => onRetrySession(selectedSession.id)),
         });
       }
     }
 
-    const statusFilters: Array<[StatusFilter, string]> = [
-      ["all", "Show all sessions"],
-      ["needs-you", "Filter: Needs you"],
-      ["working", "Filter: Working (active)"],
-      ["queued", "Filter: Queued / Blocked"],
-      ["done", "Filter: Done / Verified"],
+    const statusFilters: Array<[StatusFilter, string, string | undefined]> = [
+      ["all", "Show all sessions", "1"],
+      ["needs-you", "Filter: Needs you", "2"],
+      ["working", "Filter: Working (active)", "3"],
+      ["queued", "Filter: Queued / Blocked", undefined],
+      ["done", "Filter: Done / Verified", "4"],
     ];
-    for (const [st, label] of statusFilters) {
+    for (const [st, label, shortcut] of statusFilters) {
       items.push({
         id: `st-${st}`,
         group: "Filter by status",
         label,
         searchText: label,
         icon: <Filter className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+        shortcut,
         onSelect: () => act(() => onFilterStatus(st)),
       });
     }
@@ -311,6 +328,7 @@ export function CommandPalette({
     engines,
     multiSelect,
     onApplyPlaybook,
+    onBatchMergeWave,
     onClearFilters,
     onDownloadPatch,
     onFilterEngine,
@@ -331,6 +349,7 @@ export function CommandPalette({
     repos,
     selectedSession,
     sessions,
+    verifiedDoneCount,
     viewMode,
   ]);
 
