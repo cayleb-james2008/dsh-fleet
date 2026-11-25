@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 const GZIP_WINDOW: usize = 32_768;
 const GZIP_HASH_SIZE: usize = 32_768;
 const GZIP_HASH_MASK: usize = GZIP_HASH_SIZE - 1;
-const GZIP_MAX_CHAIN: usize = 16;
+const GZIP_MAX_CHAIN: usize = 32;
 const GZIP_MIN_MATCH: usize = 3;
 const GZIP_MAX_MATCH: usize = 258;
 
@@ -143,20 +143,235 @@ fn hash3(data: &[u8], pos: usize) -> usize {
     h & GZIP_HASH_MASK
 }
 
-/// Compress `input` into a valid RFC 1952 Gzip stream using LZ77 + fixed-Huffman DEFLATE.
+#[derive(Clone, Copy)]
+enum LzToken {
+    Lit(u8),
+    Match { len: u16, dist: u16 },
+}
+
+/// Optimal length-limited Huffman code lengths via Larmore-Hirschberg Package-Merge.
+fn build_code_lengths(freqs: &[u32], max_bits: usize) -> Vec<u8> {
+    let mut active: Vec<(u64, usize)> = freqs
+        .iter()
+        .enumerate()
+        .filter(|&(_, &f)| f > 0)
+        .map(|(sym, &f)| (u64::from(f), sym))
+        .collect();
+    let mut lengths = vec![0u8; freqs.len()];
+    if active.is_empty() {
+        return lengths;
+    }
+    if active.len() == 1 {
+        lengths[active[0].1] = 1;
+        return lengths;
+    }
+    active.sort_unstable_by_key(|&(f, s)| (f, s));
+    let n = active.len();
+    let cap_bits = max_bits.min(15);
+    let mut prev_pkgs: Vec<(u64, Vec<usize>)> = Vec::new();
+    for _lvl in 0..cap_bits {
+        let mut cur: Vec<(u64, Vec<usize>)> = Vec::with_capacity(n + prev_pkgs.len() / 2);
+        for &(w, s) in &active {
+            cur.push((w, vec![s]));
+        }
+        let mut i = 0usize;
+        while i + 1 < prev_pkgs.len() {
+            let mut syms = Vec::with_capacity(prev_pkgs[i].1.len() + prev_pkgs[i + 1].1.len());
+            syms.extend_from_slice(&prev_pkgs[i].1);
+            syms.extend_from_slice(&prev_pkgs[i + 1].1);
+            cur.push((prev_pkgs[i].0 + prev_pkgs[i + 1].0, syms));
+            i += 2;
+        }
+        cur.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.len().cmp(&b.1.len())));
+        prev_pkgs = cur;
+    }
+    let take = (2 * n - 2).min(prev_pkgs.len());
+    for (_, syms) in prev_pkgs.into_iter().take(take) {
+        for s in syms {
+            lengths[s] = lengths[s].saturating_add(1);
+        }
+    }
+    lengths
+}
+
+fn canonical_codes(lengths: &[u8]) -> Vec<(u16, u8)> {
+    let max_len = lengths.iter().copied().max().unwrap_or(0) as usize;
+    let mut bl_count = [0u16; 16];
+    for &len in lengths {
+        if len > 0 {
+            bl_count[usize::from(len)] += 1;
+        }
+    }
+    let mut next_code = [0u16; 16];
+    let mut code = 0u16;
+    for bits in 1..=max_len {
+        code = (code + bl_count[bits - 1]) << 1;
+        next_code[bits] = code;
+    }
+    let mut out = vec![(0u16, 0u8); lengths.len()];
+    for (sym, &len) in lengths.iter().enumerate() {
+        if len > 0 {
+            let l = usize::from(len);
+            out[sym] = (next_code[l], len);
+            next_code[l] += 1;
+        }
+    }
+    out
+}
+
+fn rle_code_lengths(lengths: &[u8]) -> Vec<(u8, u8, u8)> {
+    // Returns (symbol 0..=18, extra_bits, extra_val)
+    let mut out = Vec::with_capacity(lengths.len());
+    let mut i = 0usize;
+    while i < lengths.len() {
+        let cur = lengths[i];
+        let mut run = 1usize;
+        while i + run < lengths.len() && lengths[i + run] == cur {
+            run += 1;
+        }
+        if cur == 0 {
+            while run >= 3 {
+                if run >= 11 {
+                    let c = run.min(138);
+                    out.push((18, 7, (c - 11) as u8));
+                    run -= c;
+                } else {
+                    let c = run.min(10);
+                    out.push((17, 3, (c - 3) as u8));
+                    run -= c;
+                }
+            }
+            for _ in 0..run {
+                out.push((0, 0, 0));
+            }
+        } else {
+            out.push((cur, 0, 0));
+            run -= 1;
+            while run >= 3 {
+                let c = run.min(6);
+                out.push((16, 2, (c - 3) as u8));
+                run -= c;
+            }
+            for _ in 0..run {
+                out.push((cur, 0, 0));
+            }
+        }
+        i += lengths[i..]
+            .iter()
+            .take_while(|&&x| x == cur)
+            .count();
+    }
+    out
+}
+
+fn write_dynamic_block(bw: &mut BitWriter, tokens: &[LzToken], is_final: bool) {
+    let mut lit_freqs = [0u32; 286];
+    let mut dist_freqs = [0u32; 30];
+    for &tok in tokens {
+        match tok {
+            LzToken::Lit(b) => lit_freqs[usize::from(b)] += 1,
+            LzToken::Match { len, dist } => {
+                let (lsym, _, _) = encode_length(usize::from(len));
+                let (dsym, _, _) = encode_distance(usize::from(dist));
+                lit_freqs[usize::from(lsym)] += 1;
+                dist_freqs[usize::from(dsym)] += 1;
+            }
+        }
+    }
+    lit_freqs[256] = 1;
+    // RFC 1951 requires at least 1 distance code even if unused; ensure 2 active for clean tree
+    let dist_active = dist_freqs.iter().filter(|&&f| f > 0).count();
+    if dist_active == 0 {
+        dist_freqs[0] = 1;
+    }
+
+    let lit_lens = build_code_lengths(&lit_freqs, 15);
+    let dist_lens = build_code_lengths(&dist_freqs, 15);
+    let hlit_len = lit_lens
+        .iter()
+        .rposition(|&l| l > 0)
+        .map_or(257, |p| (p + 1).max(257));
+    let hdist_len = dist_lens
+        .iter()
+        .rposition(|&l| l > 0)
+        .map_or(1, |p| (p + 1).max(1));
+
+    let mut combined = Vec::with_capacity(hlit_len + hdist_len);
+    combined.extend_from_slice(&lit_lens[..hlit_len]);
+    combined.extend_from_slice(&dist_lens[..hdist_len]);
+    let rle = rle_code_lengths(&combined);
+
+    let mut cl_freqs = [0u32; 19];
+    for &(sym, _, _) in &rle {
+        cl_freqs[usize::from(sym)] += 1;
+    }
+    let cl_lens = build_code_lengths(&cl_freqs, 7);
+    const CL_ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+    let hclen = CL_ORDER
+        .iter()
+        .rposition(|&s| cl_lens[s] > 0)
+        .map_or(4, |p| (p + 1).max(4));
+
+    let lit_codes = canonical_codes(&lit_lens);
+    let dist_codes = canonical_codes(&dist_lens);
+    let cl_codes = canonical_codes(&cl_lens);
+
+    bw.write_bits_lsb(u32::from(is_final), 1);
+    bw.write_bits_lsb(2, 2); // BTYPE = 10 (dynamic Huffman)
+    bw.write_bits_lsb((hlit_len - 257) as u32, 5);
+    bw.write_bits_lsb((hdist_len - 1) as u32, 5);
+    bw.write_bits_lsb((hclen - 4) as u32, 4);
+
+    for &sym in &CL_ORDER[..hclen] {
+        bw.write_bits_lsb(u32::from(cl_lens[sym]), 3);
+    }
+    for &(sym, eb, ev) in &rle {
+        let (code, len) = cl_codes[usize::from(sym)];
+        bw.write_huffman_msb(code, len);
+        if eb > 0 {
+            bw.write_bits_lsb(u32::from(ev), eb);
+        }
+    }
+
+    for &tok in tokens {
+        match tok {
+            LzToken::Lit(b) => {
+                let (code, len) = lit_codes[usize::from(b)];
+                bw.write_huffman_msb(code, len);
+            }
+            LzToken::Match { len, dist } => {
+                let (lsym, leb, lev) = encode_length(usize::from(len));
+                let (lcode, llen) = lit_codes[usize::from(lsym)];
+                bw.write_huffman_msb(lcode, llen);
+                if leb > 0 {
+                    bw.write_bits_lsb(lev, leb);
+                }
+                let (dsym, deb, dev) = encode_distance(usize::from(dist));
+                let (dcode, dlen) = dist_codes[usize::from(dsym)];
+                bw.write_huffman_msb(dcode, dlen);
+                if deb > 0 {
+                    bw.write_bits_lsb(dev, deb);
+                }
+            }
+        }
+    }
+    let (eob_code, eob_len) = lit_codes[256];
+    bw.write_huffman_msb(eob_code, eob_len);
+}
+
+/// Compress `input` into a valid RFC 1952 Gzip stream using LZ77 + optimal Dynamic-Huffman DEFLATE.
 pub fn gzip_compress(input: &[u8]) -> Vec<u8> {
     let mut bw = BitWriter::new((input.len() / 2).max(64) + 32);
     // RFC 1952 header: ID1, ID2, CM=8 (deflate), FLG=0, MTIME=0, XFL=2, OS=3 (Unix)
     bw.out
         .extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03]);
 
-    // Single final fixed-Huffman DEFLATE block: BFINAL=1, BTYPE=01 (2 bits)
-    bw.write_bits_lsb(1, 1);
-    bw.write_bits_lsb(1, 2);
-
     let len = input.len();
     let mut head = vec![u32::MAX; GZIP_HASH_SIZE];
     let mut prev = vec![u32::MAX; GZIP_WINDOW];
+    let mut tokens: Vec<LzToken> = Vec::with_capacity((len / 2).max(64));
 
     let mut pos = 0usize;
     while pos < len {
@@ -193,7 +408,7 @@ pub fn gzip_compress(input: &[u8]) -> Vec<u8> {
                         if m > best_len {
                             best_len = m;
                             best_dist = dist;
-                            if m == GZIP_MAX_MATCH || m >= 64 {
+                            if m == GZIP_MAX_MATCH || m >= 96 {
                                 break;
                             }
                         }
@@ -205,15 +420,11 @@ pub fn gzip_compress(input: &[u8]) -> Vec<u8> {
         }
 
         if best_len >= GZIP_MIN_MATCH {
-            let (lsym, lextra_bits, lextra_val) = encode_length(best_len);
-            write_fixed_lit_len(&mut bw, lsym);
-            if lextra_bits > 0 {
-                bw.write_bits_lsb(lextra_val, lextra_bits);
-            }
-            let (dsym, dextra_bits, dextra_val) = encode_distance(best_dist);
-            write_fixed_lit_len_dist(&mut bw, dsym, dextra_bits, dextra_val);
-
-            let end = (pos + best_len.min(16)).min(len.saturating_sub(GZIP_MIN_MATCH - 1));
+            tokens.push(LzToken::Match {
+                len: best_len as u16,
+                dist: best_dist as u16,
+            });
+            let end = (pos + best_len.min(32)).min(len.saturating_sub(GZIP_MIN_MATCH - 1));
             for p in (pos + 1)..end {
                 let h = hash3(input, p);
                 prev[p & (GZIP_WINDOW - 1)] = head[h];
@@ -221,15 +432,40 @@ pub fn gzip_compress(input: &[u8]) -> Vec<u8> {
             }
             pos += best_len;
         } else {
-            write_fixed_lit_len(&mut bw, u16::from(input[pos]));
+            tokens.push(LzToken::Lit(input[pos]));
             pos += 1;
         }
     }
 
-    // End of block (256)
-    write_fixed_lit_len(&mut bw, 256);
-    bw.finish_byte_aligned();
+    if tokens.len() < 128 {
+        // Fixed Huffman has less header overhead for tiny inputs.
+        bw.write_bits_lsb(1, 1);
+        bw.write_bits_lsb(1, 2);
+        for &tok in &tokens {
+            match tok {
+                LzToken::Lit(b) => write_fixed_lit_len(&mut bw, u16::from(b)),
+                LzToken::Match { len, dist } => {
+                    let (lsym, lextra_bits, lextra_val) = encode_length(usize::from(len));
+                    write_fixed_lit_len(&mut bw, lsym);
+                    if lextra_bits > 0 {
+                        bw.write_bits_lsb(lextra_val, lextra_bits);
+                    }
+                    let (dsym, dextra_bits, dextra_val) = encode_distance(usize::from(dist));
+                    write_fixed_lit_len_dist(&mut bw, dsym, dextra_bits, dextra_val);
+                }
+            }
+        }
+        write_fixed_lit_len(&mut bw, 256);
+    } else {
+        // Emit dynamic Huffman blocks (~32k tokens per block for tight local frequency adaptation).
+        const BLOCK_TOKENS: usize = 32_768;
+        let chunks: Vec<&[LzToken]> = tokens.chunks(BLOCK_TOKENS).collect();
+        for (idx, chunk) in chunks.iter().enumerate() {
+            write_dynamic_block(&mut bw, chunk, idx + 1 == chunks.len());
+        }
+    }
 
+    bw.finish_byte_aligned();
     let crc = crc32_ieee(input);
     let isize_u32 = input.len() as u32;
     bw.out.extend_from_slice(&crc.to_le_bytes());

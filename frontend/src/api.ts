@@ -326,6 +326,8 @@ export type PolicyFeatures = {
   batch_pr?: boolean;
   wave_preflight?: boolean;
   failure_classifier?: boolean;
+  smart_router?: boolean;
+  failure_memory?: boolean;
   merge_check?: boolean;
   policy_test?: boolean;
   prune_worktrees?: boolean;
@@ -829,6 +831,8 @@ export function normalizePolicy(raw: unknown): Policy | null {
           batch_pr: Boolean(fRaw.batch_pr),
           wave_preflight: Boolean(fRaw.wave_preflight),
           failure_classifier: Boolean(fRaw.failure_classifier),
+          smart_router: Boolean(fRaw.smart_router),
+          failure_memory: Boolean(fRaw.failure_memory),
           merge_check: Boolean(fRaw.merge_check),
           policy_test: Boolean(fRaw.policy_test),
           prune_worktrees: Boolean(fRaw.prune_worktrees),
@@ -2243,6 +2247,62 @@ export async function batchCreateWavePr(
     failed_count: failedCount,
     results,
   };
+}
+
+export type RunnerScore = {
+  name: string;
+  engine: string;
+  found: boolean;
+  total_runs: number;
+  first_pass_count: number;
+  healed_count: number;
+  failed_count: number;
+  pass_rate_pct: number;
+  median_elapsed_ms?: number | null;
+  heal_efficiency_pct: number;
+  score: number;
+};
+
+export type FailureLesson = {
+  id: string;
+  repo: string;
+  category: string;
+  trigger_step: string;
+  fingerprint: string;
+  symptom: string;
+  fix_summary: string;
+  changed_files: string[];
+  hits: number;
+  updated_ms: number;
+};
+
+export type CliRecommendation = {
+  recommended_agent?: string | null;
+  recommended_engine?: string | null;
+  confidence: string;
+  reason: string;
+  runners: RunnerScore[];
+  matching_lessons: FailureLesson[];
+};
+
+export async function fetchCliRecommendation(repo: string, task: string): Promise<CliRecommendation | null> {
+  try {
+    const qs = new URLSearchParams();
+    if (repo.trim()) qs.set("repo", repo.trim());
+    if (task.trim()) qs.set("task", task.trim().slice(0, 200));
+    const r = await fetch(`/api/router/recommend?${qs.toString()}`);
+    if (!r.ok) return null;
+    const raw = (await r.json().catch(() => null)) as CliRecommendation | null;
+    return raw && typeof raw === "object"
+      ? {
+          ...raw,
+          runners: Array.isArray(raw.runners) ? raw.runners : [],
+          matching_lessons: Array.isArray(raw.matching_lessons) ? raw.matching_lessons : [],
+        }
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 export function liveSessionDurationMs(s: Session, nowMs: number): number | null {

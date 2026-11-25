@@ -218,6 +218,8 @@ export function RichDiffViewer({
 }) {
   const [mode, setMode] = useState<"unified" | "split">("unified");
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [expandedLines, setExpandedLines] = useState<Record<string, boolean>>({});
+  const [visibleFilesLimit, setVisibleFilesLimit] = useState(20);
   const [downloading, setDownloading] = useState(false);
 
   const files = useMemo(() => parseDiffFiles(session.diff), [session.diff]);
@@ -231,8 +233,14 @@ export function RichDiffViewer({
   );
 
   useEffect(() => {
-    setCollapsed({});
-  }, [session.id]);
+    const initialCollapsed: Record<string, boolean> = {};
+    if (files.length > 12) {
+      for (let i = 6; i < files.length; i++) initialCollapsed[files[i].id] = true;
+    }
+    setCollapsed(initialCollapsed);
+    setExpandedLines({});
+    setVisibleFilesLimit(20);
+  }, [session.id, files]);
 
   const allCollapsed = files.length > 0 && files.every((f) => collapsed[f.id]);
 
@@ -365,9 +373,13 @@ export function RichDiffViewer({
         </pre>
       ) : (
         <div className="max-h-[48vh] space-y-2.5 overflow-y-auto pr-0.5">
-          {files.map((file) => {
+          {files.slice(0, visibleFilesLimit).map((file) => {
             const isCollapsed = Boolean(collapsed[file.id]);
+            const showAllLines = Boolean(expandedLines[file.id]);
+            const LINE_WINDOW = 250;
+            const visibleUnified = showAllLines ? file.lines : file.lines.slice(0, LINE_WINDOW);
             const splitRows = mode === "split" && !isCollapsed ? buildSideBySideRows(file.lines) : null;
+            const visibleSplit = splitRows ? (showAllLines ? splitRows : splitRows.slice(0, LINE_WINDOW)) : null;
             return (
               <div key={file.id} className="overflow-hidden rounded-card border border-hairline bg-canvas">
                 <button
@@ -397,7 +409,7 @@ export function RichDiffViewer({
                 {!isCollapsed && mode === "unified" && (
                   <div className="overflow-x-auto font-mono text-xs leading-relaxed">
                     <div className="min-w-full py-1">
-                      {file.lines.map((line, idx) => (
+                      {visibleUnified.map((line, idx) => (
                         <div
                           key={idx}
                           className={cn(
@@ -420,14 +432,26 @@ export function RichDiffViewer({
                           <span className="min-w-0 flex-1 whitespace-pre">{line.text || " "}</span>
                         </div>
                       ))}
+                      {!showAllLines && file.lines.length > LINE_WINDOW && (
+                        <div className="border-t border-hairline px-3 py-2">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => setExpandedLines((prev) => ({ ...prev, [file.id]: true }))}
+                          >
+                            Show all {file.lines.length} lines (+{file.lines.length - LINE_WINDOW} hidden)
+                          </Button>
+                        </div>
+                      )}
                     </div>
                   </div>
                 )}
 
-                {!isCollapsed && mode === "split" && splitRows && (
+                {!isCollapsed && mode === "split" && visibleSplit && (
                   <div className="overflow-x-auto font-mono text-xs leading-relaxed" data-testid="diff-split-grid">
                     <div className="min-w-[460px] divide-y divide-hairline/40 py-1">
-                      {splitRows.map((row, idx) =>
+                      {visibleSplit.map((row, idx) =>
                         row.kind === "hunk" ? (
                           <div key={idx} className="bg-track/60 px-3 py-0.5 text-ink-3">
                             {row.hunkText}
@@ -467,12 +491,36 @@ export function RichDiffViewer({
                           </div>
                         ),
                       )}
+                      {!showAllLines && splitRows && splitRows.length > LINE_WINDOW && (
+                        <div className="border-t border-hairline px-3 py-2">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => setExpandedLines((prev) => ({ ...prev, [file.id]: true }))}
+                          >
+                            Show all {splitRows.length} rows (+{splitRows.length - LINE_WINDOW} hidden)
+                          </Button>
+                        </div>
+                      )}
                     </div>
                   </div>
                 )}
               </div>
             );
           })}
+          {files.length > visibleFilesLimit && (
+            <div className="flex justify-center pt-1">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => setVisibleFilesLimit((n) => n + 20)}
+              >
+                Load next {Math.min(20, files.length - visibleFilesLimit)} files ({files.length - visibleFilesLimit} remaining)
+              </Button>
+            </div>
+          )}
         </div>
       )}
     </div>

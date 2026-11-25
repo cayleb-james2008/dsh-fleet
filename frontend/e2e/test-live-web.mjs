@@ -1,4 +1,4 @@
-// test-live-web.mjs: Comprehensive end-to-end verification of the standalone v0.11.0 browser-only
+// test-live-web.mjs: Comprehensive end-to-end verification of the standalone v0.12.0 browser-only
 // live web bundle (dist-live-web/index.html) across desktop 1440x900 and mobile 390x844
 // in both Light and Dark themes.
 import http from "node:http";
@@ -79,9 +79,9 @@ try {
     bodyText.match(/\brune\b/i)?.[0] || "clean",
   );
   ok(
-    "Fleet v0.11.0 rebrand clean: zero dsh-fleet, DeepSeek Harness, or fleet-rs strings on board/title/release URL",
+    "Fleet v0.12.0 rebrand clean: zero dsh-fleet, DeepSeek Harness, or fleet-rs strings on board/title/release URL",
     !/\bdsh[-_ ]?fleet\b|deepseek\s+harness|\bfleet-rs\b/i.test(`${docTitle}\n${bodyText}\n${verHref}`) &&
-      verHref.includes("cayleb-james2008/fleet/releases/tag/v0.11.0"),
+      verHref.includes("cayleb-james2008/fleet/releases/tag/v0.12.0"),
     `title=${docTitle} href=${verHref}`,
   );
   ok(

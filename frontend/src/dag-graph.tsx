@@ -242,6 +242,17 @@ export function DagWaveGraph({
             {nodes.length} {nodes.length === 1 ? "session" : "sessions"} / {waves.length}{" "}
             {waves.length === 1 ? "wave" : "waves"} / {edges.length}{" "}
             {edges.length === 1 ? "dependency" : "dependencies"}
+            {(() => {
+              const settled = nodes.filter((n) => isVerified(n.session) || isFailed(n.session));
+              const passed = nodes.filter((n) => isVerified(n.session)).length;
+              const durs = nodes
+                .map((n) => n.session.run_elapsed_ms ?? n.session.duration_ms ?? n.session.elapsed_ms)
+                .filter((d): d is number => typeof d === "number" && d > 0);
+              const avgMs = durs.length > 0 ? Math.round(durs.reduce((a, b) => a + b, 0) / durs.length) : null;
+              return settled.length > 0
+                ? ` / ${Math.round((passed / settled.length) * 100)}% pass${avgMs !== null ? ` · ${avgMs}ms avg` : ""}`
+                : "";
+            })()}
           </span>
         </div>
 

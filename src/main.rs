@@ -29,6 +29,7 @@ use fleet::policy::{MAX_TIMEOUT_SECS, Policy, test_policy_script};
 use fleet::pr::{
     PrCreateRequest, PrSessionView, build_pr_preview, create_github_pr_with_options,
 };
+use fleet::router::{LessonStore, RouterSessionView, recommend_cli};
 use fleet::templates::{PlaybookInput, PlaybookTask, TemplateStore};
 use fleet::worktrees::{
     WorktreeSessionView, list_repo_worktrees, remove_worktree_checked,
@@ -600,6 +601,32 @@ impl SessionMetricView for Session {
     }
 }
 
+impl RouterSessionView for Session {
+    fn repo(&self) -> &str {
+        &self.repo
+    }
+    fn agent(&self) -> &str {
+        &self.agent
+    }
+    fn status(&self) -> &str {
+        &self.status
+    }
+    fn check_passed(&self) -> Option<bool> {
+        self.check_passed
+    }
+    fn auto_healed(&self) -> bool {
+        self.heal_attempts.iter().any(|a| a.healed)
+            && matches!(self.status.as_str(), "done" | "merged")
+    }
+    fn elapsed_ms(&self) -> Option<u64> {
+        self.run_elapsed_ms
+            .or_else(|| self.check_receipt.as_ref().map(|r| r.total_elapsed_ms))
+    }
+    fn heal_attempts_used(&self) -> usize {
+        self.heal_attempts.len()
+    }
+}
+
 impl PrSessionView for Session {
     fn id(&self) -> &str {
         &self.id
@@ -779,17 +806,19 @@ struct App {
     /// Per-repo checked-out branch cache (5s TTL) so listing 2,000+ sessions
     /// never shells out to git on every poll.
     merge_target_cache: Mutex<std::collections::HashMap<String, (Option<String>, std::time::Instant)>>,
-    /// Cached serialized GET /api/sessions payload keyed by (state_rev, cached_at).
+    /// Cached serialized GET /api/sessions HTTP response keyed by (state_rev, cached_at, body_offset).
     #[allow(clippy::type_complexity)]
-    sessions_cache: Mutex<Option<(u64, std::time::Instant, String, Arc<Vec<u8>>)>>,
+    sessions_cache: Mutex<Option<(u64, std::time::Instant, usize, Arc<Vec<u8>>)>>,
     /// Cached GET /api/repos discovery result keyed by (state_rev, FLEET_REPOS_DIR, cached_at).
     #[allow(clippy::type_complexity)]
     repos_cache: Mutex<Option<(u64, String, std::time::Instant, Vec<RepoInfo>, Arc<Vec<u8>>)>>,
     /// Single-flight lock serializing cold repo discovery cache fills under concurrent polling.
     repos_refresh_lock: Mutex<()>,
-    /// Cached serialized GET /api/metrics payload keyed by (state_rev, budget_rev, max_parallel, cached_at).
+    /// Cached serialized GET /api/metrics HTTP response keyed by (state_rev, budget_rev, max_parallel, cached_at, body_offset).
     #[allow(clippy::type_complexity)]
-    metrics_cache: Mutex<Option<(u64, u64, i64, std::time::Instant, String, Arc<Vec<u8>>)>>,
+    metrics_cache: Mutex<Option<(u64, u64, i64, std::time::Instant, usize, Arc<Vec<u8>>)>>,
+    /// Atomic per-repo failure lesson store (`<data_dir>/lessons.json`).
+    lessons: Mutex<LessonStore>,
     /// Cached serialized GET /api/repos/worktrees responses keyed by explicit_repo -> (state_rev, env_key, cached_at, payload).
     #[allow(clippy::type_complexity)]
     worktrees_cache: Mutex<std::collections::HashMap<Option<String>, (u64, String, std::time::Instant, String)>>,
@@ -1839,9 +1868,29 @@ impl App {
         self.bump_rev();
     }
 
-    /// The session JSON for the API. Each distinct repo's merge target
-    /// is resolved with git outside the sessions lock (with a 5s TTL cache).
-    fn sessions_view(&self) -> serde_json::Value {
+    /// Cached JSON string for unfiltered `GET /api/sessions`, reused across
+    /// concurrent HTTP clients while `state_rev` is unchanged (<1ms p95 at 2,000+ sessions).
+    fn sessions_view_cached(&self) -> String {
+        let (off, http) = self.sessions_cache_pair();
+        String::from_utf8_lossy(&http[off..]).into_owned()
+    }
+
+    fn sessions_http_cached(&self) -> Arc<Vec<u8>> {
+        self.sessions_cache_pair().1
+    }
+
+    fn sessions_cache_pair(&self) -> (usize, Arc<Vec<u8>>) {
+        const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+        let rev = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
+        let now = std::time::Instant::now();
+        {
+            let guard = self.sessions_cache.lock().unwrap();
+            if let Some((cached_rev, at, off, ref http)) = *guard {
+                if cached_rev == rev && now.duration_since(at) < CACHE_TTL {
+                    return (off, Arc::clone(http));
+                }
+            }
+        }
         let repos: Vec<String> = {
             let sessions = self.sessions.lock().unwrap();
             let mut r: Vec<String> = sessions
@@ -1854,53 +1903,29 @@ impl App {
             r
         };
         let targets = self.cached_merge_targets(&repos);
-        let sessions = self.sessions.lock().unwrap();
-        sessions_json(&sessions, &targets)
-    }
-
-    /// Cached JSON string for unfiltered `GET /api/sessions`, reused across
-    /// concurrent HTTP clients while `state_rev` is unchanged (<1ms p95 at 2,000+ sessions).
-    fn sessions_view_cached(&self) -> String {
-        self.sessions_cache_pair().0
-    }
-
-    fn sessions_http_cached(&self) -> Arc<Vec<u8>> {
-        self.sessions_cache_pair().1
-    }
-
-    fn sessions_cache_pair(&self) -> (String, Arc<Vec<u8>>) {
-        const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
-        let rev = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
-        let now = std::time::Instant::now();
-        {
-            let guard = self.sessions_cache.lock().unwrap();
-            if let Some((cached_rev, at, ref body, ref http)) = *guard {
-                if cached_rev == rev && now.duration_since(at) < CACHE_TTL {
-                    return (body.clone(), Arc::clone(http));
-                }
-            }
-        }
-        let body = self.sessions_view().to_string();
-        let http = Arc::new(json_response(200, &body).into_bytes());
+        let (off, http) = {
+            let sessions = self.sessions.lock().unwrap();
+            stream_sessions_http_response(&sessions, &targets)
+        };
         let rev_after = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
         if rev_after == rev {
-            *self.sessions_cache.lock().unwrap() =
-                Some((rev, now, body.clone(), Arc::clone(&http)));
+            *self.sessions_cache.lock().unwrap() = Some((rev, now, off, Arc::clone(&http)));
         }
-        (body, http)
+        (off, http)
     }
 
     /// Cached JSON string for `GET /api/metrics`, invalidated automatically whenever
     /// `state_rev`, `budget_rev`, or `effective_max_parallel()` changes (O(1) cache hit, single O(N) pass on miss).
     fn metrics_json_cached(&self) -> String {
-        self.metrics_cache_pair().0
+        let (off, http) = self.metrics_cache_pair();
+        String::from_utf8_lossy(&http[off..]).into_owned()
     }
 
     fn metrics_http_cached(&self) -> Arc<Vec<u8>> {
         self.metrics_cache_pair().1
     }
 
-    fn metrics_cache_pair(&self) -> (String, Arc<Vec<u8>>) {
+    fn metrics_cache_pair(&self) -> (usize, Arc<Vec<u8>>) {
         const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
         let rev = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
         let brev = self.budget_rev.load(std::sync::atomic::Ordering::SeqCst);
@@ -1908,13 +1933,13 @@ impl App {
         let now = std::time::Instant::now();
         {
             let guard = self.metrics_cache.lock().unwrap();
-            if let Some((cached_rev, cached_brev, cached_max, at, ref payload, ref http)) = *guard {
+            if let Some((cached_rev, cached_brev, cached_max, at, off, ref http)) = *guard {
                 if cached_rev == rev
                     && cached_brev == brev
                     && cached_max == max_parallel
                     && now.duration_since(at) < CACHE_TTL
                 {
-                    return (payload.clone(), Arc::clone(http));
+                    return (off, Arc::clone(http));
                 }
             }
         }
@@ -1927,14 +1952,43 @@ impl App {
         val["max_parallel"] = serde_json::json!(max_parallel);
         val["budget"] = budget_val;
         let payload = val.to_string();
-        let http = Arc::new(json_response(200, &payload).into_bytes());
+        let hdr = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{SECURITY_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        let off = hdr.len();
+        let mut buf = Vec::with_capacity(off + payload.len());
+        buf.extend_from_slice(hdr.as_bytes());
+        buf.extend_from_slice(payload.as_bytes());
+        let http = Arc::new(buf);
         let rev_after = self.state_rev.load(std::sync::atomic::Ordering::SeqCst);
         let brev_after = self.budget_rev.load(std::sync::atomic::Ordering::SeqCst);
         if rev_after == rev && brev_after == brev {
             *self.metrics_cache.lock().unwrap() =
-                Some((rev, brev, max_parallel, now, payload.clone(), Arc::clone(&http)));
+                Some((rev, brev, max_parallel, now, off, Arc::clone(&http)));
         }
-        (payload, http)
+        (off, http)
+    }
+
+    fn recommend_cli_for(&self, repo: Option<&str>, task: &str) -> fleet::router::CliRecommendation {
+        let agents: Vec<(String, bool)> = self
+            .agents
+            .iter()
+            .map(|a| (a.name.clone(), a.found))
+            .collect();
+        let default_agent = self.effective_default_agent();
+        let sessions = self.sessions.lock().unwrap();
+        let views: Vec<&dyn RouterSessionView> =
+            sessions.iter().map(|s| s as &dyn RouterSessionView).collect();
+        let lessons = self.lessons.lock().unwrap();
+        recommend_cli(
+            &views,
+            &agents,
+            default_agent.as_deref(),
+            &lessons,
+            repo,
+            task,
+        )
     }
 
     /// Fast filtered / paginated query over sessions (supports `q`, `status`,
@@ -3238,6 +3292,29 @@ impl App {
             }),
         );
         if let Some(ref finished_attempt) = finished_heal_event {
+            if finished_attempt.healed {
+                let (changed_files, _) = extract_changed_files_and_diff_excerpt(&diff, 8, 0);
+                let cls = classify_heal_attempt(finished_attempt);
+                let fix_summary = if changed_files.is_empty() {
+                    format!("Auto-heal pass {} fixed {}", finished_attempt.attempt, finished_attempt.trigger_step)
+                } else {
+                    format!(
+                        "Fixed {} in {}",
+                        finished_attempt.trigger_step,
+                        changed_files.join(", ")
+                    )
+                };
+                self.lessons.lock().unwrap().record_healed_lesson(
+                    &self.data_dir,
+                    &session.repo,
+                    cls.category,
+                    &finished_attempt.trigger_step,
+                    &finished_attempt.fingerprint(),
+                    &finished_attempt.stderr_tail,
+                    &fix_summary,
+                    &changed_files,
+                );
+            }
             self.events.publish(
                 "auto_heal_attempt",
                 &serde_json::json!({
@@ -3297,6 +3374,15 @@ impl App {
                                 format!("attempt {} ({}): {code}", a.attempt, a.trigger_step)
                             })
                             .collect();
+                        let cls = classify_failure(failed_ctx);
+                        let prior_lessons: Vec<String> = self
+                            .lessons
+                            .lock()
+                            .unwrap()
+                            .matching_lessons(&session.repo, Some(cls.category), &failed_ctx.step_name, 3)
+                            .into_iter()
+                            .map(|l| format!("{} (seen {}x): {}", l.trigger_step, l.hits, l.fix_summary))
+                            .collect();
                         let heal_ctx = HealSessionContext {
                             session_id: id.to_string(),
                             task: session.task.clone(),
@@ -3309,6 +3395,7 @@ impl App {
                             changed_files,
                             diff_excerpt,
                             prior_attempts_summary,
+                            prior_lessons,
                         };
                         let heal_prompt = build_heal_prompt(&heal_ctx, failed_ctx);
                         let trigger_step = if failed_ctx.step_name.trim().is_empty() {
@@ -5596,9 +5683,57 @@ fn session_to_api_value(
     v
 }
 
-/// Serialize sessions for the API with queue positions computed in:
-/// a queued session's position is its place among the queued, in
-/// hand-out order. Non-queued sessions carry null.
+fn stream_sessions_http_response(
+    sessions: &[Session],
+    targets: &std::collections::HashMap<String, Option<String>>,
+) -> (usize, Arc<Vec<u8>>) {
+    let status_map: std::collections::HashMap<&str, &str> = sessions
+        .iter()
+        .map(|s| (s.id.as_str(), s.status.as_str()))
+        .collect();
+    let mut body = Vec::with_capacity(sessions.len().saturating_mul(256).max(64));
+    body.push(b'[');
+    let mut pos = 0usize;
+    for (idx, s) in sessions.iter().enumerate() {
+        if idx > 0 {
+            body.push(b',');
+        }
+        let mut v = session_to_api_value_borrowed(s, targets, &status_map);
+        if s.status == "queued" {
+            pos += 1;
+            v["queue_position"] = serde_json::json!(pos);
+        } else {
+            v["queue_position"] = serde_json::Value::Null;
+        }
+        let _ = serde_json::to_writer(&mut body, &v);
+    }
+    body.push(b']');
+    let hdr = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{SECURITY_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let off = hdr.len();
+    let mut http = Vec::with_capacity(off + body.len());
+    http.extend_from_slice(hdr.as_bytes());
+    http.extend_from_slice(&body);
+    drop(body);
+    (off, Arc::new(http))
+}
+
+fn session_to_api_value_borrowed(
+    s: &Session,
+    targets: &std::collections::HashMap<String, Option<String>>,
+    status_map: &std::collections::HashMap<&str, &str>,
+) -> serde_json::Value {
+    let owned: std::collections::HashMap<String, String> = status_map
+        .iter()
+        .filter(|(id, _)| s.depends_on.iter().any(|d| d == **id))
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    session_to_api_value(s, targets, &owned)
+}
+
+#[cfg(test)]
 fn sessions_json(
     sessions: &[Session],
     targets: &std::collections::HashMap<String, Option<String>>,
@@ -5955,7 +6090,9 @@ fn handle_goal_plan(app: &Arc<App>, body: &str) -> String {
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let decision = app.policy.test_policy(repo, goal, agent_opt);
+    let rec = app.recommend_cli_for(Some(repo).filter(|s| !s.is_empty()), goal);
+    let chosen_agent = agent_opt.or(rec.recommended_agent.as_deref());
+    let decision = app.policy.test_policy(repo, goal, chosen_agent);
 
     let clauses: Vec<String> = goal
         .split(['\n', ';'])
@@ -5978,7 +6115,7 @@ fn handle_goal_plan(app: &Arc<App>, body: &str) -> String {
                 "alias": alias,
                 "repo": repo,
                 "task": clause,
-                "agent": agent_opt.unwrap_or(""),
+                "agent": chosen_agent.unwrap_or(""),
                 "check": decision.check_cmd,
                 "check_steps": decision.check_steps,
                 "depends_on": deps,
@@ -5994,7 +6131,7 @@ fn handle_goal_plan(app: &Arc<App>, body: &str) -> String {
             "alias": "implement",
             "repo": repo,
             "task": impl_task,
-            "agent": agent_opt.unwrap_or(""),
+            "agent": chosen_agent.unwrap_or(""),
             "check": decision.check_cmd,
             "check_steps": decision.check_steps,
             "depends_on": [],
@@ -6006,7 +6143,7 @@ fn handle_goal_plan(app: &Arc<App>, body: &str) -> String {
             "alias": "verify",
             "repo": repo,
             "task": verify_task,
-            "agent": agent_opt.unwrap_or(""),
+            "agent": chosen_agent.unwrap_or(""),
             "check": decision.check_cmd,
             "check_steps": decision.check_steps,
             "depends_on": ["implement"],
@@ -6023,6 +6160,8 @@ fn handle_goal_plan(app: &Arc<App>, body: &str) -> String {
             "repo": repo,
             "project": decision.project,
             "engine": decision.engine,
+            "recommended_agent": rec.recommended_agent,
+            "recommendation": rec,
             "check_cmd": decision.check_cmd,
             "auto_steer_budget": decision.auto_steer_budget,
             "tasks": tasks,
@@ -7063,6 +7202,8 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                         "batch_pr": true,
                         "wave_preflight": true,
                         "failure_classifier": true,
+                        "smart_router": true,
+                        "failure_memory": true,
                         "merge_check": true,
                         "policy_test": true,
                         "prune_worktrees": true,
@@ -7077,6 +7218,24 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                     "version": env!("CARGO_PKG_VERSION")
                 })
                 .to_string(),
+            )
+        }
+        ("GET", "/api/router/recommend") => {
+            let repo = params.get("repo").map(String::as_str);
+            let task = params.get("task").map(String::as_str).unwrap_or("");
+            let rec = app.recommend_cli_for(repo, task);
+            json_response(200, &serde_json::to_string(&rec).unwrap_or_default())
+        }
+        ("GET", "/api/lessons") => {
+            let repo = params
+                .get("repo")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let lessons = app.lessons.lock().unwrap().list(repo);
+            json_response(
+                200,
+                &serde_json::json!({ "lessons": lessons }).to_string(),
             )
         }
         ("GET", "/api/metrics") => json_response(200, &app.metrics_json_cached()),
@@ -7740,6 +7899,7 @@ fn load_persisted_core(data_dir: &Path, hydrate_all_logs: bool) -> (Vec<Session>
             // logs exist is a loss, not a fresh start.
             return (recover_from_logs(data_dir), counter);
         }
+        sessions.shrink_to_fit();
         for s in sessions.iter_mut() {
             let needs_sync_log = hydrate_all_logs
                 || s.transcript.is_empty()
@@ -8052,6 +8212,7 @@ fn main() {
         .unwrap_or_else(|_| "run".to_string());
     let template_store = TemplateStore::load(&data_dir);
     let budget_tracker = BudgetTracker::load(&data_dir);
+    let lesson_store = LessonStore::load(&data_dir);
     let app = Arc::new(App {
         policy,
         policy_source: policy_path.clone(),
@@ -8071,6 +8232,7 @@ fn main() {
         repos_cache: Mutex::new(None),
         repos_refresh_lock: Mutex::new(()),
         metrics_cache: Mutex::new(None),
+        lessons: Mutex::new(lesson_store),
         worktrees_cache: Mutex::new(std::collections::HashMap::new()),
         worktrees_refresh_lock: Mutex::new(()),
         templates: Mutex::new(template_store),
@@ -8449,7 +8611,8 @@ mod tests {
             repos_cache: Mutex::new(None),
             repos_refresh_lock: Mutex::new(()),
             metrics_cache: Mutex::new(None),
-        worktrees_cache: Mutex::new(std::collections::HashMap::new()),
+            lessons: Mutex::new(LessonStore::default()),
+            worktrees_cache: Mutex::new(std::collections::HashMap::new()),
         worktrees_refresh_lock: Mutex::new(()),
             templates: Mutex::new(TemplateStore::load(dir.join("data"))),
             budget: Mutex::new(BudgetTracker::load(dir.join("data"))),
@@ -8544,7 +8707,8 @@ mod tests {
             repos_cache: Mutex::new(None),
             repos_refresh_lock: Mutex::new(()),
             metrics_cache: Mutex::new(None),
-        worktrees_cache: Mutex::new(std::collections::HashMap::new()),
+            lessons: Mutex::new(LessonStore::default()),
+            worktrees_cache: Mutex::new(std::collections::HashMap::new()),
         worktrees_refresh_lock: Mutex::new(()),
             templates: Mutex::new(TemplateStore::load(&data_dir)),
             budget: Mutex::new(BudgetTracker::load(&data_dir)),
@@ -9383,7 +9547,8 @@ mod tests {
             repos_cache: Mutex::new(None),
             repos_refresh_lock: Mutex::new(()),
             metrics_cache: Mutex::new(None),
-        worktrees_cache: Mutex::new(std::collections::HashMap::new()),
+            lessons: Mutex::new(LessonStore::default()),
+            worktrees_cache: Mutex::new(std::collections::HashMap::new()),
         worktrees_refresh_lock: Mutex::new(()),
             templates: Mutex::new(TemplateStore::load(&data)),
             budget: Mutex::new(BudgetTracker::load(&data)),
@@ -11102,6 +11267,62 @@ fi
         assert!(pre["preflight"]["ready_ids"].is_array());
         assert_eq!(pre["results"][0]["diff_files"], 1);
         assert_eq!(pre["results"][0]["diff_add"], 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v0120_smart_router_and_failure_memory() {
+        let dir = std::env::temp_dir().join(format!("fleet-v0120-router-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+
+        let mut s1 = test_session("s1", Status::Done, &dir);
+        s1.agent = "codex".to_string();
+        s1.run_elapsed_ms = Some(900);
+        let mut s2 = test_session("s2", Status::NeedsYou, &dir);
+        s2.agent = "claude".to_string();
+        s2.check_passed = Some(false);
+        s2.run_elapsed_ms = Some(4000);
+
+        let mut app = test_app(data.clone(), vec![s1, s2]);
+        // Pretend both codex and claude are detected on PATH in this unit test.
+        if let Some(a) = Arc::get_mut(&mut app) {
+            a.agents = vec![
+                AgentInfo { name: "claude".to_string(), found: true, path: Some("/bin/claude".to_string()) },
+                AgentInfo { name: "codex".to_string(), found: true, path: Some("/bin/codex".to_string()) },
+            ];
+        }
+
+        let repo_path = dir.join("repo").to_string_lossy().to_string();
+        app.lessons.lock().unwrap().record_healed_lesson(
+            &data,
+            &repo_path,
+            fleet::autoheal::FailureCategory::CompileError,
+            "cargo test",
+            "fp-e0308",
+            "mismatched types",
+            "Updated return type in src/lib.rs",
+            &["src/lib.rs".to_string()],
+        );
+
+        let rec = response_body(&handle(
+            &app,
+            "GET",
+            &format!("/api/router/recommend?repo={repo_path}&task=Fix+api"),
+            "",
+        ));
+        assert_eq!(rec["recommended_agent"], "codex", "rec={rec}");
+        assert_eq!(rec["confidence"], "telemetry");
+        assert_eq!(rec["matching_lessons"][0]["trigger_step"], "cargo test");
+
+        let lessons_resp = response_body(&handle(&app, "GET", &format!("/api/lessons?repo={repo_path}"), ""));
+        assert_eq!(lessons_resp["lessons"].as_array().unwrap().len(), 1);
+
+        let pol = response_body(&handle(&app, "GET", "/api/policy", ""));
+        assert_eq!(pol["features"]["smart_router"], true);
+        assert_eq!(pol["features"]["failure_memory"], true);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

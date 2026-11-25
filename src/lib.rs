@@ -27,5 +27,6 @@ pub mod merge_check;
 pub mod metrics;
 pub mod policy;
 pub mod pr;
+pub mod router;
 pub mod templates;
 pub mod worktrees;

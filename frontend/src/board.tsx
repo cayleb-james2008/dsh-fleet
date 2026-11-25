@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { m } from "motion/react";
 import {
   BookMarked,
@@ -26,6 +26,7 @@ import {
   diffStat,
   dispatchBatchSessions,
   downloadSessionPatch,
+  fetchCliRecommendation,
   formatDurationMs,
   healBadgeInfo,
   isActivelyRunning,
@@ -38,6 +39,7 @@ import {
   repoBasename,
   statusText,
   type BoardMetrics,
+  type CliRecommendation,
   type GoalPlanTask,
   type MergeCheckResult,
   type PlaybookTemplate,
@@ -412,8 +414,19 @@ export function GoalLaunchpad({
   const [planning, setPlanning] = useState(false);
   const [dispatching, setDispatching] = useState(false);
   const [planned, setPlanned] = useState<GoalPlanTask[] | null>(null);
+  const [recommendation, setRecommendation] = useState<CliRecommendation | null>(null);
 
   const activeRepo = selectedRepo || repos[0]?.path || "/workspace/ledger-kit";
+
+  useEffect(() => {
+    let alive = true;
+    void fetchCliRecommendation(activeRepo, goal).then((rec) => {
+      if (alive && rec) setRecommendation(rec);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [activeRepo, goal]);
 
   const handlePlan = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -491,9 +504,17 @@ export function GoalLaunchpad({
         />
 
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <span className="text-[12px] text-[var(--ink-3)]">
-            Separate parallel steps with semicolons or newlines; use &quot;then&quot; for sequential DAG waves.
-          </span>
+          <div className="flex flex-wrap items-center gap-2 text-[12px] text-[var(--ink-3)]">
+            <span>Separate steps with semicolons or &quot;then&quot; for waves.</span>
+            {recommendation?.recommended_agent && (
+              <Badge tone="info" data-testid="smart-router-badge" className="mono">
+                Router: {recommendation.recommended_agent}
+                {(recommendation.matching_lessons?.length ?? 0) > 0
+                  ? ` · ${recommendation.matching_lessons.length} repo fix${recommendation.matching_lessons.length === 1 ? "" : "es"}`
+                  : ""}
+              </Badge>
+            )}
+          </div>
           <Button type="submit" variant="primary" size="md" disabled={planning || !goal.trim()}>
             <Sparkles className="size-4" strokeWidth={1.5} aria-hidden />
             <span>{planning ? "Planning..." : "Plan DAG"}</span>
