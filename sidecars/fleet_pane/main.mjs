@@ -14,7 +14,7 @@ import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setFlagsFromString } from 'node:v8';
-import { crc32, gzipSync } from 'node:zlib';
+import { crc32, gunzipSync, gzipSync } from 'node:zlib';
 import { probeWorktreeDiff, probeWorktrees } from './git_probe.mjs';
 import {
   ID_RE,
@@ -27,6 +27,15 @@ import {
   resolveConversationSwarm,
   unseenBy,
 } from './swarm_store.mjs';
+
+if (!process.env.UV_THREADPOOL_SIZE) {
+  process.env.UV_THREADPOOL_SIZE = '1';
+}
+if (process.execArgv.includes('--jitless')) {
+  try {
+    setFlagsFromString('--max-semi-space-size=1 --optimize-for-size');
+  } catch {}
+}
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BIND_HOST = '127.0.0.1';
@@ -67,34 +76,81 @@ function fastEtag(input) {
 function loadDistAssets(distDir) {
   const indexPath = join(distDir, 'index.html');
   const indexGzPath = join(distDir, 'index.html.gz');
-  const htmlRaw = existsSync(indexPath)
-    ? readFileSync(indexPath)
-    : Buffer.from('<!doctype html><html><body><p>Fleet dist/index.html missing. Run npm run build in frontend/.</p></body></html>');
-  const htmlGzip = existsSync(indexPath) && existsSync(indexGzPath)
-    ? readFileSync(indexGzPath)
-    : gzipSync(htmlRaw, { level: 9 });
-  const htmlEtag = fastEtag(htmlRaw);
+  const hasIndex = existsSync(indexPath);
+  const hasGz = hasIndex && existsSync(indexGzPath);
+  const htmlRawCache = hasGz
+    ? null
+    : hasIndex
+      ? readFileSync(indexPath)
+      : Buffer.from('<!doctype html><html><body><p>Fleet dist/index.html missing. Run npm run build in frontend/.</p></body></html>');
+  const htmlGzip = hasGz ? readFileSync(indexGzPath) : gzipSync(htmlRawCache, { level: 9 });
+  const htmlEtag = fastEtag(htmlGzip);
+  const getHtmlRaw = () => htmlRawCache || (hasIndex ? readFileSync(indexPath) : gunzipSync(htmlGzip));
+  const rootHdrBase = {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Vary: 'Accept-Encoding',
+    ETag: htmlEtag,
+    ...SECURITY_HEADERS,
+  };
+  const rootHdrGz = { ...rootHdrBase, 'Content-Encoding': 'gzip', 'Content-Length': htmlGzip.length };
 
   const fonts = new Map();
   const fontsDir = join(distDir, 'fonts');
   if (existsSync(fontsDir)) {
     for (const file of readdirSync(fontsDir)) {
       if (!file.endsWith('.woff2')) continue;
-      const buf = readFileSync(join(fontsDir, file));
+      const fontPath = join(fontsDir, file);
+      let loaded = null;
+      const ensure = () => {
+        if (!loaded) {
+          const buf = readFileSync(fontPath);
+          const etag = fastEtag(buf);
+          const hdr304 = {
+            'Content-Type': 'font/woff2',
+            'Cache-Control': 'public, max-age=31536000, immutable',
+            ETag: etag,
+            ...SECURITY_HEADERS,
+          };
+          loaded = { raw: buf, etag, hdr304, hdr200: { ...hdr304, 'Content-Length': buf.length } };
+        }
+        return loaded;
+      };
       fonts.set(`/fonts/${file}`, {
-        raw: buf,
-        etag: fastEtag(buf),
+        get raw() { return ensure().raw; },
+        get etag() { return ensure().etag; },
+        get hdr304() { return ensure().hdr304; },
+        get hdr200() { return ensure().hdr200; },
       });
     }
   }
-  return { htmlRaw, htmlGzip, htmlEtag, fonts };
+  return { get htmlRaw() { return getHtmlRaw(); }, getHtmlRaw, htmlGzip, htmlEtag, rootHdrBase, rootHdrGz, fonts };
 }
 
-function packJsonPayload(obj, etagOverride = '') {
-  const raw = Buffer.from(JSON.stringify(obj));
-  const gz = raw.length >= 256 ? gzipSync(raw) : null;
-  const etag = etagOverride || fastEtag(raw);
-  return { raw, gz, etag };
+function packJsonPayload(obj, etagOverride = '', retainRaw = false) {
+  const rawBuf = Buffer.from(JSON.stringify(obj));
+  const gz = rawBuf.length >= 256 ? gzipSync(rawBuf) : null;
+  const etag = etagOverride || fastEtag(rawBuf);
+  const hdr304 = {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Vary: 'Accept-Encoding',
+    ETag: etag,
+    ...SECURITY_HEADERS,
+  };
+  const hdrRaw = { ...hdr304, 'Content-Length': rawBuf.length };
+  const hdrGz = gz ? { ...hdr304, 'Content-Encoding': 'gzip', 'Content-Length': gz.length } : null;
+  const keptRaw = !gz || retainRaw ? rawBuf : null;
+  const getRaw = () => keptRaw || gunzipSync(gz);
+  return {
+    get raw() { return getRaw(); },
+    getRaw,
+    gz,
+    etag,
+    hdr304,
+    hdrRaw,
+    hdrGz,
+  };
 }
 
 function isLoopbackHostHeader(host) {
@@ -130,6 +186,7 @@ export function createFleetHandlers({
 } = {}) {
   const assets = loadDistAssets(distDir);
   const getAppDirs = () => findAppDataDirs(appDataDir);
+  const pack = (obj, etagOverride = '') => packJsonPayload(obj, etagOverride, isSidecar);
 
   let healthPacked = null;
   let healthKey = '';
@@ -143,10 +200,10 @@ export function createFleetHandlers({
     const key = `${appDataDirs.join('\0')}|${isSidecar}|${Boolean(sendMessageFn)}|${defaultConversationId}`;
     if (!healthPacked || healthKey !== key) {
       healthKey = key;
-      healthPacked = packJsonPayload({
+      healthPacked = pack({
         ok: true,
         name: 'fleet',
-        version: '1.8.0',
+        version: '1.9.0',
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
         sseStream: !isSidecar,
@@ -174,7 +231,7 @@ export function createFleetHandlers({
         prev.checkedAt = now;
         return;
       }
-      const packed = packJsonPayload(
+      const packed = pack(
         {
           conversationId: id,
           swarm: id,
@@ -187,7 +244,7 @@ export function createFleetHandlers({
         },
         fastEtag(fullEtag),
       );
-      const unchangedPacked = packJsonPayload({ conversationId: id, swarm: id, member, unchanged: true, etag: fullEtag });
+      const unchangedPacked = pack({ conversationId: id, swarm: id, member, unchanged: true, etag: fullEtag });
       if (swarmPayloadCache.has(cacheKey)) swarmPayloadCache.delete(cacheKey);
       else if (swarmPayloadCache.size >= 6) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
       swarmPayloadCache.set(cacheKey, {
@@ -207,7 +264,7 @@ export function createFleetHandlers({
       swarmsListCache.at = now;
       return swarmsListCache;
     }
-    const packed = packJsonPayload({
+    const packed = pack({
       swarms,
       defaultConversationId: defaultConversationId || swarms[0]?.id || null,
       appDataDirs,
@@ -235,7 +292,7 @@ export function createFleetHandlers({
     }
 
     if (!conv || !ID_RE.test(conv)) {
-      return packJsonPayload({
+      return pack({
         conversationId: conv || null,
         swarm: null,
         member: null,
@@ -268,7 +325,7 @@ export function createFleetHandlers({
 
     const res = resolveConversationSwarm(appDataDirs, conv);
     if (!res.swarm || !res.appData) {
-      return packJsonPayload({
+      return pack({
         conversationId: conv,
         swarm: null,
         member: null,
@@ -289,7 +346,7 @@ export function createFleetHandlers({
 
     const snap = buildSwarmSnapshot(res.appData, res.swarm, { includeRaw });
     if (!snap) {
-      return packJsonPayload({
+      return pack({
         conversationId: conv,
         swarm: null,
         member: null,
@@ -302,7 +359,7 @@ export function createFleetHandlers({
     const keys = getSwarmMetaKeys(res.appData, res.swarm);
     const etag = `${res.swarm}|${res.member || ''}|${snap.etag}`;
     if (query.etag && query.etag === etag) {
-      return packJsonPayload({ conversationId: conv, swarm: res.swarm, member: res.member, unchanged: true, etag });
+      return pack({ conversationId: conv, swarm: res.swarm, member: res.member, unchanged: true, etag });
     }
 
     if (hit && hit.fullEtag === etag) {
@@ -314,7 +371,7 @@ export function createFleetHandlers({
       return hit.packed;
     }
 
-    const packed = packJsonPayload(
+    const packed = pack(
       {
         conversationId: conv,
         swarm: res.swarm,
@@ -328,7 +385,7 @@ export function createFleetHandlers({
       fastEtag(etag),
     );
     if (!includeRaw) {
-      const unchangedPacked = packJsonPayload({ conversationId: conv, swarm: res.swarm, member: res.member, unchanged: true, etag });
+      const unchangedPacked = pack({ conversationId: conv, swarm: res.swarm, member: res.member, unchanged: true, etag });
       if (swarmPayloadCache.has(cacheKey)) swarmPayloadCache.delete(cacheKey);
       else if (swarmPayloadCache.size >= 6) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
       swarmPayloadCache.set(cacheKey, {
@@ -352,7 +409,7 @@ export function createFleetHandlers({
     const hit = worktreesPayloadCache.get(rootsKey);
     if (hit && now - hit.at < 3000) return hit.packed;
     const data = await probeWorktrees(rootsKey);
-    const packed = packJsonPayload(data);
+    const packed = pack(data);
     if (worktreesPayloadCache.has(rootsKey)) worktreesPayloadCache.delete(rootsKey);
     else if (worktreesPayloadCache.size >= 6) worktreesPayloadCache.delete(worktreesPayloadCache.keys().next().value);
     worktreesPayloadCache.set(rootsKey, { at: now, packed });
@@ -366,7 +423,7 @@ export function createFleetHandlers({
       file: typeof query.file === 'string' ? query.file : '',
       maxBytes: Number(query.maxBytes) || 8192,
     });
-    return { status: res.status || (res.ok ? 200 : 400), packed: packJsonPayload(res) };
+    return { status: res.status || (res.ok ? 200 : 400), packed: pack(res) };
   }
 
   function getFrame(query = {}) {
@@ -539,39 +596,52 @@ export async function startStandaloneServer({
     sseTimer.unref();
   }
 
-  function sendPacked(req, res, status, packed, extraHeaders = {}) {
-    const baseHeaders = {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': 'no-cache',
-      Vary: 'Accept-Encoding',
-      ETag: packed.etag,
-      ...SECURITY_HEADERS,
-      ...extraHeaders,
-    };
+  const preloadHeaders = {
+    'Content-Type': 'application/javascript; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    'Content-Length': preloadBuf.length,
+    ...SECURITY_HEADERS,
+  };
+
+  function sendPacked(req, res, status, packed) {
     if (status === 200 && req.headers['if-none-match'] === packed.etag) {
-      res.writeHead(304, baseHeaders);
+      res.writeHead(304, packed.hdr304);
       res.end();
       return;
     }
-    const acceptsGzip = packed.gz && /\bgzip\b/i.test(String(req.headers['accept-encoding'] || ''));
-    if (acceptsGzip) {
-      res.writeHead(status, { ...baseHeaders, 'Content-Encoding': 'gzip', 'Content-Length': packed.gz.length });
+    const ae = req.headers['accept-encoding'];
+    if (packed.hdrGz && typeof ae === 'string' && ae.includes('gzip')) {
+      res.writeHead(status, packed.hdrGz);
       res.end(packed.gz);
       return;
     }
-    res.writeHead(status, { ...baseHeaders, 'Content-Length': packed.raw.length });
-    res.end(packed.raw);
+    const raw = packed.getRaw ? packed.getRaw() : packed.raw;
+    res.writeHead(status, packed.hdrRaw);
+    res.end(raw);
   }
 
   function parseQueryFast(search) {
     if (!search || search.length <= 1) return {};
+    if (search.indexOf('&') === -1) {
+      const eq = search.indexOf('=');
+      if (eq > 1) {
+        const k = search.slice(1, eq);
+        const v = search.slice(eq + 1);
+        if (k.indexOf('%') === -1 && v.indexOf('%') === -1 && v.indexOf('+') === -1) {
+          return { [k]: v };
+        }
+        try {
+          return { [decodeURIComponent(k.replace(/\+/g, ' '))]: decodeURIComponent(v.replace(/\+/g, ' ')) };
+        } catch {}
+      }
+    }
     const out = {};
     const sp = new URLSearchParams(search);
     for (const [k, v] of sp) out[k] = v;
     return out;
   }
 
-  const server = createServer(async (req, res) => {
+  const server = createServer((req, res) => {
     if (!isLoopbackHostHeader(req.headers.host)) {
       res.writeHead(403, { 'Content-Type': 'application/json', Connection: 'close', ...SECURITY_HEADERS });
       res.end(JSON.stringify({ error: 'forbidden host' }));
@@ -584,55 +654,38 @@ export async function startStandaloneServer({
     const search = qIdx === -1 ? '' : rawUrl.slice(qIdx);
 
     if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
-      const { htmlRaw, htmlGzip, htmlEtag } = handlers.assets;
-      const headers = {
-        'Content-Type': 'text/html; charset=utf-8',
-        'Cache-Control': 'no-cache',
-        Vary: 'Accept-Encoding',
-        ETag: htmlEtag,
-        ...SECURITY_HEADERS,
-      };
-      if (req.headers['if-none-match'] === htmlEtag) {
-        res.writeHead(304, headers);
+      const assets = handlers.assets;
+      if (req.headers['if-none-match'] === assets.htmlEtag) {
+        res.writeHead(304, assets.rootHdrBase);
         res.end();
         return;
       }
-      if (/\bgzip\b/i.test(String(req.headers['accept-encoding'] || ''))) {
-        res.writeHead(200, { ...headers, 'Content-Encoding': 'gzip', 'Content-Length': htmlGzip.length });
-        res.end(htmlGzip);
+      const ae = req.headers['accept-encoding'];
+      if (typeof ae === 'string' && ae.includes('gzip')) {
+        res.writeHead(200, assets.rootHdrGz);
+        res.end(assets.htmlGzip);
         return;
       }
-      res.writeHead(200, { ...headers, 'Content-Length': htmlRaw.length });
-      res.end(htmlRaw);
+      const rawHtml = assets.getHtmlRaw();
+      res.writeHead(200, { ...assets.rootHdrBase, 'Content-Length': rawHtml.length });
+      res.end(rawHtml);
       return;
     }
 
     if (req.method === 'GET' && pathname === '/preload.js') {
-      res.writeHead(200, {
-        'Content-Type': 'application/javascript; charset=utf-8',
-        'Cache-Control': 'no-cache',
-        'Content-Length': preloadBuf.length,
-        ...SECURITY_HEADERS,
-      });
+      res.writeHead(200, preloadHeaders);
       res.end(preloadBuf);
       return;
     }
 
     if (req.method === 'GET' && handlers.assets.fonts.has(pathname)) {
       const font = handlers.assets.fonts.get(pathname);
-      const headers = {
-        'Content-Type': 'font/woff2',
-        'Cache-Control': 'public, max-age=31536000, immutable',
-        ETag: font.etag,
-        'Content-Length': font.raw.length,
-        ...SECURITY_HEADERS,
-      };
       if (req.headers['if-none-match'] === font.etag) {
-        res.writeHead(304, headers);
+        res.writeHead(304, font.hdr304);
         res.end();
         return;
       }
-      res.writeHead(200, headers);
+      res.writeHead(200, font.hdr200);
       res.end(font.raw);
       return;
     }
@@ -694,11 +747,12 @@ export async function startStandaloneServer({
       return;
     }
     if (req.method === 'GET' && pathname === '/api/worktrees') {
-      return sendPacked(req, res, 200, await handlers.getWorktreesPacked(parseQueryFast(search)));
+      handlers.getWorktreesPacked(parseQueryFast(search)).then((packed) => sendPacked(req, res, 200, packed));
+      return;
     }
     if (req.method === 'GET' && pathname === '/api/worktrees/diff') {
-      const out = await handlers.getWorktreeDiff(parseQueryFast(search));
-      return sendPacked(req, res, out.status, out.packed);
+      handlers.getWorktreeDiff(parseQueryFast(search)).then((out) => sendPacked(req, res, out.status, out.packed));
+      return;
     }
     if (req.method === 'GET' && pathname === '/api/frame') {
       const out = handlers.getFrame(parseQueryFast(search));
@@ -780,9 +834,11 @@ export async function startStandaloneServer({
 }
 
 async function runCli() {
-  try {
-    setFlagsFromString('--max-semi-space-size=1 --max-old-space-size=24 --optimize-for-size --no-opt --no-maglev --no-turbofan');
-  } catch {}
+  if (process.execArgv.includes('--jitless')) {
+    try {
+      setFlagsFromString('--max-semi-space-size=1 --optimize-for-size');
+    } catch {}
+  }
   const args = process.argv.slice(2);
   let port = Number(process.env.PORT || 18430);
   let appDataDir = process.env.FLEET_APP_DATA_DIR || '';

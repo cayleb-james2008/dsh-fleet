@@ -109,6 +109,42 @@ await runChecks("gate", async (check) => {
     return overflow <= 0;
   });
 
+  await check("Bottleneck Heat Bar renders activity counts and Copy blocker masks /home/ paths", async () => {
+    const heatTxt = await page.locator('[data-testid="bottleneck-heat-bar"]').textContent();
+    await page.evaluate(() => {
+      window.__copied = "";
+      try {
+        Object.defineProperty(navigator, "clipboard", {
+          configurable: true,
+          value: { writeText: async (t) => { window.__copied = String(t); } },
+        });
+      } catch {}
+    });
+    const copyBtn = page.locator('[data-testid^="copy-blocker-"]').first();
+    if ((await copyBtn.count()) < 1) return false;
+    await copyBtn.click();
+    const copied = await page.evaluate(() => window.__copied);
+    return (
+      Boolean(heatTxt) &&
+      heatTxt.includes("working") &&
+      heatTxt.includes("waiting") &&
+      heatTxt.includes("blocked") &&
+      copied.includes("### Blocker:") &&
+      !copied.includes("/home/")
+    );
+  });
+
+  await check("clicking Top #seq on Bottleneck Heat Bar jumps to Board", async () => {
+    const topJump = page.locator('[data-testid="top-blocker-jump"]');
+    if ((await topJump.count()) !== 1) return false;
+    await topJump.click();
+    await page.waitForSelector("#panel-board");
+    const ok = (await page.locator('#tab-board[aria-selected="true"]').count()) === 1;
+    await page.locator("#tab-triage").click();
+    await page.waitForSelector("#panel-triage");
+    return ok;
+  });
+
   // 7-9: #seq jump from Triage -> Board tab + Board filters
   await page.locator('#panel-triage button:has-text("#4")').first().click();
   await page.waitForSelector("#panel-board");

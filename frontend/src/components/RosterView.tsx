@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { ChevronDown, ChevronUp, ClipboardCopy, Cpu, Eye, EyeOff, MessageSquare, Send } from "../icons";
-import { openWorkerConversation, sendConfirmedNudge } from "../sidecar";
+import { openWorkerConversation } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot } from "../types";
-import { ActivityPeek, Badge, Button, Card, InlineComposer, StatusDot, cn, copyText, fmtElapsed, fmtTokens, toast } from "../ui";
+import { ActivityPeek, Badge, Button, Card, InlineComposer, StatusDot, cn, copyText, fmtElapsed, fmtTokens, submitNudge } from "../ui";
 
 const ORDER: Record<SwarmMember["status"], number> = { working: 0, waiting: 1, killed: 2 };
 const CONTEXT_BUDGET_TOKENS = 200_000;
@@ -11,15 +11,13 @@ const STALL_MS = 10 * 60 * 1000;
 function contextPressure(m: SwarmMember): { pct: number; tone: "neutral" | "info" | "warning" | "danger"; label: string } {
   const ctx = m.lastContextTokens || m.usage.inputTokens + m.usage.cacheReadTokens;
   const pct = Math.min(100, Math.round((ctx / CONTEXT_BUDGET_TOKENS) * 100));
-  if (m.failure?.kind === "quota") return { pct, tone: "danger", label: "Quota paused" };
+  if (m.failure?.kind === "quota") return { pct, tone: "danger", label: "Quota" };
   if (m.failure) return { pct, tone: "danger", label: "Error" };
   if (m.status === "working" && m.transcriptMtime && Date.now() - m.transcriptMtime > STALL_MS) {
     return { pct, tone: "warning", label: "Stalled" };
   }
-  if (ctx >= 140_000) return { pct, tone: "danger", label: `${pct}% ctx` };
-  if (ctx >= 90_000) return { pct, tone: "warning", label: `${pct}% ctx` };
-  if (ctx > 0) return { pct, tone: "info", label: `${pct}% ctx` };
-  return { pct: 0, tone: "neutral", label: "Idle ctx" };
+  if (ctx > 0) return { pct, tone: ctx >= 140_000 ? "danger" : ctx >= 90_000 ? "warning" : "info", label: `${pct}% ctx` };
+  return { pct: 0, tone: "neutral", label: "Idle" };
 }
 
 export function RosterView({
@@ -57,21 +55,12 @@ export function RosterView({
       );
   }, [members, showKilled]);
 
-  const sendNudge = async (member: SwarmMember) => {
-    if (!nudgeText.trim() || !member.conversation_id) return;
-    setSending(true);
-    try {
-      await sendConfirmedNudge(member.conversation_id, nudgeText.trim());
-      toast.success(`Message sent to ${member.name}`);
+  const sendNudge = (member: SwarmMember) =>
+    submitNudge(member.conversation_id, nudgeText, `Message sent to ${member.name}`, setSending, () => {
       setNudgeMember(null);
       setNudgeText("");
       onRefresh();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Nudge failed");
-    } finally {
-      setSending(false);
-    }
-  };
+    });
 
   return (
     <div className="space-y-3">
@@ -83,15 +72,15 @@ export function RosterView({
           {killedCount > 0 && <Badge tone="neutral">{killedCount} stopped</Badge>}
         </div>
         {killedCount > 0 && (
-          <Button variant="ghost" size="sm" onClick={() => setShowKilled((v) => !v)}>
-            {showKilled ? <EyeOff className="h-3.5 w-3.5" aria-hidden="true" /> : <Eye className="h-3.5 w-3.5" aria-hidden="true" />}
+          <Button variant="ghost" onClick={() => setShowKilled((v) => !v)}>
+            {showKilled ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
             {showKilled ? "Hide killed" : `Show killed (${killedCount})`}
           </Button>
         )}
       </div>
 
       {sorted.length === 0 ? (
-        <Card className="p-4 text-[14px] text-ink-2 bg-board">No workers registered on this swarm.</Card>
+        <Card className="p-4 text-[14px] text-ink-2 bg-board">No workers yet.</Card>
       ) : (
         <div className="space-y-2">
           {sorted.map((m) => {
@@ -114,8 +103,8 @@ export function RosterView({
             const peeking = peekMember === m.name;
             const tools = m.recentTools || [];
             const pressure = contextPressure(m);
-            const askStatusPrompt = `@${m.name} Quick status check: what step are you on and any blockers?`;
-            const wrapUpPrompt = `@${m.name} Wrap up your active slice, run final verification, and post [done].`;
+            const askStatusPrompt = `@${m.name} Status & blockers?`;
+            const wrapUpPrompt = `@${m.name} Wrap up, verify, and post [done].`;
 
             return (
               <Card key={m.name} className={cn("p-3 space-y-2", m.killed && "opacity-65")}>
@@ -137,23 +126,20 @@ export function RosterView({
                     {(tools.length > 0 || m.thinkingHeading) && (
                       <Button
                         variant={peeking ? "secondary" : "ghost"}
-                        size="sm"
                         aria-label={`Peek activity for ${m.name}`}
                         aria-expanded={peeking}
                         onClick={() => setPeekMember(peeking ? null : m.name)}
                       >
-                        {peeking ? <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" /> : <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />}
+                        {peeking ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
                         Peek
                       </Button>
                     )}
                     {m.conversation_id && window.sidecar?.ui?.toggleConversation && (
                       <Button
-                        variant="outline"
-                        size="sm"
                         aria-label={`Open ${m.name} chat`}
                         onClick={() => openWorkerConversation(m.conversation_id)}
                       >
-                        <MessageSquare className="h-3.5 w-3.5" aria-hidden="true" />
+                        <MessageSquare className="h-3.5 w-3.5" />
                         Chat
                       </Button>
                     )}
@@ -167,7 +153,7 @@ export function RosterView({
                           setNudgeText(`@${m.name} `);
                         }}
                       >
-                        <Send className="h-3.5 w-3.5" aria-hidden="true" />
+                        <Send className="h-3.5 w-3.5" />
                       </Button>
                     )}
                   </div>
@@ -187,7 +173,7 @@ export function RosterView({
                   )}
                   {m.model && (
                     <span className="inline-flex items-center gap-1 text-ink-3 px-1">
-                      <Cpu className="h-3 w-3" aria-hidden="true" />
+                      <Cpu className="h-3 w-3" />
                       {m.model}
                     </span>
                   )}
@@ -196,40 +182,25 @@ export function RosterView({
                 {/* Quick-Action chips for active workers */}
                 {!m.killed && m.conversation_id && (
                   <div className="flex flex-wrap items-center gap-1.5">
-                    {canNudge ? (
-                      <>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            setNudgeMember(m.name);
-                            setNudgeText(askStatusPrompt);
-                          }}
-                          className="h-7 px-2"
-                        >
-                          Ask status
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => {
-                            setNudgeMember(m.name);
-                            setNudgeText(wrapUpPrompt);
-                          }}
-                          className="h-7 px-2"
-                        >
-                          Wrap up
-                        </Button>
-                      </>
-                    ) : (
+                    <Button
+                      variant={canNudge ? "outline" : "ghost"}
+                      onClick={() =>
+                        canNudge
+                          ? (setNudgeMember(m.name), setNudgeText(askStatusPrompt))
+                          : void copyText(askStatusPrompt, `Copied status check for ${m.name}`)
+                      }
+                      className="h-7 px-2"
+                    >
+                      {!canNudge && <ClipboardCopy className="h-3 w-3" />}
+                      Ask status
+                    </Button>
+                    {canNudge && (
                       <Button
                         variant="ghost"
-                        size="sm"
-                        onClick={() => void copyText(askStatusPrompt, `Copied status check for ${m.name}`)}
+                        onClick={() => (setNudgeMember(m.name), setNudgeText(wrapUpPrompt))}
                         className="h-7 px-2"
                       >
-                        <ClipboardCopy className="h-3 w-3" aria-hidden="true" />
-                        Ask status
+                        Wrap up
                       </Button>
                     )}
                   </div>
@@ -239,9 +210,9 @@ export function RosterView({
                 <div className="rounded-chip bg-board px-2.5 py-1.5 space-y-1.5">
                   <div className="flex flex-wrap items-center gap-2.5 text-[12px] text-ink-2 num">
                     <span className="font-semibold text-ink">{fmtTokens(m.usage.totalTokens)} tok</span>
-                    <span>in {fmtTokens(m.usage.inputTokens)}</span>
-                    <span>cache {fmtTokens(m.usage.cacheReadTokens)}</span>
-                    <span>out {fmtTokens(m.usage.outputTokens)}</span>
+                    {([["in", m.usage.inputTokens], ["cache", m.usage.cacheReadTokens], ["out", m.usage.outputTokens]] as const).map(([k, v]) => (
+                      <span key={k}>{k} {fmtTokens(v)}</span>
+                    ))}
                   </div>
                   {!m.killed && pressure.pct > 0 && (
                     <div className="h-1 w-full overflow-hidden rounded-full bg-track" aria-hidden="true">

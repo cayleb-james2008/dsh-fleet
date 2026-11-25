@@ -8,20 +8,10 @@ html, body {
   font-synthesis: none;
 }
 
-*, ::before, ::after, ::backdrop {
-  --tw-ring-offset-color: var(--surface);
-}
-
 @utility transition {
   transition-property: color, background-color, border-color, text-decoration-color, fill, stroke, opacity, transform;
   transition-timing-function: var(--ease-house);
   transition-duration: var(--dur-press);
-}
-
-@property --tw-ring-offset-color {
-  syntax: "*";
-  inherits: false;
-  initial-value: transparent;
 }
 
 h1, h2, h3 {

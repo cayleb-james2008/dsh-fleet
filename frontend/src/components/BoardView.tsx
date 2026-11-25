@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, ClipboardCopy, Filter, Pin, PinOff, Reply, Search, X } from "../icons";
-import { extractLocalFilePaths, openFileInAuxPane, parseScreenshotLines, sendConfirmedNudge } from "../sidecar";
+import { ArrowDown, ClipboardCopy, Filter, Pin, Reply, Search, X } from "../icons";
+import { extractLocalFilePaths, parseScreenshotLines } from "../sidecar";
 import type { BoardMessage, SwarmSnapshot } from "../types";
-import { Badge, Button, Card, InlineComposer, Input, MediaPathChips, cn, copyText, fmtClockTime, toast } from "../ui";
+import { Badge, Button, Card, InlineComposer, Input, MediaPathChips, PinnedList, cn, copyText, fmtClockTime, openOrCopyPath, submitNudge } from "../ui";
 
 function PostBody({
   text,
@@ -25,7 +25,7 @@ function PostBody({
     <div className="space-y-1.5">
       <p className="text-[14px] text-ink whitespace-pre-wrap break-words leading-[1.48]">
         {tokens.map((tok, i) => {
-          if (/^@[a-z0-9_-]+$/i.test(tok)) {
+          if (tok[0] === "@" && /^@[a-z0-9_-]+$/i.test(tok)) {
             const name = tok.slice(1);
             const isViewer = viewer && name.toLowerCase() === viewer.toLowerCase();
             return (
@@ -34,44 +34,41 @@ function PostBody({
                 type="button"
                 onClick={() => (name.toLowerCase() !== "all" ? onFilterAgent(name) : undefined)}
                 className={cn(
-                  "inline rounded-[4px] px-1 font-medium cursor-pointer transition",
-                  isViewer
-                    ? "bg-blue-soft text-info"
-                    : "bg-track text-ink hover:bg-hairline",
+                  "inline rounded-chip px-1 font-medium cursor-pointer transition",
+                  isViewer ? "bg-blue-soft text-info" : "bg-track text-ink hover:bg-hairline",
                 )}
               >
                 {tok}
               </button>
             );
           }
-          if (/^#[0-9]+$/.test(tok)) {
-            const seq = Number(tok.slice(1));
+          if (tok[0] === "#" && /^#[0-9]+$/.test(tok)) {
             return (
               <button
                 key={i}
                 type="button"
-                onClick={() => onClickSeq(seq)}
-                className="inline rounded-[4px] bg-blue-soft px-1 text-[12px] font-medium text-info num cursor-pointer hover:underline"
+                onClick={() => onClickSeq(Number(tok.slice(1)))}
+                className="inline rounded-chip bg-blue-soft px-1 text-[12px] font-medium text-info num cursor-pointer hover:underline"
               >
                 {tok}
               </button>
             );
           }
-          if (/^\[(?:done|verified|blocked)\]$/i.test(tok)) {
-            const lower = tok.toLowerCase();
-            const cls =
-              lower === "[verified]"
-                ? "bg-ok-soft text-ok"
-                : lower === "[blocked]"
-                  ? "bg-bad-soft text-danger"
-                  : "bg-blue-soft text-info";
+          if (tok[0] === "[" && /^\[(?:done|verified|blocked)\]$/i.test(tok)) {
+            const lo = tok.toLowerCase();
             return (
-              <span key={i} className={cn("inline-block rounded-[4px] px-1.5 text-[12px] font-semibold", cls)}>
+              <span
+                key={i}
+                className={cn(
+                  "inline-block rounded-chip px-1.5 text-[12px] font-semibold",
+                  lo === "[verified]" ? "bg-ok-soft text-ok" : lo === "[blocked]" ? "bg-bad-soft text-danger" : "bg-blue-soft text-info",
+                )}
+              >
                 {tok}
               </span>
             );
           }
-          return <span key={i}>{tok}</span>;
+          return tok;
         })}
       </p>
       {needsFold && (
@@ -221,18 +218,11 @@ export function BoardView({
       setReplyDraft("");
       return;
     }
-    setSending(true);
-    try {
-      await sendConfirmedNudge(convId, replyDraft.trim());
-      toast.success(`Sent reply to @${replyTarget.agent} (#${replyTarget.seq})`);
+    await submitNudge(convId, replyDraft, `Sent reply to @${replyTarget.agent} (#${replyTarget.seq})`, setSending, () => {
       setReplyTarget(null);
       setReplyDraft("");
       onRefresh?.();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to send reply");
-    } finally {
-      setSending(false);
-    }
+    });
   };
 
   const hasActiveFilter = query.trim().length > 0 || agentFilter !== "all" || quickFilter !== "all";
@@ -248,34 +238,11 @@ export function BoardView({
         <Card className="p-2.5 space-y-1.5 bg-board" aria-label="Pinned board posts">
           <div className="flex items-center justify-between gap-2">
             <span className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-ink">
-              <Pin className="h-3.5 w-3.5 text-info" aria-hidden="true" />
+              <Pin className="h-3.5 w-3.5 text-info" />
               Pinned ({pinnedMessages.length})
             </span>
           </div>
-          <ul className="divide-y divide-hairline">
-            {pinnedMessages.map((pm) => (
-              <li key={pm.seq} className="flex items-center justify-between gap-2 py-1.5 first:pt-0.5 last:pb-0">
-                <button
-                  type="button"
-                  onClick={() => scrollToSeq(pm.seq)}
-                  className="min-w-0 flex-1 text-left text-[12px] text-ink hover:underline cursor-pointer truncate"
-                >
-                  <span className="font-semibold num">#{pm.seq}</span>{" "}
-                  <span className="font-medium">{pm.agent}:</span>{" "}
-                  <span className="text-ink-2">{parseScreenshotLines(pm.text).cleanText || pm.text.replace(/\/home\/[^/\s]+\//g, "~/")}</span>
-                </button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  aria-label={`Unpin #${pm.seq}`}
-                  onClick={() => onTogglePin(pm.seq)}
-                  className="shrink-0"
-                >
-                  <PinOff className="h-3.5 w-3.5" aria-hidden="true" />
-                </Button>
-              </li>
-            ))}
-          </ul>
+          <PinnedList messages={pinnedMessages} onJump={scrollToSeq} onUnpin={onTogglePin} compact />
         </Card>
       )}
       {/* Pinned Search & Filter Bar */}
@@ -284,11 +251,10 @@ export function BoardView({
           <div className="relative flex-1 min-w-0">
             <Search
               className="pointer-events-none absolute left-2.5 top-2 h-4 w-4 text-ink-3"
-              aria-hidden="true"
             />
             <Input
               aria-label="Search board messages"
-              placeholder="Search #seq, @agent, or text..."
+              placeholder="Search #seq, @agent, text..."
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               className="pl-8 pr-7"
@@ -300,7 +266,7 @@ export function BoardView({
                 onClick={() => setQuery("")}
                 className="absolute right-1.5 top-1.5 p-1 text-ink-3 hover:text-ink cursor-pointer"
               >
-                <X className="h-3.5 w-3.5" aria-hidden="true" />
+                <X className="h-3.5 w-3.5" />
               </button>
             )}
           </div>
@@ -313,7 +279,7 @@ export function BoardView({
             onClick={() => setShowFilters((s) => !s)}
             className="relative"
           >
-            <Filter className="h-4 w-4" aria-hidden="true" />
+            <Filter className="h-4 w-4" />
             {hasActiveFilter && (
               <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-blue" aria-hidden="true" />
             )}
@@ -321,13 +287,12 @@ export function BoardView({
 
           <Button
             variant={follow ? "primary" : "outline"}
-            size="sm"
             onClick={() => {
               setFollow((f) => !f);
               if (!follow) bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
             }}
           >
-            <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
+            <ArrowDown className="h-3.5 w-3.5" />
             {follow ? "Following" : "Latest"}
           </Button>
         </div>
@@ -360,8 +325,8 @@ export function BoardView({
             ))}
           </div>
           {onCopyWaveDigest && (
-            <Button variant="ghost" size="sm" onClick={onCopyWaveDigest} className="h-7 px-2">
-              <ClipboardCopy className="h-3.5 w-3.5" aria-hidden="true" />
+            <Button variant="ghost" onClick={onCopyWaveDigest} className="h-7 px-2">
+              <ClipboardCopy className="h-3.5 w-3.5" />
               Wave digest
             </Button>
           )}
@@ -369,33 +334,22 @@ export function BoardView({
 
         {showFilters && (
           <Card className="p-2.5 flex flex-wrap items-center gap-1.5">
-            <button
-              type="button"
-              onClick={() => setAgentFilter("all")}
-              className={cn(
-                "rounded-chip px-2 py-1 text-[12px] font-medium cursor-pointer transition",
-                agentFilter === "all"
-                  ? "bg-[var(--ink-button)] text-[var(--ink-button-fg)]"
-                  : "bg-track text-ink-2 hover:text-ink",
-              )}
-            >
-              All ({messages.filter((m) => !m.control).length})
-            </button>
-            {members.map((m) => (
-              <button
-                key={m.name}
-                type="button"
-                onClick={() => setAgentFilter(m.name === agentFilter ? "all" : m.name)}
-                className={cn(
-                  "rounded-chip px-2 py-1 text-[12px] font-medium cursor-pointer transition",
-                  agentFilter === m.name
-                    ? "bg-[var(--ink-button)] text-[var(--ink-button-fg)]"
-                    : "bg-track text-ink-2 hover:text-ink",
-                )}
-              >
-                {m.name}
-              </button>
-            ))}
+            {["all", ...members.map((m) => m.name)].map((name) => {
+              const active = agentFilter === name;
+              return (
+                <button
+                  key={name}
+                  type="button"
+                  onClick={() => setAgentFilter(name === "all" || active ? "all" : name)}
+                  className={cn(
+                    "rounded-chip px-2 py-1 text-[12px] font-medium cursor-pointer transition",
+                    active ? "bg-[var(--ink-button)] text-[var(--ink-button-fg)]" : "bg-track text-ink-2 hover:text-ink",
+                  )}
+                >
+                  {name === "all" ? `All (${messages.filter((m) => !m.control).length})` : name}
+                </button>
+              );
+            })}
           </Card>
         )}
       </div>
@@ -404,12 +358,10 @@ export function BoardView({
       {filtered.length === 0 ? (
         <Card className="p-4 text-center space-y-2 bg-board">
           <p className="text-[14px] text-ink-2">
-            {messages.length === 0 ? "No messages posted to the board yet." : "No posts match your current filter."}
+            {messages.length === 0 ? "No posts yet." : "No matching posts."}
           </p>
           {hasActiveFilter && (
             <Button
-              variant="outline"
-              size="sm"
               onClick={() => {
                 setQuery("");
                 setAgentFilter("all");
@@ -424,13 +376,8 @@ export function BoardView({
         <div className="space-y-2">
           {hiddenCount > 0 && (
             <div className="flex justify-center">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setVisibleLimit((n) => n + 120)}
-                className="num"
-              >
-                Show older posts ({hiddenCount} earlier)
+              <Button onClick={() => setVisibleLimit((n) => n + 120)} className="num">
+                Show {hiddenCount} earlier
               </Button>
             </div>
           )}
@@ -482,7 +429,7 @@ export function BoardView({
                           type="button"
                           aria-label={`Quote reply to #${m.seq}`}
                           onClick={() => openQuoteReply(m)}
-                          className="rounded-[4px] px-1 py-0.5 hover:bg-track hover:text-ink cursor-pointer transition"
+                          className="rounded-chip px-1 py-0.5 hover:bg-track hover:text-ink cursor-pointer transition"
                         >
                           #{m.seq}
                         </button>
@@ -492,13 +439,13 @@ export function BoardView({
                           aria-label={`Reply to #${m.seq}`}
                           onClick={() => openQuoteReply(m)}
                           className={cn(
-                            "p-1 rounded-[4px] cursor-pointer transition",
+                            "p-1 rounded-chip cursor-pointer transition",
                             replyTarget?.seq === m.seq
                               ? "text-info bg-blue-soft"
                               : "text-ink-3 hover:text-ink hover:bg-track",
                           )}
                         >
-                          <Reply className="h-3 w-3" aria-hidden="true" />
+                          <Reply className="h-3 w-3" />
                         </button>
                         <button
                           type="button"
@@ -506,13 +453,13 @@ export function BoardView({
                           aria-pressed={pinnedSet.has(m.seq)}
                           onClick={() => onTogglePin(m.seq)}
                           className={cn(
-                            "p-1 rounded-[4px] cursor-pointer transition",
+                            "p-1 rounded-chip cursor-pointer transition",
                             pinnedSet.has(m.seq)
                               ? "text-info bg-blue-soft"
                               : "text-ink-3 hover:text-ink hover:bg-track",
                           )}
                         >
-                          <Pin className="h-3 w-3" aria-hidden="true" />
+                          <Pin className="h-3 w-3" />
                         </button>
                       </div>
                     </div>
@@ -530,18 +477,7 @@ export function BoardView({
                             onFilterAgent={(name) => setAgentFilter(name)}
                           />
                         )}
-                        <MediaPathChips
-                          compact
-                          shots={shots}
-                          paths={paths}
-                          onOpen={(target, fallback) => {
-                            if (openFileInAuxPane(target)) {
-                              toast.success(`Opened ${target.split("/").pop() || "file"}`);
-                            } else if (fallback) {
-                              void copyText(fallback, target === fallback ? "File path copied" : "Screenshot label copied");
-                            }
-                          }}
-                        />
+                        <MediaPathChips compact shots={shots} paths={paths} onOpen={openOrCopyPath} />
                       </>
                     );
                   })()}

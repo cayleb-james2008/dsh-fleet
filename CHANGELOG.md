@@ -3,6 +3,12 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as a
 ready-to-install Antigravity plugin bundle (`tar.gz` + `zip`) with `SHA256SUMS`.
 
+## 1.9.0 - 2026-11-25
+
+- **Swarm Bottleneck Heat Bar & 1-Click Copy Blocker (`TriageView.tsx`, `ui.tsx`):** Added a proportional `working` / `waiting` / `blocked` Swarm Bottleneck Heat Bar to Needs You with a clickable `Top #seq` jump chip to Board and a 1-click **Copy blocker** action that copies a concise `~/`-masked Markdown escalation (`0` raw `/home/` paths).
+- **Sub-`92 KiB` Gzip Diet & Shared UI/Store Helpers (`frontend/src/{icons.tsx,ui.tsx,theme.css}`, `sidecars/fleet_pane/{main.mjs,swarm_store.mjs,channels.mjs}`):** Consolidated SVG icon paths, shared `maskHome` / `submitNudge` / `openOrCopyPath` / `PinnedList` helpers, and folded CSS custom property/spacing overhead down to **`311,446 B` raw (`304.1 KiB`) / `94,127 B` gz (`91.9 KiB`)** (`491,488 B` standalone web demo). Added `createMentionsMatcher` (`@`-prefix fast path), in-place `SHARED_CHUNK_BUF` carry handling, `TAIL_CAP = 16`, lazy dist asset reads, and single-param `parseQueryFast` (`73.16 MB` `--jitless` `VmHWM`, `8/8` backend tests, `28/28` CWE-22/CWE-59 raw-TCP fuzz checks, `5/5` SSE streams).
+- **Verified E2E, Sloplint & Screenshot Refresh (`docs/screenshots/*.png`, `frontend/e2e/{gate,check}.mjs`):** Refreshed all 8 Light/Dark `380x900` `@2x` screenshots with `~/`-masked `~/workspace/app(-wt)` worktrees and expanded TypeScript `src/triage.ts` diff peeks; verified `38/38` gate, `8/8` replay, `11/11` live-web, and `0 FAIL / 0 REFLEX / 0 WARN` Sloplint.
+
 ## 1.8.0 - 2026-11-25
 
 - **Inline Worktree Diff Peek & CWE-22/CWE-59 Confinement (`WorktreesView.tsx`, `sidecars/fleet_pane/{git_probe.mjs,main.mjs}`, `web-engine.js`):** Added `GET /api/worktrees/diff?root=...&worktree=...&file=...` returning bounded (`<= 8 KB`) `git diff HEAD` hunks and untracked text previews strictly confined to validated repository worktrees via `realpathSync` (rejecting `..` traversal, out-of-repo worktrees, and escaping symlinks), wired to an expandable **Diff peek** toggle beside **Open file** inside the `380px` sidebar.

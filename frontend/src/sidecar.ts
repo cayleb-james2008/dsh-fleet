@@ -38,28 +38,27 @@ function sidecarFetch(url: string, init?: RequestInit): Promise<Response> {
   return fetch(url, init);
 }
 
-export async function fetchSwarms(): Promise<{ swarms: SwarmSummary[]; defaultConversationId: string | null }> {
-  const res = await sidecarFetch("/api/swarms");
-  if (!res.ok) throw new Error(`Failed to list swarms (${res.status})`);
+async function apiJson<T>(url: string, errLabel: string): Promise<T> {
+  const res = await sidecarFetch(url);
+  if (!res.ok) throw new Error(`${errLabel} (${res.status})`);
   return res.json();
 }
 
-export async function fetchSwarmSnapshot(conversationId?: string | null, etag?: string): Promise<SwarmSnapshot> {
+export const fetchSwarms = (): Promise<{ swarms: SwarmSummary[]; defaultConversationId: string | null }> =>
+  apiJson("/api/swarms", "List swarms failed");
+
+export function fetchSwarmSnapshot(conversationId?: string | null, etag?: string): Promise<SwarmSnapshot> {
   const q = new URLSearchParams();
   if (conversationId) q.set("conversationId", conversationId);
   if (etag) q.set("etag", etag);
   const qs = q.toString();
-  const res = await sidecarFetch(`/api/swarm${qs ? `?${qs}` : ""}`);
-  if (!res.ok) throw new Error(`Failed to load swarm (${res.status})`);
-  return res.json();
+  return apiJson(`/api/swarm${qs ? `?${qs}` : ""}`, "Load swarm failed");
 }
 
-export async function fetchWorktrees(roots: string[]): Promise<WorktreesPayload> {
+export function fetchWorktrees(roots: string[]): Promise<WorktreesPayload> {
   const q = new URLSearchParams();
   if (roots.length) q.set("roots", roots.join(","));
-  const res = await sidecarFetch(`/api/worktrees?${q.toString()}`);
-  if (!res.ok) throw new Error(`Failed to probe worktrees (${res.status})`);
-  return res.json();
+  return apiJson(`/api/worktrees?${q.toString()}`, "Worktrees failed");
 }
 
 export async function fetchWorktreeDiff(root: string, worktree: string, file: string): Promise<WorktreeDiffPayload> {
@@ -135,26 +134,13 @@ export function extractLocalFilePaths(text: string): string[] {
   return [...seen];
 }
 
-/** Detect theme luminance from CSS color string (`#rrggbb` or `rgb(r,g,b)`). */
 export function inferThemeFromCssColor(color: string): ThemeMode | null {
-  const s = String(color || "").trim();
-  let r = 0;
-  let g = 0;
-  let b = 0;
-  const hex = /^#([0-9a-f]{6})$/i.exec(s);
-  if (hex) {
-    r = parseInt(hex[1].slice(0, 2), 16);
-    g = parseInt(hex[1].slice(2, 4), 16);
-    b = parseInt(hex[1].slice(4, 6), 16);
-  } else {
-    const rgb = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i.exec(s);
-    if (!rgb) return null;
-    r = Number(rgb[1]);
-    g = Number(rgb[2]);
-    b = Number(rgb[3]);
-  }
-  const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
-  return lum < 0.45 ? "dark" : "light";
+  const m = String(color || "").trim().match(/^#([0-9a-f]{6})$|^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+  if (!m) return null;
+  const [r, g, b] = m[1]
+    ? [parseInt(m[1].slice(0, 2), 16), parseInt(m[1].slice(2, 4), 16), parseInt(m[1].slice(4, 6), 16)]
+    : [Number(m[2]), Number(m[3]), Number(m[4])];
+  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 < 0.45 ? "dark" : "light";
 }
 
 export function applyTheme(theme: ThemeMode, persist = true): void {
