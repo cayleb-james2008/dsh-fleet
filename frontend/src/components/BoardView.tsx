@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, ClipboardCopy, FileCode2, Filter, Image as ImageIcon, Pin, PinOff, Reply, Search, Send, X } from "lucide-react";
+import { ArrowDown, ClipboardCopy, Filter, Pin, PinOff, Reply, Search, X } from "../icons";
 import { extractLocalFilePaths, openFileInAuxPane, parseScreenshotLines, sendConfirmedNudge } from "../sidecar";
 import type { BoardMessage, SwarmSnapshot } from "../types";
-import { Badge, Button, Card, Input, Textarea, cn, fmtClockTime, toast } from "../ui";
+import { Badge, Button, Card, InlineComposer, Input, MediaPathChips, cn, copyText, fmtClockTime, toast } from "../ui";
 
 function PostBody({
   text,
@@ -23,7 +23,7 @@ function PostBody({
 
   return (
     <div className="space-y-1.5">
-      <p className="text-[14px] text-[var(--ink)] whitespace-pre-wrap break-words leading-[1.48]">
+      <p className="text-[14px] text-ink whitespace-pre-wrap break-words leading-[1.48]">
         {tokens.map((tok, i) => {
           if (/^@[a-z0-9_-]+$/i.test(tok)) {
             const name = tok.slice(1);
@@ -36,8 +36,8 @@ function PostBody({
                 className={cn(
                   "inline rounded-[4px] px-1 font-medium cursor-pointer transition",
                   isViewer
-                    ? "bg-[var(--blue-soft)] text-[var(--info-foreground)]"
-                    : "bg-[var(--track)] text-[var(--ink)] hover:bg-[var(--hairline)]",
+                    ? "bg-blue-soft text-info"
+                    : "bg-track text-ink hover:bg-hairline",
                 )}
               >
                 {tok}
@@ -51,7 +51,7 @@ function PostBody({
                 key={i}
                 type="button"
                 onClick={() => onClickSeq(seq)}
-                className="inline rounded-[4px] bg-[var(--blue-soft)] px-1 text-[12px] font-medium text-[var(--info-foreground)] num cursor-pointer hover:underline"
+                className="inline rounded-[4px] bg-blue-soft px-1 text-[12px] font-medium text-info num cursor-pointer hover:underline"
               >
                 {tok}
               </button>
@@ -61,10 +61,10 @@ function PostBody({
             const lower = tok.toLowerCase();
             const cls =
               lower === "[verified]"
-                ? "bg-[var(--ok-soft)] text-[var(--success-foreground)]"
+                ? "bg-ok-soft text-ok"
                 : lower === "[blocked]"
-                  ? "bg-[var(--bad-soft)] text-[var(--destructive-foreground)]"
-                  : "bg-[var(--blue-soft)] text-[var(--info-foreground)]";
+                  ? "bg-bad-soft text-danger"
+                  : "bg-blue-soft text-info";
             return (
               <span key={i} className={cn("inline-block rounded-[4px] px-1.5 text-[12px] font-semibold", cls)}>
                 {tok}
@@ -78,7 +78,7 @@ function PostBody({
         <button
           type="button"
           onClick={() => setExpanded((e) => !e)}
-          className="text-[12px] font-medium text-[var(--info-foreground)] hover:underline cursor-pointer"
+          className="text-[12px] font-medium text-info hover:underline cursor-pointer"
         >
           {expanded ? "Show less" : "Show more"}
         </button>
@@ -216,14 +216,9 @@ export function BoardView({
     if (!replyTarget || !replyDraft.trim()) return;
     const convId = memberByName.get(replyTarget.agent)?.conversation_id || "";
     if (!canNudge || !convId) {
-      try {
-        await navigator.clipboard.writeText(replyDraft.trim());
-        toast.success(`Copied reply to #${replyTarget.seq}`);
-        setReplyTarget(null);
-        setReplyDraft("");
-      } catch {
-        toast.error("Clipboard unavailable");
-      }
+      await copyText(replyDraft.trim(), `Copied reply to #${replyTarget.seq}`);
+      setReplyTarget(null);
+      setReplyDraft("");
       return;
     }
     setSending(true);
@@ -250,24 +245,24 @@ export function BoardView({
   return (
     <div className="space-y-3">
       {pinnedMessages.length > 0 && (
-        <Card className="p-2.5 space-y-1.5 bg-[var(--board)]" aria-label="Pinned board posts">
+        <Card className="p-2.5 space-y-1.5 bg-board" aria-label="Pinned board posts">
           <div className="flex items-center justify-between gap-2">
-            <span className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-[var(--ink)]">
-              <Pin className="h-3.5 w-3.5 text-[var(--info-foreground)]" aria-hidden="true" />
+            <span className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-ink">
+              <Pin className="h-3.5 w-3.5 text-info" aria-hidden="true" />
               Pinned ({pinnedMessages.length})
             </span>
           </div>
-          <ul className="divide-y divide-[var(--hairline)]">
+          <ul className="divide-y divide-hairline">
             {pinnedMessages.map((pm) => (
               <li key={pm.seq} className="flex items-center justify-between gap-2 py-1.5 first:pt-0.5 last:pb-0">
                 <button
                   type="button"
                   onClick={() => scrollToSeq(pm.seq)}
-                  className="min-w-0 flex-1 text-left text-[12px] text-[var(--ink)] hover:underline cursor-pointer truncate"
+                  className="min-w-0 flex-1 text-left text-[12px] text-ink hover:underline cursor-pointer truncate"
                 >
                   <span className="font-semibold num">#{pm.seq}</span>{" "}
                   <span className="font-medium">{pm.agent}:</span>{" "}
-                  <span className="text-[var(--ink-2)]">{parseScreenshotLines(pm.text).cleanText || pm.text.replace(/\/home\/[^/\s]+\//g, "~/")}</span>
+                  <span className="text-ink-2">{parseScreenshotLines(pm.text).cleanText || pm.text.replace(/\/home\/[^/\s]+\//g, "~/")}</span>
                 </button>
                 <Button
                   variant="ghost"
@@ -284,11 +279,11 @@ export function BoardView({
         </Card>
       )}
       {/* Pinned Search & Filter Bar */}
-      <div className="sticky top-0 z-10 -mx-1 px-1 py-1.5 bg-[var(--canvas)] space-y-2">
+      <div className="sticky top-0 z-10 -mx-1 px-1 py-1.5 bg-canvas space-y-2">
         <div className="flex items-center gap-1.5">
           <div className="relative flex-1 min-w-0">
             <Search
-              className="pointer-events-none absolute left-2.5 top-2 h-4 w-4 text-[var(--ink-3)]"
+              className="pointer-events-none absolute left-2.5 top-2 h-4 w-4 text-ink-3"
               aria-hidden="true"
             />
             <Input
@@ -303,7 +298,7 @@ export function BoardView({
                 type="button"
                 aria-label="Clear board search"
                 onClick={() => setQuery("")}
-                className="absolute right-1.5 top-1.5 p-1 text-[var(--ink-3)] hover:text-[var(--ink)] cursor-pointer"
+                className="absolute right-1.5 top-1.5 p-1 text-ink-3 hover:text-ink cursor-pointer"
               >
                 <X className="h-3.5 w-3.5" aria-hidden="true" />
               </button>
@@ -320,7 +315,7 @@ export function BoardView({
           >
             <Filter className="h-4 w-4" aria-hidden="true" />
             {hasActiveFilter && (
-              <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-[var(--blue)]" aria-hidden="true" />
+              <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-blue" aria-hidden="true" />
             )}
           </Button>
 
@@ -354,10 +349,10 @@ export function BoardView({
                 aria-pressed={quickFilter === id}
                 onClick={() => onQuickFilterChange?.(id)}
                 className={cn(
-                  "rounded-[var(--radius-chip)] px-2 py-0.5 text-[12px] font-medium cursor-pointer transition num",
+                  "rounded-chip px-2 py-0.5 text-[12px] font-medium cursor-pointer transition num",
                   quickFilter === id
                     ? "bg-[var(--ink-button)] text-[var(--ink-button-fg)]"
-                    : "bg-[var(--track)] text-[var(--ink-2)] hover:text-[var(--ink)]",
+                    : "bg-track text-ink-2 hover:text-ink",
                 )}
               >
                 {label} ({count})
@@ -378,10 +373,10 @@ export function BoardView({
               type="button"
               onClick={() => setAgentFilter("all")}
               className={cn(
-                "rounded-[var(--radius-chip)] px-2 py-1 text-[12px] font-medium cursor-pointer transition",
+                "rounded-chip px-2 py-1 text-[12px] font-medium cursor-pointer transition",
                 agentFilter === "all"
                   ? "bg-[var(--ink-button)] text-[var(--ink-button-fg)]"
-                  : "bg-[var(--track)] text-[var(--ink-2)] hover:text-[var(--ink)]",
+                  : "bg-track text-ink-2 hover:text-ink",
               )}
             >
               All ({messages.filter((m) => !m.control).length})
@@ -392,10 +387,10 @@ export function BoardView({
                 type="button"
                 onClick={() => setAgentFilter(m.name === agentFilter ? "all" : m.name)}
                 className={cn(
-                  "rounded-[var(--radius-chip)] px-2 py-1 text-[12px] font-medium cursor-pointer transition",
+                  "rounded-chip px-2 py-1 text-[12px] font-medium cursor-pointer transition",
                   agentFilter === m.name
                     ? "bg-[var(--ink-button)] text-[var(--ink-button-fg)]"
-                    : "bg-[var(--track)] text-[var(--ink-2)] hover:text-[var(--ink)]",
+                    : "bg-track text-ink-2 hover:text-ink",
                 )}
               >
                 {m.name}
@@ -407,8 +402,8 @@ export function BoardView({
 
       {/* Feed */}
       {filtered.length === 0 ? (
-        <Card className="p-4 text-center space-y-2 bg-[var(--board)]">
-          <p className="text-[14px] text-[var(--ink-2)]">
+        <Card className="p-4 text-center space-y-2 bg-board">
+          <p className="text-[14px] text-ink-2">
             {messages.length === 0 ? "No messages posted to the board yet." : "No posts match your current filter."}
           </p>
           {hasActiveFilter && (
@@ -456,7 +451,7 @@ export function BoardView({
                 {m.seq === firstNewSeq && (
                   <div className="flex items-center gap-2 py-1.5" role="separator">
                     <span className="h-px flex-1 bg-[var(--unread)] opacity-45" />
-                    <span className="text-[12px] font-semibold text-[var(--destructive-foreground)]">New</span>
+                    <span className="text-[12px] font-semibold text-danger">New</span>
                     <span className="h-px flex-1 bg-[var(--unread)] opacity-45" />
                   </div>
                 )}
@@ -467,27 +462,27 @@ export function BoardView({
                     else rowRefs.current.delete(m.seq);
                   }}
                   className={cn(
-                    "rounded-[var(--radius-card)] border px-3 py-2 transition",
+                    "rounded-card border px-3 py-2 transition",
                     isHighlighted
-                      ? "border-[var(--blue)] bg-[var(--blue-soft)]"
+                      ? "border-blue bg-blue-soft"
                       : mentionsMe
-                        ? "border-[var(--hairline)] border-l-2 border-l-[var(--blue)] bg-[var(--surface)]"
-                        : "border-[var(--hairline)] bg-[var(--surface)]",
+                        ? "border-hairline border-l-2 border-l-blue bg-surface"
+                        : "border-hairline bg-surface",
                   )}
                 >
                   {!grouped && (
                     <div className="flex items-center justify-between gap-2 pb-1">
                       <div className="flex items-center gap-1.5 min-w-0">
-                        <span className="text-[13px] font-semibold text-[var(--ink)] truncate">{m.agent}</span>
+                        <span className="text-[13px] font-semibold text-ink truncate">{m.agent}</span>
                         {m.channel && m.channel !== "main" && <Badge tone="violet">#{m.channel}</Badge>}
                         {m.all && <Badge tone="info">@all</Badge>}
                       </div>
-                      <div className="flex items-center gap-1 shrink-0 text-[12px] text-[var(--ink-3)] num">
+                      <div className="flex items-center gap-1 shrink-0 text-[12px] text-ink-3 num">
                         <button
                           type="button"
                           aria-label={`Quote reply to #${m.seq}`}
                           onClick={() => openQuoteReply(m)}
-                          className="rounded-[4px] px-1 py-0.5 hover:bg-[var(--track)] hover:text-[var(--ink)] cursor-pointer transition"
+                          className="rounded-[4px] px-1 py-0.5 hover:bg-track hover:text-ink cursor-pointer transition"
                         >
                           #{m.seq}
                         </button>
@@ -499,8 +494,8 @@ export function BoardView({
                           className={cn(
                             "p-1 rounded-[4px] cursor-pointer transition",
                             replyTarget?.seq === m.seq
-                              ? "text-[var(--info-foreground)] bg-[var(--blue-soft)]"
-                              : "text-[var(--ink-3)] hover:text-[var(--ink)] hover:bg-[var(--track)]",
+                              ? "text-info bg-blue-soft"
+                              : "text-ink-3 hover:text-ink hover:bg-track",
                           )}
                         >
                           <Reply className="h-3 w-3" aria-hidden="true" />
@@ -513,8 +508,8 @@ export function BoardView({
                           className={cn(
                             "p-1 rounded-[4px] cursor-pointer transition",
                             pinnedSet.has(m.seq)
-                              ? "text-[var(--info-foreground)] bg-[var(--blue-soft)]"
-                              : "text-[var(--ink-3)] hover:text-[var(--ink)] hover:bg-[var(--track)]",
+                              ? "text-info bg-blue-soft"
+                              : "text-ink-3 hover:text-ink hover:bg-track",
                           )}
                         >
                           <Pin className="h-3 w-3" aria-hidden="true" />
@@ -535,83 +530,40 @@ export function BoardView({
                             onFilterAgent={(name) => setAgentFilter(name)}
                           />
                         )}
-                        {(shots.length > 0 || paths.length > 0) && (
-                          <div className="flex flex-wrap gap-1.5 pt-1.5">
-                            {shots.map((s) => (
-                              <button
-                                key={s.path}
-                                type="button"
-                                onClick={() => {
-                                  if (openFileInAuxPane(s.path)) {
-                                    toast.success(`Opened ${s.fileName}`);
-                                  } else {
-                                    navigator.clipboard.writeText(s.caption || s.fileName).then(() => toast.success("Screenshot label copied")).catch(() => {});
-                                  }
-                                }}
-                                className="inline-flex items-center gap-1 rounded-[var(--radius-chip)] bg-[var(--blue-soft)] px-2 py-0.5 text-[12px] text-[var(--info-foreground)] hover:opacity-90 cursor-pointer max-w-full"
-                              >
-                                <ImageIcon className="h-3 w-3 shrink-0" aria-hidden="true" />
-                                <span className="truncate">{s.caption || s.fileName}</span>
-                              </button>
-                            ))}
-                            {paths.map((fp) => (
-                              <button
-                                key={fp}
-                                type="button"
-                                onClick={() => {
-                                  if (openFileInAuxPane(fp)) {
-                                    toast.success(`Opened ${fp.split("/").pop() || "file"}`);
-                                  } else {
-                                    navigator.clipboard.writeText(fp).then(() => toast.success("File path copied")).catch(() => {});
-                                  }
-                                }}
-                                className="inline-flex items-center gap-1 rounded-[var(--radius-chip)] bg-[var(--track)] px-2 py-0.5 text-[12px] text-[var(--ink-2)] hover:text-[var(--ink)] cursor-pointer max-w-full"
-                              >
-                                <FileCode2 className="h-3 w-3 shrink-0" aria-hidden="true" />
-                                <span className="truncate mono">{fp.split("/").pop()}</span>
-                              </button>
-                            ))}
-                          </div>
-                        )}
+                        <MediaPathChips
+                          compact
+                          shots={shots}
+                          paths={paths}
+                          onOpen={(target, fallback) => {
+                            if (openFileInAuxPane(target)) {
+                              toast.success(`Opened ${target.split("/").pop() || "file"}`);
+                            } else if (fallback) {
+                              void copyText(fallback, target === fallback ? "File path copied" : "Screenshot label copied");
+                            }
+                          }}
+                        />
                       </>
                     );
                   })()}
                   {replyTarget?.seq === m.seq && (
-                    <div className="mt-2 pt-2 border-t border-[var(--hairline)] space-y-2">
-                      <label htmlFor={`board-reply-${m.seq}`} className="block text-[12px] font-medium text-[var(--ink-2)]">
-                        Quote reply to #{m.seq} (@{m.agent})
-                      </label>
-                      <Textarea
-                        id={`board-reply-${m.seq}`}
-                        rows={2}
-                        maxLength={4000}
-                        value={replyDraft}
-                        onChange={(e) => setReplyDraft(e.target.value)}
-                      />
-                      <div className="flex items-center justify-end gap-2">
-                        <Button variant="ghost" size="sm" onClick={() => setReplyTarget(null)}>
-                          Cancel
-                        </Button>
-                        <Button
-                          variant="primary"
-                          size="sm"
-                          disabled={sending || !replyDraft.trim()}
-                          onClick={handleSendQuoteReply}
-                        >
-                          {canNudge && memberByName.get(m.agent)?.conversation_id ? (
-                            <>
-                              <Send className="h-3.5 w-3.5" aria-hidden="true" />
-                              {sending ? "Sending..." : "Confirm & send"}
-                            </>
-                          ) : (
-                            <>
-                              <ClipboardCopy className="h-3.5 w-3.5" aria-hidden="true" />
-                              Copy reply
-                            </>
-                          )}
-                        </Button>
-                      </div>
-                    </div>
+                    <InlineComposer
+                      id={`board-reply-${m.seq}`}
+                      label={`Quote reply to #${m.seq} (@${m.agent})`}
+                      value={replyDraft}
+                      onChange={setReplyDraft}
+                      onCancel={() => setReplyTarget(null)}
+                      onSubmit={handleSendQuoteReply}
+                      disabled={sending}
+                      copyOnly={!(canNudge && memberByName.get(m.agent)?.conversation_id)}
+                      submitLabel={
+                        canNudge && memberByName.get(m.agent)?.conversation_id
+                          ? sending
+                            ? "Sending..."
+                            : "Confirm & send"
+                          : "Copy reply"
+                      }
+                      className="mt-2"
+                    />
                   )}
                 </div>
               </div>

@@ -197,3 +197,15 @@ export interface WorktreesPayload {
   worktrees: WorktreeInfo[];
   rejected: string[];
 }
+
+export interface WorktreeDiffPayload {
+  ok: boolean;
+  worktree: string;
+  file: string;
+  diff: string;
+  truncated: boolean;
+  untracked: boolean;
+  added: number;
+  removed: number;
+  error?: string;
+}

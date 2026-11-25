@@ -1,4 +1,4 @@
-import type { SwarmSnapshot, SwarmSummary, ThemeMode, WorktreesPayload } from "./types";
+import type { SwarmSnapshot, SwarmSummary, ThemeMode, WorktreeDiffPayload, WorktreesPayload } from "./types";
 
 interface AntigravitySidecarBridge {
   conversationId?: string | null;
@@ -60,6 +60,14 @@ export async function fetchWorktrees(roots: string[]): Promise<WorktreesPayload>
   const res = await sidecarFetch(`/api/worktrees?${q.toString()}`);
   if (!res.ok) throw new Error(`Failed to probe worktrees (${res.status})`);
   return res.json();
+}
+
+export async function fetchWorktreeDiff(root: string, worktree: string, file: string): Promise<WorktreeDiffPayload> {
+  const q = new URLSearchParams({ root, worktree, file });
+  const res = await sidecarFetch(`/api/worktrees/diff?${q.toString()}`);
+  const data = (await res.json().catch(() => ({}))) as Partial<WorktreeDiffPayload>;
+  if (!res.ok) throw new Error(data.error || `Diff peek failed (${res.status})`);
+  return data as WorktreeDiffPayload;
 }
 
 export async function sendConfirmedNudge(conversationId: string, message: string): Promise<void> {

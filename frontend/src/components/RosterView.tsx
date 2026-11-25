@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import { ChevronDown, ChevronUp, ClipboardCopy, Cpu, Eye, EyeOff, MessageSquare, Send } from "lucide-react";
+import { ChevronDown, ChevronUp, ClipboardCopy, Cpu, Eye, EyeOff, MessageSquare, Send } from "../icons";
 import { openWorkerConversation, sendConfirmedNudge } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot } from "../types";
-import { Badge, Button, Card, StatusDot, Textarea, cn, fmtElapsed, fmtTokens, toast } from "../ui";
+import { ActivityPeek, Badge, Button, Card, InlineComposer, StatusDot, cn, copyText, fmtElapsed, fmtTokens, toast } from "../ui";
 
 const ORDER: Record<SwarmMember["status"], number> = { working: 0, waiting: 1, killed: 2 };
 const CONTEXT_BUDGET_TOKENS = 200_000;
@@ -77,7 +77,7 @@ export function RosterView({
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-1.5">
-          <h2 className="text-[14px] font-semibold text-[var(--ink)]">
+          <h2 className="text-[14px] font-semibold text-ink">
             Roster ({members.length - killedCount} active)
           </h2>
           {killedCount > 0 && <Badge tone="neutral">{killedCount} stopped</Badge>}
@@ -91,7 +91,7 @@ export function RosterView({
       </div>
 
       {sorted.length === 0 ? (
-        <Card className="p-4 text-[14px] text-[var(--ink-2)] bg-[var(--board)]">No workers registered on this swarm.</Card>
+        <Card className="p-4 text-[14px] text-ink-2 bg-board">No workers registered on this swarm.</Card>
       ) : (
         <div className="space-y-2">
           {sorted.map((m) => {
@@ -123,7 +123,7 @@ export function RosterView({
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex flex-wrap items-center gap-1.5 min-w-0">
                     <StatusDot state={dotState} />
-                    <span className={cn("text-[14px] font-semibold text-[var(--ink)] truncate", m.killed && "line-through")}>
+                    <span className={cn("text-[14px] font-semibold text-ink truncate", m.killed && "line-through")}>
                       {m.name}
                     </span>
                     {isYou && <Badge tone="info">you</Badge>}
@@ -174,7 +174,7 @@ export function RosterView({
                 </div>
 
                 {/* Line 2: Clean spaced pills + Context Pressure */}
-                <div className="flex flex-wrap items-center gap-1.5 text-[12px] text-[var(--ink-2)]">
+                <div className="flex flex-wrap items-center gap-1.5 text-[12px] text-ink-2">
                   <Badge tone={m.status === "working" ? "success" : "neutral"} className="num">
                     {statusText}
                   </Badge>
@@ -186,7 +186,7 @@ export function RosterView({
                     <Badge tone="danger" className="num">{m.unread} unread</Badge>
                   )}
                   {m.model && (
-                    <span className="inline-flex items-center gap-1 text-[var(--ink-3)] px-1">
+                    <span className="inline-flex items-center gap-1 text-ink-3 px-1">
                       <Cpu className="h-3 w-3" aria-hidden="true" />
                       {m.model}
                     </span>
@@ -225,12 +225,7 @@ export function RosterView({
                       <Button
                         variant="ghost"
                         size="sm"
-                        onClick={() => {
-                          navigator.clipboard
-                            .writeText(askStatusPrompt)
-                            .then(() => toast.success(`Copied status check for ${m.name}`))
-                            .catch(() => toast.error("Clipboard unavailable"));
-                        }}
+                        onClick={() => void copyText(askStatusPrompt, `Copied status check for ${m.name}`)}
                         className="h-7 px-2"
                       >
                         <ClipboardCopy className="h-3 w-3" aria-hidden="true" />
@@ -241,15 +236,15 @@ export function RosterView({
                 )}
 
                 {/* Line 3: Token telemetry & Context saturation bar */}
-                <div className="rounded-[var(--radius-chip)] bg-[var(--board)] px-2.5 py-1.5 space-y-1.5">
-                  <div className="flex flex-wrap items-center gap-2.5 text-[12px] text-[var(--ink-2)] num">
-                    <span className="font-semibold text-[var(--ink)]">{fmtTokens(m.usage.totalTokens)} tok</span>
+                <div className="rounded-chip bg-board px-2.5 py-1.5 space-y-1.5">
+                  <div className="flex flex-wrap items-center gap-2.5 text-[12px] text-ink-2 num">
+                    <span className="font-semibold text-ink">{fmtTokens(m.usage.totalTokens)} tok</span>
                     <span>in {fmtTokens(m.usage.inputTokens)}</span>
                     <span>cache {fmtTokens(m.usage.cacheReadTokens)}</span>
                     <span>out {fmtTokens(m.usage.outputTokens)}</span>
                   </div>
                   {!m.killed && pressure.pct > 0 && (
-                    <div className="h-1 w-full overflow-hidden rounded-full bg-[var(--track)]" aria-hidden="true">
+                    <div className="h-1 w-full overflow-hidden rounded-full bg-track" aria-hidden="true">
                       <div
                         className={cn(
                           "h-full rounded-full",
@@ -257,7 +252,7 @@ export function RosterView({
                             ? "bg-[var(--dot-red)]"
                             : pressure.tone === "warning"
                               ? "bg-[var(--dot-amber)]"
-                              : "bg-[var(--blue)]",
+                              : "bg-blue",
                         )}
                         style={{ width: `${Math.max(4, pressure.pct)}%` }}
                       />
@@ -267,67 +262,28 @@ export function RosterView({
 
                 {/* Line 4: Shimmering live activity or error detail */}
                 {!m.killed && m.status === "working" && m.activity && (
-                  <p className="text-[13px] text-[var(--info-foreground)] fleet-live-shimmer truncate">
+                  <p className="text-[13px] text-info fleet-live-shimmer truncate">
                     {m.activityKind === "thinking" ? `Thinking: ${m.activity}` : m.activity}
                   </p>
                 )}
                 {m.failure && (
-                  <p className="text-[12px] text-[var(--destructive-foreground)] break-words">{m.failure.text}</p>
+                  <p className="text-[12px] text-danger break-words">{m.failure.text}</p>
                 )}
 
                 {/* Expandable Worker Activity Peek */}
-                {peeking && (
-                  <div className="rounded-[var(--radius-chip)] bg-[var(--board)] px-2.5 py-2 space-y-1.5 text-[12px]">
-                    <p className="font-semibold text-[var(--ink)]">Recent worker activity</p>
-                    {m.thinkingHeading && (
-                      <p className="text-[var(--ink-2)] truncate">Thought: {m.thinkingHeading}</p>
-                    )}
-                    {tools.length > 0 ? (
-                      <ul className="divide-y divide-[var(--hairline)]" aria-label={`Last tool calls for ${m.name}`}>
-                        {tools.map((tc, i) => (
-                          <li key={i} className="flex items-center justify-between gap-2 py-1 first:pt-0 last:pb-0">
-                            <span className="text-[var(--ink)] truncate">{tc.summary}</span>
-                            <span className="text-[var(--ink-3)] shrink-0 mono">{tc.name}</span>
-                          </li>
-                        ))}
-                      </ul>
-                    ) : (
-                      <p className="text-[var(--ink-3)]">No recent tool calls recorded.</p>
-                    )}
-                  </div>
-                )}
+                {peeking && <ActivityPeek member={m} mode="roster" />}
 
                 {nudgeMember === m.name && (
-                  <div className="pt-2 border-t border-[var(--hairline)] space-y-2">
-                    <label htmlFor={`roster-nudge-${m.name}`} className="block text-[12px] font-medium text-[var(--ink-2)]">
-                      Confirm message to {m.name}
-                    </label>
-                    <Textarea
-                      id={`roster-nudge-${m.name}`}
-                      rows={2}
-                      maxLength={4000}
-                      value={nudgeText}
-                      onChange={(e) => setNudgeText(e.target.value)}
-                    />
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-[12px] text-[var(--ink-3)] num">
-                        {nudgeText.length}/4000
-                      </span>
-                      <div className="flex gap-2">
-                        <Button variant="ghost" size="sm" onClick={() => setNudgeMember(null)}>
-                          Cancel
-                        </Button>
-                        <Button
-                          variant="primary"
-                          size="sm"
-                          disabled={sending || !nudgeText.trim() || nudgeText.trim().length > 4000}
-                          onClick={() => sendNudge(m)}
-                        >
-                          Confirm &amp; send
-                        </Button>
-                      </div>
-                    </div>
-                  </div>
+                  <InlineComposer
+                    id={`roster-nudge-${m.name}`}
+                    label={`Confirm message to ${m.name}`}
+                    value={nudgeText}
+                    onChange={setNudgeText}
+                    onCancel={() => setNudgeMember(null)}
+                    onSubmit={() => sendNudge(m)}
+                    disabled={sending || nudgeText.trim().length > 4000}
+                    showCounter
+                  />
                 )}
               </Card>
             );

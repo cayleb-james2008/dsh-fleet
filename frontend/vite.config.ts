@@ -10,7 +10,7 @@ import tailwindcss from "@tailwindcss/vite";
 
 const root = import.meta.dirname;
 const STAMP =
-  "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v1.7.0 */";
+  "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v1.8.0 */";
 
 function sidecarSingleFile(): Plugin {
   return {
@@ -28,7 +28,15 @@ function sidecarSingleFile(): Plugin {
       html = html.replace(/<link[^>]*rel="stylesheet"[^>]*href="([^"]+)"[^>]*>/g, (_m, href) => {
         const css = fs
           .readFileSync(path.join(dist, href.replace(/^\.?\//, "")), "utf8")
-          .replaceAll("../fonts/", "./fonts/");
+          .replaceAll("../fonts/", "./fonts/")
+          .replace(/\/\*![\s\S]*?\*\//g, "")
+          .replace(/@layer properties\{[\s\S]*?\}\}\}/g, "")
+          .replace(/@property --tw-(?!ring-|border-)[^}]+\}/g, "")
+          .replace(/-apple-system, BlinkMacSystemFont,[^;)]+/g, "system-ui,sans-serif")
+          .replace(/ui-monospace, SFMono-Regular,[^;)]+/g, "monospace")
+          .replace(/(-webkit-text-decoration:inherit;)+/g, "")
+          .replace(/font-(?:feature|variation)-settings:var\(--default-(?:mono-)?font-(?:feature|variation)-settings,normal\);?/g, "")
+          .replace(/::backdrop\{[^}]*\}|::file-selector-button\{[^}]*\}|abbr:where\(\[title\]\)\{[^}]*\}|:-moz-[^}]+}|::-(?:webkit|moz)-[^{]+\{[^}]*}|small\{[^}]*\}|sub,sup\{[^}]*\}sub\{[^}]*\}sup\{[^}]*\}|progress\{[^}]*\}|summary\{[^}]*\}|:where\(select:is[\s\S]*?20px\}|@supports \(not \(\(-webkit-appearance:[\s\S]*?\}\}\}/g, "");
         return `<style>${STAMP}\n${css}</style>`;
       });
       html = html
@@ -46,7 +54,7 @@ function sidecarSingleFile(): Plugin {
 
       const outHtml = path.join(outDir, "index.html");
       fs.writeFileSync(outHtml, html);
-      const gz = zlib.gzipSync(html, { level: 9 });
+      const gz = zlib.gzipSync(html, { level: 9, memLevel: 9 });
       fs.writeFileSync(`${outHtml}.gz`, gz);
       console.log(`sidecar bundle: ${outHtml} (${(html.length / 1024).toFixed(1)} kB raw, ${(gz.length / 1024).toFixed(1)} kB gz)`);
     },

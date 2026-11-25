@@ -16,11 +16,8 @@
   --ink: #111318;
   --ink-2: #434b5c;
   --ink-3: #576072;
-  --icon: #5c6578;
   --disabled: #50596b;
   --blue: #4f46e5;
-  --blue-fg: #ffffff;
-  --blue-hover: #4338ca;
   --blue-soft: #eef2ff;
   --ring: #4f46e5;
   --info-foreground: #4338ca;
@@ -29,25 +26,19 @@
   --dot-green: #147a41;
   --success-foreground: #106936;
   --ok-soft: #e8f6ee;
-  --dot-blue: #4f46e5;
   --dot-red: #c62828;
   --destructive-foreground: #b42224;
   --bad-soft: #fdeced;
   --unread: #c62828;
-  --dot-clay: #4f46e5;
   --dot-amber: #a85e00;
   --warning-foreground: #8a4b00;
   --warn-soft: #fef5e6;
   --violet: #5830b5;
   --violet-soft: #f1ecfe;
-  --elev-card: none;
   --elev-raised: 0 1px 2px rgba(17, 19, 24, 0.06);
   --elev-lift: 0 10px 28px rgba(17, 19, 24, 0.12);
   --elev-primary: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 1px 2px rgba(17, 19, 24, 0.18);
   --background: var(--surface);
-  --foreground: var(--ink);
-  --border: var(--hairline);
-  --muted-foreground: var(--ink-2);
 }
 
 :root[data-theme="dark"] {
@@ -64,11 +55,8 @@
   --ink: #eef1f6;
   --ink-2: #b4bccb;
   --ink-3: #939cb0;
-  --icon: #939cb0;
   --disabled: #96a0b5;
   --blue: #818cf8;
-  --blue-fg: #0b0c0e;
-  --blue-hover: #a5b4fc;
   --blue-soft: rgba(129, 140, 248, 0.16);
   --ring: #818cf8;
   --info-foreground: #a5b4fc;
@@ -77,46 +65,34 @@
   --dot-green: #4ad682;
   --success-foreground: #5ad98c;
   --ok-soft: #11281c;
-  --dot-blue: #818cf8;
   --dot-red: #f87171;
   --destructive-foreground: #f87171;
   --bad-soft: #2f1417;
   --unread: #f87171;
-  --dot-clay: #818cf8;
   --dot-amber: #f2b046;
   --warning-foreground: #f2b046;
   --warn-soft: #2a1f0c;
   --violet: #b69cff;
   --violet-soft: #22193b;
-  --elev-card: none;
   --elev-raised: 0 1px 2px rgba(0, 0, 0, 0.38);
   --elev-lift: 0 14px 32px rgba(0, 0, 0, 0.55);
   --elev-primary: inset 0 1px 0 rgba(255, 255, 255, 0.55), 0 1px 2px rgba(0, 0, 0, 0.35);
   --background: var(--surface);
-  --foreground: var(--ink);
-  --border: var(--hairline);
-  --muted-foreground: var(--ink-2);
 }
 
 :root {
   --font-sans: "Geist", ui-sans-serif, system-ui, sans-serif;
-  --font-heading: "Geist", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Geist Mono", ui-monospace, monospace;
   --radius-panel: 12px;
   --radius-dialog: 14px;
   --radius-card: 8px;
   --radius-segment: 6px;
   --radius-chip: 6px;
-  --radius-menu: 10px;
   --radius: 8px;
   --display-weight: 600;
   --tracking-display: -0.02em;
   --ease-house: cubic-bezier(0.23, 1, 0.32, 1);
   --dur-press: 150ms;
-  --dur-reveal: 180ms;
-  --dur-swap: 200ms;
-  --dur-enter: 220ms;
-  --dur-sheet: 220ms;
 }
 
 body {
@@ -129,7 +105,7 @@ body {
 }
 
 h1, h2, h3, .font-heading {
-  font-family: var(--font-heading);
+  font-family: var(--font-sans);
   font-weight: var(--display-weight);
   letter-spacing: var(--tracking-display);
 }
@@ -158,32 +134,29 @@ input, textarea, [contenteditable] {
   scrollbar-color: var(--hairline-s) transparent;
 }
 
-*::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-
-*::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-*::-webkit-scrollbar-thumb {
-  background: var(--hairline-s);
-  border-radius: 9999px;
-}
-
-@media (hover: hover) and (pointer: fine) {
-  *::-webkit-scrollbar-thumb:hover {
-    background: var(--icon);
-  }
-}
-
 @theme inline {
+  --color-canvas: var(--canvas);
+  --color-board: var(--board);
+  --color-surface: var(--surface);
+  --color-track: var(--track);
+  --color-hairline: var(--hairline);
+  --color-hairline-s: var(--hairline-s);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-info: var(--info-foreground);
+  --color-ok: var(--success-foreground);
+  --color-warn: var(--warning-foreground);
+  --color-danger: var(--destructive-foreground);
+  --color-blue: var(--blue);
+  --color-blue-soft: var(--blue-soft);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn-soft: var(--warn-soft);
+  --color-bad-soft: var(--bad-soft);
+  --color-violet: var(--violet);
+  --color-violet-soft: var(--violet-soft);
   --color-edge: var(--edge);
-  --color-white: var(--surface);
   --color-black: var(--ink);
-  --shadow-xs: var(--elev-card);
-  --shadow: var(--elev-raised);
-  --shadow-md: var(--elev-lift);
-  --shadow-xl: var(--elev-lift);
+  --radius-chip: 6px;
+  --radius-card: 8px;
 }

@@ -3,6 +3,11 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as a
 ready-to-install Antigravity plugin bundle (`tar.gz` + `zip`) with `SHA256SUMS`.
 
+## 1.8.0 - 2026-11-25
+
+- **Inline Worktree Diff Peek & CWE-22/CWE-59 Confinement (`WorktreesView.tsx`, `sidecars/fleet_pane/{git_probe.mjs,main.mjs}`, `web-engine.js`):** Added `GET /api/worktrees/diff?root=...&worktree=...&file=...` returning bounded (`<= 8 KB`) `git diff HEAD` hunks and untracked text previews strictly confined to validated repository worktrees via `realpathSync` (rejecting `..` traversal, out-of-repo worktrees, and escaping symlinks), wired to an expandable **Diff peek** toggle beside **Open file** inside the `380px` sidebar.
+- **Sub-`75 MB` V8 Peak RSS & `<94 KiB` Gzip Diet (`frontend/src/{icons.tsx,ui.tsx,theme.css}`, `vite.config.ts`, `sidecars/fleet_pane/main.mjs`):** Consolidated icons onto lightweight shared SVG path primitives (`322.7 KB` raw / `93.1 KiB` gz), extracted shared `InlineComposer`, `MediaPathChips`, `ActivityPeek`, and `copyText` UI helpers, replaced `node:crypto` OpenSSL ETags in `main.mjs` with zero-dep 64-bit FNV-1a ETags, and added `--no-sparkplug --memory-reducer` runtime guards in `runCli()`.
+
 ## 1.7.0 - 2026-11-25
 
 - **Board Quick-Filter Chips & 1-Click Wave Digest (`frontend/src/components/BoardView.tsx`, `ui.tsx`, `App.tsx`):** Added compact Board quick-filter pills (`All` / `Needs reply` / `[done]` / `[blocked]`, cycled via `f` hotkey), a 1-click **Wave digest** button generating clean Markdown summaries of pinned `#seq`s, active/waiting/stalled worker durations, and `~/`-masked dirty worktree files, and `~/` sanitization on pinned board post previews.

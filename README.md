@@ -71,7 +71,7 @@ Fleet scales from `340px–380px` Antigravity auxiliary sidebars up to wide `144
 - **1-Click Wave Digest, Unstick Presets & File Links:** Generate clean Markdown **Wave digest** summaries (pinned `#seq`s, active/waiting/stalled worker durations, and `~/`-masked dirty worktree files), expand worker **Activity Peek**, dispatch confirmation-gated **Unstick / Resume** nudges, inspect sanitized `Screenshot:` chips, and open files via `window.sidecar.ui.toggleAuxPane({ tabType: "fileView", uri })`.
 - **Live SSE Push Stream & Polling Fallback:** Streams instant board/transcript fingerprint deltas over `GET /api/swarm/stream` (`text/event-stream`) with automatic interval fallback inside Antigravity's `SidecarApp` gateway.
 - **Worker Roster, Context Saturation & `@mention` Graph:** Incrementally tails `transcript.jsonl` with bounded 16 KB tail rings to track real `input` / `cache_read` / `output` tokens, `% ctx` context saturation, shimmering active work, and replayable `@mention` topology.
-- **Confined Workspace Git Worktrees:** Listens to `sidecar.getWorkspaceUris()` / `onWorkspaceChange()`, runs `git status --porcelain=v1 -z` with strict root + CWE-59 symlink confinement, and exposes dirty/staged/untracked file rows with 1-click **Open file** actions.
+- **Confined Workspace Git Worktrees & Inline Diff Peek:** Listens to `sidecar.getWorkspaceUris()` / `onWorkspaceChange()`, runs `git status --porcelain=v1 -z` and bounded (`<= 8 KB`) `GET /api/worktrees/diff` hunks with strict root + `realpathSync` CWE-22/CWE-59 symlink confinement, and exposes dirty/staged/untracked file rows with 1-click **Diff** peek drawers and **Open** actions.
 
 ---
 
@@ -80,11 +80,11 @@ Fleet scales from `340px–380px` Antigravity auxiliary sidebars up to wide `144
 ```mermaid
 flowchart LR
     Host["Antigravity Host<br/>(Aux Side Pane + /preload.js)"] <-->|"SidecarApp RPC + theme-change<br/>toggleConversation / toggleAuxPane"| Backend["Fleet Sidecar Backend<br/>(sidecars/fleet_pane/main.mjs)"]
-    UI["Embedded Sidebar SPA<br/>(336.3 KB raw / 97.6 KB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>Pre-Gzipped ETag/304 JSON"| Backend
+    UI["Embedded Sidebar SPA<br/>(315.4 KiB raw / 93.1 KiB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>Pre-Gzipped ETag/304 JSON"| Backend
     Backend -->|"Zero-String Buffer Scan + 16 KB Ring"| Store["swarm_store.mjs"]
-    Backend -->|"Debounced TTL + CWE-59 Confinement"| Git["git_probe.mjs"]
+    Backend -->|"Debounced TTL + CWE-22/59 Diff Peek"| Git["git_probe.mjs"]
     Store -.->|"Read-Only"| Brain["~/.gemini/antigravity/brain/&lt;conv&gt;<br/>.system_generated/{swarm,logs}"]
-    Git -.->|"git status --porcelain=v1 -z"| WT["Workspace Git Worktrees"]
+    Git -.->|"git status + bounded diff"| WT["Workspace Git Worktrees"]
 ```
 
 ---
@@ -93,14 +93,14 @@ flowchart LR
 
 Measured under `#154` CPU isolation (`taskset -c 24-31`, `16` concurrent polling workers) on a 16–20 worker / 2,000-board-post / 50,000-transcript-line stress fixture:
 
-| Metric | v1.5.0 | v1.6.0 | **v1.7.0** |
+| Metric | v1.6.0 | v1.7.0 | **v1.8.0** |
 | --- | --- | --- | --- |
-| Embedded Sidecar UI (`/`) | `386,823 B` raw / `115,189 B` gz | `358,054 B` raw / `105,312 B` gz | **`344,345 B` raw / `99,949 B` gz** |
-| Peak RSS (`VmHWM`, 2k/50k) | `118.79 MB` | `89.79 MB` | **`66.23 MB`** |
-| Throughput (`req/s`, 16w) | `2,325.6 req/s` | `5,376.9 req/s` | **`7,984.9 req/s`** |
-| Latency (`p50` / `p95`) | `9.45 ms` p95 | `1.25 ms` / `8.70 ms` | **`1.69 ms` / `3.69 ms`** |
+| Embedded Sidecar UI (`/`) | `358,054 B` raw / `105,312 B` gz | `344,345 B` raw / `99,949 B` gz | **`322,939 B` raw (`315.4 KiB`) / `95,371 B` gz (`93.1 KiB`)** |
+| Peak RSS (`VmHWM`, 2k/50k) | `89.79 MB` | `66.23 MB` | **`66.96 MB`** |
+| Throughput (`req/s`, 16w) | `5,376.9 req/s` | `7,984.9 req/s` | **`8,478.7 req/s`** |
+| Latency (`p50` / `p95`) | `1.25 ms` / `8.70 ms` | `1.69 ms` / `3.69 ms` | **`1.63 ms` / `3.39 ms`** |
 | Simultaneous SSE (`/api/swarm/stream` x5) | `5/5` (`0` drops) | `5/5` (`0` drops) | **`5/5` (`0` drops)** |
-| E2E Gate + Replay + Sloplint | `33/33` + `7/7` + `0 FAIL` | `34/34` + `7/7` + `0 FAIL / 0 WARN` | **`35/35` + `8/8` + `0 FAIL / 0 WARN`** |
+| E2E Gate + Replay + Sloplint | `34/34` + `7/7` + `0 FAIL / 0 WARN` | `35/35` + `8/8` + `0 FAIL / 0 WARN` | **`36/36` + `8/8` + `0 FAIL / 0 WARN`** |
 
 ---
 

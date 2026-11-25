@@ -11,7 +11,7 @@ import {
   Search,
   Settings,
   Users,
-} from "lucide-react";
+} from "./icons";
 import { BoardView, type BoardQuickFilter } from "./components/BoardView";
 import { CommandPalette } from "./components/CommandPalette";
 import { GraphView } from "./components/GraphView";
@@ -39,6 +39,7 @@ import {
   SegmentControl,
   StatusDot,
   cn,
+  copyText,
   fmtTokens,
   formatSwarmDigest,
   toast,
@@ -49,22 +50,19 @@ const SWARM_PRESETS = [
     id: "feature-verifier",
     title: "Feature + Verifier",
     summary: "Isolated worktree builder + cold verifier gate",
-    prompt:
-      "/fleet Implement the scoped feature on an isolated git worktree (`workspace: \"share\"`), write targeted tests, and hand off `@verifier [done]` for cold verification before finishing.",
+    prompt: "/fleet Implement feature on isolated worktree, add tests, and hand off @verifier [done] for cold check.",
   },
   {
     id: "audit-harden",
     title: "Audit & Harden",
     summary: "Security, edge-case, and UI craft review lane",
-    prompt:
-      "/fleet Run a parallel audit across tests, security boundaries, and frontend craft with cold verification reports and zero unverified claims.",
+    prompt: "/fleet Audit tests, security boundaries, and UI craft with cold verification reports.",
   },
   {
     id: "multi-lane",
     title: "Multi-Lane Ship",
     summary: "Sharded parallel builders + monitor + verifier",
-    prompt:
-      "/fleet Split work across isolated worktree lanes with explicit file ownership, add a stall monitor, verify end-to-end builds, and publish `plan.json`.",
+    prompt: "/fleet Split across isolated worktrees with stall monitor, build gates, and plan.json.",
   },
 ];
 
@@ -336,15 +334,8 @@ export function App() {
     setSelectedSwarmId(id);
   };
 
-  const handleCopyDigest = async () => {
-    if (!snap?.swarm) return;
-    const md = formatSwarmDigest(snap, pinnedSeqs, worktrees);
-    try {
-      await navigator.clipboard.writeText(md);
-      toast.success("Wave digest copied");
-    } catch {
-      toast.error("Clipboard unavailable");
-    }
+  const handleCopyDigest = () => {
+    if (snap?.swarm) void copyText(formatSwarmDigest(snap, pinnedSeqs, worktrees), "Wave digest copied");
   };
 
   const handleTabKeyDown = (e: React.KeyboardEvent, idx: number) => {
@@ -391,18 +382,18 @@ export function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[var(--canvas)] text-[var(--ink)] flex flex-col">
+    <div className="min-h-screen bg-canvas text-ink flex flex-col">
       <FleetToaster theme={theme} />
 
       {/* Sticky Compact Sidecar Header */}
-      <header className="sticky top-0 z-20 border-b border-[var(--hairline)] bg-[var(--surface)]">
+      <header className="sticky top-0 z-20 border-b border-hairline bg-surface">
         <div className="mx-auto w-full max-w-[960px] px-3 pt-2.5">
           {/* Row 1: Brand + Swarm Switcher + Controls */}
           <div className="flex items-center justify-between gap-2 pb-2">
             <div className="flex items-center gap-2 min-w-0">
               <span
                 aria-hidden="true"
-                className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-[var(--radius-chip)] bg-[var(--ink-button)] text-[var(--ink-button-fg)]"
+                className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-chip bg-[var(--ink-button)] text-[var(--ink-button-fg)]"
               >
                 <Rocket className="h-4 w-4" />
               </span>
@@ -414,7 +405,7 @@ export function App() {
                       aria-label="Active swarm"
                       value={snap?.swarm || selectedSwarmId || ""}
                       onChange={(e) => handleSelectSwarm(e.target.value)}
-                      className="h-7 max-w-[165px] min-[380px]:max-w-[190px] sm:max-w-[320px] truncate rounded-[var(--radius-chip)] border border-[var(--input)] bg-[var(--board)] px-2 text-[14px] font-semibold text-[var(--ink)] focus-visible:outline-2 focus-visible:outline-[var(--ring)] cursor-pointer"
+                      className="h-7 max-w-[165px] min-[380px]:max-w-[190px] sm:max-w-[320px] truncate rounded-chip border border-[var(--input)] bg-board px-2 text-[14px] font-semibold text-ink focus-visible:outline-2 focus-visible:outline-[var(--ring)] cursor-pointer"
                     >
                       {swarms.map((sw) => (
                         <option key={sw.id} value={sw.id}>
@@ -424,7 +415,7 @@ export function App() {
                     </select>
                   </div>
                 ) : (
-                  <h1 className="text-[15px] font-semibold text-[var(--ink)] truncate">
+                  <h1 className="text-[15px] font-semibold text-ink truncate">
                     {snap?.title || "Fleet"}
                   </h1>
                 )}
@@ -434,7 +425,7 @@ export function App() {
             <div className="flex items-center gap-0.5 shrink-0">
               {hasSwarm && (
                 <span
-                  className="hidden sm:inline-flex items-center rounded-[var(--radius-chip)] bg-[var(--board)] px-2 py-1 text-[12px] font-medium text-[var(--ink-2)] num mr-0.5"
+                  className="hidden sm:inline-flex items-center rounded-chip bg-board px-2 py-1 text-[12px] font-medium text-ink-2 num mr-0.5"
                   title="Total tokens across swarm transcripts"
                 >
                   {fmtTokens(snap?.usage?.totalTokens)} tok
@@ -486,17 +477,17 @@ export function App() {
 
           {/* Row 2: Compact Status Telemetry (balanced padding on 380px tok pill) */}
           {hasSwarm && (
-            <div className="flex flex-wrap items-center justify-between gap-2 pb-2 text-[12px] text-[var(--ink-2)]">
+            <div className="flex flex-wrap items-center justify-between gap-2 pb-2 text-[12px] text-ink-2">
               <div className="flex flex-wrap items-center gap-2 min-w-0">
                 <StatusDot state={activeCount > 0 ? "working" : waitingCount > 0 ? "waiting" : "killed"} />
                 <span className="num">{activeCount} working</span>
                 <span className="num">{waitingCount} waiting</span>
-                <span className="num text-[var(--ink-3)]">#{snap?.head || 0}</span>
+                <span className="num text-ink-3">#{snap?.head || 0}</span>
               </div>
               <div className="flex items-center gap-1.5">
                 {sseConnected && <Badge tone="success">Live</Badge>}
                 {snap?.member && <Badge tone="neutral">you: {snap.member}</Badge>}
-                <span className="sm:hidden inline-flex items-center rounded-[var(--radius-chip)] bg-[var(--board)] px-2 py-0.5 num font-medium text-[var(--ink-2)]">
+                <span className="sm:hidden inline-flex items-center rounded-chip bg-board px-2 py-0.5 num font-medium text-ink-2">
                   {fmtTokens(snap?.usage?.totalTokens)} tok
                 </span>
               </div>
@@ -527,7 +518,7 @@ export function App() {
                     className={cn(
                       "relative inline-flex items-center justify-center gap-1 whitespace-nowrap px-1.5 sm:px-2.5 py-2 text-[12px] sm:text-[13px] font-medium cursor-pointer transition shrink-0",
                       "focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[var(--ring)]",
-                      selected ? "text-[var(--ink)]" : "text-[var(--ink-2)] hover:text-[var(--ink)]",
+                      selected ? "text-ink" : "text-ink-2 hover:text-ink",
                     )}
                   >
                     <Icon className="h-3.5 w-3.5 shrink-0 hidden min-[440px]:inline-block" aria-hidden="true" />
@@ -537,8 +528,8 @@ export function App() {
                         className={cn(
                           "rounded-full px-1.5 py-0.2 text-[12px] leading-4 num",
                           id === "triage"
-                            ? "bg-[var(--bad-soft)] text-[var(--destructive-foreground)]"
-                            : "bg-[var(--track)] text-[var(--ink-2)]",
+                            ? "bg-bad-soft text-danger"
+                            : "bg-track text-ink-2",
                         )}
                       >
                         {count}
@@ -547,7 +538,7 @@ export function App() {
                     {selected && (
                       <span
                         aria-hidden="true"
-                        className="absolute inset-x-0.5 bottom-0 h-[2px] rounded-full bg-[var(--blue)]"
+                        className="absolute inset-x-0.5 bottom-0 h-[2px] rounded-full bg-blue"
                       />
                     )}
                   </button>
@@ -561,7 +552,7 @@ export function App() {
       {/* Main Content */}
       <main className="flex-1 mx-auto w-full max-w-[960px] px-3 py-3.5">
         {error && (
-          <Card className="mb-3 border-[var(--destructive-foreground)] bg-[var(--bad-soft)] p-3 text-[13px] text-[var(--destructive-foreground)]">
+          <Card className="mb-3 border-danger bg-bad-soft p-3 text-[13px] text-danger">
             {error}
           </Card>
         )}
@@ -580,16 +571,16 @@ export function App() {
         ) : !hasSwarm ? (
           <div className="space-y-4">
             <div className="space-y-2.5">
-              <h2 className="text-[16px] font-semibold text-[var(--ink)]">Launch an Antigravity swarm</h2>
-              <p className="text-[14px] text-[var(--ink-2)]">
+              <h2 className="text-[16px] font-semibold text-ink">Launch an Antigravity swarm</h2>
+              <p className="text-[14px] text-ink-2">
                 No active swarm is attached to this conversation yet. Start a coordinated swarm with one click or inspect any recent swarm below.
               </p>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
                 {SWARM_PRESETS.map((preset) => (
                   <Card key={preset.id} className="p-3 flex flex-col justify-between gap-2.5">
                     <div className="space-y-1">
-                      <p className="text-[14px] font-semibold text-[var(--ink)]">{preset.title}</p>
-                      <p className="text-[13px] text-[var(--ink-2)]">{preset.summary}</p>
+                      <p className="text-[14px] font-semibold text-ink">{preset.title}</p>
+                      <p className="text-[13px] text-ink-2">{preset.summary}</p>
                     </div>
                     <Button variant="primary" size="sm" onClick={() => handleLaunchPreset(preset)}>
                       {window.sidecar?.agent?.startConversation ? (
@@ -611,15 +602,15 @@ export function App() {
 
             {swarms.length > 0 && (
               <section aria-labelledby="recent-swarms-heading" className="space-y-2">
-                <h2 id="recent-swarms-heading" className="text-[14px] font-semibold text-[var(--ink)]">
+                <h2 id="recent-swarms-heading" className="text-[14px] font-semibold text-ink">
                   Recent swarms ({swarms.length})
                 </h2>
                 <div className="space-y-2">
                   {swarms.map((sw) => (
                     <Card key={sw.id} className="p-3 flex items-center justify-between gap-2">
                       <div className="min-w-0 space-y-0.5">
-                        <p className="text-[14px] font-semibold text-[var(--ink)] truncate">{sw.title || sw.id}</p>
-                        <div className="flex flex-wrap items-center gap-2 text-[12px] text-[var(--ink-2)] num">
+                        <p className="text-[14px] font-semibold text-ink truncate">{sw.title || sw.id}</p>
+                        <div className="flex flex-wrap items-center gap-2 text-[12px] text-ink-2 num">
                           <span>{sw.activeCount} active</span>
                           <span>{sw.memberCount} members</span>
                           <span>#{sw.head}</span>
@@ -697,7 +688,7 @@ export function App() {
 
       {/* Keyboard Shortcuts Cheatsheet (?) */}
       <Modal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} title="Keyboard shortcuts">
-        <dl className="divide-y divide-[var(--hairline)] text-[13px]">
+        <dl className="divide-y divide-hairline text-[13px]">
           {[
             ["j / k", "Move across Needs-You items"],
             ["o / Enter", "Open worker chat"],
@@ -709,8 +700,8 @@ export function App() {
             ["?", "Toggle keyboard shortcuts"],
           ].map(([key, desc]) => (
             <div key={key} className="flex items-center justify-between gap-3 py-2 first:pt-0 last:pb-0">
-              <dt className="text-[var(--ink-2)]">{desc}</dt>
-              <dd className="rounded-[4px] border border-[var(--hairline)] bg-[var(--board)] px-1.5 py-0.5 text-[12px] text-[var(--ink)] mono shrink-0">
+              <dt className="text-ink-2">{desc}</dt>
+              <dd className="rounded-[4px] border border-hairline bg-board px-1.5 py-0.5 text-[12px] text-ink mono shrink-0">
                 {key}
               </dd>
             </div>
@@ -723,7 +714,7 @@ export function App() {
         <div className="space-y-4">
           <div className="space-y-1.5">
             <div className="flex items-center justify-between gap-2">
-              <span className="text-[13px] font-medium text-[var(--ink)]">Appearance</span>
+              <span className="text-[13px] font-medium text-ink">Appearance</span>
               {embedded && hostSynced && <Badge tone="info">Synced to Antigravity</Badge>}
             </div>
             <SegmentControl
@@ -741,7 +732,7 @@ export function App() {
           </div>
 
           <div className="space-y-1.5">
-            <span className="block text-[13px] font-medium text-[var(--ink)]">Live Poll Cadence</span>
+            <span className="block text-[13px] font-medium text-ink">Live Poll Cadence</span>
             <SegmentControl
               label="Poll cadence"
               value={pollMs}
@@ -754,10 +745,10 @@ export function App() {
             />
           </div>
 
-          <div className="rounded-[var(--radius-card)] bg-[var(--board)] p-3 text-[12px] text-[var(--ink-2)] space-y-1">
-            <div className="flex items-center gap-1.5 font-medium text-[var(--ink)]">
+          <div className="rounded-card bg-board p-3 text-[12px] text-ink-2 space-y-1">
+            <div className="flex items-center gap-1.5 font-medium text-ink">
               <CommandIcon className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Fleet Antigravity Plugin v1.7.0</span>
+              <span>Fleet Antigravity Plugin v1.8.0</span>
             </div>
             <p>
               Reads Antigravity native swarm boards and transcripts locally on loopback with zero external telemetry.

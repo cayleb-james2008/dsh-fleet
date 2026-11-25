@@ -9,14 +9,13 @@
  *    pre-serialized/pre-gzipped cached JSON snapshots, security headers,
  *    Host loopback-403 check, prompt 413 payload enforcement, and `/preload.js`.
  */
-import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setFlagsFromString } from 'node:v8';
 import { gzipSync } from 'node:zlib';
-import { probeWorktrees } from './git_probe.mjs';
+import { probeWorktreeDiff, probeWorktrees } from './git_probe.mjs';
 import {
   ID_RE,
   buildSwarmSnapshot,
@@ -58,6 +57,18 @@ const STANDALONE_PRELOAD_JS = `(function(){
   };
 })();`;
 
+function fastEtag(input) {
+  const buf = typeof input === 'string' ? Buffer.from(input, 'utf8') : input;
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i];
+    h1 = Math.imul(h1 ^ b, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ (b + i), 0x85ebca6b) >>> 0;
+  }
+  return `"${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}"`;
+}
+
 function loadDistAssets(distDir) {
   const indexPath = join(distDir, 'index.html');
   const indexGzPath = join(distDir, 'index.html.gz');
@@ -67,7 +78,7 @@ function loadDistAssets(distDir) {
   const htmlGzip = existsSync(indexPath) && existsSync(indexGzPath)
     ? readFileSync(indexGzPath)
     : gzipSync(htmlRaw, { level: 9 });
-  const htmlEtag = `"${createHash('sha256').update(htmlRaw).digest('hex').slice(0, 16)}"`;
+  const htmlEtag = fastEtag(htmlRaw);
 
   const fonts = new Map();
   const fontsDir = join(distDir, 'fonts');
@@ -77,7 +88,7 @@ function loadDistAssets(distDir) {
       const buf = readFileSync(join(fontsDir, file));
       fonts.set(`/fonts/${file}`, {
         raw: buf,
-        etag: `"${createHash('sha256').update(buf).digest('hex').slice(0, 16)}"`,
+        etag: fastEtag(buf),
       });
     }
   }
@@ -87,7 +98,7 @@ function loadDistAssets(distDir) {
 function packJsonPayload(obj, etagOverride = '') {
   const raw = Buffer.from(JSON.stringify(obj));
   const gz = raw.length >= 256 ? gzipSync(raw) : null;
-  const etag = etagOverride || `"${createHash('sha256').update(raw).digest('hex').slice(0, 16)}"`;
+  const etag = etagOverride || fastEtag(raw);
   return { raw, gz, etag };
 }
 
@@ -140,7 +151,7 @@ export function createFleetHandlers({
       healthPacked = packJsonPayload({
         ok: true,
         name: 'fleet',
-        version: '1.7.0',
+        version: '1.8.0',
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
         sseStream: !isSidecar,
@@ -179,11 +190,11 @@ export function createFleetHandlers({
           etag: fullEtag,
           capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, sseStream: !isSidecar },
         },
-        `"${createHash('sha256').update(fullEtag).digest('hex').slice(0, 16)}"`,
+        fastEtag(fullEtag),
       );
       const unchangedPacked = packJsonPayload({ conversationId: id, swarm: id, member, unchanged: true, etag: fullEtag });
       if (swarmPayloadCache.has(cacheKey)) swarmPayloadCache.delete(cacheKey);
-      else if (swarmPayloadCache.size >= 16) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
+      else if (swarmPayloadCache.size >= 6) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
       swarmPayloadCache.set(cacheKey, {
         checkedAt: now,
         appData,
@@ -319,12 +330,12 @@ export function createFleetHandlers({
         etag,
         capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, sseStream: !isSidecar },
       },
-      `"${createHash('sha256').update(etag).digest('hex').slice(0, 16)}"`,
+      fastEtag(etag),
     );
     if (!includeRaw) {
       const unchangedPacked = packJsonPayload({ conversationId: conv, swarm: res.swarm, member: res.member, unchanged: true, etag });
       if (swarmPayloadCache.has(cacheKey)) swarmPayloadCache.delete(cacheKey);
-      else if (swarmPayloadCache.size >= 16) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
+      else if (swarmPayloadCache.size >= 6) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
       swarmPayloadCache.set(cacheKey, {
         checkedAt: now,
         appData: res.appData,
@@ -348,9 +359,19 @@ export function createFleetHandlers({
     const data = await probeWorktrees(rootsKey);
     const packed = packJsonPayload(data);
     if (worktreesPayloadCache.has(rootsKey)) worktreesPayloadCache.delete(rootsKey);
-    else if (worktreesPayloadCache.size >= 16) worktreesPayloadCache.delete(worktreesPayloadCache.keys().next().value);
+    else if (worktreesPayloadCache.size >= 6) worktreesPayloadCache.delete(worktreesPayloadCache.keys().next().value);
     worktreesPayloadCache.set(rootsKey, { at: now, packed });
     return packed;
+  }
+
+  async function getWorktreeDiff(query = {}) {
+    const res = await probeWorktreeDiff({
+      root: typeof query.root === 'string' ? query.root : '',
+      worktree: typeof query.worktree === 'string' ? query.worktree : '',
+      file: typeof query.file === 'string' ? query.file : '',
+      maxBytes: Number(query.maxBytes) || 8192,
+    });
+    return { status: res.status || (res.ok ? 200 : 400), packed: packJsonPayload(res) };
   }
 
   function getFrame(query = {}) {
@@ -433,6 +454,7 @@ export function createFleetHandlers({
     getSwarmsPacked,
     getSwarmPacked,
     getWorktreesPacked,
+    getWorktreeDiff,
     getFrame,
     postNudge,
     resolveStreamTarget,
@@ -679,6 +701,10 @@ export async function startStandaloneServer({
     if (req.method === 'GET' && pathname === '/api/worktrees') {
       return sendPacked(req, res, 200, await handlers.getWorktreesPacked(parseQueryFast(search)));
     }
+    if (req.method === 'GET' && pathname === '/api/worktrees/diff') {
+      const out = await handlers.getWorktreeDiff(parseQueryFast(search));
+      return sendPacked(req, res, out.status, out.packed);
+    }
     if (req.method === 'GET' && pathname === '/api/frame') {
       const out = handlers.getFrame(parseQueryFast(search));
       const buf = Buffer.isBuffer(out.body) ? out.body : Buffer.from(String(out.body));
@@ -760,7 +786,7 @@ export async function startStandaloneServer({
 
 async function runCli() {
   try {
-    setFlagsFromString('--max-semi-space-size=1 --optimize-for-size --no-opt --no-maglev --no-turbofan');
+    setFlagsFromString('--max-semi-space-size=1 --max-old-space-size=24 --optimize-for-size --no-opt --no-maglev --no-turbofan');
   } catch {}
   const args = process.argv.slice(2);
   let port = Number(process.env.PORT || 18430);
@@ -809,6 +835,10 @@ async function runCli() {
     app.api('/api/swarms', () => new Response(handlers.getSwarmsPacked().raw, { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
     app.api('/api/swarm', (data) => new Response(handlers.getSwarmPacked(data).raw, { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
     app.api('/api/worktrees', async (data) => new Response((await handlers.getWorktreesPacked(data)).raw, { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
+    app.api('/api/worktrees/diff', async (data) => {
+      const out = await handlers.getWorktreeDiff(data);
+      return new Response(out.packed.raw, { status: out.status, contentType: 'application/json', headers: SECURITY_HEADERS });
+    }, 'GET');
     app.api('/api/frame', (data) => {
       const out = handlers.getFrame(data);
       return new Response(out.body, { status: out.status, contentType: out.contentType, headers: out.headers || SECURITY_HEADERS });
