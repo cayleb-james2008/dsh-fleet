@@ -60,10 +60,13 @@ const STANDALONE_PRELOAD_JS = `(function(){
 
 function loadDistAssets(distDir) {
   const indexPath = join(distDir, 'index.html');
+  const indexGzPath = join(distDir, 'index.html.gz');
   const htmlRaw = existsSync(indexPath)
     ? readFileSync(indexPath)
     : Buffer.from('<!doctype html><html><body><p>Fleet dist/index.html missing. Run npm run build in frontend/.</p></body></html>');
-  const htmlGzip = gzipSync(htmlRaw, { level: 9 });
+  const htmlGzip = existsSync(indexPath) && existsSync(indexGzPath)
+    ? readFileSync(indexGzPath)
+    : gzipSync(htmlRaw, { level: 9 });
   const htmlEtag = `"${createHash('sha256').update(htmlRaw).digest('hex').slice(0, 16)}"`;
 
   const fonts = new Map();
@@ -137,7 +140,7 @@ export function createFleetHandlers({
       healthPacked = packJsonPayload({
         ok: true,
         name: 'fleet',
-        version: '1.6.0',
+        version: '1.7.0',
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
         sseStream: !isSidecar,
@@ -757,7 +760,7 @@ export async function startStandaloneServer({
 
 async function runCli() {
   try {
-    setFlagsFromString('--optimize-for-size');
+    setFlagsFromString('--max-semi-space-size=1 --optimize-for-size --no-opt --no-maglev --no-turbofan');
   } catch {}
   const args = process.argv.slice(2);
   let port = Number(process.env.PORT || 18430);

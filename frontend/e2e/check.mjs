@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import { BASE, E2E, OUT, build, results, start, stop } from "./fixture.mjs";
 
-const EXPECT = { gate: 34, replay: 7 };
+const EXPECT = { gate: 35, replay: 8 };
 const args = new Set(process.argv.slice(2));
 
 await stop();

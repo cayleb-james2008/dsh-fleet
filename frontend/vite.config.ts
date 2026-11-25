@@ -3,13 +3,14 @@
 // sidecar index.html stays compact (<500 KB raw / <160 KB gzip) with zero external requests.
 import fs from "node:fs";
 import path from "node:path";
+import zlib from "node:zlib";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
 const root = import.meta.dirname;
 const STAMP =
-  "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v1.6.0 */";
+  "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v1.7.0 */";
 
 function sidecarSingleFile(): Plugin {
   return {
@@ -45,7 +46,9 @@ function sidecarSingleFile(): Plugin {
 
       const outHtml = path.join(outDir, "index.html");
       fs.writeFileSync(outHtml, html);
-      console.log(`sidecar bundle: ${outHtml} (${(html.length / 1024).toFixed(1)} kB raw)`);
+      const gz = zlib.gzipSync(html, { level: 9 });
+      fs.writeFileSync(`${outHtml}.gz`, gz);
+      console.log(`sidecar bundle: ${outHtml} (${(html.length / 1024).toFixed(1)} kB raw, ${(gz.length / 1024).toFixed(1)} kB gz)`);
     },
   };
 }
@@ -53,11 +56,6 @@ function sidecarSingleFile(): Plugin {
 export default defineConfig({
   plugins: [react(), tailwindcss(), sidecarSingleFile()],
   base: "./",
-  resolve: {
-    alias: {
-      "@radix-ui/react-dialog": path.resolve(root, "src/radix-dialog-noop.ts"),
-    },
-  },
   build: {
     target: "es2022",
     assetsInlineLimit: (filePath) => !filePath.endsWith(".woff2"),

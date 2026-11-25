@@ -91,6 +91,21 @@ await runChecks("replay", async (check) => {
     );
   });
 
+  await check("f key cycles Board quick filters cleanly", async () => {
+    await page.keyboard.press("2");
+    await page.waitForSelector("#panel-board");
+    const grp = page.locator('[aria-label="Board quick filters"]');
+    await page.keyboard.press("f");
+    const needsPressed = await grp.locator('button:has-text("Needs reply")').getAttribute("aria-pressed");
+    await page.keyboard.press("f");
+    const donePressed = await grp.locator('button:has-text("[done]")').getAttribute("aria-pressed");
+    await page.keyboard.press("f");
+    const blockedPressed = await grp.locator('button:has-text("[blocked]")').getAttribute("aria-pressed");
+    await page.keyboard.press("f");
+    const allPressed = await grp.locator('button:has-text("All")').getAttribute("aria-pressed");
+    return needsPressed === "true" && donePressed === "true" && blockedPressed === "true" && allPressed === "true";
+  });
+
   await check("zero uncaught runtime errors during replay", () => errs.length === 0);
   await ctx.close();
 });

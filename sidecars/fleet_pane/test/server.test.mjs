@@ -5,7 +5,7 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync
 import net from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { gunzipSync } from 'node:zlib';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import { startStandaloneServer } from '../main.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -21,7 +21,9 @@ function setupFixtureAppData() {
   const dir = makeScratchDir('http-');
   const distDir = join(dir, 'dist');
   mkdirSync(distDir, { recursive: true });
-  writeFileSync(distDir + '/index.html', '<!doctype html><html><body>' + 'Fleet'.repeat(120) + '</body></html>');
+  const stubHtml = '<!doctype html><html><body>' + 'Fleet'.repeat(120) + '</body></html>';
+  writeFileSync(distDir + '/index.html', stubHtml);
+  writeFileSync(distDir + '/index.html.gz', gzipSync(Buffer.from(stubHtml), { level: 9 }));
 
   const appData = join(dir, 'appdata');
   const coord = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
@@ -218,6 +220,9 @@ test('install.sh --dest deploys plugin bundle cleanly and installed main.mjs boo
     assert.ok(existsSync(join(dest, 'sidecars', 'fleet_pane', 'git_probe.mjs')));
     assert.ok(existsSync(join(dest, 'sidecars', 'fleet_pane', 'swarm_store.mjs')));
     assert.ok(existsSync(join(dest, 'sidecars', 'fleet_pane', 'dist', 'index.html')));
+    if (existsSync(join(distDir, 'index.html.gz'))) {
+      assert.ok(existsSync(join(dest, 'sidecars', 'fleet_pane', 'dist', 'index.html.gz')));
+    }
 
     const installedMain = join(dest, 'sidecars', 'fleet_pane', 'main.mjs');
     child = spawn('node', [installedMain, '--port', '0', '--app-data-dir', tmp], {
