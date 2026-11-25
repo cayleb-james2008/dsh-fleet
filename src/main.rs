@@ -11,8 +11,8 @@ mod update;
 
 use fleet::autoheal::{
     FailedCheckContext, HealAttempt, HealDecision, HealSessionContext, HealStopReason,
-    MAX_AUTO_HEAL_BUDGET, build_heal_prompt, evaluate_auto_heal,
-    extract_changed_files_and_diff_excerpt, heal_badge_label,
+    MAX_AUTO_HEAL_BUDGET, build_heal_prompt, classify_failure, classify_heal_attempt,
+    evaluate_auto_heal, extract_changed_files_and_diff_excerpt, heal_badge_label,
 };
 use fleet::budget::{BudgetConfig, BudgetError, BudgetStatus, BudgetTracker};
 use fleet::checks::{
@@ -161,24 +161,14 @@ struct AgentInfo {
 }
 
 /// The CLI agents Fleet knows how to drive, probed against the real
-/// PATH at startup. A name is "found" only when `which` (Unix) or `where` (Windows) resolves it.
+/// `PATH` in-process at startup without spawning child `which`/`where` processes.
 fn detect_agents() -> Vec<AgentInfo> {
-    let finder = if cfg!(windows) { "where" } else { "which" };
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path_env).collect();
     ["opencode", "claude", "codex"]
         .iter()
         .map(|name| {
-            let path = Command::new(finder)
-                .arg(name)
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| {
-                    String::from_utf8_lossy(&o.stdout)
-                        .lines()
-                        .map(str::trim)
-                        .find(|l| !l.is_empty())
-                        .map(str::to_string)
-                });
+            let path = find_in_path_dirs(name, &dirs);
             AgentInfo {
                 name: name.to_string(),
                 found: path.is_some(),
@@ -186,6 +176,34 @@ fn detect_agents() -> Vec<AgentInfo> {
             }
         })
         .collect()
+}
+
+fn find_in_path_dirs(name: &str, dirs: &[PathBuf]) -> Option<String> {
+    #[cfg(windows)]
+    let exts: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+
+    for dir in dirs {
+        let candidate = dir.join(name);
+        if is_executable(&candidate) {
+            return Some(candidate.display().to_string());
+        }
+        #[cfg(windows)]
+        {
+            for ext in &exts {
+                let with_ext = dir.join(format!("{name}{ext}"));
+                if is_executable(&with_ext) {
+                    return Some(with_ext.display().to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn is_executable(p: &Path) -> bool {
@@ -798,6 +816,9 @@ struct App {
     events: Arc<events::EventBus>,
     /// Version checks and self-update (see `update`).
     updater: Arc<update::Updater>,
+    /// Fast atomic flag + condvar gate cleared once background startup store hydration finishes.
+    startup_done: std::sync::atomic::AtomicBool,
+    startup_gate: (Mutex<bool>, std::sync::Condvar),
 }
 
 /// How a bounded run ended.
@@ -1179,6 +1200,20 @@ impl App {
     fn record_heal_attempt_budget(&self) {
         self.budget.lock().unwrap().record_heal_attempt();
         self.bump_budget_rev();
+    }
+
+    fn wait_startup(&self) {
+        if self
+            .startup_done
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let (lock, cv) = &self.startup_gate;
+        let mut ready = lock.lock().unwrap();
+        while !*ready {
+            ready = cv.wait(ready).unwrap();
+        }
     }
 
     fn effective_timeout_secs(&self, policy_timeout_secs: u64) -> u64 {
@@ -4538,6 +4573,7 @@ fn serve_sse(
     stream: &mut std::net::TcpStream,
     last_event_id: Option<u64>,
 ) {
+    app.wait_startup();
     let Ok((sub, replay)) = app.events.try_subscribe(last_event_id) else {
         let resp = error_response(503, "too many active SSE streams");
         let _ = stream.write_all(resp.as_bytes());
@@ -4777,9 +4813,11 @@ fn respond_bytes(app: &Arc<App>, allowed_hosts: &str, req: &ParsedRequest) -> Ht
         return HttpReply::Static(bytes);
     }
     if req.method == "GET" && route == "/api/sessions" && !req.path.contains('?') {
+        app.wait_startup();
         return HttpReply::Shared(app.sessions_http_cached());
     }
     if req.method == "GET" && route == "/api/metrics" {
+        app.wait_startup();
         return HttpReply::Shared(app.metrics_http_cached());
     }
     if req.method == "GET" && route == "/api/repos" {
@@ -4792,6 +4830,7 @@ fn respond_bytes(app: &Arc<App>, allowed_hosts: &str, req: &ParsedRequest) -> Ht
                 .into_bytes(),
             );
         }
+        app.wait_startup();
         return HttpReply::Shared(app.discover_repos_http_cached());
     }
 
@@ -5444,12 +5483,45 @@ fn session_to_api_value(
         }
     });
     v["duration_ms"] = serde_json::json!(duration_ms);
-    v["heal_attempts"] = serde_json::json!(&s.heal_attempts);
+    v["heal_attempts"] = serde_json::Value::Array(
+        s.heal_attempts
+            .iter()
+            .map(|a| {
+                let mut item = serde_json::to_value(a).unwrap_or_else(|_| serde_json::json!({}));
+                let cls = classify_heal_attempt(a);
+                item["failure_category"] = serde_json::json!(cls.category);
+                item["failure_label"] = serde_json::json!(cls.label);
+                item
+            })
+            .collect(),
+    );
     let auto_healed = s.heal_attempts.iter().any(|a| a.healed)
         && matches!(s.status.as_str(), "done" | "merged");
     v["auto_healed"] = serde_json::json!(auto_healed);
     if let Some(badge) = heal_badge_label(&s.heal_attempts, s.auto_steer_budget) {
         v["heal_badge"] = serde_json::json!(badge);
+    }
+    if s.check_passed == Some(false) || (s.status == "needs-you" && s.reason.is_some()) {
+        let cls = if let Some(last) = s.heal_attempts.last().filter(|a| !a.healed) {
+            classify_heal_attempt(last)
+        } else if let Some(ref receipt) = s.check_receipt {
+            FailedCheckContext::from_pipeline_receipt(receipt, &s.check_cmd)
+                .map(|ctx| classify_failure(&ctx))
+                .unwrap_or_else(|| {
+                    classify_failure(&FailedCheckContext::from_legacy(
+                        &s.check_cmd,
+                        s.check_exit,
+                        s.check_output.as_deref().or(s.reason.as_deref()).unwrap_or(""),
+                    ))
+                })
+        } else {
+            classify_failure(&FailedCheckContext::from_legacy(
+                &s.check_cmd,
+                s.check_exit,
+                s.check_output.as_deref().or(s.reason.as_deref()).unwrap_or(""),
+            ))
+        };
+        v["failure_classification"] = serde_json::json!(cls);
     }
     v["transcript_total"] = serde_json::json!(s.transcript_total.max(s.transcript.len()));
     // Surface structured per-step check receipts for the Receipt tab.
@@ -6556,11 +6628,16 @@ fn handle_batch_merge(app: &Arc<App>, body: &str) -> String {
     let mut merged_count = 0usize;
     let mut skipped_count = 0usize;
     let mut failed_count = 0usize;
+    let mut ready_ids: Vec<String> = Vec::new();
+    let mut conflicted_ids: Vec<String> = Vec::new();
+    let mut skipped_ids: Vec<String> = Vec::new();
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(candidates.len());
 
     for s in candidates {
+        let (diff_files, diff_add, diff_del) = unified_diff_counts(&s.diff);
         if s.status != "done" || s.verified_commit.is_none() || s.repo.is_empty() {
             skipped_count += 1;
+            skipped_ids.push(s.id.clone());
             results.push(serde_json::json!({
                 "id": s.id,
                 "task": s.task,
@@ -6569,6 +6646,9 @@ fn handle_batch_merge(app: &Arc<App>, body: &str) -> String {
                 "status": "skipped",
                 "clean": false,
                 "can_apply": false,
+                "diff_files": diff_files,
+                "diff_add": diff_add,
+                "diff_del": diff_del,
                 "conflicting_files": [],
                 "error": format!("session is '{}' (only verified done sessions can merge)", s.status),
             }));
@@ -6582,8 +6662,10 @@ fn handle_batch_merge(app: &Arc<App>, body: &str) -> String {
                 let can_apply = apply_err.is_none();
                 if chk.clean && can_apply {
                     clean_count += 1;
+                    ready_ids.push(s.id.clone());
                 } else {
                     conflict_count += 1;
+                    conflicted_ids.push(s.id.clone());
                 }
                 if dry_run {
                     results.push(serde_json::json!({
@@ -6595,6 +6677,9 @@ fn handle_batch_merge(app: &Arc<App>, body: &str) -> String {
                         "status": if chk.clean && can_apply { "ready" } else { "conflict" },
                         "clean": chk.clean,
                         "can_apply": can_apply,
+                        "diff_files": diff_files,
+                        "diff_add": diff_add,
+                        "diff_del": diff_del,
                         "conflicting_files": chk.conflicting_files,
                         "commits_ahead": chk.commits_ahead,
                         "commits_behind": chk.commits_behind,
@@ -6611,6 +6696,9 @@ fn handle_batch_merge(app: &Arc<App>, body: &str) -> String {
                         "status": "skipped",
                         "clean": chk.clean,
                         "can_apply": can_apply,
+                        "diff_files": diff_files,
+                        "diff_add": diff_add,
+                        "diff_del": diff_del,
                         "conflicting_files": chk.conflicting_files,
                         "commits_ahead": chk.commits_ahead,
                         "commits_behind": chk.commits_behind,
@@ -6628,6 +6716,9 @@ fn handle_batch_merge(app: &Arc<App>, body: &str) -> String {
                                 "status": "merged",
                                 "clean": true,
                                 "can_apply": true,
+                                "diff_files": diff_files,
+                                "diff_add": diff_add,
+                                "diff_del": diff_del,
                                 "commit": commit,
                                 "landed_commit": landed_commit,
                                 "strategy": strat.label(),
@@ -6645,6 +6736,9 @@ fn handle_batch_merge(app: &Arc<App>, body: &str) -> String {
                                 "status": "failed",
                                 "clean": chk.clean,
                                 "can_apply": false,
+                                "diff_files": diff_files,
+                                "diff_add": diff_add,
+                                "diff_del": diff_del,
                                 "conflicting_files": chk.conflicting_files,
                                 "error": e.message,
                                 "detail": e.detail,
@@ -6655,6 +6749,7 @@ fn handle_batch_merge(app: &Arc<App>, body: &str) -> String {
             }
             Err(e) => {
                 conflict_count += 1;
+                conflicted_ids.push(s.id.clone());
                 if !dry_run {
                     skipped_count += 1;
                 }
@@ -6667,6 +6762,9 @@ fn handle_batch_merge(app: &Arc<App>, body: &str) -> String {
                     "status": if dry_run { "conflict" } else { "skipped" },
                     "clean": false,
                     "can_apply": false,
+                    "diff_files": diff_files,
+                    "diff_add": diff_add,
+                    "diff_del": diff_del,
                     "conflicting_files": [],
                     "error": e,
                 }));
@@ -6685,6 +6783,224 @@ fn handle_batch_merge(app: &Arc<App>, body: &str) -> String {
             "merged_count": merged_count,
             "skipped_count": skipped_count,
             "failed_count": failed_count,
+            "preflight": {
+                "ready_ids": ready_ids,
+                "conflicted_ids": conflicted_ids,
+                "skipped_ids": skipped_ids,
+            },
+            "results": results,
+        })
+        .to_string(),
+    )
+}
+
+fn unified_diff_counts(diff: &str) -> (usize, usize, usize) {
+    let mut files = 0usize;
+    let mut add = 0usize;
+    let mut del = 0usize;
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            files += 1;
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            add += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            del += 1;
+        }
+    }
+    (files, add, del)
+}
+
+/// Confirmation-gated 1-click Batch / Stacked Wave PR handler (`POST /api/sessions/batch-pr`).
+/// Enforces `confirm: true` whenever `dry_run` is false, matching single-PR safety gates.
+fn handle_batch_pr(app: &Arc<App>, body: &str) -> String {
+    let req: serde_json::Value = if body.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_str(body) {
+            Ok(v) => v,
+            Err(e) => return error_response(400, &format!("bad json: {e}")),
+        }
+    };
+    let Some(obj) = req.as_object() else {
+        return error_response(400, "batch-pr payload must be a JSON object");
+    };
+    let dry_run = obj
+        .get("dry_run")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let confirm = obj
+        .get("confirm")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let draft = obj
+        .get("draft")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let base_branch = obj
+        .get("base_branch")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let repo_filter = obj
+        .get("repo")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let explicit_ids = match parse_string_list_field(
+        obj.get("ids").unwrap_or(&serde_json::Value::Null),
+        "ids",
+    ) {
+        Ok(v) => v,
+        Err(e) => return error_response(400, &e),
+    };
+
+    if !dry_run && !confirm {
+        return json_response(
+            400,
+            &serde_json::json!({
+                "error": "batch PR creation requires explicit confirmation (confirm: true)",
+                "code": "confirmation_required",
+            })
+            .to_string(),
+        );
+    }
+
+    let candidates: Vec<Session> = {
+        let sessions = app.sessions.lock().unwrap();
+        if explicit_ids.is_empty() {
+            sessions
+                .iter()
+                .filter(|s| {
+                    s.status == "done"
+                        && s.verified_commit.is_some()
+                        && !s.repo.is_empty()
+                        && repo_filter.as_deref().is_none_or(|r| s.repo == r)
+                })
+                .cloned()
+                .collect()
+        } else {
+            let mut list = Vec::with_capacity(explicit_ids.len());
+            for id in &explicit_ids {
+                if let Some(s) = sessions.iter().find(|x| x.id == *id) {
+                    list.push(s.clone());
+                }
+            }
+            list
+        }
+    };
+
+    let mut ready_count = 0usize;
+    let mut created_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut failed_count = 0usize;
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(candidates.len());
+
+    for s in candidates {
+        if s.status != "done" || s.verified_commit.is_none() || s.repo.is_empty() {
+            skipped_count += 1;
+            results.push(serde_json::json!({
+                "id": s.id,
+                "task": s.task,
+                "repo": s.repo,
+                "branch": s.branch,
+                "status": "skipped",
+                "ready": false,
+                "error": format!("session is '{}' (only verified done sessions can open a PR)", s.status),
+            }));
+            continue;
+        }
+        let preview = match build_pr_preview(Path::new(&s.repo), &s) {
+            Ok(p) => p,
+            Err(e) => {
+                failed_count += 1;
+                results.push(serde_json::json!({
+                    "id": s.id,
+                    "task": s.task,
+                    "repo": s.repo,
+                    "branch": s.branch,
+                    "status": "failed",
+                    "ready": false,
+                    "error": e,
+                }));
+                continue;
+            }
+        };
+        if preview.ready_to_create {
+            ready_count += 1;
+        }
+        if dry_run {
+            results.push(serde_json::json!({
+                "id": s.id,
+                "task": s.task,
+                "repo": s.repo,
+                "branch": preview.head_branch,
+                "base_branch": base_branch.as_deref().unwrap_or(&preview.base_branch),
+                "title": preview.title,
+                "ready": preview.ready_to_create,
+                "status": if preview.ready_to_create { "ready" } else { "blocked" },
+                "warnings": preview.warnings,
+                "diff_files": preview.diff_stat.files_changed,
+                "diff_add": preview.diff_stat.insertions,
+                "diff_del": preview.diff_stat.deletions,
+            }));
+            continue;
+        }
+        match create_github_pr_with_options(
+            Path::new(&s.repo),
+            &s.branch,
+            base_branch.as_deref(),
+            &preview.title,
+            &preview.body,
+            draft,
+            true,
+            false,
+        ) {
+            Ok(res) => {
+                created_count += 1;
+                results.push(serde_json::json!({
+                    "id": s.id,
+                    "task": s.task,
+                    "repo": s.repo,
+                    "branch": res.branch,
+                    "base_branch": res.base_branch,
+                    "title": res.title,
+                    "url": res.url,
+                    "pushed": res.pushed,
+                    "status": "created",
+                    "ready": true,
+                }));
+            }
+            Err(e) => {
+                failed_count += 1;
+                results.push(serde_json::json!({
+                    "id": s.id,
+                    "task": s.task,
+                    "repo": s.repo,
+                    "branch": s.branch,
+                    "base_branch": base_branch.as_deref().unwrap_or(&preview.base_branch),
+                    "title": preview.title,
+                    "status": "failed",
+                    "ready": false,
+                    "code": e.code,
+                    "error": e.message,
+                    "detail": e.detail,
+                }));
+            }
+        }
+    }
+
+    json_response(
+        200,
+        &serde_json::json!({
+            "dry_run": dry_run,
+            "draft": draft,
+            "total": results.len(),
+            "ready_count": ready_count,
+            "created_count": created_count,
+            "skipped_count": skipped_count,
+            "failed_count": failed_count,
             "results": results,
         })
         .to_string(),
@@ -6696,6 +7012,12 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
         Some((r, q)) => (r, q),
         None => (path, ""),
     };
+    if !matches!(
+        (method, route),
+        ("GET", "/") | ("HEAD", "/") | ("GET", "/api/version")
+    ) {
+        app.wait_startup();
+    }
     let params = parse_query(query);
     match (method, route) {
         ("GET", "/") => html_response(include_str!("../assets/index.html")),
@@ -6738,6 +7060,9 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                         "sse": true,
                         "batch": true,
                         "batch_merge": true,
+                        "batch_pr": true,
+                        "wave_preflight": true,
+                        "failure_classifier": true,
                         "merge_check": true,
                         "policy_test": true,
                         "prune_worktrees": true,
@@ -6793,6 +7118,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
                 json_response(200, &app.sessions_query(&params).to_string())
             }
         }
+        ("POST", "/api/sessions/batch-pr") => handle_batch_pr(app, body),
         ("POST", "/api/sessions/batch-merge") => handle_batch_merge(app, body),
         ("POST", "/api/sessions/batch") => handle_batch_sessions(app, body),
         ("POST", "/api/sessions") => {
@@ -7383,10 +7709,26 @@ fn recover_from_logs(data_dir: &Path) -> Vec<Session> {
     sessions
 }
 
+#[derive(serde::Deserialize)]
+struct PersistedStore {
+    #[serde(default)]
+    counter: u64,
+    #[serde(default)]
+    sessions: Vec<Session>,
+}
+
+#[cfg(test)]
 fn load_persisted(data_dir: &Path) -> (Vec<Session>, u64) {
+    load_persisted_core(data_dir, true)
+}
+
+fn load_persisted_core(data_dir: &Path, hydrate_all_logs: bool) -> (Vec<Session>, u64) {
     let path = data_dir.join("sessions.json");
-    let parsed = std::fs::read_to_string(&path).ok().and_then(|text| {
-        let v = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    let parsed = std::fs::read(&path).ok().and_then(|bytes| {
+        if let Ok(store) = serde_json::from_slice::<PersistedStore>(&bytes) {
+            return Some((store.sessions, store.counter));
+        }
+        let v = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
         let counter = v["counter"].as_u64().unwrap_or(0);
         let sessions: Vec<Session> =
             serde_json::from_value(v["sessions"].clone()).unwrap_or_default();
@@ -7399,6 +7741,12 @@ fn load_persisted(data_dir: &Path) -> (Vec<Session>, u64) {
             return (recover_from_logs(data_dir), counter);
         }
         for s in sessions.iter_mut() {
+            let needs_sync_log = hydrate_all_logs
+                || s.transcript.is_empty()
+                || matches!(s.status.as_str(), "working" | "checking");
+            if !needs_sync_log {
+                continue;
+            }
             let log_path = data_dir.join("logs").join(format!("{}.log", s.id));
             if let Ok(text) = std::fs::read_to_string(&log_path) {
                 let lines = transcript_lines_from_log(&text);
@@ -7702,7 +8050,6 @@ fn main() {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
         .unwrap_or_else(|_| "run".to_string());
-    let (restored, restored_counter) = load_persisted(&data_dir);
     let template_store = TemplateStore::load(&data_dir);
     let budget_tracker = BudgetTracker::load(&data_dir);
     let app = Arc::new(App {
@@ -7717,7 +8064,7 @@ fn main() {
         env_max_parallel,
         data_dir,
         run_tag,
-        sessions: Mutex::new(restored),
+        sessions: Mutex::new(Vec::new()),
         state_rev: std::sync::atomic::AtomicU64::new(1),
         merge_target_cache: Mutex::new(std::collections::HashMap::new()),
         sessions_cache: Mutex::new(None),
@@ -7731,7 +8078,7 @@ fn main() {
         budget_rev: std::sync::atomic::AtomicU64::new(1),
         dirty_records: Mutex::new(std::collections::HashSet::new()),
         lines_since_persist: std::sync::atomic::AtomicU64::new(0),
-        counter: Mutex::new(restored_counter),
+        counter: Mutex::new(0),
         stops: Mutex::new(std::collections::HashMap::new()),
         events: Arc::new(events::EventBus::new()),
         updater: update::Updater::from_env(
@@ -7741,80 +8088,9 @@ fn main() {
             "cayleb-james2008/fleet",
             true,
         ),
+        startup_done: std::sync::atomic::AtomicBool::new(false),
+        startup_gate: (Mutex::new(false), std::sync::Condvar::new()),
     });
-    // The periodic release check is started here, by the real binary only;
-    // tests never call out.
-    app.updater.start_background();
-
-    // Recovery: a session that was mid-work when the server died cannot
-    // honestly still be "working" — nobody is running it. Mark it
-    // needs-you with the reason stated; queued sessions never started,
-    // so they simply resume through the queue.
-    let interrupted: Vec<(String, String)> = {
-        let sessions = app.sessions.lock().unwrap();
-        sessions
-            .iter()
-            .filter(|s| s.status == "working" || s.status == "checking")
-            .map(|s| (s.id.clone(), s.status.clone()))
-            .collect()
-    };
-    for (id, was) in interrupted {
-        app.log(
-            &id,
-            format!(
-                "server restarted while this session was {was} — the worktree is intact; retry it or inspect it"
-            ),
-        );
-        app.set_needs_you(&id, &format!("server restarted while {was}"));
-    }
-    // A verified-done session with steering still waiting was
-    // mid-reopen when the server stopped: the operator's message
-    // supersedes its settle. It comes back needs-you — a retry
-    // delivers the steering, and its chain (if any) fires when it
-    // settles verified done again.
-    let steered_done: Vec<String> = {
-        let sessions = app.sessions.lock().unwrap();
-        sessions
-            .iter()
-            .filter(|s| s.status == "done" && !s.steer.is_empty())
-            .map(|s| s.id.clone())
-            .collect()
-    };
-    for id in steered_done {
-        app.log(
-            &id,
-            "server restarted while this session had steering waiting — retry it to deliver your message"
-                .to_string(),
-        );
-        app.set_needs_you(&id, "server restarted while steering was waiting");
-    }
-    // A verified-done session whose successor never fired (the
-    // server died in the settle-to-fire window) must not stall in
-    // silence: fire its chain now — fire_successor re-verifies the
-    // done status under its lock before handing anything out.
-    let stalled_chains: Vec<String> = {
-        let sessions = app.sessions.lock().unwrap();
-        sessions
-            .iter()
-            .filter(|s| s.status == "done" && !s.next_queue.is_empty() && s.steer.is_empty())
-            .map(|s| s.id.clone())
-            .collect()
-    };
-    for id in stalled_chains {
-        app.log(
-            &id,
-            "server restarted before this session's named successor was handed out — handing it out now"
-                .to_string(),
-        );
-        app.fire_successor(&id);
-    }
-    if !app.sessions.lock().unwrap().is_empty() {
-        println!(
-            "fleet: restored {} session(s) from disk",
-            app.sessions.lock().unwrap().len()
-        );
-    }
-    app.pump_queue();
 
     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| {
         if e.kind() == std::io::ErrorKind::AddrInUse {
@@ -7844,7 +8120,108 @@ fn main() {
         std::env::var("FLEET_UPDATE_MODE").unwrap_or_else(|_| "notify".to_string())
     );
     open_in_browser(&format!("http://127.0.0.1:{port}/"));
-    // Pre-warm embedded HTML gzip + ETag cache asynchronously so `/api/version` answers instantaneously.
+    // Hydrate persisted sessions, recovery checks, HTML gzip cache, and updater asynchronously
+    // after TcpListener::bind so cold boot responds to `/api/version` and `/` immediately.
+    {
+        let app_boot = Arc::clone(&app);
+        std::thread::spawn(move || {
+            let (restored, restored_counter) = load_persisted_core(&app_boot.data_dir, false);
+            {
+                *app_boot.sessions.lock().unwrap() = restored;
+                *app_boot.counter.lock().unwrap() = restored_counter;
+                app_boot.bump_rev();
+            }
+            let interrupted: Vec<(String, String)> = {
+                let sessions = app_boot.sessions.lock().unwrap();
+                sessions
+                    .iter()
+                    .filter(|s| s.status == "working" || s.status == "checking")
+                    .map(|s| (s.id.clone(), s.status.clone()))
+                    .collect()
+            };
+            for (id, was) in interrupted {
+                app_boot.log(
+                    &id,
+                    format!(
+                        "server restarted while this session was {was} — the worktree is intact; retry it or inspect it"
+                    ),
+                );
+                app_boot.set_needs_you(&id, &format!("server restarted while {was}"));
+            }
+            let steered_done: Vec<String> = {
+                let sessions = app_boot.sessions.lock().unwrap();
+                sessions
+                    .iter()
+                    .filter(|s| s.status == "done" && !s.steer.is_empty())
+                    .map(|s| s.id.clone())
+                    .collect()
+            };
+            for id in steered_done {
+                app_boot.log(
+                    &id,
+                    "server restarted while this session had steering waiting — retry it to deliver your message"
+                        .to_string(),
+                );
+                app_boot.set_needs_you(&id, "server restarted while steering was waiting");
+            }
+            let stalled_chains: Vec<String> = {
+                let sessions = app_boot.sessions.lock().unwrap();
+                sessions
+                    .iter()
+                    .filter(|s| s.status == "done" && !s.next_queue.is_empty() && s.steer.is_empty())
+                    .map(|s| s.id.clone())
+                    .collect()
+            };
+            for id in stalled_chains {
+                app_boot.log(
+                    &id,
+                    "server restarted before this session's named successor was handed out — handing it out now"
+                        .to_string(),
+                );
+                app_boot.fire_successor(&id);
+            }
+            let total_restored = app_boot.sessions.lock().unwrap().len();
+            if total_restored > 0 {
+                println!("fleet: restored {total_restored} session(s) from disk");
+            }
+            app_boot.pump_queue();
+            {
+                let (lock, cv) = &app_boot.startup_gate;
+                let mut ready = lock.lock().unwrap();
+                *ready = true;
+                app_boot
+                    .startup_done
+                    .store(true, std::sync::atomic::Ordering::Release);
+                cv.notify_all();
+            }
+            app_boot.updater.start_background();
+            let candidates: Vec<(String, usize)> = {
+                let sessions = app_boot.sessions.lock().unwrap();
+                sessions
+                    .iter()
+                    .filter(|s| s.transcript_total == 0 && !s.transcript.is_empty())
+                    .map(|s| (s.id.clone(), s.transcript.len()))
+                    .collect()
+            };
+            for (id, mem_len) in candidates {
+                let log_path = app_boot.data_dir.join("logs").join(format!("{id}.log"));
+                if let Ok(text) = std::fs::read_to_string(&log_path) {
+                    let lines = transcript_lines_from_log(&text);
+                    let total = lines.len();
+                    if total > mem_len {
+                        let capped = cap_transcript(lines);
+                        let mut sessions = app_boot.sessions.lock().unwrap();
+                        if let Some(s) = sessions.iter_mut().find(|x| x.id == id) {
+                            s.transcript_total = s.transcript_total.max(total);
+                            if capped.len() > s.transcript.len() {
+                                s.transcript = capped;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
     std::thread::spawn(|| {
         let _ = EmbeddedHtmlCache::global(INDEX_HTML_BYTES);
     });
@@ -8093,6 +8470,8 @@ mod tests {
                 may_apply: true,
             })
             .into(),
+            startup_done: std::sync::atomic::AtomicBool::new(true),
+            startup_gate: (Mutex::new(true), std::sync::Condvar::new()),
         });
         // Drive the same path the HTTP layer drives.
         let session = Session {
@@ -8186,6 +8565,8 @@ mod tests {
                 may_apply: true,
             })
             .into(),
+            startup_done: std::sync::atomic::AtomicBool::new(true),
+            startup_gate: (Mutex::new(true), std::sync::Condvar::new()),
         })
     }
 
@@ -9023,6 +9404,8 @@ mod tests {
                 may_apply: true,
             })
             .into(),
+            startup_done: std::sync::atomic::AtomicBool::new(true),
+            startup_gate: (Mutex::new(true), std::sync::Condvar::new()),
         });
 
         // Shared LAN host cannot read repos or mutate config.
@@ -10642,6 +11025,83 @@ fi
         drop(srv);
         let client_resp = t.join().unwrap();
         assert!(client_resp.starts_with("HTTP/1.1 413"), "{client_resp}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v0110_batch_pr_confirm_gate_preflight_and_failure_classification() {
+        let dir = std::env::temp_dir().join(format!("fleet-v0110-batch-pr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git_repo(&dir);
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+
+        let mut s1 = test_session("s1", Status::Done, &dir);
+        s1.task = "Add metric cache".to_string();
+        s1.branch = "fleet/s1".to_string();
+        s1.verified_commit = Some("abc1234".to_string());
+        s1.diff = "diff --git a/src/cache.rs b/src/cache.rs\n+pub fn hit() {}\n".to_string();
+
+        let mut s2 = test_session("s2", Status::NeedsYou, &dir);
+        s2.check_passed = Some(false);
+        s2.check_exit = Some(101);
+        s2.check_output = Some("error[E0308]: mismatched types in src/lib.rs".to_string());
+        s2.reason = Some("check failed".to_string());
+
+        let app = test_app(data.clone(), vec![s1, s2]);
+
+        // 1. /api/policy exposes batch_pr, wave_preflight, failure_classifier
+        let ver = response_body(&handle(&app, "GET", "/api/policy", ""));
+        assert_eq!(ver["features"]["batch_pr"], true);
+        assert_eq!(ver["features"]["wave_preflight"], true);
+        assert_eq!(ver["features"]["failure_classifier"], true);
+
+        // 2. /api/sessions surfaces failure_classification on failed session
+        let sess = response_body(&handle(&app, "GET", "/api/sessions", ""));
+        let failed = sess
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] == "s2")
+            .unwrap();
+        assert_eq!(
+            failed["failure_classification"]["category"],
+            "compile-error"
+        );
+
+        // 3. POST /api/sessions/batch-pr without confirm: true is refused 400
+        let denied = handle(
+            &app,
+            "POST",
+            "/api/sessions/batch-pr",
+            &format!(r#"{{"repo":"{}","confirm":false}}"#, repo.display()),
+        );
+        assert!(denied.starts_with("HTTP/1.1 400"), "{denied}");
+        assert_eq!(response_body(&denied)["code"], "confirmation_required");
+
+        // 4. dry_run: true returns wave PR preview without pushing
+        let preview = response_body(&handle(
+            &app,
+            "POST",
+            "/api/sessions/batch-pr",
+            &format!(r#"{{"repo":"{}","dry_run":true}}"#, repo.display()),
+        ));
+        assert_eq!(preview["dry_run"], true);
+        assert_eq!(preview["total"], 1);
+        assert_eq!(preview["results"][0]["id"], "s1");
+
+        // 5. batch-merge dry_run returns preflight ready_ids and diff counts
+        let pre = response_body(&handle(
+            &app,
+            "POST",
+            "/api/sessions/batch-merge",
+            r#"{"dry_run":true}"#,
+        ));
+        assert!(pre["preflight"]["ready_ids"].is_array());
+        assert_eq!(pre["results"][0]["diff_files"], 1);
+        assert_eq!(pre["results"][0]["diff_add"], 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

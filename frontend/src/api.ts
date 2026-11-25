@@ -24,6 +24,13 @@ export type CheckStepReceipt = {
   status: "pending" | "running" | "passed" | "failed" | "skipped";
 };
 
+export type FailureClassification = {
+  category: string;
+  label: string;
+  hint: string;
+  retryable: boolean;
+};
+
 export type HealAttempt = {
   attempt: number;
   trigger_step: string;
@@ -33,6 +40,8 @@ export type HealAttempt = {
   started_ms: number | null;
   elapsed_ms: number | null;
   healed: boolean;
+  failure_category?: string | null;
+  failure_label?: string | null;
 };
 
 export type PlaybookTaskSpec = {
@@ -89,6 +98,9 @@ export type BatchMergeItemResult = {
   status: "ready" | "conflict" | "merged" | "skipped" | "failed";
   clean: boolean;
   can_apply: boolean;
+  diff_files?: number;
+  diff_add?: number;
+  diff_del?: number;
   conflicting_files: string[];
   commits_ahead?: number;
   commits_behind?: number;
@@ -105,7 +117,43 @@ export type BatchMergeResponse = {
   merged_count: number;
   skipped_count: number;
   failed_count: number;
+  preflight?: {
+    ready_ids: string[];
+    conflicted_ids: string[];
+    skipped_ids: string[];
+  };
   results: BatchMergeItemResult[];
+  error?: string;
+};
+
+export type BatchPrItemResult = {
+  id: string;
+  task?: string;
+  repo?: string;
+  branch?: string;
+  base_branch?: string;
+  title?: string;
+  url?: string;
+  pushed?: boolean;
+  ready: boolean;
+  status: "ready" | "blocked" | "created" | "skipped" | "failed";
+  diff_files?: number;
+  diff_add?: number;
+  diff_del?: number;
+  warnings?: string[];
+  error?: string | null;
+};
+
+export type BatchPrResponse = {
+  ok: boolean;
+  dry_run: boolean;
+  draft: boolean;
+  total: number;
+  ready_count: number;
+  created_count: number;
+  skipped_count: number;
+  failed_count: number;
+  results: BatchPrItemResult[];
   error?: string;
 };
 
@@ -237,6 +285,7 @@ export type Session = {
   check_steps?: CheckStepReceipt[];
   heal_attempts?: HealAttempt[];
   auto_healed?: boolean;
+  failure_classification?: FailureClassification | null;
   auto_steer_budget?: number | null;
   queue_position?: number | null;
   transcript: string[];
@@ -274,6 +323,9 @@ export type PolicyFeatures = {
   sse?: boolean;
   batch?: boolean;
   batch_merge?: boolean;
+  batch_pr?: boolean;
+  wave_preflight?: boolean;
+  failure_classifier?: boolean;
   merge_check?: boolean;
   policy_test?: boolean;
   prune_worktrees?: boolean;
@@ -484,6 +536,8 @@ export function normalizeHealAttempt(raw: unknown, idx = 0): HealAttempt | null 
     started_ms: asNum(o.started_ms ?? o.startedMs),
     elapsed_ms: asNum(o.elapsed_ms ?? o.elapsedMs ?? o.duration_ms),
     healed: Boolean(o.healed ?? o.succeeded ?? o.ok),
+    failure_category: o.failure_category ? asStr(o.failure_category) : null,
+    failure_label: o.failure_label ? asStr(o.failure_label) : null,
   };
 }
 
@@ -650,6 +704,15 @@ export function normalizeSession(raw: unknown, idx = 0): Session | null {
     duration_ms: asNum(r.duration_ms),
     heal_budget_total: asNum(r.heal_budget_total),
     heal_budget_remaining: asNum(r.heal_budget_remaining),
+    failure_classification:
+      r.failure_classification && typeof r.failure_classification === "object"
+        ? {
+            category: asStr((r.failure_classification as Record<string, unknown>).category, "unknown"),
+            label: asStr((r.failure_classification as Record<string, unknown>).label, "Check failure"),
+            hint: asStr((r.failure_classification as Record<string, unknown>).hint, ""),
+            retryable: Boolean((r.failure_classification as Record<string, unknown>).retryable ?? true),
+          }
+        : null,
   };
 }
 
@@ -763,6 +826,9 @@ export function normalizePolicy(raw: unknown): Policy | null {
           sse: Boolean(fRaw.sse),
           batch: Boolean(fRaw.batch),
           batch_merge: Boolean(fRaw.batch_merge),
+          batch_pr: Boolean(fRaw.batch_pr),
+          wave_preflight: Boolean(fRaw.wave_preflight),
+          failure_classifier: Boolean(fRaw.failure_classifier),
           merge_check: Boolean(fRaw.merge_check),
           policy_test: Boolean(fRaw.policy_test),
           prune_worktrees: Boolean(fRaw.prune_worktrees),
@@ -1863,6 +1929,9 @@ export async function batchMergeVerifiedWave(
                 status: (asStr(x.status, "skipped") as BatchMergeItemResult["status"]),
                 clean: Boolean(x.clean),
                 can_apply: Boolean(x.can_apply),
+                diff_files: asNum(x.diff_files) ?? undefined,
+                diff_add: asNum(x.diff_add) ?? undefined,
+                diff_del: asNum(x.diff_del) ?? undefined,
                 conflicting_files: asStrList(x.conflicting_files),
                 commits_ahead: asNum(x.commits_ahead) ?? undefined,
                 commits_behind: asNum(x.commits_behind) ?? undefined,
@@ -1870,6 +1939,7 @@ export async function batchMergeVerifiedWave(
               };
             })
           : [];
+        const pre = raw.preflight && typeof raw.preflight === "object" ? (raw.preflight as Record<string, unknown>) : null;
         return {
           ok: true,
           dry_run: Boolean(raw.dry_run),
@@ -1880,6 +1950,13 @@ export async function batchMergeVerifiedWave(
           merged_count: asNum(raw.merged_count) ?? 0,
           skipped_count: asNum(raw.skipped_count) ?? 0,
           failed_count: asNum(raw.failed_count) ?? 0,
+          preflight: pre
+            ? {
+                ready_ids: asStrList(pre.ready_ids),
+                conflicted_ids: asStrList(pre.conflicted_ids),
+                skipped_ids: asStrList(pre.skipped_ids),
+              }
+            : undefined,
           results,
         };
       }
@@ -1995,6 +2072,174 @@ export async function batchMergeVerifiedWave(
     conflict_count: conflictCount,
     merged_count: mergedCount,
     skipped_count: skippedCount,
+    failed_count: failedCount,
+    results,
+  };
+}
+
+export async function batchCreateWavePr(
+  opts: { ids?: string[]; repo?: string; base_branch?: string; draft?: boolean; confirm: boolean; dry_run?: boolean },
+  sessions: Session[],
+  supportsBatchPr: boolean,
+): Promise<BatchPrResponse> {
+  const dryRun = Boolean(opts.dry_run);
+  const draft = Boolean(opts.draft);
+  if (!dryRun && !opts.confirm) {
+    return {
+      ok: false,
+      dry_run: false,
+      draft,
+      total: 0,
+      ready_count: 0,
+      created_count: 0,
+      skipped_count: 0,
+      failed_count: 0,
+      results: [],
+      error: "Batch PR creation requires explicit confirmation.",
+    };
+  }
+  if (supportsBatchPr) {
+    try {
+      const r = await fetch("/api/sessions/batch-pr", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ids: opts.ids && opts.ids.length > 0 ? opts.ids : undefined,
+          repo: opts.repo || undefined,
+          base_branch: opts.base_branch || undefined,
+          draft,
+          confirm: opts.confirm,
+          dry_run: dryRun,
+        }),
+      });
+      const raw = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+      if (r.ok) {
+        const results: BatchPrItemResult[] = Array.isArray(raw.results)
+          ? raw.results.map((item) => {
+              const x = (item || {}) as Record<string, unknown>;
+              return {
+                id: asStr(x.id, ""),
+                task: asStr(x.task, ""),
+                repo: asStr(x.repo, ""),
+                branch: asStr(x.branch, ""),
+                base_branch: x.base_branch ? asStr(x.base_branch) : undefined,
+                title: x.title ? asStr(x.title) : undefined,
+                url: x.url ? asStr(x.url) : undefined,
+                pushed: typeof x.pushed === "boolean" ? x.pushed : undefined,
+                ready: Boolean(x.ready),
+                status: (asStr(x.status, "skipped") as BatchPrItemResult["status"]),
+                diff_files: asNum(x.diff_files) ?? undefined,
+                diff_add: asNum(x.diff_add) ?? undefined,
+                diff_del: asNum(x.diff_del) ?? undefined,
+                warnings: asStrList(x.warnings),
+                error: x.error ? asStr(x.error) : null,
+              };
+            })
+          : [];
+        return {
+          ok: true,
+          dry_run: Boolean(raw.dry_run),
+          draft: Boolean(raw.draft),
+          total: asNum(raw.total) ?? results.length,
+          ready_count: asNum(raw.ready_count) ?? 0,
+          created_count: asNum(raw.created_count) ?? 0,
+          skipped_count: asNum(raw.skipped_count) ?? 0,
+          failed_count: asNum(raw.failed_count) ?? 0,
+          results,
+        };
+      }
+      if (r.status !== 404) {
+        return {
+          ok: false,
+          dry_run: dryRun,
+          draft,
+          total: 0,
+          ready_count: 0,
+          created_count: 0,
+          skipped_count: 0,
+          failed_count: 0,
+          results: [],
+          error: asStr(raw.error, `Batch PR failed (${r.status}).`),
+        };
+      }
+    } catch {
+      return {
+        ok: false,
+        dry_run: dryRun,
+        draft,
+        total: 0,
+        ready_count: 0,
+        created_count: 0,
+        skipped_count: 0,
+        failed_count: 0,
+        results: [],
+        error: "Could not reach Fleet for batch PR.",
+      };
+    }
+  }
+
+  const idSet = opts.ids && opts.ids.length > 0 ? new Set(opts.ids) : null;
+  const targets = sessions.filter(
+    (s) => s.status === "done" && isVerified(s) && (!idSet || idSet.has(s.id)) && (!opts.repo || s.repo === opts.repo),
+  );
+  const results: BatchPrItemResult[] = [];
+  let readyCount = 0;
+  let createdCount = 0;
+  let failedCount = 0;
+  for (const s of targets) {
+    if (dryRun) {
+      const ds = diffStat(s.diff);
+      readyCount++;
+      results.push({
+        id: s.id,
+        task: s.task,
+        repo: s.repo,
+        branch: s.branch,
+        base_branch: s.merge_target || "main",
+        title: s.task,
+        ready: true,
+        status: "ready",
+        diff_files: ds.files,
+        diff_add: ds.add,
+        diff_del: ds.del,
+      });
+      continue;
+    }
+    const res = await createSessionPr(s.id, { title: s.task, body: "", draft, confirm: true }, true);
+    if (res.ok) {
+      createdCount++;
+      results.push({
+        id: s.id,
+        task: s.task,
+        repo: s.repo,
+        branch: s.branch,
+        base_branch: s.merge_target || "main",
+        title: s.task,
+        url: res.url,
+        ready: true,
+        status: "created",
+      });
+    } else {
+      failedCount++;
+      results.push({
+        id: s.id,
+        task: s.task,
+        repo: s.repo,
+        branch: s.branch,
+        ready: false,
+        status: "failed",
+        error: res.error || res.message,
+      });
+    }
+  }
+  return {
+    ok: true,
+    dry_run: dryRun,
+    draft,
+    total: targets.length,
+    ready_count: readyCount,
+    created_count: createdCount,
+    skipped_count: 0,
     failed_count: failedCount,
     results,
   };

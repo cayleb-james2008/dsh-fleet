@@ -1,4 +1,4 @@
-// test-live-web.mjs: Comprehensive end-to-end verification of the standalone v0.10.0 browser-only
+// test-live-web.mjs: Comprehensive end-to-end verification of the standalone v0.11.0 browser-only
 // live web bundle (dist-live-web/index.html) across desktop 1440x900 and mobile 390x844
 // in both Light and Dark themes.
 import http from "node:http";
@@ -79,9 +79,9 @@ try {
     bodyText.match(/\brune\b/i)?.[0] || "clean",
   );
   ok(
-    "Fleet v0.10.0 rebrand clean: zero dsh-fleet, DeepSeek Harness, or fleet-rs strings on board/title/release URL",
+    "Fleet v0.11.0 rebrand clean: zero dsh-fleet, DeepSeek Harness, or fleet-rs strings on board/title/release URL",
     !/\bdsh[-_ ]?fleet\b|deepseek\s+harness|\bfleet-rs\b/i.test(`${docTitle}\n${bodyText}\n${verHref}`) &&
-      verHref.includes("cayleb-james2008/fleet/releases/tag/v0.10.0"),
+      verHref.includes("cayleb-james2008/fleet/releases/tag/v0.11.0"),
     `title=${docTitle} href=${verHref}`,
   );
   ok(
@@ -149,6 +149,24 @@ try {
       prEnabledAfter &&
       prStatusText.includes("Dry-run PR verified"),
     `disabledBefore=${prDisabledBefore}`,
+  );
+  await p.keyboard.press("Escape");
+  await p.waitForTimeout(250);
+
+  // Wave Ship Modal -> Preflight clean/conflict preview + confirmation-gated Batch Wave PR
+  await p.locator('[data-testid="batch-merge-wave-btn"]').click();
+  await p.waitForSelector('[data-testid="wave-ship-modal"]', { timeout: 5000 });
+  await p.waitForTimeout(250);
+  const waveModal = p.locator('[data-testid="wave-ship-modal"]');
+  const waveText = await waveModal.innerText();
+  const wavePrDisabledBefore = await waveModal.locator('[data-testid="wave-pr-submit-btn"]').isDisabled();
+  await waveModal.locator('[data-testid="wave-pr-confirm-checkbox"]').check();
+  await p.waitForTimeout(100);
+  const wavePrEnabledAfter = await waveModal.locator('[data-testid="wave-pr-submit-btn"]').isEnabled();
+  ok(
+    "Wave Ship modal renders Merge Preflight summary and confirmation-gated Batch Wave PR",
+    waveText.includes("clean") && wavePrDisabledBefore && wavePrEnabledAfter,
+    `disabledBefore=${wavePrDisabledBefore}`,
   );
   await p.keyboard.press("Escape");
   await p.waitForTimeout(250);
