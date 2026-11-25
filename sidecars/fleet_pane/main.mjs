@@ -19,6 +19,7 @@ import { probeWorktrees } from './git_probe.mjs';
 import {
   ID_RE,
   buildSwarmSnapshot,
+  computeSwarmFingerprint,
   findAppDataDirs,
   getSwarmMetaKeys,
   listSwarms,
@@ -199,13 +200,21 @@ export function createFleetHandlers({
     const cacheKey = `${conv}|${resolvedFrom}|${isSidecar}|${Boolean(sendMessageFn)}`;
     const now = Date.now();
     const hit = !includeRaw ? swarmPayloadCache.get(cacheKey) : null;
-    if (hit && now - hit.checkedAt < 250) {
-      const keys = getSwarmMetaKeys(hit.appData, hit.swarm);
-      if (keys && keys.membersKey === hit.membersKey && keys.boardKey === hit.boardKey) {
-        if (query.etag && query.etag === hit.fullEtag) {
-          return hit.unchangedPacked;
-        }
+    if (hit) {
+      if (now - hit.checkedAt < 250) {
+        if (query.etag && query.etag === hit.fullEtag) return hit.unchangedPacked;
         return hit.packed;
+      }
+      const fp = computeSwarmFingerprint(hit.appData, hit.swarm);
+      if (fp) {
+        const candidateEtag = `${hit.swarm}|${hit.member || ''}|${fp.etag}`;
+        if (candidateEtag === hit.fullEtag) {
+          hit.checkedAt = now;
+          hit.membersKey = fp.membersKey;
+          hit.boardKey = fp.boardKey;
+          if (query.etag && query.etag === hit.fullEtag) return hit.unchangedPacked;
+          return hit.packed;
+        }
       }
     }
 
@@ -221,10 +230,13 @@ export function createFleetHandlers({
       });
     }
 
-    const keys = getSwarmMetaKeys(res.appData, res.swarm);
-    if (hit && keys && hit.appData === res.appData && hit.swarm === res.swarm && hit.membersKey === keys.membersKey && hit.boardKey === keys.boardKey && now - hit.checkedAt < 250) {
-      if (query.etag && query.etag === hit.fullEtag) return hit.unchangedPacked;
-      return hit.packed;
+    if (hit && hit.appData === res.appData && hit.swarm === res.swarm) {
+      const fp = computeSwarmFingerprint(res.appData, res.swarm);
+      if (fp && `${res.swarm}|${res.member || ''}|${fp.etag}` === hit.fullEtag) {
+        hit.checkedAt = now;
+        if (query.etag && query.etag === hit.fullEtag) return hit.unchangedPacked;
+        return hit.packed;
+      }
     }
 
     const snap = buildSwarmSnapshot(res.appData, res.swarm, { includeRaw });
@@ -239,6 +251,7 @@ export function createFleetHandlers({
       });
     }
 
+    const keys = getSwarmMetaKeys(res.appData, res.swarm);
     const etag = `${res.swarm}|${res.member || ''}|${snap.etag}`;
     if (query.etag && query.etag === etag) {
       return packJsonPayload({ conversationId: conv, swarm: res.swarm, member: res.member, unchanged: true, etag });
@@ -273,6 +286,7 @@ export function createFleetHandlers({
         checkedAt: now,
         appData: res.appData,
         swarm: res.swarm,
+        member: res.member || '',
         membersKey: keys?.membersKey || '',
         boardKey: keys?.boardKey || '',
         fullEtag: etag,
