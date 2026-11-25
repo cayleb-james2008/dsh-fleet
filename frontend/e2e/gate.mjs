@@ -1,9 +1,9 @@
 // Playwright control-room verification gate for Fleet v1.0 Antigravity Sidecar.
 // Verifies 380x900 sidebar & 1440x900 desktop across Light & Dark themes (28 checks).
 import { chromium } from "playwright-core";
-import { BASE, CHROME, REPO_DIR, runChecks } from "./fixture.mjs";
+import { BASE, CHROME_LAUNCH_OPTS, REPO_DIR, runChecks } from "./fixture.mjs";
 
-const browser = await chromium.launch({ executablePath: CHROME, headless: true });
+const browser = await chromium.launch(CHROME_LAUNCH_OPTS);
 
 await runChecks("gate", async (check) => {
   const ctx = await browser.newContext({ viewport: { width: 380, height: 900 } });

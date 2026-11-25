@@ -1,60 +1,138 @@
+<div align="center">
+
 # Fleet
 
-**Antigravity-native Swarm Command Center sidecar plugin.**
+**Antigravity-native Swarm Sidebar Plugin** — turn native multi-agent swarms (`swarm`, `post_message`, `read_board`, `swarm_wait`, `plan.json`, and worker transcripts) into a keyboard-first auxiliary side pane inside Antigravity.
 
-Fleet lives directly in Antigravity's auxiliary side pane (`SIDECAR_UI_ENTRYPOINT_AUX_PANE`) and turns native multi-agent swarms (`swarm`, `post_message`, `read_board`, `swarm_wait`, `plan.json`, and conversation transcripts) into a crisp command center.
+[![CI](https://img.shields.io/github/actions/workflow/status/cayleb-james2008/fleet/release.yml?branch=main&label=CI&style=flat-square)](https://github.com/cayleb-james2008/fleet/actions/workflows/release.yml)
+[![Release](https://img.shields.io/github/v/release/cayleb-james2008/fleet?style=flat-square&color=blue)](https://github.com/cayleb-james2008/fleet/releases/latest)
+[![Platform](https://img.shields.io/badge/Antigravity-Sidecar%20Plugin-111318?style=flat-square)](https://cayleb-james2008.github.io/projects/fleet.html)
+[![Stack](https://img.shields.io/badge/Node%20ESM-React%2019%20%2B%20TS-3178c6?style=flat-square)](https://github.com/cayleb-james2008/fleet)
+[![License](https://img.shields.io/github/license/cayleb-james2008/fleet?style=flat-square)](LICENSE)
 
-> Looking for the legacy standalone Rust server (`v0.12.0`)? It remains preserved in git history at tag `v0.12.0`.
+<br />
 
-## What It Gives You
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/triage-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/triage-light.png" />
+  <img alt="Fleet Antigravity Swarm Sidebar — Needs-You Triage & Swarm Plan" src="docs/screenshots/triage-light.png" width="380" />
+</picture>
 
-- **Needs-You Triage Inbox, Unstick Presets & File Actions:** Surfaces stalled workers, model/quota errors, open worker questions, `[blocked]` escalations, unverified `[done]` deliverables, confirmation-gated 1-click **Unstick / Resume** presets, `plan.json` workstreams/milestones/gates, worker-flagged `Screenshot:` captures with 1-click **Open file** (`toggleAuxPane`), and 1-click **Copy swarm digest** Markdown summaries.
-- **Worker Activity Peek & Context Pressure Telemetry:** Incrementally tails each member's `transcript.jsonl` to display live shimmering tool/thinking activity, expandable **Activity Peek** (last 5 tool calls + thinking heading), step counts, active context saturation (`% ctx` / `High ctx` / `Quota paused`), and real `input` / `cache_read` / `output` token totals.
-- **Live SSE Push & Graceful Polling:** Streams instant board/transcript deltas over `GET /api/swarm/stream` (`text/event-stream`) in standalone mode and falls back seamlessly to interval polling inside Antigravity's `SidecarApp` gateway.
-- **Board Feed, Pinned Posts & `@mention` Graph:** Filterable, `#seq`-clickable board stream with persistent **Pin `#seq`** highlights (surfaced in both Board and Triage), unread `New` dividers, and an interactive `@mention` topology graph with timeline replay.
-- **Keyboard-First Triage:** Navigate Needs-You items with `j`/`k`, jump tabs with `1`–`5`, open worker chat with `o`/`Enter`, and pin `#seq` items with `p`.
-- **Workspace Git Worktrees:** Subscribes to `sidecar.getWorkspaceUris()` / `onWorkspaceChange()` and probes git worktree branches, dirty/staged/untracked file lists with 1-click **Open file** (`toggleAuxPane`), and latest commit metadata with debounced caching.
-- **Multi-Swarm Switcher & Empty-State Presets:** Switch across active or recent swarms in `<appData>/brain/` or launch `/fleet` swarm presets (`Feature + Verifier`, `Audit & Harden`, `Multi-Lane Ship`).
+</div>
 
-## Install Into Antigravity
+---
+
+## Sidebar Gallery
+
+Fleet scales from `340px–380px` Antigravity auxiliary sidebars up to wide `1440px` panes with live host theme luminance sync (`theme-change` postMessage) and a Settings-only Light/Dark theme switch.
+
+<table>
+  <tr>
+    <td align="center" width="25%">
+      <strong>Triage &amp; Plan</strong><br />
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/triage-dark.png" />
+        <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/triage-light.png" />
+        <img alt="Triage view" src="docs/screenshots/triage-light.png" width="220" />
+      </picture>
+    </td>
+    <td align="center" width="25%">
+      <strong>Board &amp; Pins</strong><br />
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/board-dark.png" />
+        <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/board-light.png" />
+        <img alt="Board feed view" src="docs/screenshots/board-light.png" width="220" />
+      </picture>
+    </td>
+    <td align="center" width="25%">
+      <strong>Roster &amp; Telemetry</strong><br />
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/roster-dark.png" />
+        <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/roster-light.png" />
+        <img alt="Roster telemetry view" src="docs/screenshots/roster-light.png" width="220" />
+      </picture>
+    </td>
+    <td align="center" width="25%">
+      <strong>Git Worktrees</strong><br />
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/worktrees-dark.png" />
+        <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/worktrees-light.png" />
+        <img alt="Git worktrees view" src="docs/screenshots/worktrees-light.png" width="220" />
+      </picture>
+    </td>
+  </tr>
+</table>
+
+---
+
+## Capabilities
+
+- **Keyboard-First Sidebar Triage:** Navigate Needs-You escalations, quota stalls, open worker questions, and `[done]` deliverables with `j`/`k`, jump across tabs with `1`–`5`, open worker chat directly with `o`/`Enter`, and toggle `Pin #seq` with `p`.
+- **Zero-Friction Unstick Presets & File Links:** Expand worker **Activity Peek** (last 5 tool calls + newest thinking heading), dispatch confirmation-gated **Unstick / Resume** nudges, inspect `Screenshot:` reel frames, and open board or worktree files in one click via `window.sidecar.ui.toggleAuxPane({ tabType: "fileView", uri })`.
+- **Live SSE Push Stream & Polling Fallback:** Streams instant board/transcript fingerprint deltas over `GET /api/swarm/stream` (`text/event-stream`) with automatic interval fallback inside Antigravity's `SidecarApp` gateway.
+- **Worker Roster, Context Saturation & `@mention` Graph:** Incrementally tails `transcript.jsonl` to track real `input` / `cache_read` / `output` tokens, `% ctx` context saturation, shimmering active work, and replayable `@mention` topology.
+- **Confined Workspace Git Worktrees:** Listens to `sidecar.getWorkspaceUris()` / `onWorkspaceChange()`, runs `git status --porcelain=v1 -z` with strict root + CWE-59 symlink confinement, and exposes dirty/staged/untracked file rows with 1-click **Open file** actions.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Host["Antigravity Host<br/>(Aux Side Pane + /preload.js)"] <-->|"SidecarApp RPC + theme-change<br/>toggleConversation / toggleAuxPane"| Backend["Fleet Sidecar Backend<br/>(sidecars/fleet_pane/main.mjs)"]
+    UI["Embedded Sidebar SPA<br/>(406.4 KB raw / 120.0 KB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>ETag / 304 + Gzip JSON"| Backend
+    Backend -->|"Bounded 64 KB Chunks + 32-Slot Tail Ring"| Store["swarm_store.mjs"]
+    Backend -->|"Debounced TTL + CWE-59 Confinement"| Git["git_probe.mjs"]
+    Store -.->|"Read-Only"| Brain["~/.gemini/antigravity/brain/&lt;conv&gt;<br/>.system_generated/{swarm,logs}"]
+    Git -.->|"git status --porcelain=v1 -z"| WT["Workspace Git Worktrees"]
+```
+
+---
+
+## Verified Benchmarks
+
+Measured on a 20-worker / 2,000-board-post / 50,000-transcript-line stress fixture (`30` concurrent polling workers):
+
+| Metric | v1.3.0 | **v1.4.0** | Delta |
+| --- | --- | --- | --- |
+| Embedded Sidecar UI (`/`) | `491,828 B` raw / `148,817 B` gz | **`416,186 B` raw / `122,916 B` gz** | **`-15.4%` raw / `-17.4%` wire** |
+| Peak RSS (`VmHWM`, 2k/50k) | `122.84 MB` | **`94.29 MB`** | **`-23.2%`** |
+| Throughput (`req/s`) | `1,914.6 req/s` | **`3,711 req/s`** | **`+93.8%`** |
+| Latency (`p50` / `p95`) | `14.80 ms` / `25.79 ms` | **`3.62 ms` / `21.25 ms`** | **`-75.5%` p50** |
+| Simultaneous SSE (`/api/swarm/stream` x5) | `5/5` (`0` drops) | **`5/5` (`0` drops)** | Pass |
+| E2E Gate + Replay + Sloplint | `31/31` + `6/6` | **`32/32` + `7/7` + `0 FAIL / 0 WARN`** | Pass |
+
+---
+
+## Quick Start (Antigravity Plugin)
+
+1. Install into `~/.gemini/config/plugins/fleet/` atomically:
 
 ```bash
 ./install.sh
 ```
 
-By default, `./install.sh` installs atomically into `~/.gemini/config/plugins/fleet/` (override with `--dest <dir>`).
+2. Open Antigravity Customizations (**`customization://fleet`**) to enable **`fleet`**.
+3. Open the auxiliary sidebar via **`sidecar://fleet/fleet_pane/`**, or invoke **`/fleet`** in chat to orchestrate a `plan.json`-tracked swarm with isolated worktrees.
 
-Once installed:
-1. Open Antigravity Customizations to manage **`fleet`** (`customization://fleet`).
-2. Toggle the side pane with **`[Fleet](sidecar://fleet/fleet_pane/)`**, or run **`/fleet`** in chat to coordinate a swarm with `plan.json` tracking and isolated worktrees.
+> **Legacy v0.12.0:** Fleet pivoted cleanly to an Antigravity-native sidecar plugin in `v1.0.0`. The legacy standalone Rust binary remains preserved at git tag `v0.12.0`.
 
-## Standalone Local Preview & Development
-
-You can also run Fleet's sidecar backend standalone against local `<appData>/brain/` state (default `127.0.0.1:18430`):
-
-```bash
-cd frontend && npm ci && npm run build:live-web
-cd ../sidecars/fleet_pane && npm test
-node main.mjs --port 18430
-```
-
-Flags:
-- `--port <n>`: Bind standalone HTTP server on `127.0.0.1:<n>` (default `18430`).
-- `--app-data-dir <path>`: Point to a custom Antigravity `<appData>` directory containing `brain/`.
+---
 
 ## Security Model
 
-- Strictly binds `127.0.0.1` loopback; validates loopback `Host` (`403`) and same-origin `Origin` on `POST` (`403`).
-- Prompt `413 Payload Too Large` on oversized request bodies before consuming payload bytes.
-- Strict CWE-22 / CWE-59 confinement on `GET /api/frame` (real path must lie inside `<appData>/brain/` and be explicitly listed on the board or `view.json`) and path validation on `GET /api/worktrees`.
-- Confirmation-gated mutating nudge API (`confirm: true`).
-- Zero external network calls; strict `Content-Security-Policy` (`frame-src 'none'; child-src 'none'`), `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer`.
+- Strictly loopback-bound (`127.0.0.1`) with `Host` loopback `403` validation and same-origin `Origin` checks on mutating `POST` routes (`403`).
+- Prompt `413 Payload Too Large` abort before reading oversized request bodies.
+- Strict CWE-22 / CWE-59 confinement on `GET /api/frame` (canonical `realpath` inside `<appData>/brain/` and listed on board/`view.json`) and `git_probe.mjs` worktree file URIs (escaping symlinks return empty `uri`).
+- Confirmation-gated mutating nudges (`confirm: true`), zero external network calls, `frame-src 'none'`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer`.
 
-## Verification
+---
+
+## Development & Verification
 
 ```bash
 cd sidecars/fleet_pane && npm test
-cd ../../frontend && npm run build:live-web
+cd ../../frontend && npm ci && npm run build:live-web
 npm run check:ui -- --lints
 node e2e/test-live-web.mjs
 ```

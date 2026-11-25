@@ -12,6 +12,23 @@ export const OUT = path.join(E2E, ".out");
 export const CHROME =
   process.env.E2E_CHROME ||
   `${process.env.HOME}/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome`;
+export const CHROME_LAUNCH_OPTS = {
+  executablePath: CHROME,
+  headless: true,
+  args: [
+    "--disable-gpu",
+    "--disable-gpu-compositing",
+    "--disable-gpu-sandbox",
+    "--disable-accelerated-2d-canvas",
+    "--disable-accelerated-video-decode",
+    "--num-raster-threads=1",
+  ],
+  env: {
+    ...process.env,
+    LIBGL_ALWAYS_SOFTWARE: "1",
+    VK_ICD_FILENAMES: "/dev/null",
+  },
+};
 
 export let BASE = "";
 export let REPO_DIR = "";
