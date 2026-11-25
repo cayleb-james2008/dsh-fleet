@@ -20,7 +20,7 @@ import {
 } from "lucide-react";
 import { extractLocalFilePaths, openFileInAuxPane, openWorkerConversation, sendConfirmedNudge } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot, TriageItem } from "../types";
-import { Badge, Button, Card, StatusDot, Textarea, cn, fmtTimeAgo, fmtTokens, humanizeStatus, toast } from "../ui";
+import { Badge, Button, Card, StatusDot, Textarea, cn, fmtElapsed, fmtTimeAgo, fmtTokens, humanizeStatus, toast } from "../ui";
 
 const SEVERITY_BADGE: Record<TriageItem["severity"], { tone: "danger" | "warning" | "info"; label: string }> = {
   urgent: { tone: "danger", label: "Urgent" },
@@ -79,7 +79,13 @@ export function TriageView({
   const [nudgeDraft, setNudgeDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [peekId, setPeekId] = useState<string | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const cardRefs = useRef<Array<HTMLDivElement | null>>([]);
+
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, []);
 
   const triage = snap.triage || [];
   const plan = snap.plan;
@@ -174,6 +180,13 @@ export function TriageView({
               const tools = worker?.recentTools || [];
               const presets = unstickPresetFor(item);
               const paths = extractLocalFilePaths(item.detail);
+              const lastTs = worker?.lastStepAt
+                ? Date.parse(worker.lastStepAt)
+                : worker?.transcriptMtime || worker?.lastPostTs || 0;
+              const elapsedMs = lastTs > 0 ? Math.max(0, nowMs - lastTs) : 0;
+              const elapsed = lastTs > 0 ? fmtElapsed(lastTs, nowMs) : "";
+              const isStalled = item.kind === "stuck" || (!worker?.killed && worker?.status === "working" && elapsedMs >= 600_000);
+              const askStatusPrompt = `@${item.member} Quick status check${item.seq > 0 ? ` (#${item.seq})` : ""}: current step and any blockers?`;
 
               return (
                 <div
@@ -203,6 +216,13 @@ export function TriageView({
                           )}
                           {sev.label}
                         </Badge>
+                        {worker && !worker.killed && (
+                          <Badge tone={worker.status === "working" ? "success" : "neutral"} className="num">
+                            {worker.status === "working" ? "working" : "waiting"}
+                            {elapsed ? ` ${elapsed}` : ""}
+                          </Badge>
+                        )}
+                        {isStalled && <Badge tone="danger">stalled</Badge>}
                         <span className="text-[12px] font-medium text-[var(--ink-2)] num">
                           {item.timestamp ? fmtTimeAgo(item.timestamp) : "now"}
                         </span>
@@ -254,16 +274,28 @@ export function TriageView({
                           )}
                           {item.severity === "urgent" ? presets[0].label : "Nudge"}
                         </Button>
+                        <Button variant="ghost" size="sm" onClick={() => openNudge(item, askStatusPrompt)}>
+                          Ask status
+                        </Button>
                       </>
                     ) : (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => handleCopy(presets[0].prompt, "Follow-up prompt copied")}
-                      >
-                        <ClipboardCopy className="h-3.5 w-3.5" aria-hidden="true" />
-                        Copy {item.severity === "urgent" ? presets[0].label.toLowerCase() : "follow-up"}
-                      </Button>
+                      <>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => handleCopy(presets[0].prompt, "Follow-up prompt copied")}
+                        >
+                          <ClipboardCopy className="h-3.5 w-3.5" aria-hidden="true" />
+                          Copy {item.severity === "urgent" ? presets[0].label.toLowerCase() : "follow-up"}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => handleCopy(askStatusPrompt, "Status prompt copied")}
+                        >
+                          Ask status
+                        </Button>
+                      </>
                     )}
 
                     {worker && (tools.length > 0 || worker.thinkingHeading) && (

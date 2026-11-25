@@ -104,6 +104,7 @@ export function BoardView({
   const [agentFilter, setAgentFilter] = useState<string>("all");
   const [showFilters, setShowFilters] = useState(false);
   const [follow, setFollow] = useState(true);
+  const [visibleLimit, setVisibleLimit] = useState(80);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const rowRefs = useRef<Map<number, HTMLDivElement>>(new Map());
@@ -136,8 +137,22 @@ export function BoardView({
     return hit ? hit.seq : null;
   }, [filtered, viewerMember, lastReadSeq]);
 
+  const hiddenCount = Math.max(0, filtered.length - visibleLimit);
+  const visible = useMemo(
+    () => (hiddenCount > 0 ? filtered.slice(hiddenCount) : filtered),
+    [filtered, hiddenCount],
+  );
+
   const scrollToSeq = (seq: number) => {
     setFollow(false);
+    const idx = filtered.findIndex((m) => m.seq === seq);
+    if (idx >= 0 && idx < filtered.length - visibleLimit) {
+      setVisibleLimit(filtered.length - idx + 20);
+      requestAnimationFrame(() => {
+        rowRefs.current.get(seq)?.scrollIntoView({ behavior: "smooth", block: "center" });
+      });
+      return;
+    }
     const el = rowRefs.current.get(seq);
     if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
   };
@@ -307,8 +322,20 @@ export function BoardView({
         </Card>
       ) : (
         <div className="space-y-2">
-          {filtered.map((m: BoardMessage, idx) => {
-            const prev = idx > 0 ? filtered[idx - 1] : null;
+          {hiddenCount > 0 && (
+            <div className="flex justify-center">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setVisibleLimit((n) => n + 120)}
+                className="num"
+              >
+                Show older posts ({hiddenCount} earlier)
+              </Button>
+            </div>
+          )}
+          {visible.map((m: BoardMessage, idx) => {
+            const prev = idx > 0 ? visible[idx - 1] : null;
             const grouped =
               prev &&
               prev.agent === m.agent &&

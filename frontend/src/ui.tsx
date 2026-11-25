@@ -3,18 +3,43 @@ import {
   useEffect,
   useId,
   useRef,
+  useState,
   type ButtonHTMLAttributes,
   type HTMLAttributes,
   type InputHTMLAttributes,
   type ReactNode,
   type TextareaHTMLAttributes,
 } from "react";
-import { Toaster, toast } from "sonner";
 import { X } from "lucide-react";
 import { animatePanelEnter } from "./motion";
 import type { SwarmSnapshot } from "./types";
 
-export { toast };
+type ToastKind = "success" | "error" | "info";
+interface ToastEntry {
+  id: number;
+  kind: ToastKind;
+  text: string;
+}
+
+let nextToastId = 1;
+let toastQueue: ToastEntry[] = [];
+const toastListeners = new Set<(items: ToastEntry[]) => void>();
+
+function emitToast(kind: ToastKind, msg: string) {
+  const id = nextToastId++;
+  toastQueue = [...toastQueue.slice(-2), { id, kind, text: String(msg || "") }];
+  for (const fn of toastListeners) fn(toastQueue);
+  setTimeout(() => {
+    toastQueue = toastQueue.filter((t) => t.id !== id);
+    for (const fn of toastListeners) fn(toastQueue);
+  }, 3200);
+}
+
+export const toast = Object.assign((msg: string) => emitToast("info", msg), {
+  message: (msg: string) => emitToast("info", msg),
+  success: (msg: string) => emitToast("success", msg),
+  error: (msg: string) => emitToast("error", msg),
+});
 
 export function cn(...parts: Array<string | false | null | undefined>): string {
   return parts.filter(Boolean).join(" ");
@@ -69,6 +94,18 @@ export function fmtTokens(n: number | undefined): string {
   if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(2)}M`;
   if (v >= 1_000) return `${(v / 1_000).toFixed(1)}k`;
   return String(v);
+}
+
+export function fmtElapsed(ts: number | string | null | undefined, nowMs = Date.now()): string {
+  const ms = typeof ts === "number" ? ts : ts ? Date.parse(String(ts)) : NaN;
+  if (!Number.isFinite(ms) || ms <= 0) return "";
+  const sec = Math.max(0, Math.floor((nowMs - ms) / 1000));
+  if (sec < 60) return "<1m";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h`;
+  return `${Math.floor(hr / 24)}d`;
 }
 
 export function fmtTimeAgo(ts: number | string | null | undefined): string {
@@ -365,19 +402,50 @@ export function Modal({
 }
 
 export function FleetToaster({ theme }: { theme: "light" | "dark" }) {
+  const [items, setItems] = useState<ToastEntry[]>(toastQueue);
+
+  useEffect(() => {
+    toastListeners.add(setItems);
+    return () => {
+      toastListeners.delete(setItems);
+    };
+  }, []);
+
+  if (items.length === 0) return null;
+
   return (
-    <Toaster
-      theme={theme}
-      position="bottom-right"
-      toastOptions={{
-        style: {
-          background: "var(--surface)",
-          color: "var(--ink)",
-          border: "1px solid var(--hairline)",
-          fontFamily: "var(--font-sans)",
-          fontSize: "13px",
-        },
-      }}
-    />
+    <div
+      data-theme={theme}
+      aria-live="polite"
+      className="pointer-events-none fixed bottom-3 right-3 z-50 flex max-w-[340px] flex-col gap-1.5"
+    >
+      {items.map((item) => (
+        <div
+          key={item.id}
+          role="status"
+          className={cn(
+            "pointer-events-auto flex items-center justify-between gap-2 rounded-[var(--radius-card)] border px-3 py-2 text-[13px] shadow-[var(--elev-lift)]",
+            item.kind === "error"
+              ? "border-[var(--destructive-foreground)] bg-[var(--bad-soft)] text-[var(--destructive-foreground)]"
+              : item.kind === "success"
+                ? "border-[var(--success-foreground)] bg-[var(--surface)] text-[var(--ink)]"
+                : "border-[var(--hairline)] bg-[var(--surface)] text-[var(--ink)]",
+          )}
+        >
+          <span className="break-words">{item.text}</span>
+          <button
+            type="button"
+            aria-label="Dismiss notification"
+            onClick={() => {
+              toastQueue = toastQueue.filter((t) => t.id !== item.id);
+              for (const fn of toastListeners) fn(toastQueue);
+            }}
+            className="shrink-0 rounded p-0.5 text-[var(--ink-3)] hover:text-[var(--ink)] cursor-pointer"
+          >
+            <X className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+        </div>
+      ))}
+    </div>
   );
 }

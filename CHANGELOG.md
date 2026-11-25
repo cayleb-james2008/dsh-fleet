@@ -3,6 +3,11 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as a
 ready-to-install Antigravity plugin bundle (`tar.gz` + `zip`) with `SHA256SUMS`.
 
+## 1.5.0 - 2026-11-25
+
+- **Worker Duration Pills & Inline Quick-Action Nudge Bar (`frontend/src/components/{TriageView,RosterView}.tsx`, `ui.tsx`, `sidecars/fleet_pane/main.mjs`)**: added live elapsed state badges (`Working 1m`, `Waiting 3m`, `stalled` escalation) and 1-click **Ask status / Wrap up** quick-action chips populating confirmation-gated inline nudge composers, alongside control-character validation on `POST /api/nudge`.
+- **Windowed Board Feed & Bundle/RSS Diet (`frontend/src/components/BoardView.tsx`, `ui.tsx`, `theme.css`, `sidecars/fleet_pane/swarm_store.mjs`)**: windowed long Board feeds to the newest 80 posts with automatic expansion on `#seq` jumps and **Show older posts**, replaced `sonner` with a lightweight theme-synced `FleetToaster` + trimmed unused CSS tokens to drop sidecar `dist/index.html` below `380 KB` raw (`~112 KB` gzip), and moved `swarm_store.mjs` to in-place board transformation + zero-retention compact `tailSteps` rings (`<95 MB` Peak `VmHWM`).
+
 ## 1.4.0 - 2026-11-25
 
 - **Keyboard-First Sidebar Triage (`frontend/src/App.tsx`, `frontend/src/components/TriageView.tsx`)**: added keyboard navigation across Needs-You items (`j`/`k` move focus, `o`/`Enter` open worker chat, `p` pin/unpin `#seq`, `1`–`5` jump tabs) while preserving input focus safety and compact shortcut hints.
