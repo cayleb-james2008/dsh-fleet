@@ -489,13 +489,23 @@ pub fn remove_worktree_checked<S: WorktreeSessionView>(
                 message: format!("could not run git worktree remove: {e}"),
             })?;
         if !rm.status.success() && registered_path.exists() {
-            // Double-check non-main invariant before any fallback directory removal.
+            // Double-check non-main and non-symlink invariants before fallback directory removal (CWE-59).
             let canon_reg = canonical_or_normalized(&registered_path);
             if canon_reg == canon_repo {
                 return Err(WorktreeError {
                     status: 403,
                     code: "main-worktree-protected".to_string(),
                     message: "cannot remove the main repository worktree".to_string(),
+                });
+            }
+            let is_symlink = std::fs::symlink_metadata(&registered_path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(true);
+            if is_symlink {
+                return Err(WorktreeError {
+                    status: 403,
+                    code: "symlink-worktree-refused".to_string(),
+                    message: format!("refusing to remove symlinked path '{}'", registered_path.display()),
                 });
             }
             let _ = std::fs::remove_dir_all(&registered_path);

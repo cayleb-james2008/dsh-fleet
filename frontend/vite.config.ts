@@ -6,7 +6,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
 const root = import.meta.dirname;
-const STAMP = "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v0.9.0 */";
+const STAMP = "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v0.10.0 */";
 
 function singleFile(): Plugin {
   return {
@@ -34,6 +34,15 @@ function singleFile(): Plugin {
 export default defineConfig({
   plugins: [react(), tailwindcss(), singleFile()],
   base: "./",
-  build: { assetsInlineLimit: 100_000_000, cssCodeSplit: false, chunkSizeWarningLimit: 4000, modulePreload: false },
+  build: {
+    target: "es2022",
+    assetsInlineLimit: 100_000_000,
+    cssCodeSplit: false,
+    chunkSizeWarningLimit: 4000,
+    modulePreload: false,
+    rolldownOptions: {
+      treeshake: true,
+    },
+  },
   server: { fs: { allow: [path.resolve(root, "..")] }, proxy: process.env.API_PORT ? { "/api": { target: `http://127.0.0.1:${process.env.API_PORT}`, changeOrigin: true, headers: { Origin: `http://127.0.0.1:${process.env.API_PORT}` } } } : undefined },
 });

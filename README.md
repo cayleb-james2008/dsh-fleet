@@ -130,6 +130,10 @@ the task, status, bucket and transcript, each carries:
   (201; supports symbolic task keys, `depends_on`, `auto_steer_budget`,
   `dry_run: true`, and rejects cycles or unknown dependencies with 400 before
   creating any session).
+- `POST /api/sessions/batch-merge` — 1-click verified wave merge with
+  non-destructive `git merge-tree` conflict preflight (`dry_run: true` for
+  preflight summary, `dry_run: false` to merge clean verified sessions and
+  skip conflicting ones).
 - `GET /api/metrics` — live cached board telemetry (`first_pass_count`,
   `auto_healed_count`, `needs_you_count`, `first_pass_rate_pct`,
   `effective_pass_rate_pct`, `median_check_ms`, `active_slots`, `max_slots`,

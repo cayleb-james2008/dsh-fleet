@@ -1,5 +1,5 @@
 (() => {
-  const APP_VERSION = "0.9.0";
+  const APP_VERSION = "0.10.0";
   const DB_NAME = "fleet-worktrees-v4";
   const STORE_NAME = "state";
   const BYOK_KEY_SS = "fleet-byok-api-key";
@@ -1732,6 +1732,13 @@
     delete out._branchFiles;
     delete out._checkStepSpecs;
     delete out._inFlight;
+    const healTotal = typeof s.auto_steer_budget === "number" ? s.auto_steer_budget : 0;
+    const healUsed = Array.isArray(s.heal_attempts) ? s.heal_attempts.length : 0;
+    out.heal_budget_total = healTotal;
+    out.heal_budget_remaining = Math.max(0, healTotal - healUsed);
+    if (typeof s.elapsed_ms === "number") {
+      out.duration_ms = s.elapsed_ms;
+    }
     return out;
   }
 
@@ -1916,6 +1923,7 @@
         features: {
           sse: true,
           batch: true,
+          batch_merge: true,
           merge_check: true,
           policy_test: true,
           prune_worktrees: true,
@@ -2103,6 +2111,122 @@
         check_cmd: "npm test",
         auto_steer_budget: MAX_HEAL_ATTEMPTS,
         tasks
+      });
+    }
+
+    if (method === "POST" && u.pathname === "/api/sessions/batch-merge") {
+      const dryRun = Boolean(body.dry_run);
+      const strategy = String(body.strategy || "merge").toLowerCase();
+      const repoFilter = body.repo ? String(body.repo).trim() : "";
+      const idSet = Array.isArray(body.ids) && body.ids.length > 0 ? new Set(body.ids.map(String)) : null;
+      const candidates = state.sessions.filter(
+        (s) =>
+          (idSet ? idSet.has(s.id) : s.status === "done" && Boolean(s.verified_commit)) &&
+          (!repoFilter || s.repo === repoFilter)
+      );
+      let cleanCount = 0;
+      let conflictCount = 0;
+      let mergedCount = 0;
+      let skippedCount = 0;
+      let failedCount = 0;
+      const results = [];
+      for (const s of candidates) {
+        if (s.status !== "done" || !s.verified_commit || !state.repos[s.repo]) {
+          skippedCount++;
+          results.push({
+            id: s.id,
+            task: s.task,
+            repo: s.repo,
+            branch: s.branch,
+            status: "skipped",
+            clean: false,
+            can_apply: false,
+            conflicting_files: [],
+            error: "Session is not verified done."
+          });
+          continue;
+        }
+        const chk = computeMergeCheck(s);
+        const repo = state.repos[s.repo];
+        const canApply = chk.clean && !(strategy === "ff" && chk.commits_behind > 0);
+        if (canApply) cleanCount++;
+        else conflictCount++;
+        if (dryRun) {
+          results.push({
+            id: s.id,
+            task: s.task,
+            repo: s.repo,
+            branch: s.branch,
+            target: repo.branch,
+            status: canApply ? "ready" : "conflict",
+            clean: chk.clean,
+            can_apply: canApply,
+            conflicting_files: chk.conflicting_files || [],
+            commits_ahead: chk.commits_ahead || 0,
+            commits_behind: chk.commits_behind || 0,
+            error: canApply ? null : chk.clean ? "Fast-forward not possible." : "Merge conflict detected."
+          });
+          continue;
+        }
+        if (!canApply) {
+          skippedCount++;
+          results.push({
+            id: s.id,
+            task: s.task,
+            repo: s.repo,
+            branch: s.branch,
+            target: repo.branch,
+            status: "skipped",
+            clean: chk.clean,
+            can_apply: false,
+            conflicting_files: chk.conflicting_files || [],
+            error: chk.clean ? "Fast-forward not possible." : "Merge conflict detected."
+          });
+          continue;
+        }
+        const head = repoHead(s.repo);
+        const mergedFiles = { ...head.files };
+        const changedKeys = Object.keys(s._branchFiles).filter((k) => s._branchFiles[k] !== s._baseFiles[k]);
+        for (const k of changedKeys) mergedFiles[k] = s._branchFiles[k];
+        const mergeHash = shortHash(head.hash + ":" + s.verified_commit + ":" + strategy + ":" + Date.now());
+        repo.commits.push({
+          hash: mergeHash,
+          parent: head.hash,
+          message: strategy + " fleet session " + s.id + ": " + s.task,
+          ts: Date.now(),
+          files: mergedFiles
+        });
+        s.status = "merged";
+        s.bucket = "done";
+        s.merge_strategy = strategy;
+        s.merge_error = null;
+        appendLine(s, "merged (" + strategy + ") into " + repo.branch + " at " + mergeHash + " (worktree removed)");
+        mergedCount++;
+        results.push({
+          id: s.id,
+          task: s.task,
+          repo: s.repo,
+          branch: repo.branch,
+          status: "merged",
+          clean: true,
+          can_apply: true,
+          conflicting_files: []
+        });
+      }
+      if (!dryRun && mergedCount > 0) {
+        await persistState();
+        emitSse("sessions", { sessions: state.sessions.filter((x) => x.bucket !== "archived").map(publicSession) });
+      }
+      return jsonResp({
+        dry_run: dryRun,
+        strategy,
+        total: results.length,
+        clean_count: cleanCount,
+        conflict_count: conflictCount,
+        merged_count: mergedCount,
+        skipped_count: skippedCount,
+        failed_count: failedCount,
+        results
       });
     }
 

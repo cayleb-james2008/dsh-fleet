@@ -22,6 +22,7 @@ pub mod autoheal;
 pub mod budget;
 pub mod checks;
 pub mod dag;
+pub mod http_assets;
 pub mod merge_check;
 pub mod metrics;
 pub mod policy;

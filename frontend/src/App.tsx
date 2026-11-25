@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence, m } from "motion/react";
 import {
   Command as CommandIcon,
   Cpu,
+  GitMerge,
   KeyRound,
   LayoutGrid,
   Moon,
@@ -30,6 +31,7 @@ import {
   toast,
 } from "./ui";
 import {
+  batchMergeVerifiedWave,
   computeLocalBudget,
   computeLocalMetrics,
   DEFAULT_PLAYBOOKS,
@@ -122,6 +124,8 @@ export function App() {
   const [multiSelect, setMultiSelect] = useState(false);
   const [bulkSelected, setBulkSelected] = useState<Set<string>>(() => new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
+  const [waveMergeBusy, setWaveMergeBusy] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [inboxOpenDesktop, setInboxOpenDesktop] = useState(false);
@@ -243,6 +247,18 @@ export function App() {
   });
 
   const all = sessions ?? [];
+  const hasRunning = useMemo(() => all.some(isActivelyRunning), [all]);
+  const verifiedDoneSessions = useMemo(
+    () => all.filter((s) => s.status === "done" && isVerified(s)),
+    [all],
+  );
+
+  useEffect(() => {
+    if (!hasRunning) return;
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [hasRunning]);
 
   // Auto-open the top active/needs-you/verified run on first load so desktop opens directly into work.
   useEffect(() => {
@@ -431,12 +447,77 @@ export function App() {
           e.preventDefault();
           openSession(navOrdered[0].id, nextTab);
         }
+        return;
+      }
+      if (e.key === "1" || e.key === "2" || e.key === "3" || e.key === "4") {
+        e.preventDefault();
+        const map: Record<string, StatusFilter> = {
+          "1": "all",
+          "2": "needs-you",
+          "3": "working",
+          "4": "done",
+        };
+        setStatusFilter(map[e.key]);
+        if (!leftOpen && md) setLeftOpen(true);
+        if (!md) setMobilePane("inbox");
+        return;
+      }
+      if (e.key === "[" || e.key === "]") {
+        if (inbox.length === 0) return;
+        e.preventDefault();
+        const curIdx = selected ? inbox.findIndex((s) => s.id === selected) : -1;
+        const nextIdx =
+          e.key === "]"
+            ? curIdx < 0
+              ? 0
+              : (curIdx + 1) % inbox.length
+            : curIdx <= 0
+              ? inbox.length - 1
+              : curIdx - 1;
+        const target = inbox[nextIdx];
+        if (target) openSession(target.id, requestedTab);
+        return;
+      }
+      if (e.key === "y") {
+        const target =
+          (current && current.status === "needs-you" ? current : null) ??
+          inbox[0] ??
+          null;
+        if (target) {
+          e.preventDefault();
+          void retry(target.id);
+        }
+        return;
+      }
+      if (e.key === "x") {
+        const target =
+          (current && current.status === "needs-you" ? current : null) ??
+          inbox[0] ??
+          null;
+        if (target) {
+          e.preventDefault();
+          void dismiss(target.id);
+        }
+        return;
+      }
+      if (e.key === "s" && current && current.status !== "merged") {
+        e.preventDefault();
+        setLaunchpadOpen(false);
+        setViewMode("board");
+        setTimeout(() => document.getElementById("steerText")?.focus(), 20);
+        return;
+      }
+      if (e.key === "m" && current && current.status === "done" && isVerified(current)) {
+        e.preventDefault();
+        void quickMergeSingle(current);
       }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [
     selected,
+    current,
+    inbox,
     requestedTab,
     navOrdered,
     paletteOpen,
@@ -554,6 +635,73 @@ export function App() {
     void refresh();
   };
 
+  const quickMergeSingle = async (s: Session) => {
+    if (hasServerV050) {
+      const chk = await fetchMergeCheck(s, true);
+      if (!chk.clean) {
+        toast.error(`Cannot merge ${s.id}: conflict in ${chk.conflicting_files.join(", ") || "target branch"}.`);
+        return;
+      }
+    }
+    const err = await postJson(`/api/sessions/${s.id}/merge`, { strategy: s.merge_strategy || "merge" });
+    if (err) toast.error(err);
+    else toast.success(`Merged ${s.branch || s.id}.`);
+    void refresh();
+  };
+
+  const handleBatchMergeWave = async () => {
+    if (waveMergeBusy || verifiedDoneSessions.length === 0) return;
+    setWaveMergeBusy(true);
+    const supportsBatchMerge = Boolean(policy?.features?.batch_merge) || webEngine;
+    const preflight = await batchMergeVerifiedWave(
+      { strategy: "merge", dry_run: true },
+      all,
+      supportsBatchMerge,
+    );
+    if (!preflight.ok) {
+      setWaveMergeBusy(false);
+      toast.error(preflight.error || "Batch merge preflight failed.");
+      return;
+    }
+    if (preflight.total === 0) {
+      setWaveMergeBusy(false);
+      toast.info("No verified done sessions ready to merge.");
+      return;
+    }
+    if (preflight.clean_count === 0) {
+      setWaveMergeBusy(false);
+      const firstConflict = preflight.results.find((r) => !r.clean || !r.can_apply);
+      const files = firstConflict?.conflicting_files?.join(", ");
+      toast.warning(
+        `Preflight blocked: ${preflight.conflict_count} verified ${preflight.conflict_count === 1 ? "session has" : "sessions have"} conflicts${files ? ` (${files})` : ""}.`,
+      );
+      return;
+    }
+
+    const res = await batchMergeVerifiedWave(
+      { strategy: "merge", dry_run: false },
+      all,
+      supportsBatchMerge,
+    );
+    setWaveMergeBusy(false);
+    if (!res.ok) {
+      toast.error(res.error || "Batch merge failed.");
+      return;
+    }
+    if (res.merged_count > 0) {
+      const notes = [
+        res.skipped_count > 0 ? `${res.skipped_count} conflicted skipped` : "",
+        res.failed_count > 0 ? `${res.failed_count} failed` : "",
+      ].filter(Boolean);
+      toast.success(
+        `Wave merged ${res.merged_count} verified ${res.merged_count === 1 ? "session" : "sessions"}${notes.length ? ` (${notes.join(", ")})` : ""}.`,
+      );
+    } else {
+      toast.warning(`No sessions merged (${res.skipped_count} skipped, ${res.failed_count} failed).`);
+    }
+    void refresh();
+  };
+
   const toggleBulkCard = (id: string) => {
     setBulkSelected((prev) => {
       const next = new Set(prev);
@@ -641,7 +789,7 @@ export function App() {
               )}
             >
               {viewMode === "board" && !launchpadOpen && (
-                <motion.span
+                <m.span
                   layoutId="fleet-view-pill"
                   transition={glide}
                   aria-hidden="true"
@@ -662,7 +810,7 @@ export function App() {
               )}
             >
               {viewMode === "dag" && (
-                <motion.span
+                <m.span
                   layoutId="fleet-view-pill"
                   transition={glide}
                   aria-hidden="true"
@@ -690,6 +838,22 @@ export function App() {
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
+          {verifiedDoneSessions.length > 0 && (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              data-testid="batch-merge-wave-btn"
+              disabled={waveMergeBusy}
+              onClick={() => void handleBatchMergeWave()}
+              className="hidden lg:inline-flex"
+            >
+              <GitMerge className="size-3.5 text-[var(--success-foreground)]" strokeWidth={1.5} aria-hidden />
+              <span>
+                {waveMergeBusy ? "Merging..." : `Merge wave (${verifiedDoneSessions.length})`}
+              </span>
+            </Button>
+          )}
           <div className="hidden md:inline-flex">
             <InboxPopover
               open={inboxOpenDesktop}
@@ -804,6 +968,7 @@ export function App() {
               multiSelect={multiSelect}
               bulkSelected={bulkSelected}
               bulkBusy={bulkBusy}
+              nowMs={nowMs}
               onQuery={setQuery}
               onStatusFilter={setStatusFilter}
               onRepoFilter={setRepoFilter}
@@ -835,6 +1000,9 @@ export function App() {
                 <DagWaveGraph
                   sessions={shown}
                   selectedId={selected}
+                  waveMergeableCount={verifiedDoneSessions.length}
+                  waveMergeBusy={waveMergeBusy}
+                  onBatchMergeWave={() => void handleBatchMergeWave()}
                   onOpen={(id) => openSession(id, "tr")}
                   onNewBatch={() => triggerComposer("batch", null)}
                 />
@@ -866,6 +1034,7 @@ export function App() {
                   supportsServerV050={hasServerV050}
                   mergeCheck={mergeCheck}
                   checkingMerge={checkingMerge}
+                  nowMs={nowMs}
                   onRecheckMerge={recheckMerge}
                   onTabChange={setRequestedTab}
                   onClose={closeDetail}
@@ -882,7 +1051,7 @@ export function App() {
         <AnimatePresence initial={false}>
           {((xl && rightOpen && showWorkspaceInCenter && Boolean(current) && !launchpadOpen) ||
             (!md && mobilePane === "inspector")) && (
-            <motion.div
+            <m.div
               key="right-inspector"
               initial={{ opacity: 0, x: 6 }}
               animate={{ opacity: 1, x: 0 }}
@@ -895,12 +1064,14 @@ export function App() {
                 mergeCheck={mergeCheck}
                 checkingMerge={checkingMerge}
                 supportsServerV050={hasServerV050}
+                nowMs={nowMs}
+                timeoutSecs={policy?.timeout_secs}
                 onRecheckMerge={recheckMerge}
                 onOpenTab={(tab) => {
                   if (current) openSession(current.id, tab);
                 }}
               />
-            </motion.div>
+            </m.div>
           )}
         </AnimatePresence>
       </div>
@@ -1006,6 +1177,8 @@ export function App() {
           });
         }}
         onRetrySession={(id) => void retry(id)}
+        onBatchMergeWave={() => void handleBatchMergeWave()}
+        verifiedDoneCount={verifiedDoneSessions.length}
       />
 
       {/* #67: Light/Dark theme switcher lives EXCLUSIVELY inside Settings */}

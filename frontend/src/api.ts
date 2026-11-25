@@ -76,7 +76,37 @@ export type BudgetStatus = {
   remaining_today: number;
   limit_reached: boolean;
   utilization_pct: number;
+  total_heal_attempts_today?: number;
   source: "server" | "local";
+};
+
+export type BatchMergeItemResult = {
+  id: string;
+  task?: string;
+  repo?: string;
+  branch?: string;
+  target?: string;
+  status: "ready" | "conflict" | "merged" | "skipped" | "failed";
+  clean: boolean;
+  can_apply: boolean;
+  conflicting_files: string[];
+  commits_ahead?: number;
+  commits_behind?: number;
+  error?: string | null;
+};
+
+export type BatchMergeResponse = {
+  ok: boolean;
+  dry_run: boolean;
+  strategy: MergeStrategy;
+  total: number;
+  clean_count: number;
+  conflict_count: number;
+  merged_count: number;
+  skipped_count: number;
+  failed_count: number;
+  results: BatchMergeItemResult[];
+  error?: string;
 };
 
 export type PrPreview = {
@@ -225,6 +255,13 @@ export type Session = {
   merge_strategy?: MergeStrategy | null;
   merge_error?: { message?: string; detail?: string } | null;
   elapsed_ms?: number | null;
+  created_at_ms?: number | null;
+  started_at_ms?: number | null;
+  finished_at_ms?: number | null;
+  run_elapsed_ms?: number | null;
+  duration_ms?: number | null;
+  heal_budget_total?: number | null;
+  heal_budget_remaining?: number | null;
 };
 
 export type Agent = { name: string; found: boolean; path?: string };
@@ -236,6 +273,7 @@ export type EngineModels = {
 export type PolicyFeatures = {
   sse?: boolean;
   batch?: boolean;
+  batch_merge?: boolean;
   merge_check?: boolean;
   policy_test?: boolean;
   prune_worktrees?: boolean;
@@ -605,6 +643,13 @@ export function normalizeSession(raw: unknown, idx = 0): Session | null {
     merge_strategy: mergeStrategy,
     merge_error: mergeErr,
     elapsed_ms: asNum(r.elapsed_ms),
+    created_at_ms: asNum(r.created_at_ms),
+    started_at_ms: asNum(r.started_at_ms),
+    finished_at_ms: asNum(r.finished_at_ms),
+    run_elapsed_ms: asNum(r.run_elapsed_ms),
+    duration_ms: asNum(r.duration_ms),
+    heal_budget_total: asNum(r.heal_budget_total),
+    heal_budget_remaining: asNum(r.heal_budget_remaining),
   };
 }
 
@@ -717,6 +762,7 @@ export function normalizePolicy(raw: unknown): Policy | null {
       ? {
           sse: Boolean(fRaw.sse),
           batch: Boolean(fRaw.batch),
+          batch_merge: Boolean(fRaw.batch_merge),
           merge_check: Boolean(fRaw.merge_check),
           policy_test: Boolean(fRaw.policy_test),
           prune_worktrees: Boolean(fRaw.prune_worktrees),
@@ -940,6 +986,7 @@ export function normalizeBudgetStatus(raw: unknown, fallback: BudgetStatus): Bud
     remaining_today: remaining,
     limit_reached: limitReached,
     utilization_pct: util,
+    total_heal_attempts_today: asNum(o.total_heal_attempts_today) ?? undefined,
     source: "server",
   };
 }
@@ -1781,6 +1828,192 @@ export function statusText(s: Session): string {
   }
   if (s.bucket === "working" && s.status === "queued") return `queued #${s.queue_position ?? "?"}`;
   return (s.status || "working").replace(/-/g, " ");
+}
+
+export async function batchMergeVerifiedWave(
+  opts: { ids?: string[]; repo?: string; strategy?: MergeStrategy; dry_run?: boolean },
+  sessions: Session[],
+  supportsBatchMerge: boolean,
+): Promise<BatchMergeResponse> {
+  const strategy = opts.strategy || "merge";
+  const dryRun = Boolean(opts.dry_run);
+  if (supportsBatchMerge) {
+    try {
+      const r = await fetch("/api/sessions/batch-merge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ids: opts.ids && opts.ids.length > 0 ? opts.ids : undefined,
+          repo: opts.repo || undefined,
+          strategy,
+          dry_run: dryRun,
+        }),
+      });
+      const raw = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+      if (r.ok) {
+        const results = Array.isArray(raw.results)
+          ? raw.results.map((item) => {
+              const x = (item || {}) as Record<string, unknown>;
+              return {
+                id: asStr(x.id, ""),
+                task: asStr(x.task, ""),
+                repo: asStr(x.repo, ""),
+                branch: asStr(x.branch, ""),
+                target: asStr(x.target, ""),
+                status: (asStr(x.status, "skipped") as BatchMergeItemResult["status"]),
+                clean: Boolean(x.clean),
+                can_apply: Boolean(x.can_apply),
+                conflicting_files: asStrList(x.conflicting_files),
+                commits_ahead: asNum(x.commits_ahead) ?? undefined,
+                commits_behind: asNum(x.commits_behind) ?? undefined,
+                error: x.error ? asStr(x.error) : null,
+              };
+            })
+          : [];
+        return {
+          ok: true,
+          dry_run: Boolean(raw.dry_run),
+          strategy,
+          total: asNum(raw.total) ?? results.length,
+          clean_count: asNum(raw.clean_count) ?? 0,
+          conflict_count: asNum(raw.conflict_count) ?? 0,
+          merged_count: asNum(raw.merged_count) ?? 0,
+          skipped_count: asNum(raw.skipped_count) ?? 0,
+          failed_count: asNum(raw.failed_count) ?? 0,
+          results,
+        };
+      }
+      if (r.status !== 404) {
+        return {
+          ok: false,
+          dry_run: dryRun,
+          strategy,
+          total: 0,
+          clean_count: 0,
+          conflict_count: 0,
+          merged_count: 0,
+          skipped_count: 0,
+          failed_count: 0,
+          results: [],
+          error: asStr(raw.error, `Batch merge failed (${r.status}).`),
+        };
+      }
+    } catch {
+      return {
+        ok: false,
+        dry_run: dryRun,
+        strategy,
+        total: 0,
+        clean_count: 0,
+        conflict_count: 0,
+        merged_count: 0,
+        skipped_count: 0,
+        failed_count: 0,
+        results: [],
+        error: "Could not reach Fleet for batch merge.",
+      };
+    }
+  }
+
+  // Fallback for older servers without POST /api/sessions/batch-merge
+  const idSet = opts.ids && opts.ids.length > 0 ? new Set(opts.ids) : null;
+  const targets = sessions.filter(
+    (s) => s.status === "done" && isVerified(s) && (!idSet || idSet.has(s.id)) && (!opts.repo || s.repo === opts.repo),
+  );
+  const results: BatchMergeItemResult[] = [];
+  let cleanCount = 0;
+  let conflictCount = 0;
+  let mergedCount = 0;
+  let skippedCount = 0;
+  let failedCount = 0;
+  for (const s of targets) {
+    const chk = await fetchMergeCheck(s, true);
+    if (!chk.clean) {
+      conflictCount++;
+      if (!dryRun) skippedCount++;
+      results.push({
+        id: s.id,
+        task: s.task,
+        repo: s.repo,
+        branch: s.branch,
+        status: dryRun ? "conflict" : "skipped",
+        clean: false,
+        can_apply: false,
+        conflicting_files: chk.conflicting_files,
+        error: chk.error || "Merge conflict detected during preflight check.",
+      });
+      continue;
+    }
+    cleanCount++;
+    if (dryRun) {
+      results.push({
+        id: s.id,
+        task: s.task,
+        repo: s.repo,
+        branch: s.branch,
+        status: "ready",
+        clean: true,
+        can_apply: true,
+        conflicting_files: [],
+      });
+      continue;
+    }
+    const err = await postJson(`/api/sessions/${s.id}/merge`, { strategy });
+    if (err) {
+      failedCount++;
+      results.push({
+        id: s.id,
+        task: s.task,
+        repo: s.repo,
+        branch: s.branch,
+        status: "failed",
+        clean: true,
+        can_apply: false,
+        conflicting_files: [],
+        error: err,
+      });
+    } else {
+      mergedCount++;
+      results.push({
+        id: s.id,
+        task: s.task,
+        repo: s.repo,
+        branch: s.branch,
+        status: "merged",
+        clean: true,
+        can_apply: true,
+        conflicting_files: [],
+      });
+    }
+  }
+  return {
+    ok: true,
+    dry_run: dryRun,
+    strategy,
+    total: targets.length,
+    clean_count: cleanCount,
+    conflict_count: conflictCount,
+    merged_count: mergedCount,
+    skipped_count: skippedCount,
+    failed_count: failedCount,
+    results,
+  };
+}
+
+export function liveSessionDurationMs(s: Session, nowMs: number): number | null {
+  if (typeof s.run_elapsed_ms === "number" && Number.isFinite(s.run_elapsed_ms)) {
+    return s.run_elapsed_ms;
+  }
+  if (typeof s.duration_ms === "number" && Number.isFinite(s.duration_ms)) {
+    return s.duration_ms;
+  }
+  if (isActivelyRunning(s) && typeof s.started_at_ms === "number" && s.started_at_ms > 0) {
+    return Math.max(0, nowMs - s.started_at_ms);
+  }
+  if (typeof s.elapsed_ms === "number" && Number.isFinite(s.elapsed_ms)) {
+    return s.elapsed_ms;
+  }
+  return null;
 }
 
 export function formatDurationMs(ms: number | null | undefined): string {

@@ -9,7 +9,7 @@ import {
   type ReactNode,
   type TextareaHTMLAttributes,
 } from "react";
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence, m } from "motion/react";
 import { Toaster, toast } from "sonner";
 import { ChevronDown, ChevronRight, X } from "lucide-react";
 import { enter, glide, instant, reveal } from "./motion";
@@ -200,7 +200,7 @@ export function SegmentedControl<T extends string>({
             )}
           >
             {active && layoutId ? (
-              <motion.span
+              <m.span
                 layoutId={layoutId}
                 transition={byKeyboard ? instant : glide}
                 aria-hidden="true"
@@ -319,7 +319,7 @@ export function Dialog({
   return (
     <AnimatePresence>
       {open && (
-        <motion.div
+        <m.div
           key="dialog-backdrop"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
@@ -331,7 +331,7 @@ export function Dialog({
             if (e.target === e.currentTarget) onClose();
           }}
         >
-          <motion.div
+          <m.div
             ref={panelRef}
             initial={{ opacity: 0, y: 6 }}
             animate={{ opacity: 1, y: 0 }}
@@ -359,8 +359,8 @@ export function Dialog({
               </Button>
             </div>
             <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4">{children}</div>
-          </motion.div>
-        </motion.div>
+          </m.div>
+        </m.div>
       )}
     </AnimatePresence>
   );
@@ -414,7 +414,7 @@ export function Drawer({
   return (
     <AnimatePresence>
       {open && (
-        <motion.div
+        <m.div
           key="drawer-backdrop"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
@@ -426,7 +426,7 @@ export function Drawer({
             if (e.target === e.currentTarget) onClose();
           }}
         >
-          <motion.div
+          <m.div
             ref={panelRef}
             id={id}
             initial={{ opacity: 0, x: 16 }}
@@ -449,8 +449,8 @@ export function Drawer({
               </Button>
             </div>
             <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4">{children}</div>
-          </motion.div>
-        </motion.div>
+          </m.div>
+        </m.div>
       )}
     </AnimatePresence>
   );
@@ -554,7 +554,7 @@ export function PopoverPanel({
       {trigger}
       <AnimatePresence>
         {open && (
-          <motion.div
+          <m.div
             key="popover"
             initial={{ opacity: 0, y: side === "top" ? 4 : -4 }}
             animate={{ opacity: 1, y: 0 }}
@@ -569,7 +569,7 @@ export function PopoverPanel({
             )}
           >
             {children}
-          </motion.div>
+          </m.div>
         )}
       </AnimatePresence>
     </div>

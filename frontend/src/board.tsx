@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { motion } from "motion/react";
+import { m } from "motion/react";
 import {
   BookMarked,
   CheckCircle2,
@@ -32,6 +32,7 @@ import {
   isFailed,
   isQueuedOrBlocked,
   isVerified,
+  liveSessionDurationMs,
   planGoal,
   receiptLine,
   repoBasename,
@@ -66,6 +67,7 @@ export function SessionInboxRail({
   multiSelect,
   bulkSelected,
   bulkBusy,
+  nowMs,
   onQuery,
   onStatusFilter,
   onRepoFilter,
@@ -93,6 +95,7 @@ export function SessionInboxRail({
   multiSelect: boolean;
   bulkSelected: Set<string>;
   bulkBusy: boolean;
+  nowMs: number;
   onQuery: (q: string) => void;
   onStatusFilter: (f: StatusFilter) => void;
   onRepoFilter: (r: string) => void;
@@ -123,8 +126,8 @@ export function SessionInboxRail({
   });
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-[var(--board)]">
-      <div className="space-y-2 border-b border-[var(--hairline)] p-2.5">
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="space-y-2 border-b border-[var(--hairline)] bg-[var(--board)] p-2.5">
         <div className="flex items-center gap-2">
           <Input
             ref={searchInputRef}
@@ -194,7 +197,7 @@ export function SessionInboxRail({
         )}
       </div>
 
-      <div className="flex-1 min-h-0 overflow-y-auto" aria-label="Session lanes">
+      <div className="flex-1 min-h-0 overflow-y-auto bg-[var(--board)]" aria-label="Session lanes">
         {sessions === null ? (
           <div className="p-4 text-[13px] text-[var(--ink-2)]">
             {unreachable ? (
@@ -226,6 +229,7 @@ export function SessionInboxRail({
               const running = isActivelyRunning(s);
               const queued = isQueuedOrBlocked(s);
               const heal = healBadgeInfo(s);
+              const durMs = liveSessionDurationMs(s, nowMs);
               const tail = running && s.transcript.length > 0 ? s.transcript[s.transcript.length - 1] : "";
               const checked = bulkSelected.has(s.id);
               const tone = verified ? "green" : failed ? "red" : running ? "blue" : queued ? "amber" : "muted";
@@ -243,7 +247,7 @@ export function SessionInboxRail({
                   )}
                 >
                   {isSelected && (
-                    <motion.span
+                    <m.span
                       layoutId="fleet-inbox-active"
                       transition={glide}
                       aria-hidden="true"
@@ -297,6 +301,9 @@ export function SessionInboxRail({
                           <span className="rounded-[var(--radius-chip)] bg-[var(--ok-soft)] px-1.5 py-0.5 text-[var(--success-foreground)]">
                             {heal.shortLabel}
                           </span>
+                        )}
+                        {durMs !== null && (
+                          <span className="text-[var(--ink-3)]">{formatDurationMs(durMs)}</span>
                         )}
                         {ds.files > 0 && (
                           <span className="inline-flex items-center gap-1">
@@ -563,6 +570,8 @@ export function RightInspectorRail({
   mergeCheck,
   checkingMerge,
   supportsServerV050,
+  nowMs,
+  timeoutSecs,
   onRecheckMerge,
   onOpenTab,
 }: {
@@ -570,6 +579,8 @@ export function RightInspectorRail({
   mergeCheck: MergeCheckResult | null;
   checkingMerge: boolean;
   supportsServerV050: boolean;
+  nowMs: number;
+  timeoutSecs?: number;
   onRecheckMerge: () => void;
   onOpenTab: (tab: TabId) => void;
 }) {
@@ -582,6 +593,10 @@ export function RightInspectorRail({
   }
 
   const healBadge = healBadgeInfo(session);
+  const durMs = liveSessionDurationMs(session, nowMs);
+  const healTotal = session.heal_budget_total ?? session.auto_steer_budget ?? 0;
+  const healUsed = session.heal_attempts?.length ?? 0;
+  const healLeft = session.heal_budget_remaining ?? Math.max(0, healTotal - healUsed);
   const ds = diffStat(session.diff);
   const steps = session.check_steps ?? [];
   const conflictCount = mergeCheck?.conflicting_files.length ?? 0;
@@ -633,6 +648,29 @@ export function RightInspectorRail({
             <div>
               <dt className="text-[var(--ink-3)]">Model</dt>
               <dd className="mt-0.5 mono text-[var(--ink)] break-all">{session.model}</dd>
+            </div>
+          )}
+          {(durMs !== null || healTotal > 0) && (
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
+              {durMs !== null && (
+                <div>
+                  <dt className="text-[var(--ink-3)]">Duration</dt>
+                  <dd className="mt-0.5 mono text-[var(--ink)]">
+                    {formatDurationMs(durMs)}
+                    {isActivelyRunning(session) && timeoutSecs
+                      ? ` / ${Math.max(1, Math.round(timeoutSecs / 60))}m cap`
+                      : ""}
+                  </dd>
+                </div>
+              )}
+              {healTotal > 0 && (
+                <div>
+                  <dt className="text-[var(--ink-3)]">Heal headroom</dt>
+                  <dd className="mt-0.5 mono text-[var(--ink)]">
+                    {healLeft} / {healTotal} left
+                  </dd>
+                </div>
+              )}
             </div>
           )}
           {session.allowed_globs && session.allowed_globs.length > 0 && (
@@ -795,13 +833,26 @@ export function BoardMetricsStrip({
       </div>
 
       {metrics.budget && (
-        <div className="flex items-center gap-3 mono">
+        <div className="flex flex-wrap items-center gap-3 mono">
+          {(metrics.budget.total_heal_attempts_today ?? 0) > 0 && (
+            <span className="text-[var(--ink-2)]">
+              Heals {metrics.budget.total_heal_attempts_today} today
+            </span>
+          )}
+          <span className="text-[var(--ink-2)]">Cap {metrics.budget.max_session_mins}m</span>
           <span
+            data-testid="budget-headroom-indicator"
             className={cn(
-              metrics.budget.limit_reached ? "text-[var(--destructive-foreground)] font-medium" : "text-[var(--ink-2)]",
+              metrics.budget.limit_reached
+                ? "text-[var(--destructive-foreground)] font-medium"
+                : metrics.budget.utilization_pct >= 80
+                  ? "text-[var(--warning-foreground)] font-medium"
+                  : "text-[var(--ink-2)]",
             )}
           >
-            Budget {metrics.budget.sessions_today} / {metrics.budget.daily_session_limit}
+            {metrics.budget.daily_session_limit === 0
+              ? `Budget ${metrics.budget.sessions_today} / unlimited`
+              : `Budget ${metrics.budget.sessions_today} / ${metrics.budget.daily_session_limit} (${metrics.budget.remaining_today} left)`}
           </span>
         </div>
       )}
