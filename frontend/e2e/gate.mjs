@@ -119,10 +119,19 @@ await runChecks("gate", async (check) => {
 
   await check("board renders messages with @mentions, #seq pills, and Pin #seq", async () => {
     const txt = await page.locator("#panel-board").textContent();
-    if (!txt.includes("Sidecar ready for cold check") || !txt.includes("#2")) return false;
+    if (!txt.includes("Sidecar ready for cold check") || !txt.includes("#2") || !txt.includes("Aux pane shot") || txt.includes("/home/")) {
+      return false;
+    }
     await page.locator('button[aria-label="Pin #4"]').click();
     const after = await page.locator("#panel-board").textContent();
     return after.includes("Pinned (1)") && (await page.locator('header :text("Live")').count()) >= 1;
+  });
+
+  await check("board #seq Quote-Reply composer pre-fills Re #<seq>", async () => {
+    await page.locator('button[aria-label="Reply to #2"]').click();
+    const val = await page.locator('#board-reply-2').inputValue();
+    await page.locator('#panel-board button:has-text("Cancel")').click();
+    return val.startsWith("@builder Re #2:");
   });
 
   await page.fill('input[aria-label="Search board messages"]', "no-such-query-xyz");

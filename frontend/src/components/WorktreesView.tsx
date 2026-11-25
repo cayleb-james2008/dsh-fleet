@@ -94,9 +94,12 @@ export function WorktreesView({
                         : `${wt.dirtyFiles + wt.stagedFiles + wt.untrackedFiles} changed`}
                     </Badge>
                   </div>
-                  <p className="text-[12px] text-[var(--ink-3)] mono truncate" title={wt.path}>
+                  <p
+                    className="text-[12px] text-[var(--ink-3)] mono truncate"
+                    title={wt.path.replace(/^\/home\/[^/]+\//, "~/")}
+                  >
                     <FolderGit2 className="inline h-3 w-3 mr-1 align-text-bottom" aria-hidden="true" />
-                    {wt.path}
+                    {wt.path.replace(/^\/home\/[^/]+\//, "~/")}
                   </p>
                 </div>
 

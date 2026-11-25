@@ -67,8 +67,8 @@ Fleet scales from `340px–380px` Antigravity auxiliary sidebars up to wide `144
 
 ## Capabilities
 
-- **Keyboard-First Sidebar Triage:** Navigate Needs-You escalations, quota stalls, open worker questions, and `[done]` deliverables with `j`/`k`, jump across tabs with `1`–`5`, open worker chat directly with `o`/`Enter`, and toggle `Pin #seq` with `p`.
-- **Zero-Friction Unstick Presets & File Links:** Expand worker **Activity Peek** (last 5 tool calls + newest thinking heading), dispatch confirmation-gated **Unstick / Resume** nudges, inspect `Screenshot:` reel frames, and open board or worktree files in one click via `window.sidecar.ui.toggleAuxPane({ tabType: "fileView", uri })`.
+- **Keyboard-First Sidebar Triage & `#seq` Quote-Reply:** Navigate Needs-You escalations with `j`/`k`, jump tabs with `1`–`5`, open worker chat with `o`/`Enter`, pin `#seq` with `p`, reply (`Re #<seq>:`) with `r` or Board `#seq` / **Reply** buttons, and press `?` anytime for the keyboard cheatsheet.
+- **Zero-Friction Unstick Presets & File Links:** Expand worker **Activity Peek** (last 5 tool calls + newest thinking heading), dispatch confirmation-gated **Unstick / Resume** nudges, inspect sanitized `Screenshot:` caption chips & reel frames, and open board or worktree files in one click via `window.sidecar.ui.toggleAuxPane({ tabType: "fileView", uri })`.
 - **Live SSE Push Stream & Polling Fallback:** Streams instant board/transcript fingerprint deltas over `GET /api/swarm/stream` (`text/event-stream`) with automatic interval fallback inside Antigravity's `SidecarApp` gateway.
 - **Worker Roster, Context Saturation & `@mention` Graph:** Incrementally tails `transcript.jsonl` to track real `input` / `cache_read` / `output` tokens, `% ctx` context saturation, shimmering active work, and replayable `@mention` topology.
 - **Confined Workspace Git Worktrees:** Listens to `sidecar.getWorkspaceUris()` / `onWorkspaceChange()`, runs `git status --porcelain=v1 -z` with strict root + CWE-59 symlink confinement, and exposes dirty/staged/untracked file rows with 1-click **Open file** actions.
@@ -80,8 +80,8 @@ Fleet scales from `340px–380px` Antigravity auxiliary sidebars up to wide `144
 ```mermaid
 flowchart LR
     Host["Antigravity Host<br/>(Aux Side Pane + /preload.js)"] <-->|"SidecarApp RPC + theme-change<br/>toggleConversation / toggleAuxPane"| Backend["Fleet Sidecar Backend<br/>(sidecars/fleet_pane/main.mjs)"]
-    UI["Embedded Sidebar SPA<br/>(377.7 KB raw / 112.5 KB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>ETag / 304 + Gzip JSON"| Backend
-    Backend -->|"Bounded 64 KB Chunks + Zero-Retain Tail Ring"| Store["swarm_store.mjs"]
+    UI["Embedded Sidebar SPA<br/>(349.7 KB raw / 102.8 KB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>ETag / 304 + Gzip JSON"| Backend
+    Backend -->|"Zero-String Buffer Scan + Tail Ring"| Store["swarm_store.mjs"]
     Backend -->|"Debounced TTL + CWE-59 Confinement"| Git["git_probe.mjs"]
     Store -.->|"Read-Only"| Brain["~/.gemini/antigravity/brain/&lt;conv&gt;<br/>.system_generated/{swarm,logs}"]
     Git -.->|"git status --porcelain=v1 -z"| WT["Workspace Git Worktrees"]
@@ -91,16 +91,16 @@ flowchart LR
 
 ## Verified Benchmarks
 
-Measured on a 20-worker / 2,000-board-post / 50,000-transcript-line stress fixture (`v1.4.0` & `v1.5.0` measured under `taskset -c 24-31`, `16` concurrent polling workers):
+Measured on a 20-worker / 2,000-board-post / 50,000-transcript-line stress fixture (`v1.4.0`–`v1.6.0` measured under `taskset -c 24-31`, `16` concurrent polling workers):
 
-| Metric | v1.3.0 | v1.4.0 | **v1.5.0** |
+| Metric | v1.4.0 | v1.5.0 | **v1.6.0** |
 | --- | --- | --- | --- |
-| Embedded Sidecar UI (`/`) | `491,828 B` raw / `148,817 B` gz | `416,186 B` raw / `122,803 B` gz | **`386,823 B` raw / `115,244 B` gz** |
-| Peak RSS (`VmHWM`, 2k/50k) | `122.84 MB` | `109.54 MB` | **`93.29 MB`** |
-| Throughput (`req/s`) | `1,914.6 req/s` (`30w`) | `1,324.0 req/s` (`16w`) | **`3,565.4 req/s` (`16w`)** |
-| Latency (`p50` / `p95`) | `14.80 ms` / `25.79 ms` | `11.82 ms` / `17.17 ms` | **`1.86 ms` / `12.85 ms`** |
+| Embedded Sidecar UI (`/`) | `416,186 B` raw / `122,803 B` gz | `386,823 B` raw / `115,189 B` gz | **`358,054 B` raw / `105,312 B` gz** |
+| Peak RSS (`VmHWM`, 2k/50k) | `109.54 MB` | `118.79 MB` | **`89.79 MB`** |
+| Throughput (`req/s`, 16w) | `1,324.0 req/s` | `2,325.6 req/s` | **`5,376.9 req/s`** |
+| Latency (`p50` / `p95`) | `11.82 ms` / `17.17 ms` | `9.45 ms` p95 | **`1.25 ms` / `8.70 ms`** |
 | Simultaneous SSE (`/api/swarm/stream` x5) | `5/5` (`0` drops) | `5/5` (`0` drops) | **`5/5` (`0` drops)** |
-| E2E Gate + Replay + Sloplint | `31/31` + `6/6` | `32/32` + `7/7` + `0 FAIL` | **`33/33` + `7/7` + `0 FAIL / 0 WARN`** |
+| E2E Gate + Replay + Sloplint | `32/32` + `7/7` + `0 FAIL` | `33/33` + `7/7` + `0 FAIL` | **`34/34` + `7/7` + `0 FAIL / 0 WARN`** |
 
 ---
 

@@ -14,6 +14,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { setFlagsFromString } from 'node:v8';
 import { gzipSync } from 'node:zlib';
 import { probeWorktrees } from './git_probe.mjs';
 import {
@@ -136,7 +137,7 @@ export function createFleetHandlers({
       healthPacked = packJsonPayload({
         ok: true,
         name: 'fleet',
-        version: '1.5.0',
+        version: '1.6.0',
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
         sseStream: !isSidecar,
@@ -154,7 +155,44 @@ export function createFleetHandlers({
     if (swarmsListCache.packed && swarmsListCache.key === key && now - swarmsListCache.at < 1000) {
       return swarmsListCache;
     }
-    const swarms = listSwarms(appDataDirs);
+    const swarms = listSwarms(appDataDirs, (appData, id, snap, keys) => {
+      if (defaultConversationId && defaultConversationId !== id) return;
+      const member = snap.members.find((m) => m.conversation_id === id)?.name || null;
+      const cacheKey = `${id}|conversation|${isSidecar}|${Boolean(sendMessageFn)}`;
+      const fullEtag = `${id}|${member || ''}|${snap.etag}`;
+      const prev = swarmPayloadCache.get(cacheKey);
+      if (prev && prev.fullEtag === fullEtag) {
+        prev.checkedAt = now;
+        return;
+      }
+      const packed = packJsonPayload(
+        {
+          conversationId: id,
+          swarm: id,
+          member,
+          resolvedFrom: 'conversation',
+          ...snap,
+          ...unseenBy(snap, member),
+          etag: fullEtag,
+          capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, sseStream: !isSidecar },
+        },
+        `"${createHash('sha256').update(fullEtag).digest('hex').slice(0, 16)}"`,
+      );
+      const unchangedPacked = packJsonPayload({ conversationId: id, swarm: id, member, unchanged: true, etag: fullEtag });
+      if (swarmPayloadCache.has(cacheKey)) swarmPayloadCache.delete(cacheKey);
+      else if (swarmPayloadCache.size >= 16) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
+      swarmPayloadCache.set(cacheKey, {
+        checkedAt: now,
+        appData,
+        swarm: id,
+        member: member || '',
+        membersKey: keys?.membersKey || '',
+        boardKey: keys?.boardKey || '',
+        fullEtag,
+        packed,
+        unchangedPacked,
+      });
+    });
     const sig = swarms.map((s) => `${s.id}:${s.head}:${s.triageCount}:${s.totalTokens}:${s.activeCount}`).join(',');
     if (swarmsListCache.packed && swarmsListCache.sig === sig && swarmsListCache.key === key) {
       swarmsListCache.at = now;
@@ -718,6 +756,9 @@ export async function startStandaloneServer({
 }
 
 async function runCli() {
+  try {
+    setFlagsFromString('--optimize-for-size');
+  } catch {}
   const args = process.argv.slice(2);
   let port = Number(process.env.PORT || 18430);
   let appDataDir = process.env.FLEET_APP_DATA_DIR || '';
