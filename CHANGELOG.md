@@ -3,6 +3,12 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as a
 ready-to-install Antigravity plugin bundle (`tar.gz` + `zip`) with `SHA256SUMS`.
 
+## 1.2.0 - 2026-11-25
+
+- **Zero-Friction Triage Presets, Aux-Pane File Actions & Context Pressure (`frontend/src/`, `skills/fleet/SKILL.md`)**: added confirmation-gated 1-click **Unstick / Resume / Ask status** presets on `[blocked]` / `quota` / `error` / stalled Triage cards with exact `#seq` context, 1-click **Open file** (`window.sidecar.ui.toggleAuxPane({ tabType: "fileView", uri })`) across `Screenshot:` reel items and board/triage file paths, and per-worker **Context & Token Pressure** saturation badges/bars (`% ctx`, `High ctx`, `Quota paused`, `Stalled`) in `RosterView`.
+- **Zero-Alloc Transcript Tail & Low-RSS Store (`sidecars/fleet_pane/{swarm_store.mjs,main.mjs,sidecar.json}`)**: replaced 50k-line full `JSON.parse` allocation with direct scalar extraction across transcript history (parsing JSON objects only for the newest 32-line tail window), stopped retaining parsed 2,000-message JS graphs in heap caches once `etag`-keyed serialized/gzipped `Buffer`s are built (computing `raw` lazily only on `?raw=1`), added 250ms stat-guarded payload caching + fast query slicing in `main.mjs`, and bounded V8 old-space to `64 MB` in `sidecar.json`.
+- **Typography & Sloplint Cleanliness (`frontend/src/index.css`)**: added `text-wrap: pretty` on prose paragraphs and verified `0 FAIL / 0 REFLEX / 0 WARN` (`sloplint --scope app --render`), `30/30` Playwright gate, `6/6` replay, and `11/11` offline `live-web` checks.
+
 ## 1.1.0 - 2026-11-25
 
 - **340px–380px Sidebar Tab & House-Frontend Craft (`frontend/src/`)**: sized and spaced all 5 tabs (`Triage`, `Board`, `Roster`, `Graph`, `Git`) to fit `340px` and `380px` sidebars with zero text clipping or horizontal scroll; switched section headings (`Needs you`, `Swarm plan`, `Roster`, `@Mention graph`, `Git worktrees`) to crisp sentence-case; replaced middle-dot metadata separators with spaced pills/badges; removed nested card-in-card borders inside Swarm plan and empty-state presets; and humanized workflow statuses (`In progress`, `Done`, `Running`).

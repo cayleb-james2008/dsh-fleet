@@ -5,6 +5,22 @@ import type { SwarmMember, SwarmSnapshot } from "../types";
 import { Badge, Button, Card, StatusDot, Textarea, cn, fmtTokens, toast } from "../ui";
 
 const ORDER: Record<SwarmMember["status"], number> = { working: 0, waiting: 1, killed: 2 };
+const CONTEXT_BUDGET_TOKENS = 200_000;
+const STALL_MS = 10 * 60 * 1000;
+
+function contextPressure(m: SwarmMember): { pct: number; tone: "neutral" | "info" | "warning" | "danger"; label: string } {
+  const ctx = m.lastContextTokens || m.usage.inputTokens + m.usage.cacheReadTokens;
+  const pct = Math.min(100, Math.round((ctx / CONTEXT_BUDGET_TOKENS) * 100));
+  if (m.failure?.kind === "quota") return { pct, tone: "danger", label: "Quota paused" };
+  if (m.failure) return { pct, tone: "danger", label: "Error" };
+  if (m.status === "working" && m.transcriptMtime && Date.now() - m.transcriptMtime > STALL_MS) {
+    return { pct, tone: "warning", label: "Stalled" };
+  }
+  if (ctx >= 140_000) return { pct, tone: "danger", label: `${pct}% ctx` };
+  if (ctx >= 90_000) return { pct, tone: "warning", label: `${pct}% ctx` };
+  if (ctx > 0) return { pct, tone: "info", label: `${pct}% ctx` };
+  return { pct: 0, tone: "neutral", label: "Idle ctx" };
+}
 
 export function RosterView({
   snap,
@@ -86,6 +102,7 @@ export function RosterView({
                     : "Waiting";
             const peeking = peekMember === m.name;
             const tools = m.recentTools || [];
+            const pressure = contextPressure(m);
 
             return (
               <Card key={m.name} className={cn("p-3 space-y-2", m.killed && "opacity-65")}>
@@ -143,9 +160,10 @@ export function RosterView({
                   </div>
                 </div>
 
-                {/* Line 2: Clean spaced pills (zero middle-dot separators) */}
+                {/* Line 2: Clean spaced pills + Context Pressure */}
                 <div className="flex flex-wrap items-center gap-1.5 text-[12px] text-[var(--ink-2)]">
                   <Badge tone={m.status === "working" ? "success" : "neutral"}>{statusText}</Badge>
+                  {!m.killed && <Badge tone={pressure.tone} className="num">{pressure.label}</Badge>}
                   <Badge tone="neutral" className="num">{m.steps} steps</Badge>
                   <Badge tone="neutral" className="num">{m.posts} posts</Badge>
                   {m.unread > 0 && (
@@ -159,12 +177,29 @@ export function RosterView({
                   )}
                 </div>
 
-                {/* Line 3: Token telemetry */}
-                <div className="flex flex-wrap items-center gap-2.5 rounded-[var(--radius-chip)] bg-[var(--board)] px-2.5 py-1.5 text-[12px] text-[var(--ink-2)] num">
-                  <span className="font-semibold text-[var(--ink)]">{fmtTokens(m.usage.totalTokens)} tok</span>
-                  <span>in {fmtTokens(m.usage.inputTokens)}</span>
-                  <span>cache {fmtTokens(m.usage.cacheReadTokens)}</span>
-                  <span>out {fmtTokens(m.usage.outputTokens)}</span>
+                {/* Line 3: Token telemetry & Context saturation bar */}
+                <div className="rounded-[var(--radius-chip)] bg-[var(--board)] px-2.5 py-1.5 space-y-1.5">
+                  <div className="flex flex-wrap items-center gap-2.5 text-[12px] text-[var(--ink-2)] num">
+                    <span className="font-semibold text-[var(--ink)]">{fmtTokens(m.usage.totalTokens)} tok</span>
+                    <span>in {fmtTokens(m.usage.inputTokens)}</span>
+                    <span>cache {fmtTokens(m.usage.cacheReadTokens)}</span>
+                    <span>out {fmtTokens(m.usage.outputTokens)}</span>
+                  </div>
+                  {!m.killed && pressure.pct > 0 && (
+                    <div className="h-1 w-full overflow-hidden rounded-full bg-[var(--track)]" aria-hidden="true">
+                      <div
+                        className={cn(
+                          "h-full rounded-full",
+                          pressure.tone === "danger"
+                            ? "bg-[var(--dot-red)]"
+                            : pressure.tone === "warning"
+                              ? "bg-[var(--dot-amber)]"
+                              : "bg-[var(--blue)]",
+                        )}
+                        style={{ width: `${Math.max(4, pressure.pct)}%` }}
+                      />
+                    </div>
+                  )}
                 </div>
 
                 {/* Line 4: Shimmering live activity or error detail */}
@@ -177,7 +212,7 @@ export function RosterView({
                   <p className="text-[12px] text-[var(--destructive-foreground)] break-words">{m.failure.text}</p>
                 )}
 
-                {/* Expandable Worker Activity Peek (last 5 tool calls + thinking heading) */}
+                {/* Expandable Worker Activity Peek */}
                 {peeking && (
                   <div className="rounded-[var(--radius-chip)] bg-[var(--board)] px-2.5 py-2 space-y-1.5 text-[12px]">
                     <p className="font-semibold text-[var(--ink)]">Recent worker activity</p>

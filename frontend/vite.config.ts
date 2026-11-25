@@ -9,7 +9,7 @@ import tailwindcss from "@tailwindcss/vite";
 
 const root = import.meta.dirname;
 const STAMP =
-  "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v1.1.0 */";
+  "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v1.2.0 */";
 
 function sidecarSingleFile(): Plugin {
   return {

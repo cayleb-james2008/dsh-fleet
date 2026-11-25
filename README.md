@@ -8,8 +8,8 @@ Fleet lives directly in Antigravity's auxiliary side pane (`SIDECAR_UI_ENTRYPOIN
 
 ## What It Gives You
 
-- **Needs-You Triage Inbox & Plan Tracking:** Surfaces stalled workers, model/quota errors, open worker questions, `[blocked]` escalations, unverified `[done]` deliverables, `plan.json` workstreams/milestones/gates, worker-flagged `Screenshot:` captures, and 1-click **Copy swarm digest** Markdown summaries.
-- **Worker Activity Peek & Live Token Telemetry:** Incrementally tails each member's `transcript.jsonl` to display live shimmering tool/thinking activity, expandable **Activity Peek** (last 5 tool calls + thinking heading), step counts, and real `input` / `cache_read` / `output` token totals.
+- **Needs-You Triage Inbox, Unstick Presets & File Actions:** Surfaces stalled workers, model/quota errors, open worker questions, `[blocked]` escalations, unverified `[done]` deliverables, confirmation-gated 1-click **Unstick / Resume** presets, `plan.json` workstreams/milestones/gates, worker-flagged `Screenshot:` captures with 1-click **Open file** (`toggleAuxPane`), and 1-click **Copy swarm digest** Markdown summaries.
+- **Worker Activity Peek & Context Pressure Telemetry:** Incrementally tails each member's `transcript.jsonl` to display live shimmering tool/thinking activity, expandable **Activity Peek** (last 5 tool calls + thinking heading), step counts, active context saturation (`% ctx` / `High ctx` / `Quota paused`), and real `input` / `cache_read` / `output` token totals.
 - **Board Feed & `@mention` Graph:** Filterable, `#seq`-clickable board stream with unread `New` dividers plus an interactive `@mention` topology graph with timeline replay.
 - **Workspace Git Worktrees:** Subscribes to `sidecar.getWorkspaceUris()` / `onWorkspaceChange()` and probes git worktree branches, dirty/staged/untracked counts, and latest commit metadata with debounced caching.
 - **Multi-Swarm Switcher & Empty-State Presets:** Switch across active or recent swarms in `<appData>/brain/` or launch `/fleet` swarm presets (`Feature + Verifier`, `Audit & Harden`, `Multi-Lane Ship`).

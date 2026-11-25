@@ -6,14 +6,17 @@ import {
   ChevronDown,
   ChevronUp,
   ClipboardCopy,
+  ExternalLink,
+  FileCode2,
   Image as ImageIcon,
   Layers,
   MessageSquare,
   Send,
   ShieldAlert,
   Sparkles,
+  Wrench,
 } from "lucide-react";
-import { openWorkerConversation, sendConfirmedNudge } from "../sidecar";
+import { extractLocalFilePaths, openFileInAuxPane, openWorkerConversation, sendConfirmedNudge } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot, TriageItem } from "../types";
 import { Badge, Button, Card, StatusDot, Textarea, fmtTimeAgo, fmtTokens, humanizeStatus, toast } from "../ui";
 
@@ -32,6 +35,26 @@ const WORKSTREAM_TONE: Record<string, "success" | "info" | "danger" | "neutral">
   blocked: "danger",
   failed: "danger",
 };
+
+function unstickPresetFor(item: TriageItem): Array<{ label: string; prompt: string }> {
+  const ref = item.seq > 0 ? ` (#${item.seq})` : "";
+  if (item.kind === "quota") {
+    return [
+      { label: "Resume", prompt: `@${item.member} Quota/rate limit should be clear now${ref}. Resume your current task.` },
+      { label: "Handoff status", prompt: `@${item.member} Post a brief summary of what remains${ref} so we can switch models or hand off.` },
+    ];
+  }
+  if (item.kind === "stuck" || item.kind === "error" || item.kind === "blocked") {
+    return [
+      { label: "Unstick", prompt: `@${item.member} You appear ${item.kind}${ref}. Isolate the failing step, summarize root cause, and post [blocked] or continue.` },
+      { label: "Ask status", prompt: `@${item.member} Share exact error output and files touched so far${ref}.` },
+    ];
+  }
+  return [
+    { label: "Follow up", prompt: item.suggestedPrompt },
+    { label: "Proceed", prompt: `@${item.member} Approved${ref}. Proceed with your recommended option and report [done] when verified.` },
+  ];
+}
 
 export function TriageView({
   snap,
@@ -52,10 +75,11 @@ export function TriageView({
   const frames = snap.frames || [];
   const memberByName = new Map((snap.members || []).map((m) => [m.name, m]));
   const canNudge = Boolean(snap.capabilities?.canSendMessage || window.sidecar?.agent?.sendMessage);
+  const canOpenAux = Boolean(window.sidecar?.ui?.toggleAuxPane);
 
-  const openNudge = (item: TriageItem) => {
+  const openNudge = (item: TriageItem, customPrompt?: string) => {
     setNudgeTarget(item);
-    setNudgeDraft(item.suggestedPrompt);
+    setNudgeDraft(customPrompt ?? item.suggestedPrompt);
   };
 
   const handleConfirmNudge = async () => {
@@ -74,13 +98,21 @@ export function TriageView({
     }
   };
 
-  const handleCopyPrompt = async (text: string) => {
+  const handleCopy = async (text: string, label = "Copied") => {
     try {
       await navigator.clipboard.writeText(text);
-      toast.success("Prompt copied");
+      toast.success(label);
     } catch {
       toast.error("Clipboard unavailable");
     }
+  };
+
+  const handleOpenPath = (filePath: string) => {
+    if (canOpenAux && openFileInAuxPane(filePath)) {
+      toast.success(`Opened ${filePath.split("/").pop() || "file"}`);
+      return;
+    }
+    handleCopy(filePath, "File path copied");
   };
 
   return (
@@ -113,6 +145,9 @@ export function TriageView({
               const worker: SwarmMember | undefined = memberByName.get(item.member);
               const peeking = peekId === item.id;
               const tools = worker?.recentTools || [];
+              const presets = unstickPresetFor(item);
+              const paths = extractLocalFilePaths(item.detail);
+
               return (
                 <Card key={item.id} className="p-3 space-y-2">
                   <div className="flex items-start justify-between gap-2">
@@ -140,6 +175,23 @@ export function TriageView({
                     <p className="text-[13px] text-[var(--ink-2)] break-words leading-snug">{item.detail}</p>
                   )}
 
+                  {paths.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {paths.map((fp) => (
+                        <Button
+                          key={fp}
+                          variant="secondary"
+                          size="sm"
+                          onClick={() => handleOpenPath(fp)}
+                          className="max-w-full"
+                        >
+                          <FileCode2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                          <span className="truncate mono">{fp.split("/").pop()}</span>
+                        </Button>
+                      ))}
+                    </div>
+                  )}
+
                   <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
                     {item.conversationId && window.sidecar?.ui?.toggleConversation && (
                       <Button
@@ -153,18 +205,24 @@ export function TriageView({
                     )}
 
                     {canNudge && item.conversationId ? (
-                      <Button variant="outline" size="sm" onClick={() => openNudge(item)}>
-                        <Send className="h-3.5 w-3.5" aria-hidden="true" />
-                        Nudge
-                      </Button>
+                      <>
+                        <Button variant="outline" size="sm" onClick={() => openNudge(item, presets[0].prompt)}>
+                          {item.severity === "urgent" ? (
+                            <Wrench className="h-3.5 w-3.5" aria-hidden="true" />
+                          ) : (
+                            <Send className="h-3.5 w-3.5" aria-hidden="true" />
+                          )}
+                          {item.severity === "urgent" ? presets[0].label : "Nudge"}
+                        </Button>
+                      </>
                     ) : (
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() => handleCopyPrompt(item.suggestedPrompt)}
+                        onClick={() => handleCopy(presets[0].prompt, "Follow-up prompt copied")}
                       >
                         <ClipboardCopy className="h-3.5 w-3.5" aria-hidden="true" />
-                        Copy follow-up
+                        Copy {item.severity === "urgent" ? presets[0].label.toLowerCase() : "follow-up"}
                       </Button>
                     )}
 
@@ -220,9 +278,23 @@ export function TriageView({
 
                   {editingThis && (
                     <div className="pt-2 border-t border-[var(--hairline)] space-y-2">
-                      <label htmlFor={`nudge-${item.id}`} className="block text-[12px] font-medium text-[var(--ink-2)]">
-                        Confirm message to @{item.member}
-                      </label>
+                      <div className="flex flex-wrap items-center justify-between gap-1.5">
+                        <label htmlFor={`nudge-${item.id}`} className="text-[12px] font-medium text-[var(--ink-2)]">
+                          Confirm message to @{item.member}
+                        </label>
+                        <div className="flex flex-wrap items-center gap-1">
+                          {presets.map((p) => (
+                            <button
+                              key={p.label}
+                              type="button"
+                              onClick={() => setNudgeDraft(p.prompt)}
+                              className="rounded-[var(--radius-chip)] bg-[var(--track)] px-2 py-0.5 text-[12px] font-medium text-[var(--ink)] hover:bg-[var(--hairline)] cursor-pointer"
+                            >
+                              {p.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
                       <Textarea
                         id={`nudge-${item.id}`}
                         rows={2}
@@ -252,7 +324,7 @@ export function TriageView({
         )}
       </section>
 
-      {/* Coordinator Plan & Workstreams (single tonal card, hairline dividers — zero card-in-card) */}
+      {/* Coordinator Plan & Workstreams (single tonal card, hairline dividers) */}
       {plan && (
         <section aria-labelledby="plan-heading" className="space-y-2.5">
           <div className="flex items-center gap-1.5">
@@ -300,7 +372,7 @@ export function TriageView({
         </section>
       )}
 
-      {/* Screenshot Reel */}
+      {/* Screenshot Reel with 1-click Open file in Aux Pane */}
       {frames.length > 0 && (
         <section aria-labelledby="reel-heading" className="space-y-2.5">
           <div className="flex items-center gap-1.5">
@@ -326,14 +398,25 @@ export function TriageView({
                     <span className="text-[12px] text-[var(--ink-2)] truncate">
                       {frame.caption || frame.path.split("/").pop()}
                     </span>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="num shrink-0"
-                      onClick={() => onJumpToBoardSeq(frame.seq)}
-                    >
-                      #{frame.seq}
-                    </Button>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        aria-label={`Open ${frame.caption || "capture"} file`}
+                        onClick={() => handleOpenPath(frame.path)}
+                      >
+                        <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+                        Open file
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="num"
+                        onClick={() => onJumpToBoardSeq(frame.seq)}
+                      >
+                        #{frame.seq}
+                      </Button>
+                    </div>
                   </div>
                 </Card>
               );

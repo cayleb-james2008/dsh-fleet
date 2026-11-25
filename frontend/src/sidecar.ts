@@ -95,8 +95,19 @@ export function openWorkerConversation(conversationId: string): boolean {
 export function openFileInAuxPane(uriOrPath: string): boolean {
   if (!uriOrPath || !window.sidecar?.ui?.toggleAuxPane) return false;
   const uri = uriOrPath.startsWith("file://") ? uriOrPath : `file://${uriOrPath}`;
-  window.sidecar.ui.toggleAuxPane({ openFile: uri });
+  window.sidecar.ui.toggleAuxPane({ tabType: "fileView", uri });
   return true;
+}
+
+export function extractLocalFilePaths(text: string): string[] {
+  const seen = new Set<string>();
+  const re = /(?:^|[\s`("'])(\/[a-zA-Z0-9._/-]+\.[a-zA-Z0-9]{1,12})(?=$|[\s`)"',:])/g;
+  for (const m of String(text || "").matchAll(re)) {
+    const p = m[1];
+    if (p.length > 4 && !p.includes("..")) seen.add(p);
+    if (seen.size >= 3) break;
+  }
+  return [...seen];
 }
 
 /** Detect theme luminance from CSS color string (`#rrggbb` or `rgb(r,g,b)`). */
