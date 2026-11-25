@@ -515,7 +515,7 @@
     };
 
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.7.0", mode: "live-web", canSendMessage: true, sseStream: false });
+      return jsonResp({ ok: true, name: "fleet", version: "1.8.0", mode: "live-web", canSendMessage: true, sseStream: false });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });
@@ -530,6 +530,20 @@
     }
     if (url.pathname === "/api/worktrees") {
       return jsonResp({ roots: [{ path: "/workspace/fleet", uri: "file:///workspace/fleet", isGit: true, count: state.worktrees.length, error: "" }], worktrees: state.worktrees, rejected: [] });
+    }
+    if (url.pathname === "/api/worktrees/diff") {
+      var wtPath = url.searchParams.get("worktree") || "/workspace/fleet";
+      var relFile = url.searchParams.get("file") || "README.md";
+      return jsonResp({
+        ok: true,
+        worktree: wtPath,
+        file: relFile,
+        diff: "@@ -12,4 +12,6 @@\n-  const cached = probeCache.get(key);\n+  const realTarget = realpathSync(abs);\n+  if (!realTarget.startsWith(wtPrefix)) return { ok: false, status: 404 };\n   return capDiff(stdout, 8192);",
+        truncated: false,
+        untracked: false,
+        added: 2,
+        removed: 1,
+      });
     }
     return origFetch(input, init);
   };

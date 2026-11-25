@@ -4,8 +4,8 @@
  * and debounces git commands with a short TTL cache so rapid UI polling stays fast.
  */
 import { execFile } from 'node:child_process';
-import { realpathSync, statSync } from 'node:fs';
-import { basename, isAbsolute, resolve, sep } from 'node:path';
+import { closeSync, lstatSync, openSync, readSync, realpathSync, statSync } from 'node:fs';
+import { basename, dirname, isAbsolute, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const MAX_ROOTS = 16;
@@ -284,5 +284,133 @@ export async function probeWorktrees(rawRoots, { ttlMs = DEFAULT_TTL_MS } = {}) 
     worktrees,
     rejected,
     cachedTtlMs: ttlMs,
+  };
+}
+
+/** Validate worktree/file path confinement and return bounded (<=8 KB) git diff text. */
+export async function probeWorktreeDiff({ root = '', worktree = '', file = '', maxBytes = 8192 } = {}) {
+  const normRoot = normalizeWorkspaceRoot(root);
+  const normWt = normalizeWorkspaceRoot(worktree);
+  if (!normRoot || !normWt) {
+    return { ok: false, status: 400, error: 'invalid workspace root or worktree' };
+  }
+
+  const relPath = typeof file === 'string' ? file.trim() : '';
+  if (!relPath || relPath.length > 1024 || /[\0\r\n\\%]|^-/.test(relPath) || isAbsolute(relPath)) {
+    return { ok: false, status: 400, error: 'invalid file path' };
+  }
+  if (relPath.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) {
+    return { ok: false, status: 400, error: 'invalid path segment' };
+  }
+
+  const wtList = await execGit(normRoot.path, ['worktree', 'list', '--porcelain']);
+  if (!wtList.ok) {
+    return { ok: false, status: 404, error: 'not a git repository' };
+  }
+  const allowedWts = parsePorcelainWorktrees(wtList.stdout);
+  let matchesRepoWt = false;
+  for (const w of allowedWts) {
+    try {
+      if (realpathSync(w.path) === normWt.path) {
+        matchesRepoWt = true;
+        break;
+      }
+    } catch {}
+  }
+  if (!matchesRepoWt) {
+    return { ok: false, status: 404, error: 'worktree not in repository' };
+  }
+
+  const wtPrefix = normWt.path.endsWith(sep) ? normWt.path : `${normWt.path}${sep}`;
+  const abs = resolve(normWt.path, relPath);
+  if (!abs.startsWith(wtPrefix)) {
+    return { ok: false, status: 404, error: 'path escapes worktree root' };
+  }
+
+  let realTarget = '';
+  let existsOnDisk = false;
+  try {
+    lstatSync(abs);
+    existsOnDisk = true;
+    realTarget = realpathSync(abs);
+    if (!realTarget.startsWith(wtPrefix)) {
+      return { ok: false, status: 404, error: 'symlink escapes worktree root' };
+    }
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      try {
+        const realParent = realpathSync(dirname(abs));
+        if (realParent !== normWt.path && !realParent.startsWith(wtPrefix)) {
+          return { ok: false, status: 404, error: 'parent escapes worktree root' };
+        }
+      } catch {
+        return { ok: false, status: 404, error: 'file parent missing' };
+      }
+    } else {
+      return { ok: false, status: 404, error: 'path escapes worktree root' };
+    }
+  }
+
+  const cap = Math.min(8192, Math.max(512, Number(maxBytes) || 8192));
+  let diffRes = await execGit(normWt.path, ['diff', 'HEAD', '--no-ext-diff', '--', relPath]);
+  let text = diffRes.ok ? diffRes.stdout : '';
+  if (!text) {
+    const cachedRes = await execGit(normWt.path, ['diff', '--cached', '--no-ext-diff', '--', relPath]);
+    const workRes = await execGit(normWt.path, ['diff', '--no-ext-diff', '--', relPath]);
+    text = [cachedRes.ok ? cachedRes.stdout : '', workRes.ok ? workRes.stdout : ''].filter(Boolean).join('\n');
+  }
+
+  let untracked = false;
+  if (!text && existsOnDisk && realTarget) {
+    const stRes = await execGit(normWt.path, ['status', '--porcelain=v1', '-z', '--', relPath]);
+    if (stRes.ok && stRes.stdout.startsWith('?? ')) {
+      untracked = true;
+      try {
+        const st = statSync(realTarget);
+        if (st.isFile()) {
+          const fd = openSync(realTarget, 'r');
+          const buf = Buffer.allocUnsafe(Math.min(cap, st.size));
+          const n = readSync(fd, buf, 0, buf.length, 0);
+          closeSync(fd);
+          const slice = buf.subarray(0, n);
+          if (slice.includes(0)) {
+            text = `+++ ${relPath}\n[binary untracked file omitted]`;
+          } else {
+            const rawText = slice.toString('utf8');
+            const bodyLines = rawText.split('\n').map((l) => `+${l}`).join('\n');
+            text = `+++ ${relPath} (untracked)\n${bodyLines}${st.size > cap ? '\n... (truncated)' : ''}`;
+          }
+        }
+      } catch {}
+    }
+  }
+
+  text = text.replace(/\/home\/[^/\s]+\//g, '~/');
+  let truncated = false;
+  if (Buffer.byteLength(text, 'utf8') > cap) {
+    let clipped = Buffer.from(text, 'utf8').subarray(0, cap).toString('utf8');
+    const nl = clipped.lastIndexOf('\n');
+    if (nl > cap * 0.5) clipped = clipped.slice(0, nl);
+    text = clipped;
+    truncated = true;
+  }
+
+  let added = 0;
+  let removed = 0;
+  for (const line of text.split('\n')) {
+    if (line.startsWith('+') && !line.startsWith('+++')) added++;
+    else if (line.startsWith('-') && !line.startsWith('---')) removed++;
+  }
+
+  return {
+    ok: true,
+    status: 200,
+    worktree: normWt.path,
+    file: relPath,
+    diff: text,
+    truncated,
+    untracked,
+    added,
+    removed,
   };
 }

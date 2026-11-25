@@ -7,7 +7,6 @@ import {
   ChevronUp,
   ClipboardCopy,
   ExternalLink,
-  FileCode2,
   Image as ImageIcon,
   Layers,
   MessageSquare,
@@ -17,7 +16,7 @@ import {
   ShieldAlert,
   Sparkles,
   Wrench,
-} from "lucide-react";
+} from "../icons";
 import {
   extractLocalFilePaths,
   openFileInAuxPane,
@@ -26,7 +25,7 @@ import {
   sendConfirmedNudge,
 } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot, TriageItem } from "../types";
-import { Badge, Button, Card, StatusDot, Textarea, cn, fmtElapsed, fmtTimeAgo, fmtTokens, humanizeStatus, toast } from "../ui";
+import { ActivityPeek, Badge, Button, Card, InlineComposer, MediaPathChips, StatusDot, cn, copyText, fmtElapsed, fmtTimeAgo, fmtTokens, humanizeStatus, toast } from "../ui";
 
 const SEVERITY_BADGE: Record<TriageItem["severity"], { tone: "danger" | "warning" | "info"; label: string }> = {
   urgent: { tone: "danger", label: "Urgent" },
@@ -48,19 +47,19 @@ function unstickPresetFor(item: TriageItem): Array<{ label: string; prompt: stri
   const ref = item.seq > 0 ? ` (#${item.seq})` : "";
   if (item.kind === "quota") {
     return [
-      { label: "Resume", prompt: `@${item.member} Quota/rate limit should be clear now${ref}. Resume your current task.` },
-      { label: "Handoff status", prompt: `@${item.member} Post a brief summary of what remains${ref} so we can switch models or hand off.` },
+      { label: "Resume", prompt: `@${item.member} Quota clear${ref}. Resume current task.` },
+      { label: "Handoff status", prompt: `@${item.member} Summarize remaining work${ref} for handoff.` },
     ];
   }
   if (item.kind === "stuck" || item.kind === "error" || item.kind === "blocked") {
     return [
-      { label: "Unstick", prompt: `@${item.member} You appear ${item.kind}${ref}. Isolate the failing step, summarize root cause, and post [blocked] or continue.` },
-      { label: "Ask status", prompt: `@${item.member} Share exact error output and files touched so far${ref}.` },
+      { label: "Unstick", prompt: `@${item.member} ${item.kind}${ref}: isolate failure and post [blocked] or continue.` },
+      { label: "Ask status", prompt: `@${item.member} Share exact error and files touched${ref}.` },
     ];
   }
   return [
     { label: "Follow up", prompt: item.suggestedPrompt },
-    { label: "Proceed", prompt: `@${item.member} Approved${ref}. Proceed with your recommended option and report [done] when verified.` },
+    { label: "Proceed", prompt: `@${item.member} Approved${ref}. Proceed and report [done] when verified.` },
   ];
 }
 
@@ -143,13 +142,8 @@ export function TriageView({
     }
   };
 
-  const handleCopy = async (text: string, label = "Copied") => {
-    try {
-      await navigator.clipboard.writeText(text);
-      toast.success(label);
-    } catch {
-      toast.error("Clipboard unavailable");
-    }
+  const handleCopy = (text: string, label = "Copied") => {
+    void copyText(text, label);
   };
 
   const handleOpenPath = (filePath: string) => {
@@ -165,7 +159,7 @@ export function TriageView({
       {/* Needs-You Triage Inbox */}
       <section aria-labelledby="triage-heading" className="space-y-2.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <h2 id="triage-heading" className="text-[14px] font-semibold text-[var(--ink)]">
+          <h2 id="triage-heading" className="text-[14px] font-semibold text-ink">
             Needs you ({triage.length})
           </h2>
           {triage.length === 0 ? (
@@ -174,7 +168,7 @@ export function TriageView({
               All clear
             </Badge>
           ) : (
-            <div className="hidden sm:flex items-center gap-2 text-[12px] text-[var(--ink-3)] mono">
+            <div className="hidden sm:flex items-center gap-2 text-[12px] text-ink-3 mono">
               <span>j/k move</span>
               <span>o chat</span>
               <span>p pin</span>
@@ -185,8 +179,8 @@ export function TriageView({
         </div>
 
         {triage.length === 0 ? (
-          <Card className="p-3.5 bg-[var(--board)]">
-            <p className="text-[14px] text-[var(--ink-2)]">
+          <Card className="p-3.5 bg-board">
+            <p className="text-[14px] text-ink-2">
               No stalled workers, failed steps, open questions, or unverified deliverables right now.
             </p>
           </Card>
@@ -223,7 +217,7 @@ export function TriageView({
                   <Card
                     className={cn(
                       "p-3 space-y-2",
-                      isSelected && "border-[var(--blue)] ring-1 ring-[var(--blue)]",
+                      isSelected && "border-blue ring-1 ring-blue",
                     )}
                   >
                   <div className="flex items-start justify-between gap-2">
@@ -246,46 +240,19 @@ export function TriageView({
                           </Badge>
                         )}
                         {isStalled && <Badge tone="danger">stalled</Badge>}
-                        <span className="text-[12px] font-medium text-[var(--ink-2)] num">
+                        <span className="text-[12px] font-medium text-ink-2 num">
                           {item.timestamp ? fmtTimeAgo(item.timestamp) : "now"}
                         </span>
                       </div>
-                      <p className="text-[14px] font-medium text-[var(--ink)] break-words">{item.title}</p>
+                      <p className="text-[14px] font-medium text-ink break-words">{item.title}</p>
                     </div>
                   </div>
 
                   {cleanDetail && (
-                    <p className="text-[13px] text-[var(--ink-2)] break-words leading-snug">{cleanDetail}</p>
+                    <p className="text-[13px] text-ink-2 break-words leading-snug">{cleanDetail}</p>
                   )}
 
-                  {(detailShots.length > 0 || paths.length > 0) && (
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      {detailShots.map((s) => (
-                        <Button
-                          key={s.path}
-                          variant="secondary"
-                          size="sm"
-                          onClick={() => handleOpenPath(s.path)}
-                          className="max-w-full"
-                        >
-                          <ImageIcon className="h-3.5 w-3.5 shrink-0 text-[var(--info-foreground)]" aria-hidden="true" />
-                          <span className="truncate">{s.caption || s.fileName}</span>
-                        </Button>
-                      ))}
-                      {paths.map((fp) => (
-                        <Button
-                          key={fp}
-                          variant="secondary"
-                          size="sm"
-                          onClick={() => handleOpenPath(fp)}
-                          className="max-w-full"
-                        >
-                          <FileCode2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-                          <span className="truncate mono">{fp.split("/").pop()}</span>
-                        </Button>
-                      ))}
-                    </div>
-                  )}
+                  <MediaPathChips shots={detailShots} paths={paths} onOpen={handleOpenPath} />
 
                   <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
                     {item.conversationId && window.sidecar?.ui?.toggleConversation && (
@@ -370,71 +337,33 @@ export function TriageView({
                     )}
                   </div>
 
-                  {peeking && worker && (
-                    <div className="rounded-[var(--radius-chip)] bg-[var(--board)] p-2.5 space-y-1.5 text-[12px]">
-                      <div className="flex flex-wrap items-center justify-between gap-2 text-[var(--ink-2)] num">
-                        <span className="font-medium text-[var(--ink)]">{worker.steps} steps</span>
-                        <span>
-                          {fmtTokens(worker.usage.totalTokens)} tok (in {fmtTokens(worker.usage.inputTokens)} / cache{" "}
-                          {fmtTokens(worker.usage.cacheReadTokens)} / out {fmtTokens(worker.usage.outputTokens)})
-                        </span>
-                      </div>
-                      {worker.thinkingHeading && (
-                        <p className="text-[var(--ink-2)] truncate">Thinking: {worker.thinkingHeading}</p>
-                      )}
-                      {tools.length > 0 && (
-                        <ul className="space-y-1 text-[var(--ink-2)]" aria-label={`Recent tool calls for ${worker.name}`}>
-                          {tools.map((tc, idx) => (
-                            <li key={idx} className="flex items-center justify-between gap-2">
-                              <span className="truncate">{tc.summary}</span>
-                              <span className="text-[var(--ink-3)] shrink-0 mono">{tc.name}</span>
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                    </div>
-                  )}
+                  {peeking && worker && <ActivityPeek member={worker} mode="triage" />}
 
                   {editingThis && (
-                    <div className="pt-2 border-t border-[var(--hairline)] space-y-2">
-                      <div className="flex flex-wrap items-center justify-between gap-1.5">
-                        <label htmlFor={`nudge-${item.id}`} className="text-[12px] font-medium text-[var(--ink-2)]">
-                          Confirm message to @{item.member}
-                        </label>
+                    <InlineComposer
+                      id={`nudge-${item.id}`}
+                      label={`Confirm message to @${item.member}`}
+                      value={nudgeDraft}
+                      onChange={setNudgeDraft}
+                      onCancel={() => setNudgeTarget(null)}
+                      onSubmit={handleConfirmNudge}
+                      submitLabel={sending ? "Sending..." : "Confirm & send"}
+                      disabled={sending}
+                      headerRight={
                         <div className="flex flex-wrap items-center gap-1">
                           {presets.map((p) => (
                             <button
                               key={p.label}
                               type="button"
                               onClick={() => setNudgeDraft(p.prompt)}
-                              className="rounded-[var(--radius-chip)] bg-[var(--track)] px-2 py-0.5 text-[12px] font-medium text-[var(--ink)] hover:bg-[var(--hairline)] cursor-pointer"
+                              className="rounded-chip bg-track px-2 py-0.5 text-[12px] font-medium text-ink hover:bg-hairline cursor-pointer"
                             >
                               {p.label}
                             </button>
                           ))}
                         </div>
-                      </div>
-                      <Textarea
-                        id={`nudge-${item.id}`}
-                        rows={2}
-                        value={nudgeDraft}
-                        onChange={(e) => setNudgeDraft(e.target.value)}
-                      />
-                      <div className="flex items-center justify-end gap-2">
-                        <Button variant="ghost" size="sm" onClick={() => setNudgeTarget(null)}>
-                          Cancel
-                        </Button>
-                        <Button
-                          variant="primary"
-                          size="sm"
-                          disabled={sending || !nudgeDraft.trim()}
-                          onClick={handleConfirmNudge}
-                        >
-                          <Send className="h-3.5 w-3.5" aria-hidden="true" />
-                          {sending ? "Sending..." : "Confirm & send"}
-                        </Button>
-                      </div>
-                    </div>
+                      }
+                    />
                   )}
                   </Card>
                 </div>
@@ -448,20 +377,20 @@ export function TriageView({
       {pinnedMsgs.length > 0 && (
         <section aria-labelledby="pinned-triage-heading" className="space-y-2">
           <div className="flex items-center gap-1.5">
-            <Pin className="h-4 w-4 text-[var(--info-foreground)]" aria-hidden="true" />
-            <h2 id="pinned-triage-heading" className="text-[14px] font-semibold text-[var(--ink)]">
+            <Pin className="h-4 w-4 text-info" aria-hidden="true" />
+            <h2 id="pinned-triage-heading" className="text-[14px] font-semibold text-ink">
               Pinned posts ({pinnedMsgs.length})
             </h2>
           </div>
           <Card className="p-2.5">
-            <ul className="divide-y divide-[var(--hairline)]">
+            <ul className="divide-y divide-hairline">
               {pinnedMsgs.map((pm) => (
                 <li key={pm.seq} className="flex items-center justify-between gap-2 py-1.5 first:pt-0.5 last:pb-0.5">
                   <div className="min-w-0">
-                    <p className="text-[13px] font-medium text-[var(--ink)] truncate">
+                    <p className="text-[13px] font-medium text-ink truncate">
                       <span className="num">#{pm.seq}</span> {pm.agent}
                     </p>
-                    <p className="text-[12px] text-[var(--ink-2)] truncate">{parseScreenshotLines(pm.text).cleanText || pm.text.replace(/\/home\/[^/\s]+\//g, "~/")}</p>
+                    <p className="text-[12px] text-ink-2 truncate">{parseScreenshotLines(pm.text).cleanText || pm.text.replace(/\/home\/[^/\s]+\//g, "~/")}</p>
                   </div>
                   <div className="flex items-center gap-1 shrink-0">
                     <Button variant="ghost" size="sm" className="num" onClick={() => onJumpToBoardSeq(pm.seq)}>
@@ -483,29 +412,29 @@ export function TriageView({
       {plan && (
         <section aria-labelledby="plan-heading" className="space-y-2.5">
           <div className="flex items-center gap-1.5">
-            <Layers className="h-4 w-4 text-[var(--ink-3)]" aria-hidden="true" />
-            <h2 id="plan-heading" className="text-[14px] font-semibold text-[var(--ink)]">
+            <Layers className="h-4 w-4 text-ink-3" aria-hidden="true" />
+            <h2 id="plan-heading" className="text-[14px] font-semibold text-ink">
               Swarm plan
             </h2>
           </div>
 
           <Card className="p-3 space-y-2.5">
-            {plan.goal && <p className="text-[14px] font-medium text-[var(--ink)] break-words">{plan.goal}</p>}
+            {plan.goal && <p className="text-[14px] font-medium text-ink break-words">{plan.goal}</p>}
             {plan.gate && (
-              <div className="rounded-[var(--radius-chip)] bg-[var(--board)] px-2.5 py-1.5 text-[12px] text-[var(--ink-2)]">
-                <span className="font-medium text-[var(--ink)]">Gate: </span>
+              <div className="rounded-chip bg-board px-2.5 py-1.5 text-[12px] text-ink-2">
+                <span className="font-medium text-ink">Gate: </span>
                 <code className="mono break-all">{plan.gate}</code>
               </div>
             )}
             {Array.isArray(plan.workstreams) && plan.workstreams.length > 0 && (
-              <ul className="divide-y divide-[var(--hairline)]" aria-label="Workstreams">
+              <ul className="divide-y divide-hairline" aria-label="Workstreams">
                 {plan.workstreams.map((ws, i) => {
                   const st = String(ws.status || "pending").toLowerCase();
                   return (
                     <li key={ws.id || i} className="flex items-center justify-between gap-2 py-2 first:pt-1 last:pb-0">
                       <div className="min-w-0">
-                        <p className="text-[13px] font-medium text-[var(--ink)] truncate">{ws.title}</p>
-                        {ws.owner && <p className="text-[12px] text-[var(--ink-3)]">@{ws.owner}</p>}
+                        <p className="text-[13px] font-medium text-ink truncate">{ws.title}</p>
+                        {ws.owner && <p className="text-[12px] text-ink-3">@{ws.owner}</p>}
                       </div>
                       <Badge tone={WORKSTREAM_TONE[st] || "neutral"}>{humanizeStatus(ws.status)}</Badge>
                     </li>
@@ -531,8 +460,8 @@ export function TriageView({
       {frames.length > 0 && (
         <section aria-labelledby="reel-heading" className="space-y-2.5">
           <div className="flex items-center gap-1.5">
-            <ImageIcon className="h-4 w-4 text-[var(--ink-3)]" aria-hidden="true" />
-            <h2 id="reel-heading" className="text-[14px] font-semibold text-[var(--ink)]">
+            <ImageIcon className="h-4 w-4 text-ink-3" aria-hidden="true" />
+            <h2 id="reel-heading" className="text-[14px] font-semibold text-ink">
               Verified captures ({frames.length})
             </h2>
           </div>
@@ -541,7 +470,7 @@ export function TriageView({
               const src = `/api/frame?conversationId=${encodeURIComponent(snap.swarm || snap.conversationId || "")}&path=${encodeURIComponent(frame.path)}`;
               return (
                 <Card key={frame.path} className="overflow-hidden">
-                  <div className="bg-[var(--board)] border-b border-[var(--hairline)] aspect-video flex items-center justify-center overflow-hidden">
+                  <div className="bg-board border-b border-hairline aspect-video flex items-center justify-center overflow-hidden">
                     <img
                       src={src}
                       alt={frame.caption || `Screenshot from #${frame.seq}`}
@@ -550,7 +479,7 @@ export function TriageView({
                     />
                   </div>
                   <div className="flex items-center justify-between gap-2 px-2.5 py-2">
-                    <span className="text-[12px] text-[var(--ink-2)] truncate">
+                    <span className="text-[12px] text-ink-2 truncate">
                       {frame.caption || frame.path.split("/").pop()}
                     </span>
                     <div className="flex items-center gap-1 shrink-0">

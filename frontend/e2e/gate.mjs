@@ -242,6 +242,13 @@ await runChecks("gate", async (check) => {
     return txt.includes("main") && txt.includes("lane/verify") && txt.includes("Initial fixture commit") && txt.includes("untracked.txt");
   });
 
+  await check("worktrees Diff peek expands bounded diff hunk cleanly", async () => {
+    await page.locator('button[aria-label="Diff peek untracked.txt"]').click();
+    await page.waitForSelector('#panel-worktrees pre');
+    const preTxt = await page.locator("#panel-worktrees pre").textContent();
+    return preTxt.includes("(untracked)") && preTxt.includes("+");
+  });
+
   await check("worktrees Open file calls toggleAuxPane with fileView uri", async () => {
     await page.evaluate(() => {
       window.__auxCalls = [];

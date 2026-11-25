@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parsePorcelainWorktrees, probeWorktrees } from '../git_probe.mjs';
+import { parsePorcelainWorktrees, probeWorktreeDiff, probeWorktrees } from '../git_probe.mjs';
 import { buildSwarmSnapshot, listSwarms, summarizeTranscript } from '../swarm_store.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -217,6 +217,7 @@ test('git_probe parses porcelain output, inspects real git worktrees, and reject
     const wtDir = join(dirname(repoDir), `wt-${Date.now()}`);
     try {
       execFileSync('git', ['-C', repoDir, 'worktree', 'add', '-b', 'feat/test', wtDir], { stdio: 'ignore' });
+      writeFileSync(join(wtDir, 'README.md'), '# hello\n' + 'line '.repeat(2600));
       writeFileSync(join(wtDir, 'dirty.txt'), 'change');
       symlinkSync('/etc/hosts', join(wtDir, 'escape-link'));
 
@@ -232,6 +233,30 @@ test('git_probe parses porcelain output, inspects real git worktrees, and reject
       const escapeEntry = feat.files.find((f) => f.path === 'escape-link');
       assert.ok(dirtyEntry && dirtyEntry.state === '??' && dirtyEntry.uri.endsWith('/dirty.txt'));
       assert.ok(escapeEntry && escapeEntry.uri === '');
+
+      // Worktree diff peek + truncation + CWE-22 / CWE-59 confinement
+      const dMod = await probeWorktreeDiff({ root: repoDir, worktree: wtDir, file: 'README.md' });
+      assert.equal(dMod.ok, true);
+      assert.equal(dMod.truncated, true);
+      assert.ok(Buffer.byteLength(dMod.diff, 'utf8') <= 8192);
+      assert.ok(dMod.added >= 1);
+
+      const dUntracked = await probeWorktreeDiff({ root: repoDir, worktree: wtDir, file: 'dirty.txt' });
+      assert.equal(dUntracked.ok, true);
+      assert.equal(dUntracked.untracked, true);
+      assert.ok(dUntracked.diff.includes('+change'));
+
+      const dTrav = await probeWorktreeDiff({ root: repoDir, worktree: wtDir, file: '../README.md' });
+      assert.equal(dTrav.ok, false);
+      assert.equal(dTrav.status, 400);
+
+      const dSymlink = await probeWorktreeDiff({ root: repoDir, worktree: wtDir, file: 'escape-link' });
+      assert.equal(dSymlink.ok, false);
+      assert.equal(dSymlink.status, 404);
+
+      const dOutsideWt = await probeWorktreeDiff({ root: repoDir, worktree: '/etc', file: 'passwd' });
+      assert.equal(dOutsideWt.ok, false);
+      assert.equal(dOutsideWt.status, 404);
     } finally {
       execFileSync('git', ['-C', repoDir, 'worktree', 'remove', '--force', wtDir], { stdio: 'ignore' });
       rmSync(wtDir, { recursive: true, force: true });

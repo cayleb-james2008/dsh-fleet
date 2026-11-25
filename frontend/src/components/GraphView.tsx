@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Pause, Play, Radio, SkipBack, SkipForward } from "lucide-react";
+import { Pause, Play, Radio, SkipBack, SkipForward } from "../icons";
 import type { BoardMessage, SwarmMember, SwarmSnapshot } from "../types";
 import { Badge, Button, Card, cn } from "../ui";
 
@@ -97,7 +97,7 @@ export function GraphView({ snap }: { snap: SwarmSnapshot }) {
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-[14px] font-semibold text-[var(--ink)]">
+        <h2 className="text-[14px] font-semibold text-ink">
           @Mention graph ({nodes.length} nodes)
         </h2>
         <div className="flex flex-wrap items-center gap-1.5">
@@ -118,9 +118,9 @@ export function GraphView({ snap }: { snap: SwarmSnapshot }) {
         </div>
       </div>
 
-      <Card className="p-2 overflow-hidden bg-[var(--board)]">
+      <Card className="p-2 overflow-hidden bg-board">
         {nodes.length === 0 ? (
-          <p className="py-12 text-center text-[14px] text-[var(--ink-2)]">No active nodes to graph.</p>
+          <p className="py-12 text-center text-[14px] text-ink-2">No active nodes to graph.</p>
         ) : (
           <svg
             viewBox="0 0 340 280"
@@ -129,12 +129,14 @@ export function GraphView({ snap }: { snap: SwarmSnapshot }) {
             aria-label="Swarm @mention topology graph"
           >
             <defs>
-              <marker id="fleet-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-                <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--ink-3)" />
-              </marker>
-              <marker id="fleet-arrow-hi" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-                <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--blue)" />
-              </marker>
+              {[
+                ["fleet-arrow", "var(--ink-3)"],
+                ["fleet-arrow-hi", "var(--blue)"],
+              ].map(([id, fill]) => (
+                <marker key={id} id={id} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                  <path d="M 0 1 L 10 5 L 0 9 z" fill={fill} />
+                </marker>
+              ))}
             </defs>
 
             {edges.map((e) => {
@@ -255,7 +257,7 @@ export function GraphView({ snap }: { snap: SwarmSnapshot }) {
             </div>
 
             <div className="flex items-center gap-2">
-              <span className="text-[12px] text-[var(--ink-2)] num">
+              <span className="text-[12px] text-ink-2 num">
                 {currentMsg ? `#${currentMsg.seq} ${currentMsg.agent}` : "none"}
               </span>
               <Button
@@ -283,10 +285,10 @@ export function GraphView({ snap }: { snap: SwarmSnapshot }) {
               const val = Number(e.target.value);
               setReplayIndex(val >= nonControlMsgs.length - 1 ? null : val);
             }}
-            className="w-full accent-[var(--blue)] cursor-pointer"
+            className="w-full accent-blue cursor-pointer"
           />
           {currentMsg && (
-            <div className="flex items-center justify-between gap-2 text-[12px] text-[var(--ink-2)]">
+            <div className="flex items-center justify-between gap-2 text-[12px] text-ink-2">
               <span className="truncate">{currentMsg.text}</span>
               <Badge tone="neutral" className="shrink-0 num">
                 {activeIdx + 1}/{nonControlMsgs.length}

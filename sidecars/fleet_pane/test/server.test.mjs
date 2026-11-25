@@ -192,6 +192,10 @@ test('standalone server enforces gzip, ETag/304, security headers, Host-403, Ori
 
     const fTraversal = await fetch(`${srv.url}/api/frame?conversationId=${fx.coord}&path=${encodeURIComponent(fx.appData + '/brain/../appdata/secret.png')}`);
     assert.equal(fTraversal.status, 404);
+
+    // 7. CWE-22 /api/worktrees/diff validation
+    const dBad = await fetch(`${srv.url}/api/worktrees/diff?root=/etc&worktree=/etc&file=../passwd`);
+    assert.equal(dBad.status, 400);
   } finally {
     await srv.close();
     rmSync(fx.dir, { recursive: true, force: true });
