@@ -11,9 +11,7 @@ import {
   Wrench,
   XCircle,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { cn } from "@/lib/utils";
+import { Badge, Button, cn } from "./ui";
 import {
   diffStat,
   healBadgeInfo,
@@ -49,11 +47,11 @@ const PAD_TOP = 56;
 const PAD_BOTTOM = 28;
 
 const TAG_SKINS = [
-  "bg-tag-ops-bg text-tag-ops-fg",
-  "bg-tag-mint-bg text-tag-mint-fg",
-  "bg-tag-research-bg text-tag-research-fg",
-  "bg-tag-dev-bg text-tag-dev-fg",
-  "bg-tag-plan-bg text-tag-plan-fg",
+  "bg-[var(--blue-soft)] text-[var(--info-foreground)]",
+  "bg-[var(--ok-soft)] text-[var(--success-foreground)]",
+  "bg-[var(--violet-soft)] text-[var(--violet)]",
+  "bg-[var(--warn-soft)] text-[var(--warning-foreground)]",
+  "bg-[var(--track)] text-[var(--ink-2)]",
 ];
 
 function projectSkin(project: string): string {
@@ -159,19 +157,19 @@ function edgePath(from: DagNodePos, to: DagNodePos): string {
 }
 
 function edgeTone(parent: Session, highlighted: boolean): { stroke: string; marker: string; width: number } {
-  if (highlighted) return { stroke: "var(--accent)", marker: "url(#dag-arrow-accent)", width: 2.25 };
+  if (highlighted) return { stroke: "var(--blue)", marker: "url(#dag-arrow-accent)", width: 2.25 };
   if (isVerified(parent)) return { stroke: "var(--dot-green)", marker: "url(#dag-arrow-good)", width: 1.75 };
   if (parent.bucket === "needs-you") return { stroke: "var(--unread)", marker: "url(#dag-arrow-bad)", width: 1.75 };
   return { stroke: "var(--ink-3)", marker: "url(#dag-arrow-muted)", width: 1.5 };
 }
 
 function statusRailClass(s: Session): string {
-  if (isVerified(s)) return "border-l-dot-green";
-  if (isFailed(s)) return "border-l-unread";
-  if (s.bucket === "needs-you") return "border-l-dot-clay";
-  if (isActivelyRunning(s)) return "border-l-accent";
-  if (isQueuedOrBlocked(s)) return "border-l-dot-amber";
-  return "border-l-hairline";
+  if (isVerified(s)) return "border-l-[var(--dot-green)]";
+  if (isFailed(s)) return "border-l-[var(--unread)]";
+  if (s.bucket === "needs-you") return "border-l-[var(--blue)]";
+  if (isActivelyRunning(s)) return "border-l-[var(--blue)]";
+  if (isQueuedOrBlocked(s)) return "border-l-[var(--dot-amber)]";
+  return "border-l-[var(--hairline)]";
 }
 
 export function DagWaveGraph({
@@ -233,9 +231,9 @@ export function DagWaveGraph({
             <Network className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
             <span>Multi-wave execution DAG</span>
           </span>
-          <span className="font-mono text-ink-3 tabular-nums" data-testid="dag-graph-summary">
-            {nodes.length} {nodes.length === 1 ? "session" : "sessions"} · {waves.length}{" "}
-            {waves.length === 1 ? "wave" : "waves"} · {edges.length}{" "}
+          <span className="mono text-[12px] text-[var(--ink-3)]" data-testid="dag-graph-summary">
+            {nodes.length} {nodes.length === 1 ? "session" : "sessions"} / {waves.length}{" "}
+            {waves.length === 1 ? "wave" : "waves"} / {edges.length}{" "}
             {edges.length === 1 ? "dependency" : "dependencies"}
           </span>
         </div>
@@ -377,60 +375,59 @@ export function DagWaveGraph({
                 <div className="flex items-center gap-1.5">
                   <span
                     className={cn(
-                      "inline-flex max-w-[116px] truncate rounded-chip px-1.5 py-0.5 text-xs font-medium",
+                      "inline-flex max-w-[116px] truncate rounded-[var(--radius-chip)] px-1.5 py-0.5 text-[12px] font-medium",
                       projectSkin(s.project),
                     )}
                   >
                     {s.project}
                   </span>
-                  <span className="font-mono text-xs text-ink-3">{s.id}</span>
+                  <span className="mono text-[12px] text-[var(--ink-3)]">{s.id}</span>
                   <Badge
-                    variant={
+                    tone={
                       verified
                         ? "success"
                         : failed
-                          ? "error"
+                          ? "danger"
                           : s.bucket === "needs-you"
                             ? "info"
                             : isQueuedOrBlocked(s)
                               ? "warning"
-                              : "secondary"
+                              : "neutral"
                     }
-                    size="sm"
                     className="ml-auto shrink-0"
                   >
                     {verified ? (s.status === "merged" ? "merged" : "verified") : statusText(s)}
                   </Badge>
                 </div>
 
-                <p className="line-clamp-2 text-xs font-medium leading-snug text-ink [overflow-wrap:anywhere]">
+                <p className="line-clamp-2 text-[13px] font-medium leading-snug text-[var(--ink)] [overflow-wrap:anywhere]">
                   {s.task}
                 </p>
 
-                <div className="flex items-center justify-between gap-2 font-mono text-xs text-ink-3 tabular-nums">
+                <div className="flex items-center justify-between gap-2 mono text-[12px] text-[var(--ink-3)]">
                   <span className="inline-flex min-w-0 items-center gap-1 truncate">
                     {verified ? (
-                      <CheckCircle2 className="size-3.5 shrink-0 text-success-foreground" strokeWidth={1.5} aria-hidden />
+                      <CheckCircle2 className="size-3.5 shrink-0 text-[var(--success-foreground)]" strokeWidth={1.5} aria-hidden />
                     ) : failed ? (
-                      <XCircle className="size-3.5 shrink-0 text-destructive-foreground" strokeWidth={1.5} aria-hidden />
+                      <XCircle className="size-3.5 shrink-0 text-[var(--destructive-foreground)]" strokeWidth={1.5} aria-hidden />
                     ) : (
-                      <Clock className="size-3.5 shrink-0 text-icon" strokeWidth={1.5} aria-hidden />
+                      <Clock className="size-3.5 shrink-0 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
                     )}
                     <span className="truncate">{s.branch || s.engine || s.agent || "agent"}</span>
                   </span>
                   <span className="inline-flex shrink-0 items-center gap-1.5">
                     {heal && (
-                      <span className="inline-flex items-center gap-0.5 rounded-chip bg-pill-active-bg px-1.5 py-0.5 text-pill-active-fg">
+                      <span className="inline-flex items-center gap-0.5 rounded-[var(--radius-chip)] bg-[var(--ok-soft)] px-1.5 py-0.5 text-[var(--success-foreground)]">
                         <Wrench className="size-3" strokeWidth={1.5} aria-hidden />
                         <span>{heal.shortLabel}</span>
                       </span>
                     )}
                     {ds.files > 0 && !heal && (
-                      <span className="text-diff-add-fg">+{ds.add}</span>
+                      <span className="text-[var(--diff-add-fg)]">+{ds.add}</span>
                     )}
                     {depCount > 0 && (
-                      <span className="inline-flex items-center gap-0.5 rounded-chip bg-track px-1.5 py-0.5 text-ink-2">
-                        <GitBranch className="size-3 text-icon" strokeWidth={1.5} aria-hidden />
+                      <span className="inline-flex items-center gap-0.5 rounded-[var(--radius-chip)] bg-[var(--track)] px-1.5 py-0.5 text-[var(--ink-2)]">
+                        <GitBranch className="size-3 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
                         <span>{depCount}</span>
                       </span>
                     )}

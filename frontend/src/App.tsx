@@ -1,37 +1,32 @@
-// Fleet v0.8.0: Parallel Coding-Agent War Room & Mission Control Board.
-// Top Command Bar (Cmd+K, Search, Needs-you Inbox, New/Batch Session, Settings — NO top-bar theme toggle)
-// -> Update Strip -> Scan Strip (Concurrency active/max_parallel + Live SSE status + Tremor Tracker)
-// -> Hero Verified Receipt -> Filter & Multi-Select Bulk Strip -> Three-Lane Board + Split-Pane Inspector.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Toaster, toast } from "sonner";
-import { Drawer } from "vaul";
 import {
   Command as CommandIcon,
   Cpu,
   KeyRound,
+  LayoutGrid,
+  Moon,
+  Network,
+  PanelLeft,
+  PanelRight,
   Plug,
   RefreshCw,
   RotateCcw,
   ScanLine,
-  Search,
+  Sparkles,
   Sun,
-  Moon,
-  X,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
-import { Kbd } from "@/components/ui/kbd";
-import { SegmentedControl, SegmentedControlItem } from "@/components/ui/segmented-control";
-import { Tooltip, TooltipPopup, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { SlidingNumber } from "@/components/ui/sliding-number";
-import { Tracker } from "@/components/Tracker/Tracker";
-import { AvatarStack } from "@/components/kibo-ui/avatar-stack";
-import { Pill, PillIndicator } from "@/components/kibo-ui/pill";
-import { useMediaQuery } from "@/lib/useMediaQuery";
-import { cn } from "@/lib/utils";
+import {
+  Badge,
+  Button,
+  Drawer,
+  Input,
+  Kbd,
+  PopoverPanel,
+  SegmentedControl,
+  ToastRegion,
+  cn,
+  toast,
+} from "./ui";
 import {
   computeLocalBudget,
   computeLocalMetrics,
@@ -44,7 +39,6 @@ import {
   getWebEngine,
   isActivelyRunning,
   isFailed,
-  isQueuedOrBlocked,
   isVerified,
   isWebEngineMode,
   normalizeConfig,
@@ -52,7 +46,6 @@ import {
   normalizeRepos,
   normalizeSessions,
   postJson,
-  statusText,
   supportsV050,
   supportsV060,
   supportsV070,
@@ -68,9 +61,10 @@ import {
   type ViewMode,
   type WebEngineStatus,
 } from "./api";
-import { BoardFilterBulkBar, BoardMetricsStrip, HeroVerifiedReceipt, ThreeLaneBoard } from "./board";
+import { BoardMetricsStrip, GoalLaunchpad, RightInspectorRail, SessionInboxRail } from "./board";
 import { DagWaveGraph } from "./dag-graph";
 import { DetailBody } from "./detail";
+import { useMergeCheck } from "./diff";
 import { NewSession, type ComposerMode } from "./composer";
 import { CommandPalette } from "./palette";
 import { PrPreviewModal } from "./pr-modal";
@@ -79,24 +73,9 @@ import { useFleetStream } from "./stream";
 import { onThisMachine, resultLine as resultLineOf, UpdateStrip, useUpdate } from "./update";
 
 type Theme = "dark" | "light";
+type MobilePane = "inbox" | "workspace" | "inspector";
 const THEME_KEY = "fleet-theme";
 const TEST_NOTE = "Custom script mode: an executable path runs in place of a detected coding CLI.";
-
-const AVATAR_SKINS = [
-  "bg-av-sky-bg text-av-sky-fg",
-  "bg-av-violet-bg text-av-violet-fg",
-  "bg-av-rose-bg text-av-rose-fg",
-  "bg-av-grey-bg text-av-grey-fg",
-];
-
-function agentAvatarLabel(s: Session, idx: number): string {
-  const raw = (s.engine || s.agent || "").trim();
-  if (/opencode/i.test(raw)) return "OC";
-  if (/claude/i.test(raw)) return "CL";
-  if (/codex/i.test(raw)) return "CX";
-  if (s.test_mode || !raw || /agent\.sh|custom/i.test(raw)) return `S${idx + 1}`;
-  return raw.slice(0, 2).toUpperCase();
-}
 
 function readTheme(): Theme {
   try {
@@ -104,6 +83,20 @@ function readTheme(): Theme {
   } catch {
     return "light";
   }
+}
+
+function useMedia(query: string): boolean {
+  const [matches, setMatches] = useState(() =>
+    typeof window !== "undefined" ? window.matchMedia(query).matches : true,
+  );
+  useEffect(() => {
+    const mq = window.matchMedia(query);
+    const onChange = () => setMatches(mq.matches);
+    setMatches(mq.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, [query]);
+  return matches;
 }
 
 export function App() {
@@ -114,8 +107,12 @@ export function App() {
   const [lastGood, setLastGood] = useState<Date | null>(null);
   const [unreachable, setUnreachable] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
+  const [launchpadOpen, setLaunchpadOpen] = useState(false);
   const [requestedTab, setRequestedTab] = useState<TabId>("tr");
   const [openSeq, setOpenSeq] = useState(0);
+  const [leftOpen, setLeftOpen] = useState(true);
+  const [rightOpen, setRightOpen] = useState(true);
+  const [mobilePane, setMobilePane] = useState<MobilePane>("inbox");
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [repoFilter, setRepoFilter] = useState("");
@@ -126,7 +123,6 @@ export function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [inboxOpenDesktop, setInboxOpenDesktop] = useState(false);
-  const [inboxOpenMobile, setInboxOpenMobile] = useState(false);
   const [inbox, setInbox] = useState<Session[]>([]);
   const [inboxErr, setInboxErr] = useState<Record<string, string>>({});
   const [config, setConfig] = useState<RuntimeConfig | null>(null);
@@ -134,35 +130,29 @@ export function App() {
   const [serverMetrics, setServerMetrics] = useState<BoardMetrics | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("board");
   const [prSession, setPrSession] = useState<Session | null>(null);
+  const [composerSignal, setComposerSignal] = useState(0);
 
-  const wide = useMediaQuery("(min-width: 1100px)");
-  const md = useMediaQuery("(min-width: 768px)");
-  const closeOverlaysForUpdate = useCallback(() => {
-    setSettingsOpen(false);
-    setInboxOpenDesktop(false);
-    setInboxOpenMobile(false);
-    setPaletteOpen(false);
-    setPrSession(null);
-  }, []);
-  const upd = useUpdate(closeOverlaysForUpdate);
+  const md = useMedia("(min-width: 768px)");
+  const xl = useMedia("(min-width: 1180px)");
+  const initialAutoPickedRef = useRef(false);
   const searchRef = useRef<HTMLInputElement>(null);
   const composerModeRef = useRef<ComposerMode>("single");
   const composerPlaybookRef = useRef<PlaybookTemplate | null>(null);
   const modalClosedAtRef = useRef(0);
+
+  const closeOverlaysForUpdate = useCallback(() => {
+    setSettingsOpen(false);
+    setInboxOpenDesktop(false);
+    setPaletteOpen(false);
+    setPrSession(null);
+  }, []);
+
+  const upd = useUpdate(closeOverlaysForUpdate);
   const webEngine = isWebEngineMode();
   const localHost = onThisMachine();
-  const hasServerV050 = useMemo(
-    () => supportsV050(upd.version, policy),
-    [upd.version, policy],
-  );
-  const hasServerV060 = useMemo(
-    () => supportsV060(upd.version, policy),
-    [upd.version, policy],
-  );
-  const hasServerV070 = useMemo(
-    () => supportsV070(upd.version, policy),
-    [upd.version, policy],
-  );
+  const hasServerV050 = useMemo(() => supportsV050(upd.version, policy), [upd.version, policy]);
+  const hasServerV060 = useMemo(() => supportsV060(upd.version, policy), [upd.version, policy]);
+  const hasServerV070 = useMemo(() => supportsV070(upd.version, policy), [upd.version, policy]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -251,6 +241,20 @@ export function App() {
 
   const all = sessions ?? [];
 
+  // Auto-open the top active/needs-you/verified run on first load so desktop opens directly into work.
+  useEffect(() => {
+    if (initialAutoPickedRef.current || !sessions || sessions.length === 0) return;
+    initialAutoPickedRef.current = true;
+    if (!selected) {
+      const top =
+        sessions.find((s) => s.bucket === "needs-you") ??
+        sessions.find(isActivelyRunning) ??
+        sessions.find(isVerified) ??
+        sessions[0];
+      if (top) setSelected(top.id);
+    }
+  }, [sessions, selected]);
+
   const distinctProjects = useMemo(
     () => Array.from(new Set(all.map((s) => s.project).filter(Boolean))).sort(),
     [all],
@@ -272,7 +276,7 @@ export function App() {
     return all.filter((s) => {
       if (statusFilter === "needs-you" && s.bucket !== "needs-you") return false;
       if (statusFilter === "working" && !isActivelyRunning(s)) return false;
-      if (statusFilter === "queued" && !isQueuedOrBlocked(s)) return false;
+      if (statusFilter === "queued" && (s.bucket !== "working" || isActivelyRunning(s))) return false;
       if (statusFilter === "done" && s.bucket !== "done") return false;
       if (repoFilter && s.project !== repoFilter) return false;
       if (engineFilter) {
@@ -286,7 +290,6 @@ export function App() {
     });
   }, [all, query, statusFilter, repoFilter, engineFilter]);
 
-  // Lane-ordered list for j/k keyboard navigation (Needs you -> Working -> Done)
   const navOrdered = useMemo(() => {
     const needs = shown.filter((s) => s.bucket === "needs-you");
     const working = shown.filter((s) => s.bucket === "working");
@@ -299,7 +302,8 @@ export function App() {
     if (selected && sessions && !current) setSelected(null);
   }, [selected, sessions, current]);
 
-  // Prune removed sessions from bulk selection automatically
+  const { mergeCheck, checkingMerge, recheckMerge } = useMergeCheck(current, hasServerV050);
+
   useEffect(() => {
     if (bulkSelected.size === 0) return;
     const valid = new Set(all.map((s) => s.id));
@@ -314,28 +318,29 @@ export function App() {
 
   const openSession = useCallback((id: string, tab: TabId = "tr") => {
     setSelected(id);
+    setLaunchpadOpen(false);
+    setViewMode("board");
     setRequestedTab(tab);
     setOpenSeq((n) => n + 1);
+    setMobilePane("workspace");
   }, []);
 
   const closeDetail = useCallback(() => {
     const id = selected;
     setSelected(null);
+    setLaunchpadOpen(true);
+    setMobilePane("inbox");
     requestAnimationFrame(() => {
-      (document.querySelector<HTMLElement>(`[data-open="${id}"]`) ?? document.getElementById("lane-needs-h"))?.focus();
+      document.querySelector<HTMLElement>(`[data-open="${id}"]`)?.focus();
     });
   }, [selected]);
 
   const triggerComposer = useCallback((mode: ComposerMode, playbook: PlaybookTemplate | null = null) => {
     composerModeRef.current = mode;
     composerPlaybookRef.current = playbook;
-    const desktopBtn = document.querySelector<HTMLButtonElement>('[data-thing="new-session-desktop"]');
-    const mobileBtn = document.querySelector<HTMLButtonElement>('[data-thing="new-session-mobile"]');
-    const btn = desktopBtn && desktopBtn.offsetParent !== null ? desktopBtn : mobileBtn ?? desktopBtn;
-    btn?.click();
+    setComposerSignal((n) => n + 1);
   }, []);
 
-  // Global keyboard shortcuts: Cmd+K/Ctrl+K palette, / search, n new session, j/k sessions, t/d/r tabs, Escape close
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
@@ -343,7 +348,6 @@ export function App() {
         setPaletteOpen((prev) => !prev);
         return;
       }
-
       const active = document.activeElement as HTMLElement | null;
       const tag = active?.tagName;
       const inEditable =
@@ -357,36 +361,41 @@ export function App() {
         e.key === "Escape" &&
         !e.defaultPrevented &&
         Date.now() - modalClosedAtRef.current > 150 &&
-        selected &&
         !dialogOpen &&
         !paletteOpen &&
         !prSession &&
-        !settingsOpen
+        !settingsOpen &&
+        inboxOpenDesktop
       ) {
-        closeDetail();
+        setInboxOpenDesktop(false);
         return;
       }
 
-      if (inEditable || dialogOpen || paletteOpen || Boolean(prSession) || settingsOpen || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (inEditable || dialogOpen || paletteOpen || Boolean(prSession) || settingsOpen || e.metaKey || e.ctrlKey || e.altKey) {
+        return;
+      }
 
       if (e.key === "/") {
         e.preventDefault();
-        searchRef.current?.focus();
+        if (leftOpen && md) {
+          searchRef.current?.focus();
+        } else {
+          if (!leftOpen) setLeftOpen(true);
+          if (!md) setMobilePane("inbox");
+          setTimeout(() => searchRef.current?.focus(), 20);
+        }
         return;
       }
-
       if (e.key === "n") {
         e.preventDefault();
         triggerComposer("single");
         return;
       }
-
       if (e.key === "g") {
         e.preventDefault();
         setViewMode((cur) => (cur === "board" ? "dag" : "board"));
         return;
       }
-
       if (e.key === "j" || e.key === "k") {
         if (navOrdered.length === 0) return;
         e.preventDefault();
@@ -403,11 +412,12 @@ export function App() {
         if (target) openSession(target.id, requestedTab);
         return;
       }
-
       if (e.key === "t" || e.key === "d" || e.key === "r") {
         const nextTab: TabId = e.key === "t" ? "tr" : e.key === "d" ? "df" : "rc";
         if (selected) {
           e.preventDefault();
+          setLaunchpadOpen(false);
+          setViewMode("board");
           setRequestedTab(nextTab);
         } else if (navOrdered.length > 0) {
           e.preventDefault();
@@ -417,37 +427,30 @@ export function App() {
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [selected, requestedTab, navOrdered, paletteOpen, prSession, settingsOpen, closeDetail, openSession, triggerComposer]);
+  }, [
+    selected,
+    requestedTab,
+    navOrdered,
+    paletteOpen,
+    prSession,
+    settingsOpen,
+    inboxOpenDesktop,
+    leftOpen,
+    md,
+    openSession,
+    triggerComposer,
+  ]);
 
-  const verifiedAll = all.filter(isVerified);
-  const verifiedCount = verifiedAll.length;
-  const latestVerified = verifiedAll[0] ?? null;
-  const needsAll = all.filter((s) => s.bucket === "needs-you");
-  const workingActive = all.filter(isActivelyRunning);
-  const queuedCount = all.filter(isQueuedOrBlocked).length;
-  const needsCount = needsAll.length;
-  const workingCount = all.filter((s) => s.bucket === "working").length;
   const maxParallel = policy?.max_parallel ?? config?.max_parallel ?? 4;
   const liveMetrics = useMemo(() => {
     const local: BoardMetrics = {
       ...computeLocalMetrics(all, maxParallel),
       budget: computeLocalBudget(all, policy),
     };
-    if (serverMetrics && hasServerV060) {
-      return serverMetrics;
-    }
-    return local;
+    return serverMetrics && hasServerV060 ? serverMetrics : local;
   }, [all, maxParallel, policy, serverMetrics, hasServerV060]);
-  const testMode = !webEngine && (policy?.default_agent_engine === "custom" || all.some((s) => s.test_mode));
-  const hasActiveFilters = Boolean(query.trim() || statusFilter !== "all" || repoFilter || engineFilter);
 
-  const focusNeedsLane = () => {
-    requestAnimationFrame(() => {
-      const el = document.getElementById("lane-needs-h");
-      el?.scrollIntoView({ block: "nearest" });
-      el?.focus();
-    });
-  };
+  const testMode = !webEngine && (policy?.default_agent_engine === "custom" || all.some((s) => s.test_mode));
 
   const retry = async (id: string) => {
     const e = await postJson(`/api/sessions/${id}/retry`);
@@ -466,7 +469,6 @@ export function App() {
       if (selected === id) setSelected(null);
     }
     void refresh();
-    focusNeedsLane();
   };
 
   const bulkRetry = async (ids: string[]) => {
@@ -512,7 +514,6 @@ export function App() {
     let mergedCount = 0;
     let skippedConflicts = 0;
     let failedCount = 0;
-
     for (const id of ids) {
       const s = all.find((x) => x.id === id);
       if (!s || !isVerified(s) || s.status !== "done") continue;
@@ -527,7 +528,6 @@ export function App() {
       if (err) failedCount++;
       else mergedCount++;
     }
-
     setBulkBusy(false);
     if (mergedCount > 0) {
       const notes = [
@@ -543,27 +543,6 @@ export function App() {
       toast.error(`Merge refused for ${failedCount} ${failedCount === 1 ? "session" : "sessions"}.`);
     }
     setBulkSelected(new Set());
-    void refresh();
-  };
-
-  const mergeFromHero = async (s: Session) => {
-    try {
-      const r = await fetch(`/api/sessions/${s.id}/merge`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ strategy: "merge" }),
-      });
-      if (r.ok) {
-        const j = await r.json().catch(() => ({}));
-        toast.success(`Merged ${s.branch} into ${j.branch || s.merge_target || "the target branch"}.`);
-      } else {
-        const j = await r.json().catch(() => ({}));
-        toast.error(j.error || "The merge was refused.");
-        openSession(s.id, "rc");
-      }
-    } catch {
-      toast.error("Could not reach Fleet. Is it running?");
-    }
     void refresh();
   };
 
@@ -583,126 +562,113 @@ export function App() {
     setEngineFilter("");
   };
 
-  const openPrPreview = useCallback(
-    (s: Session) => {
-      if (!wide) setSelected(null);
-      setPrSession(s);
-    },
-    [wide],
-  );
+  const streamLabel = streamState === "browser" ? "Browser engine" : streamState === "sse" ? "SSE live" : "Polling";
 
-  const detailBody = current && (
-    <DetailBody
-      s={current}
-      allSessions={all}
-      requestedTab={requestedTab}
-      openSeq={openSeq}
-      supportsServerV050={hasServerV050}
-      onClose={closeDetail}
-      onOpenSession={openSession}
-      onOpenPrPreview={openPrPreview}
-      onChanged={refresh}
-      onDismissed={() => void dismiss(current.id)}
-    />
-  );
-
-  const streamLabel =
-    streamState === "browser"
-      ? "Browser engine"
-      : streamState === "sse"
-        ? "SSE live"
-        : "Polling";
+  const showWorkspaceInCenter = viewMode === "board";
 
   return (
-    <TooltipProvider>
-      <div className="flex min-h-dvh flex-col bg-canvas text-ink">
-        <header className="sticky top-0 z-20 flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-hairline bg-surface px-4 py-2.5 md:px-6">
-          <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <ScanLine className="size-5 shrink-0 text-ink" strokeWidth={1.5} aria-hidden />
-            <h1 className="font-heading text-[20px] font-medium tracking-[-0.025em] text-ink">Fleet</h1>
-            {upd.version && (
-              <a
-                href={`${VERSION_URL}${upd.version}`}
-                target="_blank"
-                rel="noopener"
-                className="hidden min-h-8 items-center rounded-chip bg-track px-2 font-mono text-xs text-ink-2 outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-ring md:inline-flex"
-              >
-                v{upd.version}
-              </a>
-            )}
-            {localHost && upd.snap?.mode !== "off" && !webEngine && (
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="Check for updates"
-                      disabled={upd.checking}
-                      onClick={upd.check}
-                      className="hidden md:inline-flex"
-                    />
-                  }
-                >
-                  <RefreshCw
-                    className={cn("size-3.5 text-ink-2 motion-reduce:animate-none", upd.checking && "animate-spin")}
-                    strokeWidth={1.5}
-                    aria-hidden
-                  />
-                </TooltipTrigger>
-                <TooltipPopup>Check for updates</TooltipPopup>
-              </Tooltip>
-            )}
-            {testMode && (
-              <Badge variant="warning" size="sm" title={TEST_NOTE} className="shrink-0">
-                custom script
-              </Badge>
-            )}
-            {upd.hidden && upd.snap?.available && upd.dismissed && (
-              <Button id="show-update" size="sm" variant="outline" onClick={upd.show} className="max-md:min-h-11 max-md:px-3">
-                Show update
-              </Button>
-            )}
+    <div className="flex h-dvh flex-col overflow-hidden bg-[var(--canvas)] text-[var(--ink)]">
+      {/* Slim 44px single top chrome */}
+      <header className="h-11 shrink-0 flex items-center justify-between gap-2 border-b border-[var(--hairline)] bg-[var(--surface)] px-3 md:px-4">
+        <div className="flex min-w-0 items-center gap-2">
+          {md && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label="Toggle inbox rail"
+              aria-pressed={leftOpen}
+              onClick={() => setLeftOpen((v) => !v)}
+            >
+              <PanelLeft className="size-4" strokeWidth={1.5} />
+            </Button>
+          )}
+          <ScanLine className="size-4 shrink-0 text-[var(--blue)]" strokeWidth={1.75} aria-hidden />
+          <h1 className="text-[16px] font-semibold tracking-tight text-[var(--ink)]">Fleet</h1>
+          {upd.version && (
+            <a
+              href={`${VERSION_URL}${upd.version}`}
+              target="_blank"
+              rel="noopener"
+              className="hidden sm:inline-flex items-center rounded-[var(--radius-chip)] bg-[var(--track)] px-2 h-6 mono text-[12px] text-[var(--ink-2)] hover:text-[var(--ink)] focus-visible:outline-2 focus-visible:outline-[var(--ring)]"
+            >
+              v{upd.version}
+            </a>
+          )}
+          {localHost && upd.snap?.mode !== "off" && !webEngine && (
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="Check for updates"
+              disabled={upd.checking}
+              onClick={upd.check}
+              className="hidden lg:inline-flex"
+            >
+              <RefreshCw className={cn("size-3.5 text-[var(--ink-2)]", upd.checking && "animate-spin")} strokeWidth={1.5} />
+            </Button>
+          )}
+          {testMode && <Badge tone="warning" className="max-sm:hidden">custom script</Badge>}
+          {upd.hidden && upd.snap?.available && upd.dismissed && (
+            <Button id="show-update" size="sm" variant="outline" onClick={upd.show}>
+              Show update
+            </Button>
+          )}
+        </div>
+
+        <div className="hidden md:flex items-center gap-1.5">
+          <div className="inline-flex items-center gap-0.5 rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--track)] p-0.5">
+            <button
+              type="button"
+              data-testid="view-toggle-board"
+              aria-pressed={viewMode === "board" && !launchpadOpen}
+              onClick={() => {
+                setViewMode("board");
+                setLaunchpadOpen(false);
+              }}
+              className={cn(
+                "inline-flex items-center gap-1.5 rounded-[var(--radius-segment)] px-2.5 h-8 text-[13px] font-medium cursor-pointer transition active:bg-[var(--board)]",
+                viewMode === "board" && !launchpadOpen
+                  ? "bg-[var(--raised)] text-[var(--ink)] border border-[var(--hairline)]"
+                  : "text-[var(--ink-2)] border border-transparent hover:text-[var(--ink)]",
+              )}
+            >
+              <LayoutGrid className="size-3.5" strokeWidth={1.5} aria-hidden />
+              <span>Workbench</span>
+            </button>
+            <button
+              type="button"
+              data-testid="view-toggle-dag"
+              aria-pressed={viewMode === "dag"}
+              onClick={() => setViewMode("dag")}
+              className={cn(
+                "inline-flex items-center gap-1.5 rounded-[var(--radius-segment)] px-2.5 h-8 text-[13px] font-medium cursor-pointer transition active:bg-[var(--board)]",
+                viewMode === "dag"
+                  ? "bg-[var(--raised)] text-[var(--ink)] border border-[var(--hairline)]"
+                  : "text-[var(--ink-2)] border border-transparent hover:text-[var(--ink)]",
+              )}
+            >
+              <Network className="size-3.5" strokeWidth={1.5} aria-hidden />
+              <span>DAG</span>
+            </button>
           </div>
 
-          <InputGroup className="order-last flex h-11 w-full md:order-none md:ml-auto md:h-9 md:w-52 lg:w-64">
-            <InputGroupAddon>
-              <Search className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
-            </InputGroupAddon>
-            <InputGroupInput
-              ref={searchRef}
-              type="search"
-              aria-label="Search sessions"
-              placeholder="Search sessions"
-              className="max-md:[&_input]:!h-11 max-md:!h-11"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-            />
-            <InputGroupAddon align="inline-end">
-              <Kbd>/</Kbd>
-            </InputGroupAddon>
-          </InputGroup>
+          <Button
+            type="button"
+            variant={launchpadOpen && viewMode === "board" ? "secondary" : "ghost"}
+            size="sm"
+            data-testid="open-launchpad"
+            onClick={() => {
+              setViewMode("board");
+              setLaunchpadOpen((v) => !v);
+            }}
+          >
+            <Sparkles className="size-3.5 text-[var(--blue)]" strokeWidth={1.5} aria-hidden />
+            <span>Plan goal</span>
+          </Button>
+        </div>
 
-          <div className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-2 md:ml-0">
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    id="cmdk-open"
-                    aria-label="Command palette"
-                    onClick={() => setPaletteOpen(true)}
-                    className="h-9 gap-1.5 px-2.5 max-md:size-11 max-md:px-0"
-                  />
-                }
-              >
-                <CommandIcon className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
-                <Kbd className="hidden lg:inline-flex">K</Kbd>
-              </TooltipTrigger>
-              <TooltipPopup>Command palette (Cmd+K)</TooltipPopup>
-            </Tooltip>
-
+        <div className="flex items-center gap-1.5 shrink-0">
+          <div className="hidden md:inline-flex">
             <InboxPopover
               open={inboxOpenDesktop}
               onOpenChange={setInboxOpenDesktop}
@@ -713,475 +679,26 @@ export function App() {
               onRetry={retry}
               onBulkRetryAll={() => void bulkRetry(inbox.map((x) => x.id))}
               onBulkDismissAll={() => void bulkDismiss(inbox.map((x) => x.id))}
-              onGo={focusNeedsLane}
-              side="bottom"
-              className="hidden md:inline-flex"
+              onGo={() => {
+                setStatusFilter("needs-you");
+                setLeftOpen(true);
+              }}
             />
-            <span data-answers-via="4" className="hidden md:inline-flex">
-              <NewSession
-                policy={policy}
-                sessions={all}
-                playbooks={playbooks}
-                supportsServerV050={hasServerV050}
-                supportsServerV060={hasServerV060}
-                initialModeRef={composerModeRef}
-                initialPlaybookRef={composerPlaybookRef}
-                thing="new-session-desktop"
-                onPlaybooksChanged={() => void refreshPlaybooks()}
-                onHanded={(s) => {
-                  setSessions((prev) => (prev ? [s, ...prev.filter((x) => x.id !== s.id)] : [s]));
-                  openSession(s.id, "tr");
-                  void refresh();
-                }}
-                onHandedBatch={(created) => {
-                  setSessions((prev) => {
-                    const existing = prev ?? [];
-                    const newIds = new Set(created.map((c) => c.id));
-                    return [...created, ...existing.filter((x) => !newIds.has(x.id))];
-                  });
-                  if (created[0]) openSession(created[0].id, "tr");
-                  void refresh();
-                }}
-              />
-            </span>
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    id="settings-open"
-                    className="max-md:size-11"
-                    aria-label="Engines and settings"
-                    onClick={() => {
-                      setInboxOpenDesktop(false);
-                      setInboxOpenMobile(false);
-                      setSettingsOpen(true);
-                    }}
-                  />
-                }
-              >
-                <Cpu className="size-4" strokeWidth={1.5} aria-hidden />
-              </TooltipTrigger>
-              <TooltipPopup>Engines and settings</TooltipPopup>
-            </Tooltip>
           </div>
-        </header>
 
-        <UpdateStrip u={upd} />
+          <Button
+            variant="outline"
+            size="sm"
+            id="cmdk-open"
+            aria-label="Command palette"
+            onClick={() => setPaletteOpen(true)}
+            className="hidden sm:inline-flex"
+          >
+            <CommandIcon className="size-3.5 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
+            <Kbd>K</Kbd>
+          </Button>
 
-        <section
-          aria-label="Scan"
-          className="grid grid-cols-2 border-b border-hairline bg-surface/60 md:grid-cols-[repeat(4,minmax(0,1fr))_minmax(0,1.7fr)]"
-        >
-          <Reading label="Sessions" value={sessions ? all.length : null} className="max-md:border-b max-md:border-hairline" />
-          <Reading
-            label="Needs you"
-            value={sessions ? needsCount : null}
-            tone={needsCount ? "bad" : undefined}
-            answers="1"
-            className="max-md:border-b max-md:border-r-0 max-md:border-hairline"
-          />
-          <div className="min-w-0 border-r border-hairline max-md:border-b" data-answers="2">
-            <div className="flex items-start justify-between gap-2 pr-4">
-              <Reading label="Working" value={sessions ? workingCount : null} bare />
-              {sessions && (
-                <span
-                  data-testid="concurrency-indicator"
-                  className="mt-3 shrink-0 rounded-chip bg-track px-2 py-0.5 font-mono text-xs tabular-nums text-ink-2"
-                >
-                  {workingActive.length} / {maxParallel} slots
-                </span>
-              )}
-            </div>
-            <div className="flex min-h-7 items-center gap-2 px-4 pb-3">
-              {workingActive.length >= 1 ? (
-                <>
-                  <AvatarStack size={24}>
-                    {workingActive.slice(0, 4).map((s, idx) => (
-                      <Avatar key={s.id} className="size-6 ring-2 ring-surface" title={`${s.engine || s.agent || "agent"}: ${s.task}`}>
-                        <AvatarFallback className={cn("font-mono text-xs font-medium", AVATAR_SKINS[idx % AVATAR_SKINS.length])}>
-                          {agentAvatarLabel(s, idx)}
-                        </AvatarFallback>
-                      </Avatar>
-                    ))}
-                  </AvatarStack>
-                  <span className="min-w-0 truncate text-xs text-ink-2">
-                    {workingActive.length === 1
-                      ? `running ${workingActive[0].test_mode ? "custom script" : workingActive[0].engine || workingActive[0].agent || "agent"}`
-                      : `${workingActive.length} running`}
-                    {queuedCount > 0 ? ` · ${queuedCount} queued` : ""}
-                  </span>
-                </>
-              ) : (
-                <span className="text-xs text-ink-3">
-                  {sessions ? (queuedCount > 0 ? `${queuedCount} queued` : "idle") : ""}
-                </span>
-              )}
-            </div>
-          </div>
-          <Reading
-            label="Verified"
-            value={sessions ? verifiedCount : null}
-            tone={verifiedCount ? "good" : undefined}
-            className="max-md:border-b max-md:border-r-0 max-md:border-hairline"
-          />
-          <div className="col-span-2 flex min-w-0 flex-col justify-center gap-2 px-4 py-3 md:col-span-1">
-            <div className="flex items-center justify-between gap-2">
-              <p className="text-sm text-ink-2">Recent sessions</p>
-              <div className="flex items-center gap-1.5">
-                {sessions && (
-                  <Pill variant="secondary" className="px-2 py-0.5 font-mono text-xs" data-testid="stream-pill">
-                    <PillIndicator
-                      variant={streamState === "sse" || streamState === "browser" ? "success" : "info"}
-                      pulse={workingActive.length > 0 && streamState === "sse"}
-                    />
-                    <span>{streamLabel}</span>
-                  </Pill>
-                )}
-                {sessions && (
-                  <span className="font-mono text-xs text-ink-3 tabular-nums">{Math.min(all.length, 32)} / 32</span>
-                )}
-              </div>
-            </div>
-            {all.length ? (
-              <Tracker
-                className="h-6"
-                data={all.slice(0, 32).map((s) => ({
-                  key: s.id,
-                  color: isVerified(s)
-                    ? "bg-dot-green"
-                    : isFailed(s)
-                      ? "bg-unread"
-                      : s.bucket === "needs-you"
-                        ? "bg-dot-clay"
-                        : isQueuedOrBlocked(s)
-                          ? "bg-dot-amber"
-                          : s.bucket === "working"
-                            ? "bg-ink-3"
-                            : "bg-track",
-                  tooltip: `${s.task}: ${statusText(s)}`,
-                }))}
-              />
-            ) : (
-              <div className="flex h-6 items-center rounded-control bg-track px-2.5 font-mono text-xs text-ink-3">
-                {sessions ? "No session outcomes yet" : ""}
-              </div>
-            )}
-          </div>
-        </section>
-
-        {sessions !== null && <BoardMetricsStrip metrics={liveMetrics} />}
-
-        {unreachable && (
-          <p role="status" className="border-b border-hairline bg-pill-pro-bg px-4 py-2 text-sm text-destructive-foreground md:px-6">
-            {lastGood
-              ? `Cannot reach Fleet. Showing the last list from ${lastGood.toLocaleTimeString()}. Retrying.`
-              : "Cannot reach Fleet. Retrying."}
-          </p>
-        )}
-
-        <div className="flex min-h-0 flex-1">
-          <main className="min-w-0 flex-1 pb-28 md:pb-0">
-            {sessions !== null && (
-              <HeroVerifiedReceipt
-                latest={latestVerified}
-                needsTop={needsAll[0] ?? null}
-                workingCount={workingCount}
-                totalCount={all.length}
-                onInspect={openSession}
-                onMerge={mergeFromHero}
-                onRetry={retry}
-              />
-            )}
-
-            {sessions !== null && (
-              <BoardFilterBulkBar
-                viewMode={viewMode}
-                statusFilter={statusFilter}
-                repoFilter={repoFilter}
-                engineFilter={engineFilter}
-                repos={distinctProjects}
-                engines={distinctEngines}
-                hasActiveFilters={hasActiveFilters}
-                multiSelect={multiSelect}
-                selectedIds={bulkSelected}
-                visibleSessions={shown}
-                bulkBusy={bulkBusy}
-                onViewMode={setViewMode}
-                onStatusFilter={setStatusFilter}
-                onRepoFilter={setRepoFilter}
-                onEngineFilter={setEngineFilter}
-                onClearFilters={clearAllFilters}
-                onToggleMultiSelect={() => {
-                  setMultiSelect((prev) => {
-                    if (prev) setBulkSelected(new Set());
-                    return !prev;
-                  });
-                }}
-                onSelectVisible={() => setBulkSelected(new Set(shown.map((s) => s.id)))}
-                onClearSelection={() => setBulkSelected(new Set())}
-                onBulkRetry={bulkRetry}
-                onBulkDismiss={bulkDismiss}
-                onBulkMerge={bulkMerge}
-              />
-            )}
-
-            {viewMode === "dag" && sessions !== null ? (
-              <DagWaveGraph
-                sessions={shown}
-                selectedId={selected}
-                onOpen={(id) => openSession(id, "tr")}
-                onNewBatch={() => triggerComposer("batch", null)}
-              />
-            ) : (
-              <ThreeLaneBoard
-                sessions={sessions === null ? null : shown}
-                unreachable={unreachable}
-                selected={selected}
-                bulkMode={multiSelect}
-                bulkSelected={bulkSelected}
-                latestHeroId={latestVerified?.id ?? null}
-                onOpen={openSession}
-                onToggleBulk={toggleBulkCard}
-                onRetry={retry}
-                onDismiss={dismiss}
-              />
-            )}
-
-            {sessions !== null && all.length > 0 && shown.length === 0 && (
-              <p role="status" className="px-4 py-4 text-sm text-ink-2 md:px-6">
-                No session matches {query.trim() ? `“${query.trim()}”` : "the active filters"}.
-              </p>
-            )}
-          </main>
-
-          {wide && current && (
-            <aside
-              aria-label="Session inspector"
-              className="sticky top-14 hidden h-[calc(100dvh-56px)] w-[480px] shrink-0 overflow-y-auto border-l border-hairline bg-surface p-6 xl:w-[540px] min-[1100px]:block"
-            >
-              {detailBody}
-            </aside>
-          )}
-        </div>
-
-        {!wide && (
-          <Drawer.Root open={Boolean(current)} onOpenChange={(o) => { if (!o) closeDetail(); }}>
-            <Drawer.Portal>
-              <Drawer.Overlay className="fixed inset-0 z-40 bg-canvas/60" />
-              <Drawer.Content className="fixed inset-x-0 bottom-0 z-50 flex max-h-[92dvh] flex-col rounded-t-panel border-t border-hairline bg-surface text-ink outline-none">
-                <Drawer.Handle className="mx-auto mt-3 !h-1 !w-10 !bg-track" />
-                <Drawer.Title className="sr-only">{current?.task || "Session details"}</Drawer.Title>
-                <div className="flex-1 overflow-y-auto p-4">{detailBody}</div>
-              </Drawer.Content>
-            </Drawer.Portal>
-          </Drawer.Root>
-        )}
-
-        <CommandPalette
-          open={paletteOpen}
-          onOpenChange={setPaletteOpen}
-          sessions={all}
-          selectedSession={current}
-          playbooks={playbooks}
-          repos={repos}
-          engines={distinctEngines}
-          viewMode={viewMode}
-          multiSelect={multiSelect}
-          onViewMode={setViewMode}
-          onOpenSession={openSession}
-          onOpenPrPreview={openPrPreview}
-          onSwitchTab={(t) => {
-            setRequestedTab(t);
-            if (!selected && navOrdered[0]) openSession(navOrdered[0].id, t);
-          }}
-          onNewSingle={() => triggerComposer("single", null)}
-          onNewBatch={() => triggerComposer("batch", null)}
-          onApplyPlaybook={(tpl) =>
-            triggerComposer((tpl.tasks?.length ?? 1) > 1 ? "batch" : "single", tpl)
-          }
-          onOpenSettings={() => setSettingsOpen(true)}
-          onToggleMultiSelect={() => {
-            setMultiSelect((prev) => {
-              if (prev) setBulkSelected(new Set());
-              return !prev;
-            });
-          }}
-          onFocusSearch={() => searchRef.current?.focus()}
-          onFilterStatus={setStatusFilter}
-          onFilterRepo={setRepoFilter}
-          onFilterEngine={setEngineFilter}
-          onClearFilters={clearAllFilters}
-          onDownloadPatch={(s) => {
-            void downloadSessionPatch(s, hasServerV050).then((res) => {
-              if (res.ok) toast.success(`Downloaded ${res.filename}`);
-              else toast.error(res.error || "Could not download patch.");
-            });
-          }}
-          onRetrySession={(id) => void retry(id)}
-        />
-
-        <Drawer.Root direction="right" open={settingsOpen} onOpenChange={setSettingsOpen}>
-          <Drawer.Portal>
-            <Drawer.Overlay className="fixed inset-0 z-40 bg-canvas/60" />
-            <Drawer.Content
-              id="settings"
-              className="fixed inset-y-0 right-0 z-50 flex w-full max-w-[460px] flex-col border-l border-hairline bg-surface text-ink outline-none"
-            >
-              <div className="flex items-center justify-between border-b border-hairline px-5 py-4">
-                <Drawer.Title className="font-heading text-xl font-medium text-ink">Engines and settings</Drawer.Title>
-                <Drawer.Close asChild>
-                  <Button variant="ghost" size="icon" className="max-md:size-11" aria-label="Close settings">
-                    <X className="size-4" strokeWidth={1.5} aria-hidden />
-                  </Button>
-                </Drawer.Close>
-              </div>
-              <div className="flex-1 space-y-6 overflow-y-auto p-5">
-                <section className="border-b border-hairline pb-5">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div className="min-w-0">
-                      <h3 className="text-sm font-medium text-ink">Appearance</h3>
-                      <p className="text-xs text-ink-3">Light or dark theme, saved in this browser.</p>
-                    </div>
-                    <SegmentedControl aria-label="Theme" size="sm" id="themeBtn">
-                      {(["light", "dark"] as const).map((t) => (
-                        <SegmentedControlItem
-                          key={t}
-                          aria-pressed={theme === t}
-                          data-checked={theme === t ? "" : undefined}
-                          onClick={() => setTheme(t)}
-                          aria-label={t === "light" ? "Light" : "Dark"}
-                          className="gap-1.5 px-2.5 max-md:!h-11 max-md:!min-w-11"
-                        >
-                          {t === "light" ? (
-                            <Sun className="size-4" strokeWidth={1.5} aria-hidden />
-                          ) : (
-                            <Moon className="size-4" strokeWidth={1.5} aria-hidden />
-                          )}
-                          <span>{t === "light" ? "Light" : "Dark"}</span>
-                        </SegmentedControlItem>
-                      ))}
-                    </SegmentedControl>
-                  </div>
-                </section>
-
-                <Drawer.Description className="text-sm leading-relaxed text-ink-2">
-                  {policy
-                    ? `Up to ${policy.max_parallel} sessions run in parallel. Any agent or check exceeding ${policy.timeout_secs}s returns to Needs you. Policy source: ${policy.source}.${policy.model ? ` OpenCode model: ${policy.model}.` : ""} ${policy.default_agent ? `Default agent: ${policy.default_agent_engine === "custom" ? "custom script" : policy.default_agent}.` : "No default agent is set."}`
-                    : "Loading policy rules..."}
-                </Drawer.Description>
-
-                <section>
-                  <h3 className="mb-2 text-sm font-medium text-ink">
-                    {webEngine ? "Browser Worktree Engine" : "CLI engines detected on PATH"}
-                  </h3>
-                  <ul className="divide-y divide-hairline rounded-card border border-hairline bg-canvas">
-                    {(policy?.agents ?? []).length === 0 && (
-                      <li className="p-3 text-sm text-ink-2">No CLI agents detected on PATH.</li>
-                    )}
-                    {(policy?.agents ?? []).map((a) => (
-                      <li key={a.name} className="flex items-center justify-between gap-3 px-3 py-2.5 text-sm">
-                        <div className="min-w-0">
-                          <span className="block truncate font-mono text-ink">{a.name}</span>
-                          {a.path && <span className="block truncate font-mono text-xs text-ink-3">{a.path}</span>}
-                        </div>
-                        <Pill variant={a.found ? "success" : "secondary"} className="shrink-0 px-2.5 py-0.5 text-xs">
-                          <PillIndicator variant={a.found ? "success" : "warning"} />
-                          <span>{a.found ? (webEngine ? "active" : "found on this machine") : "not installed"}</span>
-                        </Pill>
-                      </li>
-                    ))}
-                  </ul>
-                  {testMode && <p className="mt-2 text-xs text-ink-3">{TEST_NOTE}</p>}
-                </section>
-
-                <PolicyTesterSection
-                  policy={policy}
-                  config={config}
-                  repos={repos}
-                  sessions={all}
-                  metrics={liveMetrics}
-                  settingsOpen={settingsOpen}
-                  supportsServerV050={hasServerV050}
-                  supportsServerV070={hasServerV070}
-                  canPrune={localHost && !webEngine}
-                  onPruned={refresh}
-                />
-
-                {localHost && !webEngine && (
-                  <EngineConfigSection
-                    policy={policy}
-                    config={config}
-                    onSaved={() => {
-                      void refreshConfig();
-                      void refresh();
-                    }}
-                  />
-                )}
-
-                {webEngine && (
-                  <WebEngineSettingsSection
-                    onChanged={() => {
-                      void refreshConfig();
-                      void refresh();
-                    }}
-                  />
-                )}
-
-                <section className="border-t border-hairline pt-5">
-                  <h3 className="mb-2 text-sm font-medium text-ink">Version and updates</h3>
-                  <div className="flex flex-wrap items-center gap-3 text-sm text-ink-2">
-                    {upd.version && <span className="font-mono text-ink">Fleet {upd.version}</span>}
-                    {localHost && !webEngine ? (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="max-md:min-h-11 max-md:px-4"
-                        onClick={upd.check}
-                        disabled={upd.checking || upd.snap?.mode === "off"}
-                      >
-                        {upd.checking ? "Checking..." : "Check for updates"}
-                      </Button>
-                    ) : webEngine ? (
-                      <span className="text-xs text-ink-2">
-                        Running in-browser git worktree, DAG scheduler, and Blob Web Worker check engine.
-                      </span>
-                    ) : (
-                      <span className="text-xs text-ink-2">To update, open Fleet on the computer it runs on.</span>
-                    )}
-                  </div>
-                  {!webEngine && (
-                    <p className="mt-2 text-sm text-ink-2 [overflow-wrap:anywhere]" role="status">
-                      {upd.snap && !upd.live ? resultLineOf(upd.snap) : upd.live}
-                    </p>
-                  )}
-                </section>
-              </div>
-            </Drawer.Content>
-          </Drawer.Portal>
-        </Drawer.Root>
-
-        <nav
-          aria-label="Board actions"
-          className="fixed inset-x-0 bottom-0 z-30 flex gap-2 border-t border-hairline bg-surface px-4 pt-2 md:hidden"
-          style={{ paddingBottom: "max(8px, env(safe-area-inset-bottom))" }}
-        >
-          <InboxPopover
-            open={inboxOpenMobile}
-            onOpenChange={setInboxOpenMobile}
-            inbox={inbox}
-            errs={inboxErr}
-            bulkBusy={bulkBusy}
-            onView={(id) => openSession(id, "tr")}
-            onRetry={retry}
-            onBulkRetryAll={() => void bulkRetry(inbox.map((x) => x.id))}
-            onBulkDismissAll={() => void bulkDismiss(inbox.map((x) => x.id))}
-            onGo={focusNeedsLane}
-            side="top"
-            className="h-11 flex-1 justify-center"
-          />
-          <span data-answers-via="4" className="flex flex-1">
+          {md && (
             <NewSession
               policy={policy}
               sessions={all}
@@ -1190,7 +707,8 @@ export function App() {
               supportsServerV060={hasServerV060}
               initialModeRef={composerModeRef}
               initialPlaybookRef={composerPlaybookRef}
-              thing="new-session-mobile"
+              openSignal={composerSignal}
+              thing="new-session-desktop"
               onPlaybooksChanged={() => void refreshPlaybooks()}
               onHanded={(s) => {
                 setSessions((prev) => (prev ? [s, ...prev.filter((x) => x.id !== s.id)] : [s]));
@@ -1206,73 +724,404 @@ export function App() {
                 if (created[0]) openSession(created[0].id, "tr");
                 void refresh();
               }}
-              className="h-11 flex-1 justify-center"
+              className="h-8 px-3 text-[13px]"
             />
-          </span>
+          )}
+
+          {xl && viewMode === "board" && current && !launchpadOpen && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label="Toggle inspector rail"
+              aria-pressed={rightOpen}
+              onClick={() => setRightOpen((v) => !v)}
+            >
+              <PanelRight className="size-4" strokeWidth={1.5} />
+            </Button>
+          )}
+
+          <Button
+            variant="outline"
+            size="icon"
+            id="settings-open"
+            aria-label="Engines and settings"
+            onClick={() => {
+              setInboxOpenDesktop(false);
+              setSettingsOpen(true);
+            }}
+          >
+            <Cpu className="size-4" strokeWidth={1.5} aria-hidden />
+          </Button>
+        </div>
+      </header>
+
+      <UpdateStrip u={upd} />
+
+      {unreachable && sessions !== null && (
+        <p role="status" className="border-b border-[var(--hairline)] bg-[var(--bad-soft)] px-4 py-2 text-[13px] text-[var(--destructive-foreground)]">
+          {lastGood
+            ? `Cannot reach Fleet. Showing the last list from ${lastGood.toLocaleTimeString()}. Retrying.`
+            : "Cannot reach Fleet. Retrying."}
+        </p>
+      )}
+
+      {/* 3-pane Desktop Workbench (or tabbed mobile panes on <768px) */}
+      <div className="flex flex-1 min-h-0 overflow-hidden">
+        {(md ? leftOpen : mobilePane === "inbox") && (
+          <div className={cn("flex flex-col h-full min-h-0 shrink-0 overflow-hidden", md ? "w-[292px] border-r border-[var(--hairline)]" : "w-full pb-16")}>
+            <SessionInboxRail
+              sessions={sessions === null ? null : shown}
+              allSessions={all}
+              unreachable={unreachable}
+              selectedId={selected}
+              statusFilter={statusFilter}
+              repoFilter={repoFilter}
+              repos={distinctProjects}
+              query={query}
+              multiSelect={multiSelect}
+              bulkSelected={bulkSelected}
+              bulkBusy={bulkBusy}
+              onQuery={setQuery}
+              onStatusFilter={setStatusFilter}
+              onRepoFilter={setRepoFilter}
+              onClearFilters={clearAllFilters}
+              onToggleMultiSelect={() =>
+                setMultiSelect((prev) => {
+                  if (prev) setBulkSelected(new Set());
+                  return !prev;
+                })
+              }
+              onToggleBulk={toggleBulkCard}
+              onSelectVisible={() => setBulkSelected(new Set(shown.map((s) => s.id)))}
+              onClearSelection={() => setBulkSelected(new Set())}
+              onBulkRetry={bulkRetry}
+              onBulkDismiss={bulkDismiss}
+              onBulkMerge={bulkMerge}
+              onOpen={openSession}
+              onRetry={(id) => void retry(id)}
+              onDismiss={(id) => void dismiss(id)}
+              searchInputRef={searchRef}
+            />
+          </div>
+        )}
+
+        {(md || mobilePane === "workspace") && (
+          <main className={cn("flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden bg-[var(--surface)]", !md && "pb-16")}>
+            <div className="flex-1 min-h-0 overflow-y-auto p-4 md:p-5 flex flex-col">
+              {viewMode === "dag" ? (
+                <DagWaveGraph
+                  sessions={shown}
+                  selectedId={selected}
+                  onOpen={(id) => openSession(id, "tr")}
+                  onNewBatch={() => triggerComposer("batch", null)}
+                />
+              ) : launchpadOpen || !current ? (
+                <GoalLaunchpad
+                  repos={repos}
+                  playbooks={playbooks}
+                  policy={policy}
+                  supportsServerV050={hasServerV050}
+                  onDispatched={(created) => {
+                    setSessions((prev) => {
+                      const existing = prev ?? [];
+                      const newIds = new Set(created.map((c) => c.id));
+                      return [...created, ...existing.filter((x) => !newIds.has(x.id))];
+                    });
+                    if (created[0]) openSession(created[0].id, "tr");
+                    void refresh();
+                  }}
+                  onApplyPlaybook={(tpl) =>
+                    triggerComposer((tpl.tasks?.length ?? 1) > 1 ? "batch" : "single", tpl)
+                  }
+                />
+              ) : (
+                <DetailBody
+                  s={current}
+                  allSessions={all}
+                  requestedTab={requestedTab}
+                  openSeq={openSeq}
+                  supportsServerV050={hasServerV050}
+                  mergeCheck={mergeCheck}
+                  checkingMerge={checkingMerge}
+                  onRecheckMerge={recheckMerge}
+                  onTabChange={setRequestedTab}
+                  onClose={closeDetail}
+                  onOpenSession={openSession}
+                  onOpenPrPreview={(s) => setPrSession(s)}
+                  onChanged={refresh}
+                  onDismissed={() => void dismiss(current.id)}
+                />
+              )}
+            </div>
+          </main>
+        )}
+
+        {((xl && rightOpen && showWorkspaceInCenter && Boolean(current) && !launchpadOpen) ||
+          (!md && mobilePane === "inspector")) && (
+          <div className={cn("flex flex-col h-full min-h-0 shrink-0 overflow-hidden", md ? "w-[300px] border-l border-[var(--hairline)]" : "w-full pb-16")}>
+            <RightInspectorRail
+              session={current}
+              mergeCheck={mergeCheck}
+              checkingMerge={checkingMerge}
+              supportsServerV050={hasServerV050}
+              onRecheckMerge={recheckMerge}
+              onOpenTab={(tab) => {
+                if (current) openSession(current.id, tab);
+              }}
+              onOpenPrPreview={(s) => setPrSession(s)}
+            />
+          </div>
+        )}
+      </div>
+
+      {md && (
+        <BoardMetricsStrip
+          metrics={liveMetrics}
+          streamLabel={streamLabel}
+          reachable={!unreachable}
+        />
+      )}
+
+      {/* Mobile bottom navigation bar */}
+      {!md && (
+        <nav
+          aria-label="Workbench panes"
+          className="fixed inset-x-0 bottom-0 z-30 flex items-center gap-1.5 border-t border-[var(--hairline)] bg-[var(--surface)] px-2 py-1.5"
+          style={{ paddingBottom: "max(6px, env(safe-area-inset-bottom))" }}
+        >
+          <Button
+            type="button"
+            variant={mobilePane === "inbox" ? "primary" : "ghost"}
+            size="sm"
+            onClick={() => setMobilePane("inbox")}
+            className="flex-1"
+          >
+            Inbox ({all.length})
+          </Button>
+          <Button
+            type="button"
+            variant={mobilePane === "workspace" ? "primary" : "ghost"}
+            size="sm"
+            onClick={() => setMobilePane("workspace")}
+            className="flex-1"
+          >
+            Workspace
+          </Button>
+          <Button
+            type="button"
+            variant={mobilePane === "inspector" ? "primary" : "ghost"}
+            size="sm"
+            onClick={() => setMobilePane("inspector")}
+            className="flex-1"
+          >
+            Inspector
+          </Button>
+          <Button
+            type="button"
+            variant="primary"
+            size="sm"
+            aria-label="New session"
+            onClick={() => triggerComposer("single", null)}
+          >
+            New
+          </Button>
         </nav>
+      )}
 
-        <PrPreviewModal
-          session={prSession}
-          supportsServerV070={hasServerV070}
-          onClose={() => {
-            modalClosedAtRef.current = Date.now();
-            setPrSession(null);
-          }}
-          onCreated={refresh}
-        />
+      <CommandPalette
+        open={paletteOpen}
+        onOpenChange={setPaletteOpen}
+        sessions={all}
+        selectedSession={current}
+        playbooks={playbooks}
+        repos={repos}
+        engines={distinctEngines}
+        viewMode={viewMode}
+        multiSelect={multiSelect}
+        onViewMode={setViewMode}
+        onOpenSession={openSession}
+        onOpenPrPreview={(s) => setPrSession(s)}
+        onSwitchTab={(t) => {
+          setLaunchpadOpen(false);
+          setViewMode("board");
+          setRequestedTab(t);
+          if (!selected && navOrdered[0]) openSession(navOrdered[0].id, t);
+        }}
+        onNewSingle={() => triggerComposer("single", null)}
+        onNewBatch={() => triggerComposer("batch", null)}
+        onApplyPlaybook={(tpl) =>
+          triggerComposer((tpl.tasks?.length ?? 1) > 1 ? "batch" : "single", tpl)
+        }
+        onOpenSettings={() => setSettingsOpen(true)}
+        onToggleMultiSelect={() =>
+          setMultiSelect((prev) => {
+            if (prev) setBulkSelected(new Set());
+            return !prev;
+          })
+        }
+        onFocusSearch={() => {
+          setLeftOpen(true);
+          if (!md) setMobilePane("inbox");
+          setTimeout(() => searchRef.current?.focus(), 20);
+        }}
+        onFilterStatus={setStatusFilter}
+        onFilterRepo={setRepoFilter}
+        onFilterEngine={setEngineFilter}
+        onClearFilters={clearAllFilters}
+        onDownloadPatch={(s) => {
+          void downloadSessionPatch(s, hasServerV050).then((res) => {
+            if (res.ok) toast.success(`Downloaded ${res.filename}`);
+            else toast.error(res.error || "Could not download patch.");
+          });
+        }}
+        onRetrySession={(id) => void retry(id)}
+      />
 
-        <Toaster
-          position={md ? "bottom-right" : "top-center"}
-          theme={theme}
-          style={
-            {
-              "--normal-bg": "var(--surface)",
-              "--normal-text": "var(--ink)",
-              "--normal-border": "var(--hairline)",
-              "--border-radius": "10px",
-              fontSize: "14px",
-            } as React.CSSProperties
-          }
-        />
-      </div>
-    </TooltipProvider>
-  );
-}
-
-function Reading({
-  label,
-  value,
-  tone,
-  bare,
-  answers,
-  className,
-}: {
-  label: string;
-  value: number | null;
-  tone?: "bad" | "good";
-  bare?: boolean;
-  answers?: string;
-  className?: string;
-}) {
-  return (
-    <div data-answers={answers} className={cn("px-4 py-3", !bare && "border-r border-hairline last:border-r-0", className)}>
-      <p className="text-sm text-ink-2">{label}</p>
-      <div
-        className={cn(
-          "mt-1 border-l-2 font-mono text-[26px] font-medium leading-none tabular-nums",
-          tone === "bad"
-            ? "border-unread pl-2 text-destructive-foreground"
-            : tone === "good"
-              ? "border-dot-green pl-2 text-ink"
-              : "border-transparent pl-0 text-ink",
-        )}
+      {/* #67: Light/Dark theme switcher lives EXCLUSIVELY inside Settings */}
+      <Drawer
+        id="settings"
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        title="Engines and settings"
+        closeLabel="Close settings"
       >
-        {value === null ? (
-          <span className="block h-7 w-10 rounded-control bg-track" aria-label="not loaded yet" />
-        ) : (
-          <SlidingNumber value={value} />
-        )}
-      </div>
+        <div className="space-y-6">
+          <section className="border-b border-[var(--hairline)] pb-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="min-w-0">
+                <h3 className="text-[14px] font-semibold text-[var(--ink)]">Appearance</h3>
+                <p className="text-[12px] text-[var(--ink-3)]">Light or dark theme, saved in this browser.</p>
+              </div>
+              <div id="themeBtn" role="group" aria-label="Theme" className="inline-flex items-center gap-0.5 rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--track)] p-0.5">
+                {(["light", "dark"] as const).map((t) => {
+                  const active = theme === t;
+                  return (
+                    <Button
+                      key={t}
+                      type="button"
+                      size="sm"
+                      variant={active ? "primary" : "ghost"}
+                      aria-pressed={active}
+                      aria-label={t === "light" ? "Light" : "Dark"}
+                      onClick={() => setTheme(t)}
+                    >
+                      {t === "light" ? (
+                        <Sun className="size-4" strokeWidth={1.5} aria-hidden />
+                      ) : (
+                        <Moon className="size-4" strokeWidth={1.5} aria-hidden />
+                      )}
+                      <span>{t === "light" ? "Light" : "Dark"}</span>
+                    </Button>
+                  );
+                })}
+              </div>
+            </div>
+          </section>
+
+          <p className="text-[13px] leading-relaxed text-[var(--ink-2)]">
+            {policy
+              ? `Up to ${policy.max_parallel} sessions run in parallel. Any agent or check exceeding ${policy.timeout_secs}s returns to Needs you. Policy source: ${policy.source}.${policy.model ? ` OpenCode model: ${policy.model}.` : ""} ${policy.default_agent ? `Default agent: ${policy.default_agent_engine === "custom" ? "custom script" : policy.default_agent}.` : "No default agent is set."}`
+              : "Loading policy rules..."}
+          </p>
+
+          <section>
+            <h3 className="mb-2 text-[14px] font-semibold text-[var(--ink)]">
+              {webEngine ? "Browser Worktree Engine" : "CLI engines detected on PATH"}
+            </h3>
+            <ul className="divide-y divide-[var(--hairline)] rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--canvas)]">
+              {(policy?.agents ?? []).length === 0 && (
+                <li className="p-3 text-[13px] text-[var(--ink-2)]">No CLI agents detected on PATH.</li>
+              )}
+              {(policy?.agents ?? []).map((a) => (
+                <li key={a.name} className="flex items-center justify-between gap-3 px-3 py-2.5 text-[13px]">
+                  <div className="min-w-0">
+                    <span className="block truncate mono text-[var(--ink)]">{a.name}</span>
+                    {a.path && <span className="block truncate mono text-[12px] text-[var(--ink-3)]">{a.path}</span>}
+                  </div>
+                  <Badge tone={a.found ? "success" : "warning"}>
+                    {a.found ? (webEngine ? "active" : "found on this machine") : "not installed"}
+                  </Badge>
+                </li>
+              ))}
+            </ul>
+            {testMode && <p className="mt-2 text-[12px] text-[var(--ink-3)]">{TEST_NOTE}</p>}
+          </section>
+
+          <PolicyTesterSection
+            policy={policy}
+            config={config}
+            repos={repos}
+            sessions={all}
+            metrics={liveMetrics}
+            settingsOpen={settingsOpen}
+            supportsServerV050={hasServerV050}
+            supportsServerV070={hasServerV070}
+            canPrune={localHost && !webEngine}
+            onPruned={refresh}
+          />
+
+          {localHost && !webEngine && (
+            <EngineConfigSection
+              policy={policy}
+              config={config}
+              onSaved={() => {
+                void refreshConfig();
+                void refresh();
+              }}
+            />
+          )}
+
+          {webEngine && (
+            <WebEngineSettingsSection
+              onChanged={() => {
+                void refreshConfig();
+                void refresh();
+              }}
+            />
+          )}
+
+          <section className="border-t border-[var(--hairline)] pt-5">
+            <h3 className="mb-2 text-[14px] font-semibold text-[var(--ink)]">Version and updates</h3>
+            <div className="flex flex-wrap items-center gap-3 text-[13px] text-[var(--ink-2)]">
+              {upd.version && <span className="mono text-[var(--ink)]">Fleet {upd.version}</span>}
+              {localHost && !webEngine ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={upd.check}
+                  disabled={upd.checking || upd.snap?.mode === "off"}
+                >
+                  {upd.checking ? "Checking..." : "Check for updates"}
+                </Button>
+              ) : webEngine ? (
+                <span className="text-[12px] text-[var(--ink-2)]">
+                  Running in-browser git worktree, DAG scheduler, and Blob Web Worker check engine.
+                </span>
+              ) : (
+                <span className="text-[12px] text-[var(--ink-2)]">To update, open Fleet on the computer it runs on.</span>
+              )}
+            </div>
+            {!webEngine && (
+              <p className="mt-2 text-[13px] text-[var(--ink-2)] [overflow-wrap:anywhere]" role="status">
+                {upd.snap && !upd.live ? resultLineOf(upd.snap) : upd.live}
+              </p>
+            )}
+          </section>
+        </div>
+      </Drawer>
+
+      <PrPreviewModal
+        session={prSession}
+        supportsServerV070={hasServerV070}
+        onClose={() => {
+          modalClosedAtRef.current = Date.now();
+          setPrSession(null);
+        }}
+        onCreated={refresh}
+      />
+
+      <ToastRegion />
     </div>
   );
 }
@@ -1329,99 +1178,84 @@ function EngineConfigSection({
   };
 
   return (
-    <section className="border-t border-hairline pt-5">
-      <h3 className="mb-1 text-sm font-medium text-ink">Engine and model routing</h3>
-      <p className="mb-3 text-xs leading-relaxed text-ink-3">
-        Saved to Fleet’s data folder and applied immediately to new runs. Leave a model blank to inherit FLEET_MODEL or policies.rn.
+    <section className="border-t border-[var(--hairline)] pt-5">
+      <h3 className="mb-1 text-[14px] font-semibold text-[var(--ink)]">Engine and model routing</h3>
+      <p className="mb-3 text-[12px] leading-relaxed text-[var(--ink-3)]">
+        Saved to Fleet data folder and applied immediately to new runs. Leave a model blank to inherit policies.rn.
       </p>
       <form onSubmit={save} className="space-y-3">
         {foundAgents.length > 0 && (
           <div className="space-y-1.5">
-            <p className="text-xs font-medium text-ink-2">Default engine</p>
-            <SegmentedControl aria-label="Default engine" size="sm">
-              {foundAgents.map((name) => (
-                <SegmentedControlItem
-                  key={name}
-                  aria-pressed={defaultAgent === name}
-                  data-checked={defaultAgent === name ? "" : undefined}
-                  onClick={() => setDefaultAgent(name)}
-                  className="max-md:!min-h-11"
-                >
-                  {name}
-                </SegmentedControlItem>
-              ))}
-            </SegmentedControl>
+            <p className="text-[12px] font-medium text-[var(--ink-2)]">Default engine</p>
+            <SegmentedControl
+              label="Default engine"
+              value={defaultAgent}
+              onChange={setDefaultAgent}
+              options={foundAgents.map((name) => ({ value: name, label: name }))}
+            />
           </div>
         )}
-        <div className="space-y-1.5">
-          <label htmlFor="cfg-opencode-model" className="block text-xs font-medium text-ink-2">
+        <div className="space-y-1">
+          <label htmlFor="cfg-opencode-model" className="block text-[12px] font-medium text-[var(--ink-2)]">
             OpenCode model
           </label>
-          <InputGroup>
-            <InputGroupInput
-              id="cfg-opencode-model"
-              value={opencodeModel}
-              onChange={(e) => setOpencodeModel(e.target.value)}
-              placeholder={config?.effective_models?.opencode || policy?.model || "opencode/deepseek-v4.1-flash-free"}
-              autoComplete="off"
-              className="font-mono text-xs max-md:!h-11"
-            />
-          </InputGroup>
+          <Input
+            id="cfg-opencode-model"
+            value={opencodeModel}
+            onChange={(e) => setOpencodeModel(e.target.value)}
+            placeholder={config?.effective_models?.opencode || policy?.model || "opencode/deepseek-v4.1-flash-free"}
+            autoComplete="off"
+            className="mono text-[13px]"
+          />
         </div>
-        <div className="space-y-1.5">
-          <label htmlFor="cfg-claude-model" className="block text-xs font-medium text-ink-2">
+        <div className="space-y-1">
+          <label htmlFor="cfg-claude-model" className="block text-[12px] font-medium text-[var(--ink-2)]">
             Claude model (optional)
           </label>
-          <InputGroup>
-            <InputGroupInput
-              id="cfg-claude-model"
-              value={claudeModel}
-              onChange={(e) => setClaudeModel(e.target.value)}
-              placeholder={config?.effective_models?.claude || "engine default"}
-              autoComplete="off"
-              className="font-mono text-xs max-md:!h-11"
-            />
-          </InputGroup>
+          <Input
+            id="cfg-claude-model"
+            value={claudeModel}
+            onChange={(e) => setClaudeModel(e.target.value)}
+            placeholder={config?.effective_models?.claude || "engine default"}
+            autoComplete="off"
+            className="mono text-[13px]"
+          />
         </div>
-        <div className="space-y-1.5">
-          <label htmlFor="cfg-codex-model" className="block text-xs font-medium text-ink-2">
+        <div className="space-y-1">
+          <label htmlFor="cfg-codex-model" className="block text-[12px] font-medium text-[var(--ink-2)]">
             Codex model (optional)
           </label>
-          <InputGroup>
-            <InputGroupInput
-              id="cfg-codex-model"
-              value={codexModel}
-              onChange={(e) => setCodexModel(e.target.value)}
-              placeholder={config?.effective_models?.codex || "engine default"}
-              autoComplete="off"
-              className="font-mono text-xs max-md:!h-11"
-            />
-          </InputGroup>
+          <Input
+            id="cfg-codex-model"
+            value={codexModel}
+            onChange={(e) => setCodexModel(e.target.value)}
+            placeholder={config?.effective_models?.codex || "engine default"}
+            autoComplete="off"
+            className="mono text-[13px]"
+          />
         </div>
-        <div className="space-y-1.5">
-          <label htmlFor="cfg-max-parallel" className="block text-xs font-medium text-ink-2">
+        <div className="space-y-1">
+          <label htmlFor="cfg-max-parallel" className="block text-[12px] font-medium text-[var(--ink-2)]">
             Max parallel agents
           </label>
-          <InputGroup>
-            <InputGroupInput
-              id="cfg-max-parallel"
-              type="number"
-              min={1}
-              max={64}
-              value={maxParallelInput}
-              onChange={(e) => setMaxParallelInput(e.target.value)}
-              placeholder={String(policy?.max_parallel ?? 4)}
-              autoComplete="off"
-              className="font-mono text-xs tabular-nums max-md:!h-11"
-            />
-          </InputGroup>
+          <Input
+            id="cfg-max-parallel"
+            type="number"
+            min={1}
+            max={64}
+            value={maxParallelInput}
+            onChange={(e) => setMaxParallelInput(e.target.value)}
+            placeholder={String(policy?.max_parallel ?? 4)}
+            autoComplete="off"
+            className="mono text-[13px]"
+          />
         </div>
         {err && (
-          <p role="alert" className="text-xs text-destructive-foreground">
+          <p role="alert" className="text-[13px] text-[var(--destructive-foreground)]">
             {err}
           </p>
         )}
-        <Button type="submit" size="sm" variant="outline" disabled={saving} className="max-md:min-h-11 max-md:px-4">
+        <Button type="submit" size="sm" variant="outline" disabled={saving}>
           {saving ? "Saving..." : "Save engine settings"}
         </Button>
       </form>
@@ -1485,41 +1319,38 @@ function WebEngineSettingsSection({ onChanged }: { onChanged: () => void }) {
 
   return (
     <>
-      <section className="space-y-3 border-t border-hairline pt-5">
+      <section className="space-y-3 border-t border-[var(--hairline)] pt-5">
         <div className="flex items-center justify-between gap-2">
-          <h3 className="flex items-center gap-1.5 text-sm font-medium text-ink">
-            <Plug className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
+          <h3 className="flex items-center gap-2 text-[14px] font-semibold text-[var(--ink)]">
+            <Plug className="size-4 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
             <span>Connect to local Fleet</span>
           </h3>
-          <Pill variant={status.mode === "local" ? "success" : "secondary"} className="px-2 py-0.5 text-xs">
-            <PillIndicator variant={status.mode === "local" ? "success" : "info"} />
-            <span>{status.mode === "local" ? "local binary" : "browser engine"}</span>
-          </Pill>
+          <Badge tone={status.mode === "local" ? "success" : "neutral"}>
+            {status.mode === "local" ? "local binary" : "browser engine"}
+          </Badge>
         </div>
-        <p className="text-xs leading-relaxed text-ink-3">
-          Run real CLI agents on your machine with <span className="font-mono text-ink-2">fleet</span>, or keep running real git worktrees, DAG dependencies, and Blob Web Worker check pipelines directly in this browser.
+        <p className="text-[12px] leading-relaxed text-[var(--ink-3)]">
+          Connect to a running local Fleet daemon or run git worktrees and Blob Web Worker checks directly in this browser.
         </p>
-        <div className="space-y-1.5">
-          <label htmlFor="local-fleet-url" className="block text-xs font-medium text-ink-2">
+        <div className="space-y-1">
+          <label htmlFor="local-fleet-url" className="block text-[12px] font-medium text-[var(--ink-2)]">
             Local Fleet address
           </label>
-          <InputGroup>
-            <InputGroupInput
-              id="local-fleet-url"
-              value={localUrl}
-              onChange={(e) => setLocalUrl(e.target.value)}
-              placeholder="http://127.0.0.1:8471"
-              className="font-mono text-xs max-md:!h-11"
-            />
-          </InputGroup>
+          <Input
+            id="local-fleet-url"
+            value={localUrl}
+            onChange={(e) => setLocalUrl(e.target.value)}
+            placeholder="http://127.0.0.1:8471"
+            className="mono text-[13px]"
+          />
         </div>
         <div className="flex flex-wrap gap-2">
           {status.mode === "local" ? (
-            <Button size="sm" variant="outline" disabled={connBusy} onClick={() => void connectLocal(false)} className="max-md:min-h-11 max-md:px-4">
+            <Button size="sm" variant="outline" disabled={connBusy} onClick={() => void connectLocal(false)}>
               Use browser engine
             </Button>
           ) : (
-            <Button size="sm" variant="outline" disabled={connBusy} onClick={() => void connectLocal(true)} className="max-md:min-h-11 max-md:px-4">
+            <Button size="sm" variant="outline" disabled={connBusy} onClick={() => void connectLocal(true)}>
               {connBusy ? "Connecting..." : "Connect to local Fleet"}
             </Button>
           )}
@@ -1527,71 +1358,64 @@ function WebEngineSettingsSection({ onChanged }: { onChanged: () => void }) {
             href={localUrl.trim() || "http://127.0.0.1:8471"}
             target="_blank"
             rel="noopener"
-            className="inline-flex h-8 items-center rounded-control border border-hairline px-3 text-xs font-medium text-ink-2 hover:bg-raised hover:text-ink max-md:min-h-11"
+            className="inline-flex h-8 items-center rounded-[var(--radius-chip)] border border-[var(--hairline-s)] px-3 text-[13px] font-medium text-[var(--ink-2)] hover:bg-[var(--board)] hover:text-[var(--ink)]"
           >
             Open local UI
           </a>
         </div>
         {connMsg && (
-          <p role="status" className="text-xs leading-relaxed text-destructive-foreground [overflow-wrap:anywhere]">
+          <p role="status" className="text-[12px] leading-relaxed text-[var(--destructive-foreground)] [overflow-wrap:anywhere]">
             {connMsg}
           </p>
         )}
       </section>
 
-      <section className="space-y-3 border-t border-hairline pt-5">
+      <section className="space-y-3 border-t border-[var(--hairline)] pt-5">
         <div className="flex items-center justify-between gap-2">
-          <h3 className="flex items-center gap-1.5 text-sm font-medium text-ink">
-            <KeyRound className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
+          <h3 className="flex items-center gap-2 text-[14px] font-semibold text-[var(--ink)]">
+            <KeyRound className="size-4 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
             <span>BYOK coding agent (optional)</span>
           </h3>
-          <Pill variant={status.byokConfigured ? "success" : "secondary"} className="px-2 py-0.5 text-xs">
-            <PillIndicator variant={status.byokConfigured ? "success" : "info"} />
-            <span>{status.byokConfigured ? "key in session" : "built-in patcher"}</span>
-          </Pill>
+          <Badge tone={status.byokConfigured ? "success" : "neutral"}>
+            {status.byokConfigured ? "key in session" : "built-in patcher"}
+          </Badge>
         </div>
-        <p className="text-xs leading-relaxed text-ink-3">
-          Optionally connect any OpenAI-compatible API so dispatched tasks generate real file patches via your model. Keys stay strictly in sessionStorage and clear when you close this tab.
+        <p className="text-[12px] leading-relaxed text-[var(--ink-3)]">
+          Optionally connect an OpenAI-compatible API. Keys stay strictly in sessionStorage for this tab.
         </p>
         <form onSubmit={saveByok} className="space-y-2.5">
           <div className="space-y-1">
-            <label htmlFor="byok-url" className="block text-xs font-medium text-ink-2">
+            <label htmlFor="byok-url" className="block text-[12px] font-medium text-[var(--ink-2)]">
               API base URL
             </label>
-            <InputGroup>
-              <InputGroupInput id="byok-url" value={byokUrl} onChange={(e) => setByokUrl(e.target.value)} className="font-mono text-xs max-md:!h-11" />
-            </InputGroup>
+            <Input id="byok-url" value={byokUrl} onChange={(e) => setByokUrl(e.target.value)} className="mono text-[13px]" />
           </div>
           <div className="space-y-1">
-            <label htmlFor="byok-model" className="block text-xs font-medium text-ink-2">
+            <label htmlFor="byok-model" className="block text-[12px] font-medium text-[var(--ink-2)]">
               Model
             </label>
-            <InputGroup>
-              <InputGroupInput id="byok-model" value={byokModel} onChange={(e) => setByokModel(e.target.value)} className="font-mono text-xs max-md:!h-11" />
-            </InputGroup>
+            <Input id="byok-model" value={byokModel} onChange={(e) => setByokModel(e.target.value)} className="mono text-[13px]" />
           </div>
           <div className="space-y-1">
-            <label htmlFor="byok-key" className="block text-xs font-medium text-ink-2">
+            <label htmlFor="byok-key" className="block text-[12px] font-medium text-[var(--ink-2)]">
               API key (sessionStorage only)
             </label>
-            <InputGroup>
-              <InputGroupInput
-                id="byok-key"
-                type="password"
-                value={byokKey}
-                onChange={(e) => setByokKey(e.target.value)}
-                placeholder={status.byokConfigured ? "Key stored for this tab (enter new to replace)" : "sk-..."}
-                autoComplete="off"
-                className="font-mono text-xs max-md:!h-11"
-              />
-            </InputGroup>
+            <Input
+              id="byok-key"
+              type="password"
+              value={byokKey}
+              onChange={(e) => setByokKey(e.target.value)}
+              placeholder={status.byokConfigured ? "Key stored for this tab (enter new to replace)" : "sk-..."}
+              autoComplete="off"
+              className="mono text-[13px]"
+            />
           </div>
           <div className="flex flex-wrap gap-2">
-            <Button type="submit" size="sm" variant="outline" className="max-md:min-h-11 max-md:px-4">
+            <Button type="submit" size="sm" variant="outline">
               Save BYOK settings
             </Button>
             {status.byokConfigured && (
-              <Button type="button" size="sm" variant="ghost" onClick={clearByok} className="max-md:min-h-11 max-md:px-4">
+              <Button type="button" size="sm" variant="ghost" onClick={clearByok}>
                 Clear key
               </Button>
             )}
@@ -1599,14 +1423,15 @@ function WebEngineSettingsSection({ onChanged }: { onChanged: () => void }) {
         </form>
       </section>
 
-      <section className="border-t border-hairline pt-5">
+      <section className="border-t border-[var(--hairline)] pt-5">
         <div className="flex items-center justify-between gap-2">
           <div className="min-w-0">
-            <h3 className="text-sm font-medium text-ink">Browser git workspace</h3>
-            <p className="text-xs text-ink-3">Stored locally in IndexedDB across reloads.</p>
+            <h3 className="text-[14px] font-semibold text-[var(--ink)]">Browser git workspace</h3>
+            <p className="text-[12px] text-[var(--ink-3)]">Stored locally in IndexedDB across reloads.</p>
           </div>
-          <Button size="sm" variant="outline" onClick={() => void resetRepo()} className="shrink-0 max-md:min-h-11 max-md:px-4">
-            <RotateCcw className="size-3.5" strokeWidth={1.5} aria-hidden />Reset
+          <Button size="sm" variant="outline" onClick={() => void resetRepo()}>
+            <RotateCcw className="size-3.5" strokeWidth={1.5} aria-hidden />
+            <span>Reset</span>
           </Button>
         </div>
       </section>
@@ -1625,8 +1450,6 @@ function InboxPopover({
   onBulkRetryAll,
   onBulkDismissAll,
   onGo,
-  side,
-  className,
 }: {
   open: boolean;
   onOpenChange: (o: boolean) => void;
@@ -1638,127 +1461,115 @@ function InboxPopover({
   onBulkRetryAll: () => void;
   onBulkDismissAll: () => void;
   onGo: () => void;
-  side: "top" | "bottom";
-  className?: string;
 }) {
   const n = inbox.length;
   return (
-    <Popover open={open} onOpenChange={onOpenChange}>
-      <PopoverTrigger
-        aria-label={`Needs you, ${n}`}
-        className={cn(
-          "inline-flex h-9 cursor-pointer items-center gap-2 whitespace-nowrap rounded-control border px-3 text-sm font-medium outline-none transition-colors duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11",
-          n ? "border-unread text-destructive-foreground hover:bg-pill-pro-bg" : "border-hairline text-ink hover:bg-raised",
-          className,
-        )}
-      >
-        <span>Needs you</span>
-        <span
-          className={cn(
-            "rounded-chip px-1.5 py-0.5 font-mono text-xs tabular-nums",
-            n ? "bg-pill-pro-bg text-destructive-foreground" : "bg-track text-ink-2",
-          )}
+    <PopoverPanel
+      open={open}
+      onClose={() => onOpenChange(false)}
+      align="end"
+      side="bottom"
+      className="w-[360px] p-0"
+      trigger={
+        <Button
+          type="button"
+          size="sm"
+          variant={n > 0 ? "danger" : "outline"}
+          aria-label={`Needs you, ${n}`}
+          aria-expanded={open}
+          onClick={() => onOpenChange(!open)}
         >
-          {n}
-        </span>
-      </PopoverTrigger>
-      <PopoverContent
-        side={side}
-        align={side === "top" ? "center" : "end"}
-        sideOffset={8}
-        className="z-30 w-full max-w-[380px] rounded-dialog border border-hairline bg-surface p-0 text-ink shadow-lift"
-      >
-        <div className="p-4">
-          <div className="flex items-center justify-between gap-2">
-            <h2 className="font-heading text-lg font-medium text-ink">Needs you</h2>
-            {n > 0 && (
-              <div className="flex items-center gap-1.5">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={bulkBusy}
-                  onClick={() => {
-                    onOpenChange(false);
-                    onBulkRetryAll();
-                  }}
-                  className="h-7 px-2 text-xs max-md:min-h-11"
-                >
-                  Retry all
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={bulkBusy}
-                  onClick={() => {
-                    onOpenChange(false);
-                    onBulkDismissAll();
-                  }}
-                  className="h-7 px-2 text-xs max-md:min-h-11"
-                >
-                  Dismiss all
-                </Button>
-              </div>
+          <span>Needs you</span>
+          <span className="mono">{n}</span>
+        </Button>
+      }
+    >
+      <div className="p-3.5 border-b border-[var(--hairline)]">
+        <div className="flex items-center justify-between gap-2">
+          <h2 className="text-[15px] font-semibold text-[var(--ink)]">Needs you</h2>
+          {n > 0 && (
+            <div className="flex items-center gap-1.5">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={bulkBusy}
+                onClick={() => {
+                  onOpenChange(false);
+                  onBulkRetryAll();
+                }}
+              >
+                Retry all
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={bulkBusy}
+                onClick={() => {
+                  onOpenChange(false);
+                  onBulkDismissAll();
+                }}
+              >
+                Dismiss all
+              </Button>
+            </div>
+          )}
+        </div>
+        <p className="mt-1 text-[12px] text-[var(--ink-2)]">
+          Runs paused on a failed check, conflict, or manual steer.
+        </p>
+      </div>
+      <div className="max-h-[50dvh] overflow-y-auto divide-y divide-[var(--hairline)]">
+        {n === 0 && (
+          <p className="p-4 text-[13px] text-[var(--ink-2)]">
+            Nothing needs you right now. Failed checks and stopped runs appear here.
+          </p>
+        )}
+        {inbox.map((s) => (
+          <div key={s.id} className="p-3.5 space-y-2">
+            <p className="text-[14px] font-medium text-[var(--ink)] [overflow-wrap:anywhere]">{s.task}</p>
+            <p
+              className={cn(
+                "text-[12px] [overflow-wrap:anywhere]",
+                isFailed(s) ? "text-[var(--destructive-foreground)]" : "text-[var(--info-foreground)]",
+              )}
+            >
+              {s.reason || "needs you"}
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  onOpenChange(false);
+                  onView(s.id);
+                }}
+              >
+                View session
+              </Button>
+              <Button size="sm" variant="primary" onClick={() => onRetry(s.id)}>
+                Retry
+              </Button>
+            </div>
+            {errs[s.id] && (
+              <p role="alert" className="text-[12px] text-[var(--destructive-foreground)]">
+                {errs[s.id]}
+              </p>
             )}
           </div>
-          <p className="mt-1 text-sm leading-relaxed text-ink-2">
-            Sessions that need a person: a failed check, a refused merge, a stopped or timed-out run.
-          </p>
-        </div>
-        <div className="max-h-[55dvh] overflow-y-auto border-t border-hairline">
-          {n === 0 && (
-            <p className="p-4 text-sm text-ink-2">
-              Nothing needs you right now. Failed checks and stopped runs appear here with the reason.
-            </p>
-          )}
-          {inbox.map((s) => (
-            <div key={s.id} className="border-t border-hairline p-4 first:border-t-0">
-              <p className="font-medium text-ink [overflow-wrap:anywhere]">{s.task}</p>
-              <p
-                className={cn(
-                  "mt-1 text-sm leading-relaxed [overflow-wrap:anywhere]",
-                  isFailed(s) ? "text-destructive-foreground" : "text-info-foreground",
-                )}
-              >
-                {s.reason || "needs you"}
-              </p>
-              <div className="mt-3 flex flex-wrap gap-2">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="max-md:min-h-11 max-md:px-3.5"
-                  onClick={() => {
-                    onOpenChange(false);
-                    onView(s.id);
-                  }}
-                >
-                  View session
-                </Button>
-                <Button size="sm" className="max-md:min-h-11 max-md:px-3.5" onClick={() => onRetry(s.id)}>
-                  Retry
-                </Button>
-              </div>
-              {errs[s.id] && (
-                <p role="alert" className="mt-2 text-sm text-destructive-foreground [overflow-wrap:anywhere]">
-                  {errs[s.id]}
-                </p>
-              )}
-            </div>
-          ))}
-        </div>
-        <div className="border-t border-hairline p-3 text-right">
-          <Button
-            size="sm"
-            variant="ghost"
-            className="max-md:min-h-11 max-md:px-3.5"
-            onClick={() => {
-              onOpenChange(false);
-              onGo();
-            }}
-          >
-            Go to Needs you
-          </Button>
-        </div>
-      </PopoverContent>
-    </Popover>
+        ))}
+      </div>
+      <div className="border-t border-[var(--hairline)] p-2 text-right">
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => {
+            onOpenChange(false);
+            onGo();
+          }}
+        >
+          Go to Needs you
+        </Button>
+      </div>
+    </PopoverPanel>
   );
 }

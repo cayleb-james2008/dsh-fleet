@@ -1,4 +1,4 @@
-// Global Command Palette (Cmd+K / Ctrl+K) powered by House Frontend Command (cmdk + Radix Dialog).
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   BookMarked,
   CheckSquare,
@@ -18,17 +18,7 @@ import {
   Terminal,
   X,
 } from "lucide-react";
-import {
-  CommandDialog,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-  CommandSeparator,
-  CommandShortcut,
-} from "@/components/ui/command";
-import { Badge } from "@/components/ui/badge";
+import { Badge, Dialog, Input, Kbd, cn } from "./ui";
 import {
   isFailed,
   isVerified,
@@ -40,6 +30,17 @@ import {
   type TabId,
   type ViewMode,
 } from "./api";
+
+type CmdItem = {
+  id: string;
+  group: string;
+  label: string;
+  searchText: string;
+  icon: ReactNode;
+  shortcut?: string;
+  badge?: { text: string; tone: "neutral" | "info" | "success" | "warning" | "danger" };
+  onSelect: () => void;
+};
 
 export function CommandPalette({
   open,
@@ -94,208 +95,343 @@ export function CommandPalette({
   onDownloadPatch: (s: Session) => void;
   onRetrySession: (id: string) => void;
 }) {
+  const [query, setQuery] = useState("");
+  const [activeIdx, setActiveIdx] = useState(0);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setQuery("");
+      setActiveIdx(0);
+      setTimeout(() => inputRef.current?.focus(), 20);
+    }
+  }, [open]);
+
   const act = (fn: () => void) => {
     onOpenChange(false);
-    setTimeout(fn, 60);
+    setTimeout(fn, 40);
   };
 
+  const allItems = useMemo<CmdItem[]>(() => {
+    const items: CmdItem[] = [
+      {
+        id: "act-new",
+        group: "Orchestration",
+        label: "New session",
+        searchText: "new session dispatch single task goal",
+        icon: <Plus className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+        shortcut: "N",
+        onSelect: () => act(onNewSingle),
+      },
+      {
+        id: "act-batch",
+        group: "Orchestration",
+        label: "Dispatch Batch DAG",
+        searchText: "batch dispatch fan out parallel tasks dag depends on",
+        icon: <Layers className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+        onSelect: () => act(onNewBatch),
+      },
+      {
+        id: "act-view",
+        group: "Orchestration",
+        label: viewMode === "dag" ? "Switch to Workbench view" : "Switch to DAG Graph view",
+        searchText: "view dag graph multi wave board workbench",
+        icon: viewMode === "dag"
+          ? <LayoutGrid className="size-4 text-[var(--icon)]" strokeWidth={1.5} />
+          : <Network className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+        shortcut: "G",
+        onSelect: () => act(() => onViewMode(viewMode === "dag" ? "board" : "dag")),
+      },
+      {
+        id: "act-multi",
+        group: "Orchestration",
+        label: multiSelect ? "Exit multi-select mode" : "Select multiple sessions",
+        searchText: "multi select bulk retry dismiss merge",
+        icon: <CheckSquare className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+        onSelect: () => act(onToggleMultiSelect),
+      },
+      {
+        id: "act-search",
+        group: "Orchestration",
+        label: "Focus session search",
+        searchText: "focus search input",
+        icon: <Search className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+        shortcut: "/",
+        onSelect: () => act(onFocusSearch),
+      },
+      {
+        id: "act-settings",
+        group: "Orchestration",
+        label: "Open Engines, Worktrees & Settings",
+        searchText: "settings engines policy worktrees theme",
+        icon: <Cpu className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+        onSelect: () => act(onOpenSettings),
+      },
+      {
+        id: "act-clear",
+        group: "Orchestration",
+        label: "Clear all filters",
+        searchText: "clear reset filters",
+        icon: <X className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+        onSelect: () => act(onClearFilters),
+      },
+    ];
+
+    for (const tpl of playbooks) {
+      const count = tpl.tasks?.length ?? 1;
+      items.push({
+        id: `pb-${tpl.id}`,
+        group: `Playbooks (${playbooks.length})`,
+        label: tpl.name,
+        searchText: `playbook template ${tpl.name} ${tpl.description} ${tpl.repo || ""}`,
+        icon: <BookMarked className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+        shortcut: count > 1 ? `${count} tasks` : "Single",
+        onSelect: () => act(() => onApplyPlaybook(tpl)),
+      });
+    }
+
+    if (selectedSession) {
+      const grp = `Current session (${selectedSession.id})`;
+      items.push(
+        {
+          id: "cur-tr",
+          group: grp,
+          label: "View Transcript",
+          searchText: "inspect transcript tab log lines",
+          icon: <Terminal className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+          shortcut: "T",
+          onSelect: () => act(() => onSwitchTab("tr")),
+        },
+        {
+          id: "cur-df",
+          group: grp,
+          label: "View Diff (Unified / Split)",
+          searchText: "inspect diff tab unified split side by side",
+          icon: <FileDiff className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+          shortcut: "D",
+          onSelect: () => act(() => onSwitchTab("df")),
+        },
+        {
+          id: "cur-rc",
+          group: grp,
+          label: "View Verification Checks & Receipt",
+          searchText: "inspect receipt tab check steps timeline",
+          icon: <GitMerge className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+          shortcut: "R",
+          onSelect: () => act(() => onSwitchTab("rc")),
+        },
+        {
+          id: "cur-patch",
+          group: grp,
+          label: `Download .patch for ${selectedSession.branch || selectedSession.id}`,
+          searchText: "download patch export diff",
+          icon: <Download className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+          onSelect: () => act(() => onDownloadPatch(selectedSession)),
+        },
+      );
+      if (selectedSession.branch) {
+        items.push({
+          id: "cur-pr",
+          group: grp,
+          label: `PR preview & Create PR for ${selectedSession.id}`,
+          searchText: "pr preview create github pull request markdown",
+          icon: <GitPullRequest className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+          onSelect: () => act(() => onOpenPrPreview(selectedSession)),
+        });
+      }
+      if (selectedSession.status === "needs-you") {
+        items.push({
+          id: "cur-retry",
+          group: grp,
+          label: `Retry ${selectedSession.id}`,
+          searchText: "retry selected session",
+          icon: <RotateCcw className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+          onSelect: () => act(() => onRetrySession(selectedSession.id)),
+        });
+      }
+    }
+
+    const statusFilters: Array<[StatusFilter, string]> = [
+      ["all", "Show all sessions"],
+      ["needs-you", "Filter: Needs you"],
+      ["working", "Filter: Working (active)"],
+      ["queued", "Filter: Queued / Blocked"],
+      ["done", "Filter: Done / Verified"],
+    ];
+    for (const [st, label] of statusFilters) {
+      items.push({
+        id: `st-${st}`,
+        group: "Filter by status",
+        label,
+        searchText: label,
+        icon: <Filter className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+        onSelect: () => act(() => onFilterStatus(st)),
+      });
+    }
+
+    for (const s of sessions.slice(0, 40)) {
+      const verified = isVerified(s);
+      const failed = isFailed(s);
+      items.push({
+        id: `ses-${s.id}`,
+        group: `Sessions (${sessions.length})`,
+        label: s.task,
+        searchText: `${s.id} ${s.task} ${s.project} ${s.branch || ""} ${s.engine || ""} ${s.status}`,
+        icon: <Terminal className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+        badge: {
+          text: verified ? (s.status === "merged" ? "merged" : "verified") : statusText(s),
+          tone: verified ? "success" : failed ? "danger" : s.bucket === "needs-you" ? "info" : "neutral",
+        },
+        onSelect: () => act(() => onOpenSession(s.id, "tr")),
+      });
+    }
+
+    for (const r of repos.slice(0, 8)) {
+      items.push({
+        id: `repo-${r.path}`,
+        group: "Filter by repository or engine",
+        label: `Repo: ${r.name}`,
+        searchText: `repo repository ${r.name} ${r.path}`,
+        icon: <FolderGit2 className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+        shortcut: r.branch || "git",
+        onSelect: () => act(() => onFilterRepo(r.name)),
+      });
+    }
+    for (const eng of engines) {
+      items.push({
+        id: `eng-${eng}`,
+        group: "Filter by repository or engine",
+        label: `Engine: ${eng}`,
+        searchText: `engine agent ${eng}`,
+        icon: <Cpu className="size-4 text-[var(--icon)]" strokeWidth={1.5} />,
+        onSelect: () => act(() => onFilterEngine(eng)),
+      });
+    }
+    return items;
+  }, [
+    engines,
+    multiSelect,
+    onApplyPlaybook,
+    onClearFilters,
+    onDownloadPatch,
+    onFilterEngine,
+    onFilterRepo,
+    onFilterStatus,
+    onFocusSearch,
+    onNewBatch,
+    onNewSingle,
+    onOpenChange,
+    onOpenPrPreview,
+    onOpenSession,
+    onOpenSettings,
+    onRetrySession,
+    onSwitchTab,
+    onToggleMultiSelect,
+    onViewMode,
+    playbooks,
+    repos,
+    selectedSession,
+    sessions,
+    viewMode,
+  ]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return allItems;
+    const words = q.split(/\s+/);
+    return allItems.filter((it) => {
+      const hay = `${it.label} ${it.searchText}`.toLowerCase();
+      return words.every((w) => hay.includes(w));
+    });
+  }, [allItems, query]);
+
+  const grouped = useMemo(() => {
+    const map = new Map<string, Array<{ item: CmdItem; flatIdx: number }>>();
+    filtered.forEach((item, flatIdx) => {
+      const list = map.get(item.group) ?? [];
+      list.push({ item, flatIdx });
+      map.set(item.group, list);
+    });
+    return Array.from(map.entries());
+  }, [filtered]);
+
+  const clampedIdx = filtered.length === 0 ? -1 : Math.min(activeIdx, filtered.length - 1);
+
   return (
-    <CommandDialog
+    <Dialog
       open={open}
-      onOpenChange={onOpenChange}
-      title="Fleet Command Palette"
-      description="Jump to sessions, dispatch tasks, filter the board, or control the inspector."
+      onClose={() => onOpenChange(false)}
+      title="Command palette"
+      description="Jump to sessions, dispatch tasks, filter runs, or control the workspace."
+      maxWidth="max-w-xl"
     >
-      <CommandInput placeholder="Jump to session, dispatch batch, filter repo, or run action..." />
-      <CommandList>
-        <CommandEmpty>No matching commands or sessions.</CommandEmpty>
+      <div cmdk-root="" className="space-y-3">
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 size-4 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
+          <Input
+            ref={inputRef}
+            cmdk-input=""
+            type="search"
+            aria-label="Search commands and sessions"
+            placeholder="Jump to session, playbook, filter repo, or run action..."
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setActiveIdx(0);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "ArrowDown") {
+                e.preventDefault();
+                if (filtered.length > 0) setActiveIdx((i) => (i + 1) % filtered.length);
+              } else if (e.key === "ArrowUp") {
+                e.preventDefault();
+                if (filtered.length > 0) setActiveIdx((i) => (i - 1 + filtered.length) % filtered.length);
+              } else if (e.key === "Enter" && clampedIdx >= 0) {
+                e.preventDefault();
+                filtered[clampedIdx]?.onSelect();
+              }
+            }}
+            className="pl-9"
+          />
+        </div>
 
-        <CommandGroup heading="Orchestration actions">
-          <CommandItem value="New session dispatch single task" onSelect={() => act(onNewSingle)}>
-            <Plus className="text-icon" strokeWidth={1.5} aria-hidden />
-            <span>New session</span>
-            <CommandShortcut>N</CommandShortcut>
-          </CommandItem>
-          <CommandItem value="Batch dispatch fan out parallel tasks dag depends on" onSelect={() => act(onNewBatch)}>
-            <Layers className="text-icon" strokeWidth={1.5} aria-hidden />
-            <span>Batch fan-out dispatch</span>
-            <CommandShortcut>DAG</CommandShortcut>
-          </CommandItem>
-          <CommandItem value="Focus board search sessions" onSelect={() => act(onFocusSearch)}>
-            <Search className="text-icon" strokeWidth={1.5} aria-hidden />
-            <span>Focus search bar</span>
-            <CommandShortcut>/</CommandShortcut>
-          </CommandItem>
-          <CommandItem
-            value="Switch workspace view board kanban dag dependency wave graph"
-            onSelect={() => act(() => onViewMode(viewMode === "board" ? "dag" : "board"))}
-          >
-            {viewMode === "board" ? (
-              <Network className="text-icon" strokeWidth={1.5} aria-hidden />
-            ) : (
-              <LayoutGrid className="text-icon" strokeWidth={1.5} aria-hidden />
-            )}
-            <span>{viewMode === "board" ? "Switch to DAG Graph view" : "Switch to Board lanes view"}</span>
-            <CommandShortcut>G</CommandShortcut>
-          </CommandItem>
-          <CommandItem
-            value="Toggle multi select bulk inbox board actions"
-            onSelect={() => act(onToggleMultiSelect)}
-          >
-            <CheckSquare className="text-icon" strokeWidth={1.5} aria-hidden />
-            <span>{multiSelect ? "Exit multi-select mode" : "Enable multi-select bulk actions"}</span>
-          </CommandItem>
-          <CommandItem value="Engines and settings policy tester light dark theme" onSelect={() => act(onOpenSettings)}>
-            <Cpu className="text-icon" strokeWidth={1.5} aria-hidden />
-            <span>Open Engines &amp; settings (Policy Tester · Theme)</span>
-          </CommandItem>
-          <CommandItem value="Clear all filters reset search" onSelect={() => act(onClearFilters)}>
-            <X className="text-icon" strokeWidth={1.5} aria-hidden />
-            <span>Clear all board filters</span>
-          </CommandItem>
-        </CommandGroup>
-
-        {playbooks.length > 0 && (
-          <>
-            <CommandSeparator />
-            <CommandGroup heading={`Playbooks (${playbooks.length})`}>
-              {playbooks.map((tpl) => {
-                const count = tpl.tasks?.length ?? 1;
-                return (
-                  <CommandItem
-                    key={tpl.id}
-                    value={`playbook template ${tpl.name} ${tpl.description} ${tpl.repo || ""}`}
-                    onSelect={() => act(() => onApplyPlaybook(tpl))}
-                  >
-                    <BookMarked className="text-icon" strokeWidth={1.5} aria-hidden />
-                    <span className="min-w-0 flex-1 truncate">{tpl.name}</span>
-                    <CommandShortcut>{count > 1 ? `${count} tasks` : "Single"}</CommandShortcut>
-                  </CommandItem>
-                );
-              })}
-            </CommandGroup>
-          </>
-        )}
-
-        {selectedSession && (
-          <>
-            <CommandSeparator />
-            <CommandGroup heading={`Current session · ${selectedSession.id}`}>
-              <CommandItem value="Inspect transcript tab log lines" onSelect={() => act(() => onSwitchTab("tr"))}>
-                <Terminal className="text-icon" strokeWidth={1.5} aria-hidden />
-                <span>View Transcript</span>
-                <CommandShortcut>T</CommandShortcut>
-              </CommandItem>
-              <CommandItem value="Inspect diff tab unified split side by side" onSelect={() => act(() => onSwitchTab("df"))}>
-                <FileDiff className="text-icon" strokeWidth={1.5} aria-hidden />
-                <span>View Diff (Unified / Split)</span>
-                <CommandShortcut>D</CommandShortcut>
-              </CommandItem>
-              <CommandItem value="Inspect receipt tab check steps timeline" onSelect={() => act(() => onSwitchTab("rc"))}>
-                <GitMerge className="text-icon" strokeWidth={1.5} aria-hidden />
-                <span>View Receipt timeline</span>
-                <CommandShortcut>R</CommandShortcut>
-              </CommandItem>
-              <CommandItem value="Download patch file export diff" onSelect={() => act(() => onDownloadPatch(selectedSession))}>
-                <Download className="text-icon" strokeWidth={1.5} aria-hidden />
-                <span>Download .patch for {selectedSession.branch || selectedSession.id}</span>
-              </CommandItem>
-              {selectedSession.branch && (
-                <CommandItem value="PR preview create github pull request markdown" onSelect={() => act(() => onOpenPrPreview(selectedSession))}>
-                  <GitPullRequest className="text-icon" strokeWidth={1.5} aria-hidden />
-                  <span>PR preview &amp; Create PR for {selectedSession.id}</span>
-                </CommandItem>
-              )}
-              {selectedSession.status === "needs-you" && (
-                <CommandItem value="Retry selected session" onSelect={() => act(() => onRetrySession(selectedSession.id))}>
-                  <RotateCcw className="text-icon" strokeWidth={1.5} aria-hidden />
-                  <span>Retry {selectedSession.id}</span>
-                </CommandItem>
-              )}
-            </CommandGroup>
-          </>
-        )}
-
-        <CommandSeparator />
-        <CommandGroup heading="Filter by status">
-          {(
-            [
-              ["all", "Show all sessions"],
-              ["needs-you", "Filter: Needs you"],
-              ["working", "Filter: Working (active)"],
-              ["queued", "Filter: Queued / Blocked"],
-              ["done", "Filter: Done / Verified"],
-            ] as const
-          ).map(([st, label]) => (
-            <CommandItem key={st} value={label} onSelect={() => act(() => onFilterStatus(st))}>
-              <Filter className="text-icon" strokeWidth={1.5} aria-hidden />
-              <span>{label}</span>
-            </CommandItem>
-          ))}
-        </CommandGroup>
-
-        {sessions.length > 0 && (
-          <>
-            <CommandSeparator />
-            <CommandGroup heading={`Sessions (${sessions.length})`}>
-              {sessions.slice(0, 40).map((s) => {
-                const verified = isVerified(s);
-                const failed = isFailed(s);
-                return (
-                  <CommandItem
-                    key={s.id}
-                    value={`${s.id} ${s.task} ${s.project} ${s.branch || ""} ${s.engine || ""} ${s.status}`}
-                    onSelect={() => act(() => onOpenSession(s.id, "tr"))}
-                  >
-                    <span className="min-w-0 flex-1 truncate">{s.task}</span>
-                    <span className="hidden shrink-0 font-mono text-xs text-ink-3 sm:inline">{s.project}</span>
-                    <Badge
-                      variant={verified ? "success" : failed ? "error" : s.bucket === "needs-you" ? "info" : "secondary"}
-                      size="sm"
-                      className="shrink-0"
+        <div className="max-h-[50dvh] overflow-y-auto space-y-3 pr-1">
+          {filtered.length === 0 ? (
+            <p className="py-8 text-center text-[14px] text-[var(--ink-3)]">No matching commands or sessions.</p>
+          ) : (
+            grouped.map(([group, rows]) => (
+              <div key={group} className="space-y-1">
+                <p className="px-2 text-[12px] font-medium text-[var(--ink-3)]">{group}</p>
+                {rows.map(({ item, flatIdx }) => {
+                  const active = flatIdx === clampedIdx;
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onMouseEnter={() => setActiveIdx(flatIdx)}
+                      onClick={item.onSelect}
+                      className={cn(
+                        "w-full flex items-center gap-2.5 rounded-[var(--radius)] px-2.5 py-2 text-left text-[14px] cursor-pointer max-md:min-h-11",
+                        active ? "bg-[var(--blue-soft)] text-[var(--ink)]" : "text-[var(--ink)] hover:bg-[var(--track)]",
+                      )}
                     >
-                      {verified ? (s.status === "merged" ? "merged" : "verified") : statusText(s)}
-                    </Badge>
-                  </CommandItem>
-                );
-              })}
-            </CommandGroup>
-          </>
-        )}
+                      <span className="shrink-0" aria-hidden>{item.icon}</span>
+                      <span className="min-w-0 flex-1 truncate">{item.label}</span>
+                      {item.badge && <Badge tone={item.badge.tone}>{item.badge.text}</Badge>}
+                      {item.shortcut && <Kbd>{item.shortcut}</Kbd>}
+                    </button>
+                  );
+                })}
+              </div>
+            ))
+          )}
+        </div>
 
-        {(repos.length > 0 || engines.length > 0) && (
-          <>
-            <CommandSeparator />
-            <CommandGroup heading="Filter by repository or engine">
-              {repos.slice(0, 8).map((r) => (
-                <CommandItem
-                  key={`repo-${r.path}`}
-                  value={`repo repository ${r.name} ${r.path}`}
-                  onSelect={() => act(() => onFilterRepo(r.name))}
-                >
-                  <FolderGit2 className="text-icon" strokeWidth={1.5} aria-hidden />
-                  <span>Repo: {r.name}</span>
-                  <CommandShortcut>{r.branch || "git"}</CommandShortcut>
-                </CommandItem>
-              ))}
-              {engines.map((eng) => (
-                <CommandItem
-                  key={`eng-${eng}`}
-                  value={`engine agent ${eng}`}
-                  onSelect={() => act(() => onFilterEngine(eng))}
-                >
-                  <Cpu className="text-icon" strokeWidth={1.5} aria-hidden />
-                  <span>Engine: {eng}</span>
-                </CommandItem>
-              ))}
-            </CommandGroup>
-          </>
-        )}
-      </CommandList>
-      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline bg-canvas px-3.5 py-2 font-mono text-xs text-ink-3">
-        <span>j/k sessions · t/d/r tabs · n new · / search</span>
-        <span>Enter select · Esc close</span>
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--hairline)] pt-2.5 mono text-[12px] text-[var(--ink-3)]">
+          <span>j/k sessions, t/d/r/g views, n new, / search</span>
+          <span>Enter select, Esc close</span>
+        </div>
       </div>
-    </CommandDialog>
+    </Dialog>
   );
 }

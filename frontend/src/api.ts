@@ -1834,3 +1834,79 @@ export const isHonest = (s: Session) => s.check_passed === true && s.status === 
 export const isFailed = (s: Session) => s.status === "needs-you" && s.check_ran === true && s.check_passed === false;
 export const isQueuedOrBlocked = (s: Session) => s.bucket === "working" && (s.status === "queued" || s.status === "blocked");
 export const isActivelyRunning = (s: Session) => s.bucket === "working" && s.status !== "queued" && s.status !== "blocked";
+
+export type GoalPlanTask = BatchDispatchItem & {
+  alias: string;
+  title?: string;
+};
+
+export type GoalPlanResponse = {
+  goal: string;
+  repo: string;
+  engine: string;
+  model?: string | null;
+  check_cmd: string;
+  auto_steer_budget: number;
+  tasks: GoalPlanTask[];
+};
+
+export function planGoalLocally(req: { goal: string; repo: string; agent?: string }): GoalPlanResponse {
+  const goal = req.goal.trim();
+  const repo = req.repo.trim();
+  const clauses = goal
+    .split(/\n+|;\s*|\s+then\s+/i)
+    .map((c) => c.replace(/^[-*\d.)\s]+/, "").trim())
+    .filter(Boolean);
+  const rawSteps = clauses.length > 0 ? clauses : [goal || "Implement requested task with tests"];
+  const tasks: GoalPlanTask[] = rawSteps.slice(0, 6).map((step, idx) => ({
+    alias: `#${idx + 1}`,
+    repo,
+    task: step,
+    agent: req.agent || undefined,
+    depends_on: idx > 0 && /\bthen\b/i.test(goal) ? [`#${idx}`] : undefined,
+    auto_steer_budget: 2,
+  }));
+  return {
+    goal,
+    repo,
+    engine: req.agent || "opencode",
+    model: null,
+    check_cmd: "npm test",
+    auto_steer_budget: 2,
+    tasks,
+  };
+}
+
+export async function planGoal(req: { goal: string; repo: string; agent?: string }): Promise<GoalPlanResponse> {
+  try {
+    const r = await fetch("/api/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+    });
+    if (!r.ok) return planGoalLocally(req);
+    const raw = (await r.json()) as Partial<GoalPlanResponse>;
+    if (!Array.isArray(raw.tasks) || raw.tasks.length === 0) return planGoalLocally(req);
+    return {
+      goal: asStr(raw.goal, req.goal),
+      repo: asStr(raw.repo, req.repo),
+      engine: asStr(raw.engine, req.agent || "opencode"),
+      model: raw.model ? asStr(raw.model) : null,
+      check_cmd: asStr(raw.check_cmd, "npm test"),
+      auto_steer_budget: typeof raw.auto_steer_budget === "number" ? raw.auto_steer_budget : 2,
+      tasks: raw.tasks.map((t, i) => ({
+        alias: asStr((t as GoalPlanTask).alias, `#${i + 1}`),
+        repo: asStr(t.repo, req.repo),
+        task: asStr(t.task, req.goal),
+        agent: t.agent ? asStr(t.agent) : undefined,
+        check: t.check ? asStr(t.check) : undefined,
+        depends_on: Array.isArray(t.depends_on) ? t.depends_on.map((d) => asStr(d)).filter(Boolean) : undefined,
+        allowed_globs: Array.isArray(t.allowed_globs) ? t.allowed_globs.map((g) => asStr(g)).filter(Boolean) : undefined,
+        forbidden_globs: Array.isArray(t.forbidden_globs) ? t.forbidden_globs.map((g) => asStr(g)).filter(Boolean) : undefined,
+        auto_steer_budget: typeof t.auto_steer_budget === "number" ? t.auto_steer_budget : 2,
+      })),
+    };
+  } catch {
+    return planGoalLocally(req);
+  }
+}

@@ -1,12 +1,8 @@
-// Virtualized Searchable Transcript Viewer — smoothly renders 50,000+ log lines at 60fps
-// with instant substring search, match jumping, "Jump to first error", and auto-follow tail.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ArrowDown, ChevronDown, ChevronUp, Filter, Search, X } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
-import { cn } from "@/lib/utils";
+import { Button, Input, cn } from "./ui";
 
-const ROW_H = 22;
+const ROW_H = 24;
 const OVERSCAN = 24;
 const ERROR_RE = /\b(error|err:|failed|failure|panic|exception|traceback|assertionerror|fatal|conflict|timed out|exit\s+[1-9]\d*|exit code\s+[1-9]\d*)\b/i;
 
@@ -23,7 +19,7 @@ function renderHighlightedLine(line: string, query: string) {
   while (idx !== -1 && k < 24) {
     if (idx > cursor) parts.push(line.slice(cursor, idx));
     parts.push(
-      <mark key={k++} className="rounded-[3px] bg-pill-warn-bg px-0.5 text-ink">
+      <mark key={k++} className="rounded-[3px] bg-[var(--warn-soft)] px-0.5 text-[var(--ink)]">
         {line.slice(idx, idx + q.length)}
       </mark>,
     );
@@ -54,7 +50,7 @@ export function VirtualizedTranscript({
   const [activeErrorCursor, setActiveErrorCursor] = useState(0);
   const [highlightedLineNo, setHighlightedLineNo] = useState<number | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
-  const [viewHeight, setViewHeight] = useState(340);
+  const [viewHeight, setViewHeight] = useState(420);
   const [fullLines, setFullLines] = useState<string[] | null>(null);
   const [loadingFull, setLoadingFull] = useState(false);
 
@@ -147,7 +143,6 @@ export function VirtualizedTranscript({
 
   const errorSet = useMemo(() => new Set(errorIndices), [errorIndices]);
 
-  // Auto-follow live tail while running
   useEffect(() => {
     if (!followTail || !viewportRef.current || rows.length === 0) return;
     const el = viewportRef.current;
@@ -188,21 +183,20 @@ export function VirtualizedTranscript({
     scrollToRow(rowIndex, origIdx);
   };
 
-  const totalHeight = Math.max(rows.length * ROW_H, ROW_H);
   const startIdx = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
   const endIdx = Math.min(rows.length, Math.ceil((scrollTop + viewHeight) / ROW_H) + OVERSCAN);
+  const topPad = startIdx * ROW_H;
+  const bottomPad = Math.max(0, (rows.length - endIdx) * ROW_H);
   const visibleSlice = rows.slice(startIdx, endIdx);
   const displayTotal = typeof totalHint === "number" && totalHint > activeLines.length ? totalHint : activeLines.length;
   const canLoadMore = Boolean(supportsServerV050 && displayTotal > activeLines.length);
 
   return (
-    <div className="space-y-2.5" data-testid="virtualized-transcript">
+    <div className="flex flex-col gap-3 h-full min-h-0" data-testid="virtualized-transcript">
       <div className="flex flex-wrap items-center gap-2">
-        <InputGroup className="min-w-[160px] flex-1">
-          <InputGroupAddon>
-            <Search className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
-          </InputGroupAddon>
-          <InputGroupInput
+        <div className="relative flex-1 min-w-[180px]">
+          <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 size-4 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
+          <Input
             type="search"
             aria-label="Filter transcript"
             placeholder="Search transcript lines"
@@ -211,63 +205,58 @@ export function VirtualizedTranscript({
               setSearch(e.target.value);
               setActiveMatchCursor(0);
             }}
-            className="text-xs max-md:!h-11"
+            className="pl-9 pr-9"
           />
           {search && (
-            <InputGroupAddon align="inline-end">
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                aria-label="Clear transcript search"
-                onClick={() => {
-                  setSearch("");
-                  setMatchesOnly(false);
-                }}
-                className="size-7 max-md:size-11"
-              >
-                <X className="size-3.5" strokeWidth={1.5} aria-hidden />
-              </Button>
-            </InputGroupAddon>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label="Clear transcript search"
+              onClick={() => {
+                setSearch("");
+                setMatchesOnly(false);
+              }}
+              className="absolute right-1 top-1/2 -translate-y-1/2"
+            >
+              <X className="size-3.5" strokeWidth={1.5} aria-hidden />
+            </Button>
           )}
-        </InputGroup>
+        </div>
 
         {q && (
-          <div className="flex items-center gap-1">
-            <span className="rounded-chip bg-track px-2 py-1 font-mono text-xs tabular-nums text-ink-2">
+          <div className="flex items-center gap-1.5">
+            <span className="rounded-[var(--radius-chip)] bg-[var(--track)] px-2.5 py-1 mono text-[12px] text-[var(--ink-2)]">
               {matchIndices.length > 0
                 ? `${(activeMatchCursor % matchIndices.length) + 1}/${matchIndices.length}`
                 : "0 matches"}
             </span>
             <Button
               type="button"
-              size="icon-sm"
+              size="icon"
               variant="outline"
               aria-label="Previous transcript match"
               disabled={matchIndices.length === 0}
               onClick={() => stepMatch(-1)}
-              className="max-md:size-11"
             >
-              <ChevronUp className="size-3.5" strokeWidth={1.5} aria-hidden />
+              <ChevronUp className="size-4" strokeWidth={1.5} aria-hidden />
             </Button>
             <Button
               type="button"
-              size="icon-sm"
+              size="icon"
               variant="outline"
               aria-label="Next transcript match"
               disabled={matchIndices.length === 0}
               onClick={() => stepMatch(1)}
-              className="max-md:size-11"
             >
-              <ChevronDown className="size-3.5" strokeWidth={1.5} aria-hidden />
+              <ChevronDown className="size-4" strokeWidth={1.5} aria-hidden />
             </Button>
             <Button
               type="button"
               size="sm"
-              variant={matchesOnly ? "default" : "outline"}
+              variant={matchesOnly ? "primary" : "outline"}
               aria-pressed={matchesOnly}
               onClick={() => setMatchesOnly((v) => !v)}
-              className="max-md:min-h-11 max-md:px-3"
             >
               <Filter className="size-3.5" strokeWidth={1.5} aria-hidden />
               <span>Matches</span>
@@ -276,19 +265,18 @@ export function VirtualizedTranscript({
         )}
       </div>
 
-      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-ink-3">
-        <span className="font-mono tabular-nums">
-          {plural(displayTotal, "line")}
-          {matchesOnly && q ? ` · showing ${rows.length.toLocaleString()}` : ""}
-        </span>
-        <div className="flex flex-wrap items-center gap-1.5">
+      <div className="flex flex-wrap items-center justify-between gap-2 text-[13px] text-[var(--ink-3)]">
+        <div className="flex items-center gap-3">
+          <span className="mono">{plural(displayTotal, "line")}</span>
+          {matchesOnly && q && <span>showing {rows.length.toLocaleString()}</span>}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             type="button"
             size="sm"
-            variant={errorIndices.length > 0 ? "destructive-outline" : "outline"}
+            variant={errorIndices.length > 0 ? "danger" : "outline"}
             disabled={errorIndices.length === 0}
             onClick={jumpToError}
-            className="h-7 px-2.5 text-xs max-md:min-h-11 max-md:px-3"
           >
             <AlertTriangle className="size-3.5" strokeWidth={1.5} aria-hidden />
             <span>
@@ -300,7 +288,7 @@ export function VirtualizedTranscript({
           <Button
             type="button"
             size="sm"
-            variant={followTail ? "default" : "outline"}
+            variant={followTail ? "primary" : "outline"}
             aria-pressed={followTail}
             onClick={() => {
               const next = !followTail;
@@ -311,7 +299,6 @@ export function VirtualizedTranscript({
                 setScrollTop(bottom);
               }
             }}
-            className="h-7 px-2.5 text-xs max-md:min-h-11 max-md:px-3"
           >
             <ArrowDown className="size-3.5" strokeWidth={1.5} aria-hidden />
             <span>Follow</span>
@@ -320,7 +307,7 @@ export function VirtualizedTranscript({
       </div>
 
       {rows.length === 0 ? (
-        <div className="min-h-24 rounded-card border border-hairline bg-canvas p-3 font-mono text-xs leading-relaxed text-ink-2">
+        <div className="min-h-28 rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--canvas)] p-4 mono text-[12px] leading-relaxed text-[var(--ink-2)]">
           {activeLines.length === 0 ? "No output yet." : `No transcript lines match "${search.trim()}".`}
         </div>
       ) : (
@@ -335,48 +322,43 @@ export function VirtualizedTranscript({
             const nearBottom = el.scrollHeight - (el.scrollTop + el.clientHeight) <= ROW_H * 2;
             if (!nearBottom && followTail) setFollowTail(false);
           }}
-          className="h-[44vh] min-h-[180px] max-h-[460px] overflow-auto rounded-card border border-hairline bg-canvas font-mono text-xs text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="flex-1 min-h-[260px] overflow-auto rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--canvas)] mono text-[12px] text-[var(--ink)] outline-none focus-visible:outline-2 focus-visible:outline-[var(--ring)]"
         >
-          <div className="relative min-w-full" style={{ height: `${totalHeight}px` }}>
-            {visibleSlice.map((row, offset) => {
-              const idx = startIdx + offset;
+          <div className="min-w-full w-max">
+            {topPad > 0 && <div style={{ height: `${topPad}px` }} aria-hidden="true" />}
+            {visibleSlice.map((row) => {
               const isErr = errorSet.has(row.origIdx);
               const isJumpTarget = highlightedLineNo === row.origIdx;
               return (
                 <div
                   key={row.origIdx}
                   data-line={row.origIdx + 1}
-                  style={{
-                    position: "absolute",
-                    top: `${idx * ROW_H}px`,
-                    left: 0,
-                    right: 0,
-                    height: `${ROW_H}px`,
-                  }}
+                  style={{ height: `${ROW_H}px` }}
                   className={cn(
-                    "flex items-center gap-2.5 whitespace-pre px-3 leading-[22px]",
+                    "flex items-center gap-3 whitespace-pre px-3 leading-[24px]",
                     isJumpTarget
-                      ? "bg-blue-soft text-ink font-medium"
+                      ? "bg-[var(--blue-soft)] text-[var(--ink)] font-medium"
                       : isErr
-                        ? "bg-diff-del-bg/65 text-diff-del-fg"
-                        : "text-ink",
+                        ? "bg-[var(--diff-del-bg)] text-[var(--diff-del-fg)]"
+                        : "text-[var(--ink)]",
                   )}
                 >
-                  <span className="w-11 shrink-0 select-none text-right tabular-nums text-ink-3">
+                  <span className="w-12 shrink-0 overflow-hidden select-none text-right tabular-nums text-[var(--ink-3)]">
                     {row.origIdx + 1}
                   </span>
-                  <span className="min-w-0 flex-1 whitespace-pre">
+                  <span className="shrink-0 whitespace-pre">
                     {renderHighlightedLine(row.text, q)}
                   </span>
                 </div>
               );
             })}
+            {bottomPad > 0 && <div style={{ height: `${bottomPad}px` }} aria-hidden="true" />}
           </div>
         </div>
       )}
 
       {(activeLines.length >= 2000 || canLoadMore) && (
-        <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-ink-3">
+        <div className="flex flex-wrap items-center justify-between gap-2 text-[12px] text-[var(--ink-3)]">
           <span>
             Virtualized viewport active ({activeLines.length.toLocaleString()} of {displayTotal.toLocaleString()} lines loaded; full archive at logs/{sessionId}.log).
           </span>
@@ -387,7 +369,6 @@ export function VirtualizedTranscript({
               variant="outline"
               disabled={loadingFull}
               onClick={() => void loadFullTranscript()}
-              className="h-7 px-2.5 text-xs max-md:min-h-11"
             >
               {loadingFull ? "Loading..." : `Load all ${displayTotal.toLocaleString()} lines`}
             </Button>

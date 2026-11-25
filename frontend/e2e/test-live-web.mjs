@@ -1,12 +1,6 @@
-// test-live-web.mjs: Comprehensive end-to-end verification of the standalone v0.8.0 browser-only
-// live web bundle (shared-live-web/fleet/index.html) across desktop 1440x900 and mobile 390x844
-// in both Light and Dark themes. Verifies Fleet rebrand (0 dsh-fleet / DeepSeek Harness / fleet-rs
-// / Rune jargon), Board/DAG Graph toggle + directed SVG arrows + node click, PR Preview &
-// confirmation-gated Create PR modal, Worktrees Inspector (GET/DELETE orphan prune), Budget
-// Guardrails, Board Metrics Strip, real Auto-Heal recovery & timeline, Playbooks, Batch fan-out,
-// multi-step Blob Web Worker checks, Unified + Split Diff (zero cross-column bleed), .patch
-// download, keyboard nav, Policy Tester, IndexedDB persistence, Settings-only Light/Dark mobile
-// tap, ZERO fixture pills, ZERO external network requests.
+// test-live-web.mjs: Comprehensive end-to-end verification of the standalone v0.9.0 browser-only
+// live web bundle (dist-live-web/index.html) across desktop 1440x900 and mobile 390x844
+// in both Light and Dark themes.
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
@@ -15,10 +9,10 @@ import { chromium } from "playwright-core";
 
 const BUNDLE =
   process.env.LIVE_WEB_FILE ||
-  "/home/cayleb/Work/scratch/swarm-v080/shared-live-web/fleet/index.html";
+  path.resolve(import.meta.dirname, "../../dist-live-web/index.html");
 const SHOT_DIR =
   process.env.SHOT_DIR ||
-  "/home/cayleb/.gemini/antigravity/brain/4d606d0e-862d-43e1-b40f-5f32ac566aa0";
+  path.resolve(import.meta.dirname, ".out/live-web-shots");
 const CHROME =
   process.env.E2E_CHROME ||
   path.join(os.homedir(), ".cache/ms-playwright/chromium-1234/chrome-linux64/chrome");
@@ -50,7 +44,6 @@ const externalReqs = [];
 const pageErrors = [];
 
 try {
-  // 1. Desktop 1440x900 Light + full v0.7.0 feature walkthrough
   const ctx = await browser.newContext({
     viewport: { width: 1440, height: 900 },
     colorScheme: "light",
@@ -86,9 +79,9 @@ try {
     bodyText.match(/\brune\b/i)?.[0] || "clean",
   );
   ok(
-    "Fleet v0.8.0 rebrand clean: zero dsh-fleet, DeepSeek Harness, or fleet-rs strings on board/title/release URL",
+    "Fleet v0.9.0 rebrand clean: zero dsh-fleet, DeepSeek Harness, or fleet-rs strings on board/title/release URL",
     !/\bdsh[-_ ]?fleet\b|deepseek\s+harness|\bfleet-rs\b/i.test(`${docTitle}\n${bodyText}\n${verHref}`) &&
-      verHref.includes("cayleb-james2008/fleet/releases/tag/v0.8.0"),
+      verHref.includes("cayleb-james2008/fleet/releases/tag/v0.9.0"),
     `title=${docTitle} href=${verHref}`,
   );
   ok(
@@ -97,12 +90,11 @@ try {
       (await p.locator('[data-testid="concurrency-indicator"]').isVisible()),
   );
 
-  // Board Metrics Strip telemetry + Daily budget chip
   const metricsStrip = p.locator('[data-testid="board-metrics-strip"]');
   const metricsText = await metricsStrip.innerText();
   const autoHealedCount = Number.parseInt(await p.locator('[data-testid="metric-auto-healed"]').innerText(), 10);
   ok(
-    "Board Metrics Strip renders live First-pass %, Auto-healed count, Median check, Active/Max, and Daily budget",
+    "Bottom metrics bar renders First-pass %, Auto-healed count, Median check, Active/Max, and Daily budget",
     metricsText.includes("First-pass") &&
       metricsText.includes("Median check") &&
       metricsText.includes("0 / 4") &&
@@ -115,9 +107,8 @@ try {
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
   );
   ok("1440 desktop has 0px horizontal overflow", overflow1440 <= 0, `overflow=${overflow1440}`);
-  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v080-live-1440-light.png") });
 
-  // Switch to interactive Multi-Wave DAG Graph view -> verify SVG edges + waves + click node -> Inspector
+  // Switch to interactive Multi-Wave DAG Graph view -> verify SVG edges + waves + click node -> Workbench
   await p.locator('[data-testid="view-toggle-dag"]').click();
   await p.waitForTimeout(300);
   const dagNodes = await p.locator('[data-testid="dag-node"]').count();
@@ -125,12 +116,11 @@ try {
   const dagOverflow = await p.evaluate(
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
   );
-  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v080-dag-graph-1440-light.png") });
   await p.locator('[data-testid="dag-node"][data-session-id="s-002"]').click();
   await p.waitForTimeout(350);
   const inspector = p.locator('aside[aria-label="Session inspector"]');
   ok(
-    "DAG Graph view renders 2+ waves, directed SVG arrows, 0px page overflow, and opens Inspector on node click",
+    "DAG Graph view renders 2+ waves, directed SVG arrows, 0px page overflow, and opens session on node click",
     dagNodes >= 4 && dagEdges >= 1 && dagOverflow <= 0 && (await inspector.isVisible()),
     `nodes=${dagNodes} edges=${dagEdges} overflow=${dagOverflow}`,
   );
@@ -160,24 +150,19 @@ try {
       prStatusText.includes("Dry-run PR verified"),
     `disabledBefore=${prDisabledBefore}`,
   );
-  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v080-pr-preview-1440-light.png") });
   await p.keyboard.press("Escape");
   await p.waitForTimeout(250);
-
-  // Switch back to Board view
-  await p.locator('[data-testid="view-toggle-board"]').click();
-  await p.waitForTimeout(200);
 
   // Receipt tab with keyboard 'r' -> Auto-Heal Timeline + Multi-Step Check Timeline
   await p.keyboard.press("r");
   await p.waitForTimeout(300);
-  const healTimeline = inspector.locator('[data-testid="auto-heal-timeline"]');
+  const healTimeline = p.locator('main [data-testid="auto-heal-timeline"]');
   await healTimeline.getByRole("button", { name: /Diagnostic steer prompt for attempt 1/ }).click();
   await p.waitForTimeout(200);
   const healText = await healTimeline.innerText();
-  const stepCount = await inspector.locator('ol[aria-label="Check pipeline steps"] > li').count();
+  const stepCount = await p.locator('main ol[aria-label="Check pipeline steps"] > li').count();
   ok(
-    "Receipt tab renders Auto-Heal Attempt Timeline (steer prompt + healed badge) and 2-step check timeline",
+    "Receipt view renders Auto-Heal Attempt Timeline (steer prompt + healed badge) and 2-step check timeline",
     healText.includes("Auto-heal attempt 1/2") && stepCount >= 2 && (await p.locator("details").count()) === 0,
     `steps=${stepCount}`,
   );
@@ -185,7 +170,7 @@ try {
   // Diff tab with keyboard 'd' -> Split diff zero cross-column bleed + .patch download
   await p.keyboard.press("d");
   await p.waitForTimeout(300);
-  const diffViewer = inspector.locator('[data-testid="rich-diff-viewer"]');
+  const diffViewer = p.locator('main [data-testid="rich-diff-viewer"]');
   ok("keyboard d switches to Diff tab with merge-check badge", await diffViewer.isVisible());
 
   await diffViewer.getByRole("button", { name: "Split" }).click();
@@ -216,7 +201,15 @@ try {
   // Switch to Transcript with 't'
   await p.keyboard.press("t");
   await p.waitForTimeout(200);
-  ok("keyboard t switches to Virtualized Transcript", await inspector.locator('[data-testid="virtualized-transcript"]').isVisible());
+  ok("keyboard t switches to Virtualized Transcript", await p.locator('main [data-testid="virtualized-transcript"]').isVisible());
+
+  // 1-click Goal-to-DAG planner in browser engine
+  await p.locator('[data-testid="open-launchpad"]').click();
+  await p.waitForTimeout(200);
+  await p.locator("#launchpad-goal").fill("Add negative entry guard; then run unit checks");
+  await p.locator('[data-testid="goal-launchpad"]').getByRole("button", { name: "Plan DAG" }).click();
+  await p.waitForTimeout(300);
+  ok("Goal-to-DAG plans multi-wave tasks via /api/plan inside browser engine", await p.locator('[data-testid="planned-dag-preview"]').isVisible());
 
   // Open Cmd+K Command Palette -> verify Playbooks & DAG action -> launch Two-Wave DAG Rollout playbook
   await p.keyboard.press("Control+k");
@@ -237,7 +230,6 @@ try {
   const batchTask0Val = await p.locator("#batch-task-0").inputValue();
   ok("Selecting Two-Wave DAG Rollout playbook pre-populates Batch DAG composer", batchTask0Val.includes("Wave 1"));
 
-  // Save a custom playbook from Composer via POST /api/templates
   await p.getByRole("button", { name: "Save as playbook" }).click();
   await p.waitForTimeout(200);
   await p.locator("#playbook-name").fill("Release Hardening Wave");
@@ -248,7 +240,6 @@ try {
     (await p.locator('section[aria-label="Playbooks"]').innerText()).includes("Release Hardening Wave"),
   );
 
-  // Dispatch the 2-wave DAG batch from the playbook
   await p.getByRole("button", { name: /Dispatch 2 tasks/ }).click();
   await p.waitForTimeout(2400);
   const afterBatchCount = await p.locator('div[aria-label="Session lanes"] article').count();
@@ -263,14 +254,14 @@ try {
 
   // Settings-only Light/Dark + Budget Guardrails + Worktrees Inspector + Policy Tester + zero Rune jargon
   const headerThemeCount = await p.locator('header #themeBtn, header [aria-label="Light"], header [aria-label="Dark"]').count();
-  ok("Light/Dark switcher absent from top bar in live web bundle", headerThemeCount === 0);
+  ok("Light/Dark switcher absent from top bar in live web bundle (#67)", headerThemeCount === 0);
 
   await p.getByRole("button", { name: "Engines and settings" }).click();
-  await p.waitForTimeout(400);
+  await p.waitForTimeout(350);
   const settings = p.locator("#settings");
   const settingsText = await settings.innerText();
   ok(
-    "Settings sheet has zero Rune jargon and zero legacy DSH-Fleet / fleet-rs branding",
+    "Settings sheet has zero Rune jargon and zero legacy branding",
     !/\brune\b|\bdsh[-_ ]?fleet\b|deepseek\s+harness|\bfleet-rs\b/i.test(settingsText),
   );
 
@@ -291,9 +282,6 @@ try {
     orphanRowsBefore === 1 && orphanRowsAfter === 0,
     `orphans=${orphanRowsBefore}->${orphanRowsAfter}`,
   );
-  await settings.locator('[data-testid="budget-guardrails"]').scrollIntoViewIfNeeded();
-  await p.waitForTimeout(150);
-  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v080-settings-worktrees-budget-1440-light.png") });
 
   await settings.getByRole("button", { name: "Test policy" }).click();
   await p.waitForTimeout(250);
@@ -301,20 +289,17 @@ try {
   ok(
     "Policy Tester evaluates route inside Settings drawer",
     policyText.includes("Routed engine") && policyText.includes("policies.rn"),
-    policyText.slice(0, 80).replace(/\n/g, " "),
   );
 
-  // Switch to Dark theme inside Settings and capture 1440 dark shot (in DAG Graph view + Board view!)
   await settings.getByRole("button", { name: "Dark", exact: true }).click();
-  await p.waitForTimeout(300);
+  await p.waitForTimeout(250);
   await p.keyboard.press("Escape");
-  await p.waitForTimeout(300);
+  await p.waitForTimeout(250);
   const darkAttr = await p.evaluate(() => document.documentElement.dataset.theme);
   ok("Dark theme activates from Settings drawer", darkAttr === "dark");
-  await p.screenshot({ path: path.join(SHOT_DIR, "fleet-v080-live-1440-dark.png") });
   await ctx.close();
 
-  // 2. Real Mobile 390x844 Settings Tap Test + DAG Graph mobile scroll check + Light & Dark screenshots
+  // Real Mobile 390x844 Settings Tap Test
   const mCtx = await browser.newContext({
     viewport: { width: 390, height: 844 },
     hasTouch: true,
@@ -334,7 +319,6 @@ try {
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
   );
   ok("390x844 mobile has 0px horizontal overflow", mOverflow <= 0, `overflow=${mOverflow}`);
-  await mp.screenshot({ path: path.join(SHOT_DIR, "fleet-v080-live-390-light.png") });
 
   const bgLum = () =>
     mp.evaluate(() => {
@@ -346,14 +330,11 @@ try {
     });
   const lumLight = await bgLum();
   await mp.locator("#settings-open").tap();
-  await mp.waitForTimeout(400);
-  await mp.locator("#settings").getByRole("button", { name: "Dark", exact: true }).tap();
   await mp.waitForTimeout(350);
+  await mp.locator("#settings").getByRole("button", { name: "Dark", exact: true }).tap();
+  await mp.waitForTimeout(300);
   const mThemeDark = await mp.evaluate(() => document.documentElement.dataset.theme);
   const lumDark = await bgLum();
-  await mp.locator('#settings button[aria-label="Close settings"]').tap();
-  await mp.waitForTimeout(350);
-  await mp.screenshot({ path: path.join(SHOT_DIR, "fleet-v080-live-390-dark.png") });
   ok(
     "390x844 real mobile Settings tap toggles Dark theme cleanly",
     mThemeDark === "dark" && lumDark < lumLight,

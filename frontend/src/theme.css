@@ -1,108 +1,161 @@
-/* Layout concept: Parallel coding-agent mission control — scan strip + measured verified-receipt hero over a hairline three-lane board (Needs you · Working · Done) with a split-pane session inspector.
-   Fleet colour scheme: House Frontend + owner warm palette, light default + full dark parity.
-   Roles: --blue is the ONE clay accent (primary key, current selection, focus); green, red, amber are state only. */
+/* Fleet v0.9.0 Desktop Workbench palette: Neutral Slate + Electric Blue, light default + full dark parity.
+   Roles: --blue is the primary accent (primary actions, active selection, focus); semantic green/red/amber are state only. */
+:root,
 :root[data-theme="light"] {
   color-scheme: light;
-  --canvas: #f5f4ee;       /* page */
-  --board: #eeede5;        /* hover / selected tint */
-  --surface: #fdfcfa;      /* cards, panels (warm white, never #fff) */
-  --hairline: #e3e1d6;     /* 1px lines */
-  --edge: #8a887f; --input: var(--edge);   /* input edges, 3.2:1 on canvas, 3.5:1 on surface */
-  --track: #ebe9df;        /* segmented track, count chip */
-  --raised: #fefefc;       /* the raised segment / key face */
-  --ink: #141413;
-  --ink-2: #4d4c47;
-  --ink-3: #66655e;
-  --icon: #7d7c75;
-  --disabled: #b0aea5;
-  --blue: #d97757; --blue-fg: #141413; --blue-hover: #cc6a49; --blue-soft: #f6e3d9;  /* ACCENT (clay); ink text 5.9:1 */
-  --ring: #cc6a49;         /* focus ring: clay one step darker, 3.3:1 on canvas, 3.6:1 on surface */
-  --info-foreground: #9c4326;   /* accent-coloured TEXT on light (5.2:1 on blue-soft) */
-  --ink-button: #141413; --ink-button-fg: #faf9f5;
-  --dot-green: #788c5d;  --success-foreground: #4f6038;   /* verified: sage */
-  --dot-blue: #6a9bcc;     /* instrument / info, not the accent */
-  --dot-red: #c4483a;    --destructive-foreground: #9a2f24;  --unread: #c4483a;   /* failed: red fill, red TEXT is the dark one (7.3:1) */
-  --dot-clay: #d97757;   /* needs you */
-  --dot-amber: #c99a3e;  --warning-foreground: #7a5a14;   /* queued, honest-but-needs-you */
-  --dot-online: #788c5d;
-  --diff-add-bg: #eaf3df; --diff-add-fg: #34471d;
-  --diff-del-bg: #fbe7e4; --diff-del-fg: #822319;
-  --tag-plan-bg: #ffe3d7; --tag-plan-fg: #67260c;
-  --tag-ops-bg: #d8eeff; --tag-ops-fg: #023f6f;
-  --tag-design-bg: #ffe1e5; --tag-design-fg: #672131;
-  --tag-research-bg: #efe6ff; --tag-research-fg: #462e69;
-  --tag-mint-bg: #e2f1d5; --tag-mint-fg: #2b4700;
-  --tag-dev-bg: #f8eace; --tag-dev-fg: #553700;
-  --tag-neutral-bg: #f5ebce; --tag-neutral-fg: #513900;
-  --tag-sky-bg: #d8eeff; --tag-sky-fg: #023f6f;
-  --pill-active-bg: #e2f1d5; --pill-active-fg: #2b4700;
-  --pill-pro-bg: #ffe2de; --pill-pro-fg: #682321;
-  --pill-inactive-bg: #f5ebce; --pill-inactive-fg: #513900;
-  --pill-warn-bg: #f8eace; --pill-warn-fg: #553700;
-  --av-rose-bg: #ffe1e5; --av-rose-fg: #672131;
-  --av-violet-bg: #efe6ff; --av-violet-fg: #462e69;
-  --av-sky-bg: #d8eeff; --av-sky-fg: #023f6f;
-  --av-grey-bg: #f5ebce; --av-grey-fg: #513900;
-  --elev-shell: none; --elev-card: none; --elev-raised: none; --elev-lift: 0 10px 24px rgba(20, 20, 19, 0.14); --elev-primary: none;
+  --canvas: #f6f7f9;
+  --board: #eff2f6;
+  --surface: #ffffff;
+  --hairline: #dfe3ea;
+  --hairline-s: #cbd2de;
+  --edge: #757e91;
+  --input: #757e91;
+  --track: #e5e9f0;
+  --raised: #ffffff;
+  --ink: #111318;
+  --ink-2: #434b5c;
+  --ink-3: #576072;
+  --icon: #5c6578;
+  --disabled: #50596b;
+  --blue: #1d5ef6;
+  --blue-fg: #ffffff;
+  --blue-hover: #154dd1;
+  --blue-soft: #ebf1ff;
+  --ring: #1d5ef6;
+  --info-foreground: #1649c4;
+  --ink-button: #111318;
+  --ink-button-fg: #ffffff;
+  --dot-green: #147a41;
+  --success-foreground: #106936;
+  --ok-soft: #e8f6ee;
+  --dot-blue: #1d5ef6;
+  --dot-red: #c62828;
+  --destructive-foreground: #b42224;
+  --bad-soft: #fdeced;
+  --unread: #c62828;
+  --dot-clay: #1d5ef6;
+  --dot-amber: #a85e00;
+  --warning-foreground: #8a4b00;
+  --warn-soft: #fef5e6;
+  --dot-online: #147a41;
+  --violet: #5830b5;
+  --violet-soft: #f1ecfe;
+  --diff-add-bg: #e8f6ee;
+  --diff-add-fg: #0d5a2e;
+  --diff-del-bg: #fdeced;
+  --diff-del-fg: #9f1a1a;
+  --diff-hunk-bg: #edf2fc;
+  --diff-hunk-fg: #1e4ca8;
+  --elev-shell: none;
+  --elev-card: none;
+  --elev-raised: none;
+  --elev-lift: 0 10px 28px rgba(17, 19, 24, 0.12);
+  --elev-primary: none;
+  --background: var(--surface);
+  --foreground: var(--ink);
+  --border: var(--hairline);
+  --muted-foreground: var(--ink-2);
 }
+
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --canvas: #141413;
-  --board: #1c1c1a;
-  --surface: #1f1e1c;
-  --hairline: #33322f;
-  --edge: #6f6e67; --input: var(--edge);
-  --track: #262523;
-  --raised: #2a2926;
-  --ink: #faf9f5;
-  --ink-2: #c8c7bd;
-  --ink-3: #9d9c92;
-  --icon: #8c8b82;
-  --disabled: #5b5a55;
-  --blue: #d97757; --blue-fg: #141413; --blue-hover: #e08a6d; --blue-soft: #3a2a22;
-  --ring: #d97757;
-  --info-foreground: #e6a387;
-  --ink-button: #faf9f5; --ink-button-fg: #141413;
-  --dot-green: #8fa86d;  --success-foreground: #a9c188;
-  --dot-blue: #7fb0e0;
-  --dot-red: #e0675a;    --destructive-foreground: #f0988e;  --unread: #e0675a;
-  --dot-clay: #d97757;
-  --dot-amber: #d9a84a;  --warning-foreground: #e7c277;
-  --dot-online: #8fa86d;
-  --diff-add-bg: #1d2715; --diff-add-fg: #b9d49b;
-  --diff-del-bg: #2f1917; --diff-del-fg: #f4a89f;
-  --tag-plan-bg: #3e2015; --tag-plan-fg: #ffb294;
-  --tag-ops-bg: #142a41; --tag-ops-fg: #92d0ff;
-  --tag-design-bg: #3e1e23; --tag-design-fg: #ffacba;
-  --tag-research-bg: #2d233e; --tag-research-fg: #d5baff;
-  --tag-mint-bg: #212e12; --tag-mint-fg: #b3d98c;
-  --tag-dev-bg: #342707; --tag-dev-fg: #ebc573;
-  --tag-neutral-bg: #322707; --tag-neutral-fg: #e6c873;
-  --tag-sky-bg: #142a41; --tag-sky-fg: #92d0ff;
-  --pill-active-bg: #212e12; --pill-active-fg: #b3d98c;
-  --pill-pro-bg: #3e1e1c; --pill-pro-fg: #ffaea6;
-  --pill-inactive-bg: #322707; --pill-inactive-fg: #e6c873;
-  --pill-warn-bg: #342707; --pill-warn-fg: #ebc573;
-  --av-rose-bg: #3e1e23; --av-rose-fg: #ffacba;
-  --av-violet-bg: #2d233e; --av-violet-fg: #d5baff;
-  --av-sky-bg: #142a41; --av-sky-fg: #92d0ff;
-  --av-grey-bg: #322707; --av-grey-fg: #e6c873;
-  --elev-shell: none; --elev-card: none; --elev-raised: none; --elev-lift: 0 10px 24px rgba(0, 0, 0, 0.55); --elev-primary: none;
+  --canvas: #0d0f13;
+  --board: #12151c;
+  --surface: #161a22;
+  --hairline: #272d3a;
+  --hairline-s: #353e50;
+  --edge: #6d778c;
+  --input: #6d778c;
+  --track: #202531;
+  --raised: #29303f;
+  --ink: #eef1f6;
+  --ink-2: #b4bccb;
+  --ink-3: #939cb0;
+  --icon: #939cb0;
+  --disabled: #96a0b5;
+  --blue: #568cff;
+  --blue-fg: #071127;
+  --blue-hover: #74a0ff;
+  --blue-soft: #1b2948;
+  --ring: #568cff;
+  --info-foreground: #93b6ff;
+  --ink-button: #eef1f6;
+  --ink-button-fg: #0d0f13;
+  --dot-green: #4ad682;
+  --success-foreground: #5ad98c;
+  --ok-soft: #11281c;
+  --dot-blue: #568cff;
+  --dot-red: #f87171;
+  --destructive-foreground: #f87171;
+  --bad-soft: #2f1417;
+  --unread: #f87171;
+  --dot-clay: #568cff;
+  --dot-amber: #f2b046;
+  --warning-foreground: #f2b046;
+  --warn-soft: #2a1f0c;
+  --dot-online: #4ad682;
+  --violet: #b69cff;
+  --violet-soft: #22193b;
+  --diff-add-bg: #102819;
+  --diff-add-fg: #7be3a4;
+  --diff-del-bg: #2e1518;
+  --diff-del-fg: #fca5a5;
+  --diff-hunk-bg: #152238;
+  --diff-hunk-fg: #8cb4ff;
+  --elev-shell: none;
+  --elev-card: none;
+  --elev-raised: none;
+  --elev-lift: 0 14px 32px rgba(0, 0, 0, 0.55);
+  --elev-primary: none;
+  --background: var(--surface);
+  --foreground: var(--ink);
+  --border: var(--hairline);
+  --muted-foreground: var(--ink-2);
 }
+
 :root {
-  /* House Frontend type voice and nested radii (inner strictly smaller than outer) */
   --font-sans: "Geist", ui-sans-serif, system-ui, sans-serif;
   --font-heading: "Geist", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Geist Mono", ui-monospace, monospace;
-  --radius-shell: 24px; --radius-panel: 16px; --radius-dialog: 16px; --radius-card: 10px;
-  --radius-segment: 7px; --radius-chip: 6px; --radius-menu: 12px; --radius: 9px;
-  --display-weight: 500; --tracking-display: -0.025em;
-  --ease-out: cubic-bezier(.23,1,.32,1); --ease-in-out: cubic-bezier(.77,0,.175,1); --ease-soft: cubic-bezier(.33,1,.68,1);
-  --t-press: 150ms; --t-hover: 180ms; --t-ui: 240ms;
+  --radius-panel: 12px;
+  --radius-dialog: 12px;
+  --radius-card: 8px;
+  --radius-segment: 6px;
+  --radius-chip: 6px;
+  --radius-menu: 10px;
+  --radius: 8px;
+  --display-weight: 600;
+  --tracking-display: -0.02em;
+  --ease-house: cubic-bezier(0.23, 1, 0.32, 1);
+  --dur-press: 120ms;
+  --dur-reveal: 150ms;
+  --dur-swap: 180ms;
+  --dur-sheet: 220ms;
 }
-h1, h2, h3, .font-heading { font-family: var(--font-heading); font-weight: var(--display-weight); letter-spacing: var(--tracking-display); }
-.num, .mono, [data-measured] { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-::selection { background: color-mix(in oklab, var(--blue) 28%, transparent); }
+
+body {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  background-color: var(--canvas);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, .font-heading {
+  font-family: var(--font-heading);
+  font-weight: var(--display-weight);
+  letter-spacing: var(--tracking-display);
+}
+
+.num, .mono, code, pre, [data-measured] {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+::selection {
+  background: color-mix(in oklab, var(--blue) 24%, transparent);
+}
 
 @theme inline {
   --color-edge: var(--edge);

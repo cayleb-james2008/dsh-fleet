@@ -4,9 +4,7 @@
 // - Raw error text and multi-line release notes use Cult UI Expandable (zero native <details>).
 // - Deterministic keyboard focus: busy -> status line; staged -> Restart now; dismiss -> Show update; refused restart -> status line.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { toast } from "sonner";
-import { Button } from "@/components/ui/button";
-import { Expandable, ExpandableContent, ExpandableTrigger } from "@/components/ui/expandable";
+import { Button, Expandable, toast } from "./ui";
 import { getJson, postJson, VERSION_URL, type UpdateState } from "./api";
 
 const DISMISS_KEY = "fleet-update-dismissed";
@@ -210,17 +208,18 @@ export function UpdateStrip({ u }: { u: UpdateController }) {
   const extraNotes = noteLines.slice(1).join("\n");
 
   return (
-    <section aria-label="Fleet update" className="relative z-10 flex flex-wrap items-start gap-x-4 gap-y-2 border-b border-hairline bg-surface px-4 py-3 md:px-6">
+    <section aria-label="Fleet update" className="relative z-10 flex flex-wrap items-start gap-x-4 gap-y-2 border-b border-[var(--hairline)] bg-[var(--surface)] px-4 py-3 md:px-6">
       {u.staged ? (
         <div className="flex w-full flex-wrap items-center gap-3">
-          <p id="upd-status" ref={statusRef} tabIndex={-1} className="text-sm font-medium text-ink outline-none">
+          <p id="upd-status" ref={statusRef} tabIndex={-1} className="text-[14px] font-medium text-[var(--ink)] outline-none">
             {u.staged} installed. Restart to use it.
           </p>
           <Button
             ref={restartBtnRef}
+            variant="primary"
             size="sm"
             onClick={u.restart}
-            className="ml-auto max-md:min-h-11 max-md:px-4"
+            className="ml-auto"
             disabled={u.restarting}
           >
             Restart now
@@ -228,54 +227,45 @@ export function UpdateStrip({ u }: { u: UpdateController }) {
         </div>
       ) : u.showErrorOnly ? (
         <div className="flex w-full flex-wrap items-center gap-3">
-          <p ref={statusRef} tabIndex={-1} role="status" aria-live="polite" className="min-w-0 flex-1 text-sm text-destructive-foreground outline-none">
+          <p ref={statusRef} tabIndex={-1} role="status" aria-live="polite" className="min-w-0 flex-1 text-[14px] text-[var(--destructive-foreground)] outline-none">
             {u.live}
           </p>
           {local && (
-            <Button size="sm" variant="outline" onClick={u.check} disabled={u.checking} className="max-md:min-h-11 max-md:px-4">
+            <Button size="sm" variant="outline" onClick={u.check} disabled={u.checking}>
               Try again
             </Button>
           )}
-          <Button size="sm" variant="ghost" onClick={() => u.dismiss()} className="max-md:min-h-11 max-md:px-3">
+          <Button size="sm" variant="ghost" onClick={() => u.dismiss()}>
             Dismiss
           </Button>
         </div>
       ) : (
         <>
           <div className="min-w-0 flex-1 space-y-1">
-            <p ref={statusRef} tabIndex={-1} className="text-sm font-medium text-ink outline-none">
-              Version <span className="font-mono">{s.latest}</span> is available
-              {leadNote && <span className="ml-2 font-normal text-ink-2 [overflow-wrap:anywhere]">{leadNote}</span>}
+            <p ref={statusRef} tabIndex={-1} className="text-[14px] font-medium text-[var(--ink)] outline-none">
+              Version <span className="mono">{s.latest}</span> is available
+              {leadNote && <span className="ml-2 font-normal text-[var(--ink-2)] [overflow-wrap:anywhere]">{leadNote}</span>}
             </p>
             {canApply && (
-              <p className="text-xs leading-relaxed text-ink-3">
+              <p className="text-[13px] leading-relaxed text-[var(--ink-3)]">
                 Update now downloads it, checks it, and replaces this app. Restart to start using it.
               </p>
             )}
             {extraNotes && (
-              <Expandable expandDirection="vertical" expandBehavior="push" className="pt-0.5">
-                {({ isExpanded }) => (
-                  <>
-                    <ExpandableTrigger className="inline-flex cursor-pointer items-center rounded-control text-xs font-medium text-ink-2 outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11 max-md:px-2">
-                      {isExpanded ? "Hide release notes" : "Release notes"}
-                    </ExpandableTrigger>
-                    <ExpandableContent preset="fade">
-                      <pre className="mt-1.5 max-h-36 overflow-y-auto whitespace-pre-wrap break-words rounded-control border border-hairline bg-canvas p-2.5 font-sans text-xs leading-relaxed text-ink-2">
-                        {extraNotes}
-                      </pre>
-                    </ExpandableContent>
-                  </>
-                )}
+              <Expandable triggerLabel="Release notes" openLabel="Hide release notes" className="mt-1">
+                <pre className="max-h-36 overflow-y-auto whitespace-pre-wrap break-words rounded-[var(--radius-chip)] bg-[var(--canvas)] p-2.5 text-[12px] leading-relaxed text-[var(--ink-2)]">
+                  {extraNotes}
+                </pre>
               </Expandable>
             )}
           </div>
           <div className="ml-auto flex flex-wrap items-center gap-2">
             {canApply ? (
-              <Button size="sm" onClick={u.apply} disabled={u.busy} className="max-md:min-h-11 max-md:px-4">
+              <Button variant="primary" size="sm" onClick={u.apply} disabled={u.busy}>
                 {u.busy ? "Updating..." : "Update now"}
               </Button>
             ) : (
-              <p className="text-sm text-ink-2">
+              <p className="text-[13px] text-[var(--ink-2)]">
                 {local
                   ? "This is a developer copy, so it does not update itself. Install a released version to get updates."
                   : "To update, open Fleet on the computer it runs on."}
@@ -285,11 +275,11 @@ export function UpdateStrip({ u }: { u: UpdateController }) {
               href={s.release_url || VERSION_URL + (s.latest || "")}
               target="_blank"
               rel="noopener"
-              className="inline-flex h-8 items-center rounded-control px-2.5 text-sm text-ink-2 underline-offset-4 outline-none hover:text-ink hover:underline focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11 max-md:px-3"
+              className="inline-flex h-8 items-center rounded-[var(--radius-chip)] px-2.5 text-[13px] text-[var(--ink-2)] underline-offset-4 outline-none hover:text-[var(--ink)] hover:underline focus-visible:outline-2 focus-visible:outline-[var(--ring)] max-md:min-h-11 max-md:px-3"
             >
               What&apos;s new<span className="sr-only"> (opens in a new tab)</span>
             </a>
-            <Button size="sm" variant="ghost" onClick={u.dismiss} className="max-md:min-h-11 max-md:px-3">
+            <Button size="sm" variant="ghost" onClick={u.dismiss}>
               Dismiss
             </Button>
           </div>
@@ -298,11 +288,11 @@ export function UpdateStrip({ u }: { u: UpdateController }) {
 
       {!u.showErrorOnly && u.live && (
         <div className={u.liveBad ? "flex w-full flex-wrap items-center gap-3 pt-1" : "sr-only"}>
-          <p role="status" aria-live="polite" className={u.liveBad ? "min-w-0 flex-1 text-sm text-destructive-foreground" : ""}>
+          <p role="status" aria-live="polite" className={u.liveBad ? "min-w-0 flex-1 text-[14px] text-[var(--destructive-foreground)]" : ""}>
             {u.live}
           </p>
           {u.liveBad && local && (
-            <Button size="sm" variant="outline" onClick={u.staged ? u.restart : u.apply} disabled={u.busy || u.restarting} className="max-md:min-h-11 max-md:px-4">
+            <Button size="sm" variant="outline" onClick={u.staged ? u.restart : u.apply} disabled={u.busy || u.restarting}>
               Try again
             </Button>
           )}
@@ -310,19 +300,10 @@ export function UpdateStrip({ u }: { u: UpdateController }) {
       )}
 
       {u.live && u.liveBad && u.raw && (
-        <Expandable expandDirection="vertical" expandBehavior="push" className="w-full">
-          {({ isExpanded }) => (
-            <>
-              <ExpandableTrigger aria-label="Details of the update failure" className="inline-flex cursor-pointer items-center rounded-control text-xs text-ink-3 outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11 max-md:px-2">
-                {isExpanded ? "Hide details" : "Details"}
-              </ExpandableTrigger>
-              <ExpandableContent preset="fade">
-                <pre className="mt-1.5 max-h-32 overflow-y-auto whitespace-pre-wrap break-all rounded-control border border-hairline bg-canvas p-2 font-mono text-xs text-ink-2">
-                  {u.raw}
-                </pre>
-              </ExpandableContent>
-            </>
-          )}
+        <Expandable triggerLabel="Details" openLabel="Hide details" className="w-full">
+          <pre className="max-h-32 overflow-y-auto whitespace-pre-wrap break-all rounded-[var(--radius-chip)] bg-[var(--canvas)] p-2 mono text-[12px] text-[var(--ink-2)]">
+            {u.raw}
+          </pre>
         </Expandable>
       )}
     </section>

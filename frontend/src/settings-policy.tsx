@@ -12,12 +12,7 @@ import {
   ShieldAlert,
   Trash2,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { InputGroup, InputGroupInput } from "@/components/ui/input-group";
-import { SegmentedControl, SegmentedControlItem } from "@/components/ui/segmented-control";
-import { Pill, PillIndicator } from "@/components/kibo-ui/pill";
-import { cn } from "@/lib/utils";
+import { Badge, Button, Input, SegmentedControl, cn, toast } from "./ui";
 import {
   computeLocalBudget,
   deleteRepoWorktree,
@@ -32,7 +27,6 @@ import {
   type Session,
   type WorktreeEntry,
 } from "./api";
-import { toast } from "sonner";
 
 const ENGINE_OPTIONS = ["auto", "opencode", "claude", "codex"] as const;
 
@@ -141,103 +135,97 @@ export function PolicyTesterSection({
   return (
     <>
       <section
-        className="space-y-3 border-t border-hairline pt-5"
+        className="space-y-3 border-t border-[var(--hairline)] pt-5"
         aria-label="Budget guardrails"
         data-testid="budget-guardrails"
       >
         <div className="flex items-center justify-between gap-2">
-          <h3 className="flex items-center gap-1.5 text-sm font-medium text-ink">
-            <Gauge className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
+          <h3 className="flex items-center gap-2 text-[14px] font-semibold text-[var(--ink)]">
+            <Gauge className="size-4 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
             <span>Budget guardrails</span>
           </h3>
-          <Pill
-            variant={budget.limit_reached ? "secondary" : "success"}
-            className="px-2 py-0.5 font-mono text-xs"
+          <Badge
+            tone={budget.limit_reached ? "warning" : "success"}
+            className="mono"
             data-testid="budget-status-pill"
           >
-            <PillIndicator variant={budget.limit_reached ? "warning" : "success"} />
-            <span>
-              {budget.limit_reached
-                ? "daily cap reached"
-                : `${budget.sessions_today} / ${budget.daily_session_limit} today`}
-            </span>
-          </Pill>
+            {budget.limit_reached
+              ? "daily cap reached"
+              : `${budget.sessions_today} / ${budget.daily_session_limit} today`}
+          </Badge>
         </div>
-        <p className="text-xs leading-relaxed text-ink-3">
+        <p className="text-[13px] leading-relaxed text-[var(--ink-3)]">
           Prevents runaway dispatch loops with daily session caps (HTTP 429 on overflow), per-session time ceilings, and auto-heal retry limits.
         </p>
 
-        <div className="space-y-2.5 rounded-card border border-hairline bg-canvas p-3 text-xs">
-          <div className="space-y-1">
-            <div className="flex items-center justify-between font-mono tabular-nums">
-              <span className="text-ink-2">Daily dispatch utilization</span>
-              <span className={cn("font-medium", budget.limit_reached ? "text-destructive-foreground" : "text-ink")}>
+        <div className="space-y-2.5 rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--canvas)] p-3 text-[13px]">
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between mono text-[12px]">
+              <span className="text-[var(--ink-2)]">Daily dispatch utilization</span>
+              <span className={cn("font-medium", budget.limit_reached ? "text-[var(--destructive-foreground)]" : "text-[var(--ink)]")}>
                 {budget.sessions_today} / {budget.daily_session_limit} ({budgetPct}%)
               </span>
             </div>
-            <div className="h-2 w-full overflow-hidden rounded-full bg-track">
+            <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--track)]">
               <div
                 className={cn(
-                  "h-full w-full origin-left transition-transform duration-(--dur-press) ease-(--ease-house)",
+                  "h-full w-full origin-left transition",
                   budget.limit_reached
-                    ? "bg-unread"
+                    ? "bg-[var(--dot-red)]"
                     : budgetPct >= 80
-                      ? "bg-dot-amber"
-                      : "bg-dot-green",
+                      ? "bg-[var(--dot-amber)]"
+                      : "bg-[var(--dot-green)]",
                 )}
                 style={{ transform: `scaleX(${Math.max(budgetPct, budget.sessions_today > 0 ? 4 : 0) / 100})` }}
               />
             </div>
           </div>
 
-          <dl className="grid grid-cols-3 gap-2 border-t border-hairline pt-2.5 font-mono tabular-nums">
+          <dl className="grid grid-cols-3 gap-2 border-t border-[var(--hairline)] pt-2.5 mono text-[12px]">
             <div>
-              <dt className="font-sans text-ink-3">Remaining</dt>
-              <dd className="mt-0.5 font-medium text-ink">{budget.remaining_today}</dd>
+              <dt className="font-sans text-[var(--ink-3)]">Remaining</dt>
+              <dd className="mt-0.5 font-medium text-[var(--ink)]">{budget.remaining_today}</dd>
             </div>
             <div>
-              <dt className="font-sans text-ink-3">Max session</dt>
-              <dd className="mt-0.5 font-medium text-ink">{budget.max_session_mins} min</dd>
+              <dt className="font-sans text-[var(--ink-3)]">Max session</dt>
+              <dd className="mt-0.5 font-medium text-[var(--ink)]">{budget.max_session_mins} min</dd>
             </div>
             <div>
-              <dt className="font-sans text-ink-3">Max heals</dt>
-              <dd className="mt-0.5 font-medium text-ink">{budget.max_heal_attempts} / run</dd>
+              <dt className="font-sans text-[var(--ink-3)]">Max heals</dt>
+              <dd className="mt-0.5 font-medium text-[var(--ink)]">{budget.max_heal_attempts} / run</dd>
             </div>
           </dl>
         </div>
       </section>
 
-      <section className="space-y-3 border-t border-hairline pt-5" aria-label="Live Policy Tester">
+      <section className="space-y-3 border-t border-[var(--hairline)] pt-5" aria-label="Live Policy Tester">
         <div className="flex items-center justify-between gap-2">
-          <h3 className="flex items-center gap-1.5 text-sm font-medium text-ink">
-            <FlaskConical className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
+          <h3 className="flex items-center gap-2 text-[14px] font-semibold text-[var(--ink)]">
+            <FlaskConical className="size-4 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
             <span>Policy tester</span>
           </h3>
           {result && (
-            <Pill variant={result.warnings.length ? "secondary" : "success"} className="px-2 py-0.5 font-mono text-xs">
-              <PillIndicator variant={result.warnings.length ? "warning" : "success"} />
-              <span>{result.source === "server" ? "live rules" : "policy preview"}</span>
-            </Pill>
+            <Badge tone={result.warnings.length ? "warning" : "success"} className="mono">
+              {result.source === "server" ? "live rules" : "policy preview"}
+            </Badge>
           )}
         </div>
-        <p className="text-xs leading-relaxed text-ink-3">
-          Dry-run a repo path, task prompt, and engine choice through <span className="font-mono text-ink-2">policies.rn</span> before dispatching.
+        <p className="text-[13px] leading-relaxed text-[var(--ink-3)]">
+          Dry-run a repo path, task prompt, and engine choice through <span className="mono text-[var(--ink-2)]">policies.rn</span> before dispatching.
         </p>
 
         <form onSubmit={runTest} className="space-y-2.5">
           <div className="space-y-1">
-            <label htmlFor="policy-test-repo" className="block text-xs font-medium text-ink-2">
+            <label htmlFor="policy-test-repo" className="block text-[13px] font-medium text-[var(--ink-2)]">
               Repository path or project
             </label>
-            <InputGroup>
-              <InputGroupInput
-                id="policy-test-repo"
-                value={repo}
-                onChange={(e) => setRepo(e.target.value)}
-                placeholder="/home/you/projects/app"
-                className="font-mono text-xs max-md:!h-11"
-              />
-            </InputGroup>
+            <Input
+              id="policy-test-repo"
+              value={repo}
+              onChange={(e) => setRepo(e.target.value)}
+              placeholder="/home/you/projects/app"
+              className="mono text-[13px]"
+            />
             {repos.length > 0 && (
               <div className="flex flex-wrap gap-1.5 pt-1">
                 {repos.slice(0, 4).map((r) => (
@@ -245,9 +233,9 @@ export function PolicyTesterSection({
                     key={r.path}
                     type="button"
                     size="sm"
-                    variant={repo === r.path ? "default" : "outline"}
+                    variant={repo === r.path ? "primary" : "outline"}
                     onClick={() => setRepo(r.path)}
-                    className="h-8 px-2.5 font-mono text-xs max-md:min-h-11"
+                    className="mono"
                   >
                     {r.name}
                   </Button>
@@ -257,38 +245,28 @@ export function PolicyTesterSection({
           </div>
 
           <div className="space-y-1">
-            <label htmlFor="policy-test-task" className="block text-xs font-medium text-ink-2">
+            <label htmlFor="policy-test-task" className="block text-[13px] font-medium text-[var(--ink-2)]">
               Sample task
             </label>
-            <InputGroup>
-              <InputGroupInput
-                id="policy-test-task"
-                value={task}
-                onChange={(e) => setTask(e.target.value)}
-                placeholder="Describe a sample coding task"
-                className="text-xs max-md:!h-11"
-              />
-            </InputGroup>
+            <Input
+              id="policy-test-task"
+              value={task}
+              onChange={(e) => setTask(e.target.value)}
+              placeholder="Describe a sample coding task"
+            />
           </div>
 
           <div className="space-y-1">
-            <p className="text-xs font-medium text-ink-2">Engine override</p>
-            <SegmentedControl aria-label="Policy test engine" size="sm">
-              {ENGINE_OPTIONS.map((opt) => (
-                <SegmentedControlItem
-                  key={opt}
-                  aria-pressed={engine === opt}
-                  data-checked={engine === opt ? "" : undefined}
-                  onClick={() => setEngine(opt)}
-                  className="text-xs max-md:!min-h-11"
-                >
-                  {opt}
-                </SegmentedControlItem>
-              ))}
-            </SegmentedControl>
+            <p className="text-[13px] font-medium text-[var(--ink-2)]">Engine override</p>
+            <SegmentedControl
+              label="Policy test engine"
+              value={engine}
+              onChange={(opt) => setEngine(opt)}
+              options={ENGINE_OPTIONS.map((opt) => ({ value: opt, label: opt }))}
+            />
           </div>
 
-          <Button type="submit" size="sm" variant="outline" disabled={testing} className="max-md:min-h-11 max-md:px-4">
+          <Button type="submit" size="sm" variant="outline" disabled={testing}>
             <Play className="size-3.5" strokeWidth={1.5} aria-hidden />
             <span>{testing ? "Evaluating..." : "Test policy"}</span>
           </Button>
@@ -297,49 +275,49 @@ export function PolicyTesterSection({
         {result && (
           <div
             data-testid="policy-test-result"
-            className="space-y-2 rounded-card border border-hairline bg-canvas p-3 text-xs"
+            className="space-y-2 rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--canvas)] p-3 text-[12px]"
           >
-            <dl className="grid grid-cols-2 gap-x-3 gap-y-2 font-mono tabular-nums">
+            <dl className="grid grid-cols-2 gap-x-3 gap-y-2 mono">
               <div>
-                <dt className="text-ink-3">Routed engine</dt>
-                <dd className="font-medium text-ink">{result.engine}</dd>
+                <dt className="text-[var(--ink-3)]">Routed engine</dt>
+                <dd className="font-medium text-[var(--ink)]">{result.engine}</dd>
               </div>
               <div>
-                <dt className="text-ink-3">Model</dt>
-                <dd className="truncate text-ink">{result.model || "engine default"}</dd>
+                <dt className="text-[var(--ink-3)]">Model</dt>
+                <dd className="truncate text-[var(--ink)]">{result.model || "engine default"}</dd>
               </div>
               <div className="col-span-2">
-                <dt className="text-ink-3">Check command</dt>
-                <dd className="break-all text-ink">{result.check_cmd}</dd>
+                <dt className="text-[var(--ink-3)]">Check command</dt>
+                <dd className="break-all text-[var(--ink)]">{result.check_cmd}</dd>
               </div>
               <div>
-                <dt className="text-ink-3">Concurrency / Timeout</dt>
-                <dd className="text-ink">{result.max_parallel} slots · {result.timeout_secs}s</dd>
+                <dt className="text-[var(--ink-3)]">Concurrency / Timeout</dt>
+                <dd className="text-[var(--ink)]">{result.max_parallel} slots / {result.timeout_secs}s</dd>
               </div>
               <div>
-                <dt className="text-ink-3">Retry / Steer budget</dt>
-                <dd className="text-ink">{result.auto_retry_budget} retry · {result.auto_steer_budget} steer</dd>
+                <dt className="text-[var(--ink-3)]">Retry / Steer budget</dt>
+                <dd className="text-[var(--ink)]">{result.auto_retry_budget} retry / {result.auto_steer_budget} steer</dd>
               </div>
               <div className="col-span-2">
-                <dt className="text-ink-3">Matched rule</dt>
-                <dd className="break-all text-ink-2">{result.matched_rule}</dd>
+                <dt className="text-[var(--ink-3)]">Matched rule</dt>
+                <dd className="break-all text-[var(--ink-2)]">{result.matched_rule}</dd>
               </div>
               {result.allowed_globs.length > 0 && (
                 <div className="col-span-2">
-                  <dt className="text-ink-3">Allowed globs</dt>
-                  <dd className="break-all text-ink-2">{result.allowed_globs.join(", ")}</dd>
+                  <dt className="text-[var(--ink-3)]">Allowed globs</dt>
+                  <dd className="break-all text-[var(--ink-2)]">{result.allowed_globs.join(", ")}</dd>
                 </div>
               )}
               {result.forbidden_globs.length > 0 && (
                 <div className="col-span-2">
-                  <dt className="text-ink-3">Forbidden globs</dt>
-                  <dd className="break-all text-ink-2">{result.forbidden_globs.join(", ")}</dd>
+                  <dt className="text-[var(--ink-3)]">Forbidden globs</dt>
+                  <dd className="break-all text-[var(--ink-2)]">{result.forbidden_globs.join(", ")}</dd>
                 </div>
               )}
             </dl>
 
             {result.warnings.length > 0 && (
-              <div className="space-y-1 border-t border-hairline pt-2 text-warning-foreground">
+              <div className="space-y-1 border-t border-[var(--hairline)] pt-2 text-[var(--warning-foreground)]">
                 {result.warnings.map((w, i) => (
                   <p key={i} className="flex items-start gap-1.5">
                     <ShieldAlert className="mt-0.5 size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
@@ -353,17 +331,17 @@ export function PolicyTesterSection({
       </section>
 
       <section
-        className="space-y-3 border-t border-hairline pt-5"
+        className="space-y-3 border-t border-[var(--hairline)] pt-5"
         aria-label="Worktrees inspector"
         data-testid="worktrees-inspector"
       >
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="min-w-0">
-            <h3 className="flex items-center gap-1.5 text-sm font-medium text-ink">
-              <FolderGit2 className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
+            <h3 className="flex items-center gap-2 text-[14px] font-semibold text-[var(--ink)]">
+              <FolderGit2 className="size-4 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
               <span>Worktrees inspector</span>
             </h3>
-            <p className="text-xs text-ink-3">
+            <p className="text-[13px] text-[var(--ink-3)]">
               Inspect git worktrees across repositories, spot orphans, and prune individual non-main checkouts.
             </p>
           </div>
@@ -375,7 +353,6 @@ export function PolicyTesterSection({
               disabled={wtLoading}
               onClick={() => void loadWorktrees()}
               aria-label="Refresh worktrees"
-              className="h-8 px-2.5 text-xs max-md:min-h-11 max-md:px-3"
             >
               <RefreshCw className={cn("size-3.5", wtLoading && "animate-spin")} strokeWidth={1.5} aria-hidden />
               <span>Refresh</span>
@@ -387,7 +364,6 @@ export function PolicyTesterSection({
                 variant="outline"
                 disabled={pruning}
                 onClick={runPrune}
-                className="h-8 px-2.5 text-xs max-md:min-h-11 max-md:px-3"
               >
                 <FolderSync className="size-3.5" strokeWidth={1.5} aria-hidden />
                 <span>{pruning ? "Pruning..." : "Prune all stale"}</span>
@@ -396,10 +372,10 @@ export function PolicyTesterSection({
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2 font-mono text-xs text-ink-3 tabular-nums">
+        <div className="flex flex-wrap items-center gap-2 mono text-[12px] text-[var(--ink-3)]">
           <span>{worktrees.length} {worktrees.length === 1 ? "worktree" : "worktrees"}</span>
           {orphanCount > 0 && (
-            <Badge variant="warning" size="sm">
+            <Badge tone="warning">
               {orphanCount} {orphanCount === 1 ? "orphan" : "orphans"}
             </Badge>
           )}
@@ -407,7 +383,7 @@ export function PolicyTesterSection({
         </div>
 
         {worktrees.length === 0 ? (
-          <p className="rounded-card border border-hairline bg-canvas px-3 py-2.5 text-xs text-ink-3">
+          <p className="rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--canvas)] px-3 py-2.5 text-[13px] text-[var(--ink-3)]">
             No git worktrees reported yet.
           </p>
         ) : (
@@ -420,49 +396,36 @@ export function PolicyTesterSection({
                   key={wt.path}
                   data-testid="worktree-row"
                   data-orphan={wt.is_orphan ? "true" : "false"}
-                  className="space-y-1.5 rounded-card border border-hairline bg-canvas p-2.5 text-xs"
+                  className="space-y-1.5 rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--canvas)] p-2.5 text-[12px]"
                 >
                   <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="font-medium text-ink">{wt.project}</span>
-                    <span className="inline-flex min-w-0 items-center gap-1 rounded-chip bg-track px-1.5 py-0.5 font-mono text-ink-2">
-                      <GitBranch className="size-3 shrink-0 text-icon" strokeWidth={1.5} aria-hidden />
+                    <span className="font-medium text-[var(--ink)]">{wt.project}</span>
+                    <span className="inline-flex min-w-0 items-center gap-1 rounded-[var(--radius-chip)] bg-[var(--track)] px-1.5 py-0.5 mono text-[var(--ink-2)]">
+                      <GitBranch className="size-3 shrink-0 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
                       <span className="truncate">{wt.branch}</span>
                     </span>
-                    {wt.is_main && (
-                      <Badge variant="secondary" size="sm">
-                        main
-                      </Badge>
-                    )}
-                    {wt.is_orphan && !wt.is_main && (
-                      <Badge variant="warning" size="sm">
-                        orphan
-                      </Badge>
-                    )}
-                    {wt.dirty && (
-                      <Badge variant="error" size="sm">
-                        dirty
-                      </Badge>
-                    )}
+                    {wt.is_main && <Badge tone="neutral">main</Badge>}
+                    {wt.is_orphan && !wt.is_main && <Badge tone="warning">orphan</Badge>}
+                    {wt.dirty && <Badge tone="danger">dirty</Badge>}
                     {wt.session_id && (
-                      <span className="rounded-chip bg-board px-1.5 py-0.5 font-mono text-ink-2">
-                        {wt.session_id} · {wt.session_status || "linked"}
+                      <span className="rounded-[var(--radius-chip)] bg-[var(--board)] px-1.5 py-0.5 mono text-[var(--ink-2)]">
+                        {wt.session_id} ({wt.session_status || "linked"})
                       </span>
                     )}
                   </div>
 
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <p className="min-w-0 flex-1 break-all font-mono text-ink-3">{wt.path}</p>
+                    <p className="min-w-0 flex-1 break-all mono text-[var(--ink-3)]">{wt.path}</p>
                     {!wt.is_main && wt.removable && supportsServerV070 && (
                       isConfirming ? (
                         <div className="flex items-center gap-1.5">
                           <Button
                             type="button"
                             size="sm"
-                            variant="destructive-outline"
+                            variant="danger"
                             disabled={isDeleting}
                             onClick={() => void removeOneWorktree(wt)}
                             data-testid="worktree-confirm-prune"
-                            className="h-8 px-2.5 text-xs max-md:min-h-11"
                           >
                             {isDeleting ? "Removing..." : "Confirm prune"}
                           </Button>
@@ -471,7 +434,6 @@ export function PolicyTesterSection({
                             size="sm"
                             variant="ghost"
                             onClick={() => setConfirmPath(null)}
-                            className="h-8 px-2 text-xs max-md:min-h-11"
                           >
                             Cancel
                           </Button>
@@ -484,7 +446,6 @@ export function PolicyTesterSection({
                           onClick={() => setConfirmPath(wt.path)}
                           data-testid="worktree-prune-btn"
                           aria-label={`Prune worktree ${wt.branch}`}
-                          className="h-8 px-2.5 text-xs max-md:min-h-11"
                         >
                           <Trash2 className="size-3.5" strokeWidth={1.5} aria-hidden />
                           <span>Prune</span>

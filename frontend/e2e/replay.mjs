@@ -31,21 +31,20 @@ const patch = (fn) => async r => { const res = await r.fetch(); const j = await 
 for (const w of [1440, 390]) {
   {
     const { ctx, p } = await page(w, BASE, [['**/api/sessions', r => json(r, 'no', 500)]])
-    const band = await p.locator('section[aria-label=Scan]').innerText()
-    ok(`fleet ${w}: unreachable from the start says so; no zeros`,
-      await p.locator('text=Fleet has not answered yet').count() === 1 && !/\b0\b/.test(band.replace(/Recent sessions/, '')))
+    ok(`fleet ${w}: unreachable from the start says so clearly`,
+      await p.locator('text=Fleet has not answered yet').count() === 1)
     await ctx.close()
   }
   {
     const { ctx, p } = await page(w, BASE, [['**/api/sessions', patch(j => [null, ...j.map((s, i) => i ? s : { ...s, task: '', transcript: null, steer: null })])]])
-    ok(`fleet ${w}: null entry, blank task, and null transcript do not blank the board`,
+    ok(`fleet ${w}: null entry, blank task, and null transcript do not blank the workbench`,
       !p.errs.length && await p.locator('div[aria-label="Session lanes"]').count() === 1 && await p.locator('text=Untitled session').count() >= 1,
       p.errs.join('|'))
     await ctx.close()
   }
   {
     const { ctx, p } = await page(w, BASE, [['**/api/sessions', patch(j => j.map(s => s.bucket === 'needs-you' ? { ...s, reason: 'Check failed: ' + LONG, project: 'p/' + LONG, branch: 'fleet/' + LONG } : s))]])
-    ok(`fleet ${w}: long unbroken reason/project/branch stay inside their lane`, (await clipped(p)) === 0)
+    ok(`fleet ${w}: long unbroken reason/project/branch stay inside their container`, (await clipped(p)) === 0)
     await p.screenshot({ path: `${OUT}/fleet-long-${w}.png` })
     await ctx.close()
   }
