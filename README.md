@@ -82,7 +82,7 @@ Fleet scales from `340px–380px` Antigravity auxiliary sidebars up to wide `144
 ```mermaid
 flowchart LR
     Host["Antigravity Host<br/>(Aux Side Pane + /preload.js)"] <-->|"SidecarApp RPC + theme-change<br/>toggleConversation / toggleAuxPane"| Backend["Fleet Sidecar Backend<br/>(sidecars/fleet_pane/main.mjs)"]
-    UI["Embedded Sidebar SPA<br/>(291.8 KiB raw / 90.9 KiB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>Pre-Gzipped ETag/304 JSON"| Backend
+    UI["Embedded Sidebar SPA<br/>(292.5 KiB raw / 91.1 KiB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>Pre-Gzipped ETag/304 JSON"| Backend
     Backend -->|"Zero-String Buffer Scan + 16 KB Ring"| Store["swarm_store.mjs"]
     Backend -->|"Debounced TTL + CWE-22/59 Diff Peek"| Git["git_probe.mjs"]
     Store -.->|"Read-Only"| Brain["~/.gemini/antigravity/brain/&lt;conv&gt;<br/>.system_generated/{swarm,logs}"]
@@ -97,10 +97,10 @@ Measured under `#154` CPU isolation (`taskset -c 24-31`, `16` concurrent polling
 
 | Metric | v1.8.0 | v1.9.0 | **v1.10.0** |
 | --- | --- | --- | --- |
-| Embedded Sidecar UI (`/`) | `322,939 B` raw (`315.4 KiB`) / `95,371 B` gz (`93.1 KiB`) | `311,446 B` raw (`304.1 KiB`) / `94,127 B` gz (`91.9 KiB`) | **`298,839 B` raw (`291.8 KiB`) / `93,061 B` gz (`90.88 KiB`)** |
+| Embedded Sidecar UI (`/`) | `322,939 B` raw (`315.4 KiB`) / `95,371 B` gz (`93.1 KiB`) | `311,446 B` raw (`304.1 KiB`) / `94,127 B` gz (`91.9 KiB`) | **`299,493 B` raw (`292.5 KiB`) / `93,290 B` gz (`91.10 KiB`)** |
 | Peak RSS (`VmHWM`, `--jitless` 16w) | `80.49 MB` (`72.82 MB` sidecar `--jitless`) | `73.16 MB` (`74,916 KB` sidecar `--jitless`, `99.86 MB` zero-flag) | **`64.90 MB` (`66,456 KB` sidecar `--jitless`, `92.06 MB` zero-flag)** |
-| Throughput (`req/s`, 16w `taskset 24-31`) | `2,766.0 req/s` | `1,351.7 req/s` (`--jitless`) / `1,088.0 req/s` (audit) | **`8,964.7 req/s` (`--jitless` keep-alive) · `27,086.0 req/s` (keep-alive) · `1,360.7 req/s` (cold audit)** |
-| Latency (`p50` / `p95`, `taskset 24-31`) | `5.64 ms` / `8.34 ms` (`15.38 ms` max) | `14.38 ms` / `22.81 ms` (audit) · `15.66 ms` p95 (`--jitless`) | **`1.63 ms` / `2.52 ms` (`--jitless`) · `11.43 ms` / `17.47 ms` (cold audit)** |
+| Throughput (`req/s`, 16w `taskset 24-31`) | `2,766.0 req/s` | `1,351.7 req/s` (`--jitless`) / `1,088.0 req/s` (audit) | **`8,964.7 req/s` (`--jitless` keep-alive) · `27,086.0 req/s` (keep-alive) · `1,105.1 req/s` (cold audit)** |
+| Latency (`p50` / `p95`, `taskset 24-31`) | `5.64 ms` / `8.34 ms` (`15.38 ms` max) | `14.38 ms` / `22.81 ms` (audit) · `15.66 ms` p95 (`--jitless`) | **`1.63 ms` / `2.52 ms` (`--jitless`) · `14.20 ms` / `20.94 ms` (cold audit)** |
 | Simultaneous SSE (`/api/swarm/stream` x5) | `5/5` (`0` drops) | `5/5` (`0` drops) | **`5/5` (`0` drops)** |
 | E2E Gate + Replay + Sloplint | `36/36` + `8/8` + `0 FAIL / 0 WARN` | `38/38` + `8/8` + `0 FAIL / 0 REFLEX / 0 WARN` | **`40/40` + `8/8` + `0 FAIL / 0 REFLEX / 0 WARN`** |
 
