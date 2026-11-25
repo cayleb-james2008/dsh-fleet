@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, FileCode2, Filter, Search, X } from "lucide-react";
+import { ArrowDown, FileCode2, Filter, Pin, PinOff, Search, X } from "lucide-react";
 import { extractLocalFilePaths, openFileInAuxPane } from "../sidecar";
 import type { BoardMessage, SwarmSnapshot } from "../types";
 import { Badge, Button, Card, Input, cn, fmtClockTime, toast } from "../ui";
@@ -90,10 +90,14 @@ function PostBody({
 export function BoardView({
   snap,
   highlightSeq,
+  pinnedSeqs,
+  onTogglePin,
   onClearHighlight,
 }: {
   snap: SwarmSnapshot;
   highlightSeq: number | null;
+  pinnedSeqs: number[];
+  onTogglePin: (seq: number) => void;
   onClearHighlight: () => void;
 }) {
   const [query, setQuery] = useState("");
@@ -153,9 +157,48 @@ export function BoardView({
   }, [filtered.length, follow, highlightSeq]);
 
   const hasActiveFilter = query.trim().length > 0 || agentFilter !== "all";
+  const pinnedSet = useMemo(() => new Set(pinnedSeqs), [pinnedSeqs]);
+  const pinnedMessages = useMemo(
+    () => messages.filter((m) => !m.control && pinnedSet.has(m.seq)),
+    [messages, pinnedSet],
+  );
 
   return (
     <div className="space-y-3">
+      {pinnedMessages.length > 0 && (
+        <Card className="p-2.5 space-y-1.5 bg-[var(--board)]" aria-label="Pinned board posts">
+          <div className="flex items-center justify-between gap-2">
+            <span className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-[var(--ink)]">
+              <Pin className="h-3.5 w-3.5 text-[var(--info-foreground)]" aria-hidden="true" />
+              Pinned ({pinnedMessages.length})
+            </span>
+          </div>
+          <ul className="divide-y divide-[var(--hairline)]">
+            {pinnedMessages.map((pm) => (
+              <li key={pm.seq} className="flex items-center justify-between gap-2 py-1.5 first:pt-0.5 last:pb-0">
+                <button
+                  type="button"
+                  onClick={() => scrollToSeq(pm.seq)}
+                  className="min-w-0 flex-1 text-left text-[12px] text-[var(--ink)] hover:underline cursor-pointer truncate"
+                >
+                  <span className="font-semibold num">#{pm.seq}</span>{" "}
+                  <span className="font-medium">{pm.agent}:</span>{" "}
+                  <span className="text-[var(--ink-2)]">{pm.text}</span>
+                </button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`Unpin #${pm.seq}`}
+                  onClick={() => onTogglePin(pm.seq)}
+                  className="shrink-0"
+                >
+                  <PinOff className="h-3.5 w-3.5" aria-hidden="true" />
+                </Button>
+              </li>
+            ))}
+          </ul>
+        </Card>
+      )}
       {/* Pinned Search & Filter Bar */}
       <div className="sticky top-0 z-10 -mx-1 px-1 py-1.5 bg-[var(--canvas)] space-y-2">
         <div className="flex items-center gap-1.5">
@@ -307,9 +350,23 @@ export function BoardView({
                         {m.channel && m.channel !== "main" && <Badge tone="violet">#{m.channel}</Badge>}
                         {m.all && <Badge tone="info">@all</Badge>}
                       </div>
-                      <div className="flex items-center gap-2 shrink-0 text-[12px] text-[var(--ink-3)] num">
+                      <div className="flex items-center gap-1.5 shrink-0 text-[12px] text-[var(--ink-3)] num">
                         <span>#{m.seq}</span>
                         <span>{fmtClockTime(m.ts, m.time)}</span>
+                        <button
+                          type="button"
+                          aria-label={pinnedSet.has(m.seq) ? `Unpin #${m.seq}` : `Pin #${m.seq}`}
+                          aria-pressed={pinnedSet.has(m.seq)}
+                          onClick={() => onTogglePin(m.seq)}
+                          className={cn(
+                            "p-1 rounded-[4px] cursor-pointer transition",
+                            pinnedSet.has(m.seq)
+                              ? "text-[var(--info-foreground)] bg-[var(--blue-soft)]"
+                              : "text-[var(--ink-3)] hover:text-[var(--ink)] hover:bg-[var(--track)]",
+                          )}
+                        >
+                          <Pin className="h-3 w-3" aria-hidden="true" />
+                        </button>
                       </div>
                     </div>
                   )}

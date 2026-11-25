@@ -3,6 +3,11 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as a
 ready-to-install Antigravity plugin bundle (`tar.gz` + `zip`) with `SHA256SUMS`.
 
+## 1.3.0 - 2026-11-25
+
+- **Live SSE Push Stream (`/api/swarm/stream`, `sidecars/fleet_pane/main.mjs`, `frontend/src/App.tsx`)**: added bounded `text/event-stream` endpoint pushing instant `etag` deltas via `computeSwarmFingerprint` (64-client cap, shared 150ms watcher active only while subscribers are connected, 15s keepalive, clean disconnect teardown) with automatic `EventSource` subscription in standalone mode and graceful polling fallback inside `SidecarApp`, verified under 5/5 concurrent SSE client survival.
+- **Pinned Board Posts (`Pin #seq`) & `380px` Sidebar Micro-Polish (`frontend/src/components/{BoardView,TriageView}.tsx`, `App.tsx`, `install.sh`)**: added per-swarm persistent `Pin #seq` toggles surfacing pinned decisions/blockers at the top of both Board and Triage views, aligned `#seq` jump pills cleanly on Triage cards, balanced horizontal padding on the `380px` sidebar `tok` pill, and ensured `chmod 755` on the atomic install staging root in `install.sh`.
+
 ## 1.2.0 - 2026-11-25
 
 - **Zero-Friction Triage Presets, Aux-Pane File Actions & Context Pressure (`frontend/src/`, `skills/fleet/SKILL.md`)**: added confirmation-gated 1-click **Unstick / Resume / Ask status** presets on `[blocked]` / `quota` / `error` / stalled Triage cards with exact `#seq` context, 1-click **Open file** (`window.sidecar.ui.toggleAuxPane({ tabType: "fileView", uri })`) across `Screenshot:` reel items and board/triage file paths, and per-worker **Context & Token Pressure** saturation badges/bars (`% ctx`, `High ctx`, `Quota paused`, `Stalled`) in `RosterView`.

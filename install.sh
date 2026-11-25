@@ -44,6 +44,7 @@ fi
 
 mkdir -p "$(dirname "${DEST}")"
 STAGE_DIR="$(mktemp -d "$(dirname "${DEST}")/.fleet-install.XXXXXX")"
+chmod 755 "${STAGE_DIR}"
 cleanup() {
   rm -rf "${STAGE_DIR}"
 }
