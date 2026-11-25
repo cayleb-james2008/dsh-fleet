@@ -6,8 +6,8 @@
  *    registers routes on `SidecarApp` from `sidecar_sdk`.
  * 2. Standalone loopback mode (CLI flags `--port <n>`, `--app-data-dir <dir>`,
  *    `PORT`, or `FLEET_STANDALONE=1`): serves pre-compressed gzip + ETag/304 UI,
- *    security headers, Host loopback-403 check, prompt 413 payload enforcement,
- *    and `/preload.js` browser shim.
+ *    pre-serialized/pre-gzipped cached JSON snapshots, security headers,
+ *    Host loopback-403 check, prompt 413 payload enforcement, and `/preload.js`.
  */
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
@@ -78,6 +78,13 @@ function loadDistAssets(distDir) {
   return { htmlRaw, htmlGzip, htmlEtag, fonts };
 }
 
+function packJsonPayload(obj, etagOverride = '') {
+  const raw = Buffer.from(JSON.stringify(obj));
+  const gz = raw.length >= 256 ? gzipSync(raw) : null;
+  const etag = etagOverride || `"${createHash('sha256').update(raw).digest('hex').slice(0, 16)}"`;
+  return { raw, gz, etag };
+}
+
 function isLoopbackHostHeader(host) {
   if (!host) return true;
   const h = String(host).trim().toLowerCase();
@@ -101,7 +108,7 @@ function isLoopbackOrigin(origin) {
   }
 }
 
-/** Build framework-agnostic route handlers shared by `SidecarApp` and standalone HTTP mode. */
+/** Build framework-agnostic route handlers with pre-serialized/pre-gzipped response caching. */
 export function createFleetHandlers({
   distDir = join(__dirname, 'dist'),
   appDataDir = '',
@@ -112,30 +119,56 @@ export function createFleetHandlers({
   const assets = loadDistAssets(distDir);
   const getAppDirs = () => findAppDataDirs(appDataDir);
 
-  function getHealth() {
+  let healthPacked = null;
+  let healthKey = '';
+
+  const swarmPayloadCache = new Map(); // cacheKey -> { etag, packed }
+  const worktreesPayloadCache = new Map(); // rootsKey -> { at, packed }
+  let swarmsListCache = { at: 0, key: '', sig: '', swarms: [], packed: null };
+
+  function getHealthPacked() {
     const appDataDirs = getAppDirs();
-    return {
-      ok: true,
-      name: 'fleet',
-      version: '1.0.0',
-      mode: isSidecar ? 'sidecar' : 'standalone',
-      canSendMessage: Boolean(sendMessageFn),
-      appDataDirs,
-      conversationId: defaultConversationId || null,
-    };
+    const key = `${appDataDirs.join('\0')}|${isSidecar}|${Boolean(sendMessageFn)}|${defaultConversationId}`;
+    if (!healthPacked || healthKey !== key) {
+      healthKey = key;
+      healthPacked = packJsonPayload({
+        ok: true,
+        name: 'fleet',
+        version: '1.0.0',
+        mode: isSidecar ? 'sidecar' : 'standalone',
+        canSendMessage: Boolean(sendMessageFn),
+        appDataDirs,
+        conversationId: defaultConversationId || null,
+      });
+    }
+    return healthPacked;
   }
 
-  function getSwarms() {
+  function getSwarmsEntry() {
     const appDataDirs = getAppDirs();
+    const now = Date.now();
+    const key = appDataDirs.join('\0');
+    if (swarmsListCache.packed && swarmsListCache.key === key && now - swarmsListCache.at < 1000) {
+      return swarmsListCache;
+    }
     const swarms = listSwarms(appDataDirs);
-    return {
+    const sig = swarms.map((s) => `${s.id}:${s.head}:${s.triageCount}:${s.totalTokens}:${s.activeCount}`).join(',');
+    if (swarmsListCache.packed && swarmsListCache.sig === sig && swarmsListCache.key === key) {
+      swarmsListCache.at = now;
+      return swarmsListCache;
+    }
+    const packed = packJsonPayload({
       swarms,
       defaultConversationId: defaultConversationId || swarms[0]?.id || null,
       appDataDirs,
-    };
+    });
+    swarmsListCache = { at: now, key, sig, swarms, packed };
+    return swarmsListCache;
   }
 
-  function getSwarm(query = {}) {
+  const getSwarmsPacked = () => getSwarmsEntry().packed;
+
+  function getSwarmPacked(query = {}) {
     const appDataDirs = getAppDirs();
     const requestedConv = typeof query.conversationId === 'string' ? query.conversationId.trim() : '';
     const fallbackConv = !requestedConv ? defaultConversationId : '';
@@ -143,68 +176,87 @@ export function createFleetHandlers({
     let resolvedFrom = 'conversation';
 
     if (!conv) {
-      const available = listSwarms(appDataDirs);
-      if (available.length) {
-        conv = available[0].id;
+      const swarmsData = getSwarmsEntry().swarms;
+      if (swarmsData.length) {
+        conv = swarmsData[0].id;
         resolvedFrom = 'latest';
       }
     }
 
     if (!conv || !ID_RE.test(conv)) {
-      return {
+      return packJsonPayload({
         conversationId: conv || null,
         swarm: null,
         member: null,
         resolvedFrom,
         capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar },
-        swarms: listSwarms(appDataDirs),
-      };
+        swarms: getSwarmsEntry().swarms,
+      });
     }
 
     const res = resolveConversationSwarm(appDataDirs, conv);
     if (!res.swarm || !res.appData) {
-      const available = listSwarms(appDataDirs);
-      return {
+      return packJsonPayload({
         conversationId: conv,
         swarm: null,
         member: null,
         resolvedFrom,
         capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar },
-        swarms: available,
-      };
+        swarms: getSwarmsEntry().swarms,
+      });
     }
 
     const snap = buildSwarmSnapshot(res.appData, res.swarm);
     if (!snap) {
-      return {
+      return packJsonPayload({
         conversationId: conv,
         swarm: null,
         member: null,
         resolvedFrom,
         capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar },
-        swarms: listSwarms(appDataDirs),
-      };
+        swarms: getSwarmsEntry().swarms,
+      });
     }
 
     const etag = `${res.swarm}|${res.member || ''}|${snap.etag}`;
     if (query.etag && query.etag === etag) {
-      return { conversationId: conv, swarm: res.swarm, member: res.member, unchanged: true, etag };
+      return packJsonPayload({ conversationId: conv, swarm: res.swarm, member: res.member, unchanged: true, etag });
     }
 
-    return {
-      conversationId: conv,
-      swarm: res.swarm,
-      member: res.member,
-      resolvedFrom,
-      ...snap,
-      ...unseenBy(snap, res.member),
-      etag,
-      capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar },
-    };
+    const cacheKey = `${conv}|${resolvedFrom}|${isSidecar}|${Boolean(sendMessageFn)}`;
+    const hit = swarmPayloadCache.get(cacheKey);
+    if (hit && hit.etag === etag) {
+      return hit.packed;
+    }
+
+    const packed = packJsonPayload(
+      {
+        conversationId: conv,
+        swarm: res.swarm,
+        member: res.member,
+        resolvedFrom,
+        ...snap,
+        ...unseenBy(snap, res.member),
+        etag,
+        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar },
+      },
+      `"${createHash('sha256').update(etag).digest('hex').slice(0, 16)}"`,
+    );
+    if (swarmPayloadCache.size > 64) swarmPayloadCache.clear();
+    swarmPayloadCache.set(cacheKey, { etag, packed });
+    return packed;
   }
 
-  async function getWorktrees(query = {}) {
-    return probeWorktrees(query.roots || '');
+  async function getWorktreesPacked(query = {}) {
+    const rootsKey = String(query.roots || '');
+    const now = Date.now();
+    const hit = worktreesPayloadCache.get(rootsKey);
+    if (hit && now - hit.at < 3000) return hit.packed;
+    const data = await probeWorktrees(rootsKey);
+    const packed = packJsonPayload(data);
+    if (worktreesPayloadCache.size > 32) worktreesPayloadCache.clear();
+    worktreesPayloadCache.set(rootsKey, { at: now, packed });
+    return packed;
   }
 
   function getFrame(query = {}) {
@@ -258,10 +310,10 @@ export function createFleetHandlers({
 
   return {
     assets,
-    getHealth,
-    getSwarms,
-    getSwarm,
-    getWorktrees,
+    getHealthPacked,
+    getSwarmsPacked,
+    getSwarmPacked,
+    getWorktreesPacked,
     getFrame,
     postNudge,
   };
@@ -284,31 +336,30 @@ export async function startStandaloneServer({
     sendMessageFn,
   });
 
-  function sendJson(req, res, status, data, extraHeaders = {}) {
-    const raw = Buffer.from(JSON.stringify(data));
-    const etag = `"${createHash('sha256').update(raw).digest('hex').slice(0, 16)}"`;
+  const preloadBuf = Buffer.from(STANDALONE_PRELOAD_JS);
+
+  function sendPacked(req, res, status, packed, extraHeaders = {}) {
     const baseHeaders = {
       'Content-Type': 'application/json; charset=utf-8',
       'Cache-Control': 'no-cache',
       Vary: 'Accept-Encoding',
-      ETag: etag,
+      ETag: packed.etag,
       ...SECURITY_HEADERS,
       ...extraHeaders,
     };
-    if (status === 200 && req.headers['if-none-match'] === etag) {
+    if (status === 200 && req.headers['if-none-match'] === packed.etag) {
       res.writeHead(304, baseHeaders);
       res.end();
       return;
     }
-    const acceptsGzip = /\bgzip\b/i.test(String(req.headers['accept-encoding'] || ''));
-    if (acceptsGzip && raw.length >= 256) {
-      const gz = gzipSync(raw);
-      res.writeHead(status, { ...baseHeaders, 'Content-Encoding': 'gzip', 'Content-Length': gz.length });
-      res.end(gz);
+    const acceptsGzip = packed.gz && /\bgzip\b/i.test(String(req.headers['accept-encoding'] || ''));
+    if (acceptsGzip) {
+      res.writeHead(status, { ...baseHeaders, 'Content-Encoding': 'gzip', 'Content-Length': packed.gz.length });
+      res.end(packed.gz);
       return;
     }
-    res.writeHead(status, { ...baseHeaders, 'Content-Length': raw.length });
-    res.end(raw);
+    res.writeHead(status, { ...baseHeaders, 'Content-Length': packed.raw.length });
+    res.end(packed.raw);
   }
 
   const server = createServer(async (req, res) => {
@@ -345,14 +396,13 @@ export async function startStandaloneServer({
     }
 
     if (req.method === 'GET' && url.pathname === '/preload.js') {
-      const buf = Buffer.from(STANDALONE_PRELOAD_JS);
       res.writeHead(200, {
         'Content-Type': 'application/javascript; charset=utf-8',
         'Cache-Control': 'no-cache',
-        'Content-Length': buf.length,
+        'Content-Length': preloadBuf.length,
         ...SECURITY_HEADERS,
       });
-      res.end(buf);
+      res.end(preloadBuf);
       return;
     }
 
@@ -376,18 +426,18 @@ export async function startStandaloneServer({
     }
 
     if (req.method === 'GET' && url.pathname === '/api/health') {
-      return sendJson(req, res, 200, handlers.getHealth());
+      return sendPacked(req, res, 200, handlers.getHealthPacked());
     }
     if (req.method === 'GET' && url.pathname === '/api/swarms') {
-      return sendJson(req, res, 200, handlers.getSwarms());
+      return sendPacked(req, res, 200, handlers.getSwarmsPacked());
     }
     if (req.method === 'GET' && url.pathname === '/api/swarm') {
       const q = Object.fromEntries(url.searchParams.entries());
-      return sendJson(req, res, 200, handlers.getSwarm(q));
+      return sendPacked(req, res, 200, handlers.getSwarmPacked(q));
     }
     if (req.method === 'GET' && url.pathname === '/api/worktrees') {
       const q = Object.fromEntries(url.searchParams.entries());
-      return sendJson(req, res, 200, await handlers.getWorktrees(q));
+      return sendPacked(req, res, 200, await handlers.getWorktreesPacked(q));
     }
     if (req.method === 'GET' && url.pathname === '/api/frame') {
       const q = Object.fromEntries(url.searchParams.entries());
@@ -434,11 +484,11 @@ export async function startStandaloneServer({
           try {
             parsed = JSON.parse(text);
           } catch {
-            return sendJson(req, res, 400, { error: 'invalid JSON body' });
+            return sendPacked(req, res, 400, packJsonPayload({ error: 'invalid JSON body' }));
           }
         }
         const out = await handlers.postNudge(parsed);
-        sendJson(req, res, out.status, out.json);
+        sendPacked(req, res, out.status, packJsonPayload(out.json));
       });
       return;
     }
@@ -504,10 +554,10 @@ async function runCli() {
       );
     }
 
-    app.api('/api/health', () => new Response(JSON.stringify(handlers.getHealth()), { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
-    app.api('/api/swarms', () => new Response(JSON.stringify(handlers.getSwarms()), { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
-    app.api('/api/swarm', (data) => new Response(JSON.stringify(handlers.getSwarm(data)), { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
-    app.api('/api/worktrees', async (data) => new Response(JSON.stringify(await handlers.getWorktrees(data)), { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
+    app.api('/api/health', () => new Response(handlers.getHealthPacked().raw, { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
+    app.api('/api/swarms', () => new Response(handlers.getSwarmsPacked().raw, { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
+    app.api('/api/swarm', (data) => new Response(handlers.getSwarmPacked(data).raw, { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
+    app.api('/api/worktrees', async (data) => new Response((await handlers.getWorktreesPacked(data)).raw, { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
     app.api('/api/frame', (data) => {
       const out = handlers.getFrame(data);
       return new Response(out.body, { status: out.status, contentType: out.contentType, headers: out.headers || SECURITY_HEADERS });

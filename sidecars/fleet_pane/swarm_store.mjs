@@ -1,6 +1,8 @@
 /**
  * Antigravity native swarm & transcript store for Fleet sidecar.
- * Reads <appData>/brain/<conv>/.system_generated/{swarm,logs}/ read-only.
+ * Reads <appData>/brain/<conv>/.system_generated/{swarm,logs}/ read-only with
+ * mtime:size memoization and streaming line scanning to keep Peak RSS low and
+ * concurrent polling fast at 50k+ transcript lines.
  */
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -32,6 +34,7 @@ const SHOT_RE = /^\s*(?:[-*]\s*)?screenshot:\s*`?(\/[^\s`|]+\.(?:png|jpe?g|webp)
 const MAX_POSTED_FRAMES = 24;
 const FRAME_EXT = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' };
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+const SWARM_SCAN_TTL_MS = 2000;
 
 function safeReaddir(path) {
   try {
@@ -50,13 +53,15 @@ function statOf(path) {
   }
 }
 
-const fileCache = new Map();
-function readCached(path, maxBytes = Infinity) {
+function readSmallCached(path, cache, maxBytes = VIEW_MAX_BYTES) {
   const s = statOf(path);
-  if (s.size < 0) return { text: null, ...s };
+  if (s.size < 0) {
+    cache.delete(path);
+    return { text: null, ...s };
+  }
   if (s.size > maxBytes) return { text: null, tooLarge: true, ...s };
   const key = `${s.mtime}:${s.size}`;
-  const hit = fileCache.get(path);
+  const hit = cache.get(path);
   if (hit && hit.key === key) return { text: hit.text, ...s };
   let text = null;
   try {
@@ -64,9 +69,23 @@ function readCached(path, maxBytes = Infinity) {
   } catch {
     return { text: null, ...s };
   }
-  if (fileCache.size > 800) fileCache.clear();
-  fileCache.set(path, { key, text });
+  if (cache.size > 400) cache.clear();
+  cache.set(path, { key, text });
   return { text, ...s };
+}
+
+/** Iterate non-empty lines over a string without allocating a full split array. */
+function forEachLine(text, fn) {
+  let start = 0;
+  const len = text.length;
+  while (start < len) {
+    const nl = text.indexOf('\n', start);
+    const end = nl === -1 ? len : nl;
+    const raw = text.slice(start, end).trim();
+    if (raw) fn(raw);
+    if (nl === -1) break;
+    start = nl + 1;
+  }
 }
 
 /** Locate Antigravity appData roots containing `brain/`. */
@@ -144,15 +163,14 @@ export function parseRoster(text) {
 
 export function parseBoard(text) {
   const out = [];
-  for (const line of String(text || '').split('\n')) {
-    if (!line.trim()) continue;
+  forEachLine(String(text || ''), (line) => {
     try {
       const m = JSON.parse(line);
       if (m && typeof m === 'object' && !Array.isArray(m)) out.push(m);
     } catch {
       // Torn trailing line is ignored until next poll.
     }
-  }
+  });
   return out;
 }
 
@@ -207,10 +225,10 @@ function thinkingHeading(thinking) {
   return hs.length ? oneLine(hs[hs.length - 1][1]) : '';
 }
 
-function turnEnded(parsedSteps) {
+function turnEnded(tailSteps) {
   const results = [];
-  for (let i = parsedSteps.length - 1; i >= 0; i--) {
-    const step = parsedSteps[i];
+  for (let i = tailSteps.length - 1; i >= 0; i--) {
+    const step = tailSteps[i];
     if (!step) return false;
     if (step.type === 'GENERIC') {
       results.unshift(step);
@@ -225,9 +243,9 @@ function turnEnded(parsedSteps) {
   return false;
 }
 
-function finalReply(parsedSteps) {
-  if (!parsedSteps.length) return null;
-  const step = parsedSteps[parsedSteps.length - 1];
+function finalReply(tailSteps) {
+  if (!tailSteps.length) return null;
+  const step = tailSteps[tailSteps.length - 1];
   if (!step) return null;
   const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
   return step.type === 'PLANNER_RESPONSE' && calls.length === 0 ? String(step.content || '') : null;
@@ -255,7 +273,10 @@ function num(v) {
   return Number.isFinite(v) && v >= 0 ? v : 0;
 }
 
-/** Parse a member's `transcript.jsonl` into steps, activity, state, and real token usage. */
+/**
+ * Parse a member's `transcript.jsonl` into steps, activity, state, and real token usage.
+ * Keeps only a 32-step sliding tail in RAM so 50k-line transcripts use near-zero heap.
+ */
 export function summarizeTranscript(appData, conv) {
   if (!appData || !conv || !ID_RE.test(conv)) return NO_TRANSCRIPT;
   const path = transcriptPath(appData, conv);
@@ -272,29 +293,32 @@ export function summarizeTranscript(appData, conv) {
     return NO_TRANSCRIPT;
   }
 
-  const lines = text.split('\n').filter((l) => l.trim());
-  const parsedSteps = [];
-  let maxStepIndex = lines.length;
+  let lineCount = 0;
+  let maxStepIndex = 0;
   let inputTokens = 0;
   let cacheReadTokens = 0;
   let outputTokens = 0;
   let model = '';
   let startedAt = '';
   let lastStepAt = '';
+  const tailSteps = [];
+  const TAIL_CAP = 32;
 
-  for (const line of lines) {
+  forEachLine(text, (line) => {
+    lineCount++;
     let step;
     try {
       step = JSON.parse(line);
     } catch {
-      parsedSteps.push(null);
-      continue;
+      tailSteps.push(null);
+      if (tailSteps.length > TAIL_CAP) tailSteps.shift();
+      return;
     }
     if (!step || typeof step !== 'object' || Array.isArray(step)) {
-      parsedSteps.push(null);
-      continue;
+      tailSteps.push(null);
+      if (tailSteps.length > TAIL_CAP) tailSteps.shift();
+      return;
     }
-    parsedSteps.push(step);
     if (Number.isFinite(step.step_index)) {
       maxStepIndex = Math.max(maxStepIndex, step.step_index + 1);
     }
@@ -311,28 +335,45 @@ export function summarizeTranscript(appData, conv) {
       cacheReadTokens += num(Number(u.cache_read_tokens ?? u.cacheReadTokens));
       outputTokens += num(Number(u.output_tokens));
     }
-  }
+    // Store minimal projection in the tail window (drop giant content/thinking except what tail needs)
+    const isLastCandidate = step.type === 'PLANNER_RESPONSE' || step.type === 'GENERIC' || step.type === 'ERROR_MESSAGE' || step.type === 'USER_INPUT';
+    if (isLastCandidate) {
+      tailSteps.push({
+        type: String(step.type || ''),
+        status: String(step.status || ''),
+        error: typeof step.error === 'string' ? oneLine(step.error, 240) : '',
+        tool_calls: Array.isArray(step.tool_calls) ? step.tool_calls : [],
+        thinkingHeading: step.type === 'PLANNER_RESPONSE' ? thinkingHeading(step.thinking) : '',
+        content: step.type === 'PLANNER_RESPONSE' && (!Array.isArray(step.tool_calls) || step.tool_calls.length === 0) ? String(step.content || '') : '',
+      });
+    } else {
+      tailSteps.push({ type: String(step.type || ''), status: String(step.status || ''), error: '', tool_calls: [], thinkingHeading: '', content: '' });
+    }
+    if (tailSteps.length > TAIL_CAP) tailSteps.shift();
+  });
+
+  // Drop retained raw string immediately
+  text = '';
 
   let activity = '';
   let activityKind = '';
   let last = null;
-  for (let i = parsedSteps.length - 1; i >= 0; i--) {
-    const step = parsedSteps[i];
+  for (let i = tailSteps.length - 1; i >= 0; i--) {
+    const step = tailSteps[i];
     if (!step) continue;
     if (!last) {
       last = {
-        type: String(step.type || ''),
-        status: String(step.status || ''),
-        error: typeof step.error === 'string' ? oneLine(step.error, 240) : '',
+        type: step.type,
+        status: step.status,
+        error: step.error,
       };
     }
     if (step.type === 'USER_INPUT') break;
     if (step.type !== 'PLANNER_RESPONSE') continue;
-    const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
-    if (calls.some((tc) => tc?.name === 'swarm_wait')) break;
-    const labeled = calls.filter((tc) => describeToolCall(tc)).pop();
+    if (step.tool_calls.some((tc) => tc?.name === 'swarm_wait')) break;
+    const labeled = step.tool_calls.filter((tc) => describeToolCall(tc)).pop();
     const label = labeled ? describeToolCall(labeled) : '';
-    const heading = thinkingHeading(step.thinking);
+    const heading = step.thinkingHeading;
     if (label) {
       activity = label;
       activityKind = 'tool';
@@ -345,8 +386,8 @@ export function summarizeTranscript(appData, conv) {
     break;
   }
 
-  const idle = turnEnded(parsedSteps);
-  const reply = finalReply(parsedSteps);
+  const idle = turnEnded(tailSteps);
+  const reply = finalReply(tailSteps);
   const replied = reply !== null;
   const replyAsk = replied ? replyQuestion(reply) : '';
   const totalTokens = inputTokens + cacheReadTokens + outputTokens;
@@ -354,7 +395,7 @@ export function summarizeTranscript(appData, conv) {
   const entry = {
     key,
     summary: {
-      steps: maxStepIndex,
+      steps: Math.max(lineCount, maxStepIndex),
       activity,
       activityKind,
       last,
@@ -441,6 +482,7 @@ function postedFrames(roster, msgs) {
   return [...out.values()].slice(-MAX_POSTED_FRAMES);
 }
 
+const smallFileCache = new Map();
 const viewJsonCache = new Map();
 function parseViewJson(id, f) {
   if (f.size < 0) {
@@ -471,11 +513,11 @@ function parseViewJson(id, f) {
 function readView(appData, id, dir, narrator) {
   let vdir = dir;
   let source = 'swarm';
-  let jf = readCached(join(dir, 'view.json'), VIEW_MAX_BYTES);
+  let jf = readSmallCached(join(dir, 'view.json'), smallFileCache, VIEW_MAX_BYTES);
   const conv = narrator?.conversation_id;
   if (jf.size < 0 && typeof conv === 'string' && ID_RE.test(conv)) {
     const alt = join(appData, 'brain', conv, 'swarm_view');
-    const altJson = readCached(join(alt, 'view.json'), VIEW_MAX_BYTES);
+    const altJson = readSmallCached(join(alt, 'view.json'), smallFileCache, VIEW_MAX_BYTES);
     if (altJson.size >= 0) {
       vdir = alt;
       source = 'narrator';
@@ -493,12 +535,11 @@ function readView(appData, id, dir, narrator) {
       jsonMtime: mtime,
       jsonError: error,
     },
-    rawJson: jf.text || '',
   };
 }
 
 function readPlan(dir) {
-  const pf = readCached(join(dir, 'plan.json'), VIEW_MAX_BYTES);
+  const pf = readSmallCached(join(dir, 'plan.json'), smallFileCache, VIEW_MAX_BYTES);
   let plan = null;
   if (pf.size >= 0 && !pf.tooLarge) {
     try {
@@ -610,7 +651,6 @@ function buildTriageItems({ members, messages, sysAttention }) {
     });
   }
 
-  // Unresolved [blocked] posts and unverified [done] worker posts.
   const latestByWorker = new Map();
   let lastVerifiedSeq = 0;
   for (const msg of messages) {
@@ -665,25 +705,42 @@ function buildTriageItems({ members, messages, sysAttention }) {
   return items;
 }
 
-/** Build a complete snapshot for a local file-backed swarm. */
+const snapshotCache = new Map(); // `${appData}\0${id}` -> { checkedAt, membersKey, boardKey, etag, snap }
+const SNAPSHOT_TRANSCRIPT_TTL_MS = 250;
+
+/** Build (or return memoized) snapshot for a local file-backed swarm. */
 export function buildSwarmSnapshot(appData, id) {
+  const cacheKey = `${appData}\0${id}`;
+  const now = Date.now();
   const dir = swarmDir(appData, id);
-  const membersFile = readCached(join(dir, 'members.json'));
-  if (membersFile.text == null) return null;
-  const boardFile = readCached(join(dir, 'board.jsonl'));
+  const membersFile = readSmallCached(join(dir, 'members.json'), smallFileCache, 1024 * 1024);
+  if (membersFile.text == null) {
+    snapshotCache.delete(cacheKey);
+    return null;
+  }
+  const boardPath = join(dir, 'board.jsonl');
+  const boardStat = statOf(boardPath);
+  const membersKey = `${membersFile.mtime}:${membersFile.size}`;
+  const boardKey = `${boardStat.mtime}:${boardStat.size}`;
+  const prev = snapshotCache.get(cacheKey);
+  if (
+    prev &&
+    prev.membersKey === membersKey &&
+    prev.boardKey === boardKey &&
+    now - prev.checkedAt < SNAPSHOT_TRANSCRIPT_TTL_MS
+  ) {
+    return prev.snap;
+  }
+
   const roster = parseRoster(membersFile.text) || { title: '', members: {} };
-  const msgs = parseBoard(boardFile.text);
   const title = roster.title || id;
-  const head = msgs.length ? Number(msgs[msgs.length - 1].seq) || msgs.length : 0;
   const names = Object.keys(roster.members).filter((n) => roster.members[n] && typeof roster.members[n] === 'object');
   const transcripts = new Map(names.map((n) => [n, summarizeTranscript(appData, roster.members[n].conversation_id)]));
   const trKeys = names.map((n) => `${n}:${transcripts.get(n).key}`).join(',');
   const narratorName = pickNarrator(roster);
   const vf = readView(appData, id, dir, narratorName ? roster.members[narratorName] : null);
   const { plan, key: planKey } = readPlan(dir);
-  const frames = postedFrames(roster, msgs);
   const allowedFiles = allowedFilesOf(appData, vf.view.json);
-  const now = Date.now();
   const failures = new Map(names.map((n) => [n, stepFailure(transcripts.get(n).summary, now)]));
   const stuckKeys = names
     .map((n) => {
@@ -693,8 +750,25 @@ export function buildSwarmSnapshot(appData, id) {
     })
     .join(',');
 
-  const etag = `${membersFile.mtime}:${membersFile.size}|${boardFile.mtime}:${boardFile.size}|${title}|${trKeys}|${vf.etag}|${planKey}|${stuckKeys}`;
+  const etag = `${membersKey}|${boardKey}|${title}|${trKeys}|${vf.etag}|${planKey}|${stuckKeys}`;
+  if (prev && prev.etag === etag) {
+    prev.checkedAt = now;
+    return prev.snap;
+  }
 
+  let boardText = '';
+  if (boardStat.size > 0) {
+    try {
+      boardText = readFileSync(boardPath, 'utf-8');
+    } catch {
+      boardText = '';
+    }
+  }
+  const msgs = parseBoard(boardText);
+  boardText = '';
+
+  const head = msgs.length ? Number(msgs[msgs.length - 1].seq) || msgs.length : 0;
+  const frames = postedFrames(roster, msgs);
   const posts = new Map();
   const edges = new Map();
   const channels = channelRegistry(msgs);
@@ -793,7 +867,7 @@ export function buildSwarmSnapshot(appData, id) {
   const triage = buildTriageItems({ members, messages, sysAttention });
   const totalTokens = totalInputTokens + totalCacheReadTokens + totalOutputTokens;
 
-  return {
+  const snap = {
     id,
     title,
     appData,
@@ -816,69 +890,86 @@ export function buildSwarmSnapshot(appData, id) {
       outputTokens: totalOutputTokens,
       totalTokens,
     },
-    raw: { members: membersFile.text || '', board: boardFile.text || '', view: vf.rawJson },
   };
+
+  if (snapshotCache.size > 128) snapshotCache.clear();
+  snapshotCache.set(cacheKey, { checkedAt: now, membersKey, boardKey, etag, snap });
+  return snap;
+}
+
+const swarmIdsScanCache = new Map(); // rootKey -> { at, entries }
+
+function scanSwarmIds(appDataDirs) {
+  const rootKey = appDataDirs.join('\0');
+  const now = Date.now();
+  const hit = swarmIdsScanCache.get(rootKey);
+  if (hit && now - hit.at < SWARM_SCAN_TTL_MS) return hit.entries;
+
+  const seen = new Set();
+  const entries = [];
+  for (const appData of appDataDirs) {
+    for (const id of safeReaddir(join(appData, 'brain'))) {
+      if (seen.has(id) || !ID_RE.test(id)) continue;
+      if (existsSync(join(swarmDir(appData, id), 'members.json'))) {
+        seen.add(id);
+        entries.push({ appData, id });
+      }
+    }
+  }
+  swarmIdsScanCache.set(rootKey, { at: now, entries });
+  return entries;
 }
 
 /** Resolve which swarm a conversation belongs to (coordinator dir or member roster). */
 export function resolveConversationSwarm(appDataDirs, conv) {
   if (!conv || !ID_RE.test(conv)) return { appData: null, swarm: null, member: null };
   for (const appData of appDataDirs) {
-    if (existsSync(join(swarmDir(appData, conv), 'members.json'))) {
-      const text = readCached(join(swarmDir(appData, conv), 'members.json')).text;
-      const roster = parseRoster(text || '');
+    const membersFile = readSmallCached(join(swarmDir(appData, conv), 'members.json'), smallFileCache, 1024 * 1024);
+    if (membersFile.text != null) {
+      const roster = parseRoster(membersFile.text);
       const member = Object.entries(roster?.members || {}).find(([, m]) => m?.conversation_id === conv)?.[0] || null;
       return { appData, swarm: conv, member };
     }
   }
-  for (const appData of appDataDirs) {
-    for (const id of safeReaddir(join(appData, 'brain'))) {
-      if (!ID_RE.test(id)) continue;
-      const text = readCached(join(swarmDir(appData, id), 'members.json')).text;
-      if (!text) continue;
-      const roster = parseRoster(text);
-      const member = Object.entries(roster?.members || {}).find(([, m]) => m?.conversation_id === conv)?.[0] || null;
-      if (member) return { appData, swarm: id, member };
-    }
+  for (const { appData, id } of scanSwarmIds(appDataDirs)) {
+    const membersFile = readSmallCached(join(swarmDir(appData, id), 'members.json'), smallFileCache, 1024 * 1024);
+    if (!membersFile.text) continue;
+    const roster = parseRoster(membersFile.text);
+    const member = Object.entries(roster?.members || {}).find(([, m]) => m?.conversation_id === conv)?.[0] || null;
+    if (member) return { appData, swarm: id, member };
   }
   return { appData: null, swarm: null, member: null };
 }
 
 /** Scan all available local swarms across `appDataDirs` for the Multi-Swarm Switcher. */
 export function listSwarms(appDataDirs) {
-  const seen = new Set();
   const list = [];
-  for (const appData of appDataDirs) {
-    for (const id of safeReaddir(join(appData, 'brain'))) {
-      if (seen.has(id) || !ID_RE.test(id)) continue;
-      const mPath = join(swarmDir(appData, id), 'members.json');
-      if (!existsSync(mPath)) continue;
-      seen.add(id);
-      const snap = buildSwarmSnapshot(appData, id);
-      if (!snap) continue;
-      const activeCount = snap.members.filter((m) => !m.killed && m.status === 'working').length;
-      const waitingCount = snap.members.filter((m) => !m.killed && m.status === 'waiting').length;
-      const killedCount = snap.members.filter((m) => m.killed).length;
-      const lastActivityTs = Math.max(
-        statOf(join(swarmDir(appData, id), 'board.jsonl')).mtime || 0,
-        statOf(mPath).mtime || 0,
-        ...snap.members.map((m) => m.transcriptMtime || 0),
-      );
-      list.push({
-        id: snap.id,
-        title: snap.title,
-        appData,
-        head: snap.head,
-        memberCount: snap.members.length,
-        activeCount,
-        waitingCount,
-        killedCount,
-        triageCount: snap.triage.length,
-        totalTokens: snap.usage.totalTokens,
-        hasPlan: Boolean(snap.plan),
-        lastActivityTs,
-      });
-    }
+  for (const { appData, id } of scanSwarmIds(appDataDirs)) {
+    const snap = buildSwarmSnapshot(appData, id);
+    if (!snap) continue;
+    const activeCount = snap.members.filter((m) => !m.killed && m.status === 'working').length;
+    const waitingCount = snap.members.filter((m) => !m.killed && m.status === 'waiting').length;
+    const killedCount = snap.members.filter((m) => m.killed).length;
+    const mPath = join(swarmDir(appData, id), 'members.json');
+    const lastActivityTs = Math.max(
+      statOf(join(swarmDir(appData, id), 'board.jsonl')).mtime || 0,
+      statOf(mPath).mtime || 0,
+      ...snap.members.map((m) => m.transcriptMtime || 0),
+    );
+    list.push({
+      id: snap.id,
+      title: snap.title,
+      appData,
+      head: snap.head,
+      memberCount: snap.members.length,
+      activeCount,
+      waitingCount,
+      killedCount,
+      triageCount: snap.triage.length,
+      totalTokens: snap.usage.totalTokens,
+      hasPlan: Boolean(snap.plan),
+      lastActivityTs,
+    });
   }
   list.sort((a, b) => b.activeCount - a.activeCount || b.lastActivityTs - a.lastActivityTs);
   return list;
