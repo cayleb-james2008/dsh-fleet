@@ -1,5 +1,4 @@
-// House-frontend build for Fleet (Rust): React + Tailwind 4, the library parts live in ../rune/used,
-// and the result is ONE html file (js, css and fonts inline) at ../assets/index.html, which the Rust binary embeds.
+// Single-file production bundle for Fleet (Rust): React + Tailwind 4 + Geist/Geist Mono -> ../assets/index.html.
 import fs from "node:fs";
 import path from "node:path";
 import { defineConfig, type Plugin } from "vite";
@@ -7,30 +6,8 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
 const root = import.meta.dirname;
-const used = path.resolve(root, "../rune/used");
+const STAMP = "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v0.9.0 */";
 
-// "@/x" is the app's own src/x first, then the copied library part rune/used/x.
-function runeUsed(): Plugin {
-  const exts = ["", ".tsx", ".ts", ".css", "/index.tsx", "/index.ts"];
-  return {
-    name: "rune-used",
-    enforce: "pre",
-    resolveId(id) {
-      if (!id.startsWith("@/")) return null;
-      for (const base of [path.resolve(root, "src"), used]) {
-        for (const e of exts) {
-          const p = path.join(base, id.slice(2) + e);
-          if (fs.existsSync(p) && fs.statSync(p).isFile()) return p;
-        }
-      }
-      return null;
-    },
-  };
-}
-
-const STAMP = "/* Hallmark · checked: 2026-11-22 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v0.8.0 */";
-
-// After the build: inline the script, the stylesheet and (through assetsInlineLimit) the fonts into one page.
 function singleFile(): Plugin {
   return {
     name: "single-file",
@@ -44,11 +21,8 @@ function singleFile(): Plugin {
       });
       html = html.replace(/<link[^>]*rel="stylesheet"[^>]*href="([^"]+)"[^>]*>/g, (_m, href) => {
         const css = fs.readFileSync(path.join(dist, href.replace(/^\.?\//, "")), "utf8");
-        // The Hallmark stamp is the first line of the page CSS (the lint reads that line); the minifier drops comments, so it is added here.
         return `<style>${STAMP}\n${css}</style>`;
       });
-      // The ring offset literal becomes the surface token (Hallmark 48); the bare `transition` utility comes only from
-      // motion prop names in source, never from an element here, and would fade focus rings (Hallmark 15).
       html = html.replace(/--tw-ring-offset-color:#fff/g, "--tw-ring-offset-color:var(--surface)").replace(/\.transition\{[^}]*\}/g, "");
       const out = path.resolve(root, "../assets/index.html");
       fs.writeFileSync(out, html);
@@ -58,7 +32,7 @@ function singleFile(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [runeUsed(), react(), tailwindcss(), singleFile()],
+  plugins: [react(), tailwindcss(), singleFile()],
   base: "./",
   build: { assetsInlineLimit: 100_000_000, cssCodeSplit: false, chunkSizeWarningLimit: 4000, modulePreload: false },
   server: { fs: { allow: [path.resolve(root, "..")] }, proxy: process.env.API_PORT ? { "/api": { target: `http://127.0.0.1:${process.env.API_PORT}`, changeOrigin: true, headers: { Origin: `http://127.0.0.1:${process.env.API_PORT}` } } } : undefined },

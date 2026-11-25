@@ -11,11 +11,7 @@ import {
   RefreshCw,
   Rows3,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { SegmentedControl, SegmentedControlItem } from "@/components/ui/segmented-control";
-import { Pill, PillIndicator } from "@/components/kibo-ui/pill";
-import { Expandable, ExpandableContent, ExpandableTrigger } from "@/components/ui/expandable";
-import { cn } from "@/lib/utils";
+import { Button, Badge, Expandable, SegmentedControl, cn, toast } from "./ui";
 import {
   downloadSessionPatch,
   fetchMergeCheck,
@@ -23,7 +19,6 @@ import {
   type MergeStrategy,
   type Session,
 } from "./api";
-import { toast } from "sonner";
 
 export type DiffLineEntry = {
   kind: "hunk" | "add" | "del" | "ctx";
@@ -196,20 +191,14 @@ export function MergeStrategyControl({
         <GitMerge className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
         <span>Merge strategy</span>
       </span>
-      <SegmentedControl aria-label="Merge strategy" size="sm">
-        {MERGE_STRATEGIES.map((st) => (
-          <SegmentedControlItem
-            key={st.id}
-            disabled={disabled}
-            aria-pressed={value === st.id}
-            data-checked={value === st.id ? "" : undefined}
-            onClick={() => onChange(st.id)}
-            className="text-xs max-md:!min-h-11"
-          >
-            {st.label}
-          </SegmentedControlItem>
-        ))}
-      </SegmentedControl>
+      <SegmentedControl
+        label="Merge strategy"
+        value={value}
+        onChange={(v) => {
+          if (!disabled) onChange(v);
+        }}
+        options={MERGE_STRATEGIES.map((st) => ({ value: st.id, label: st.label }))}
+      />
     </div>
   );
 }
@@ -286,40 +275,37 @@ export function RichDiffViewer({
         {session.status !== "merged" && (
           <div className="flex flex-wrap items-center gap-1.5">
             {mergeCheck ? (
-              <Pill
-                variant={mergeCheck.clean ? "success" : "destructive"}
-                className="px-2 py-0.5 font-mono text-xs"
+              <Badge
+                tone={mergeCheck.clean ? "success" : "danger"}
+                className="mono"
                 data-testid="merge-check-badge"
               >
-                <PillIndicator variant={mergeCheck.clean ? "success" : "error"} />
                 <span>
                   {mergeCheck.clean
                     ? "Clean merge"
                     : `${conflictCount || 1} ${conflictCount === 1 ? "conflict" : "conflicts"}`}
                 </span>
-              </Pill>
+              </Badge>
             ) : (
-              <Pill variant="secondary" className="px-2 py-0.5 font-mono text-xs">
-                <PillIndicator variant="info" />
+              <Badge tone="neutral" className="mono">
                 <span>{checkingMerge ? "Checking merge..." : "Merge check ready"}</span>
-              </Pill>
+              </Badge>
             )}
             {mergeCheck && (mergeCheck.commits_ahead > 0 || mergeCheck.commits_behind > 0) && (
-              <span className="rounded-chip bg-track px-1.5 py-0.5 font-mono text-xs tabular-nums text-ink-2">
-                ↑{mergeCheck.commits_ahead} ↓{mergeCheck.commits_behind}
+              <span className="rounded-[var(--radius-chip)] bg-[var(--track)] px-2 py-0.5 mono text-[12px] text-[var(--ink-2)]">
+                +{mergeCheck.commits_ahead} / -{mergeCheck.commits_behind}
               </span>
             )}
             <Button
               type="button"
-              size="icon-sm"
+              size="icon"
               variant="ghost"
               aria-label="Re-run pre-merge conflict check"
               disabled={checkingMerge}
               onClick={onRecheckMerge}
-              className="size-7 max-md:size-11"
             >
               <RefreshCw
-                className={cn("size-3.5 text-ink-2 motion-reduce:animate-none", checkingMerge && "animate-spin")}
+                className={cn("size-3.5 text-[var(--ink-2)] motion-reduce:animate-none", checkingMerge && "animate-spin")}
                 strokeWidth={1.5}
                 aria-hidden
               />
@@ -327,36 +313,19 @@ export function RichDiffViewer({
           </div>
         )}
 
-        <div className="ml-auto flex flex-wrap items-center gap-1.5">
-          <SegmentedControl aria-label="Diff view mode" size="sm">
-            <SegmentedControlItem
-              aria-pressed={mode === "unified"}
-              data-checked={mode === "unified" ? "" : undefined}
-              onClick={() => setMode("unified")}
-              className="gap-1 px-2 text-xs max-md:!min-h-11"
-            >
-              <Rows3 className="size-3.5" strokeWidth={1.5} aria-hidden />
-              <span>Unified</span>
-            </SegmentedControlItem>
-            <SegmentedControlItem
-              aria-pressed={mode === "split"}
-              data-checked={mode === "split" ? "" : undefined}
-              onClick={() => setMode("split")}
-              className="gap-1 px-2 text-xs max-md:!min-h-11"
-            >
-              <Columns2 className="size-3.5" strokeWidth={1.5} aria-hidden />
-              <span>Split</span>
-            </SegmentedControlItem>
-          </SegmentedControl>
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          <SegmentedControl
+            label="Diff view mode"
+            value={mode}
+            onChange={(m) => setMode(m)}
+            options={[
+              { value: "unified", label: "Unified" },
+              { value: "split", label: "Split" },
+            ]}
+          />
 
           {files.length > 1 && (
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              onClick={toggleAll}
-              className="h-8 px-2.5 text-xs max-md:min-h-11"
-            >
+            <Button type="button" size="sm" variant="outline" onClick={toggleAll}>
               {allCollapsed ? "Expand files" : "Collapse files"}
             </Button>
           )}
@@ -367,7 +336,6 @@ export function RichDiffViewer({
             variant="outline"
             disabled={downloading || files.length === 0}
             onClick={handleDownloadPatch}
-            className="h-8 px-2.5 text-xs max-md:min-h-11"
           >
             <Download className="size-3.5" strokeWidth={1.5} aria-hidden />
             <span>.patch</span>
@@ -376,29 +344,17 @@ export function RichDiffViewer({
       </div>
 
       {mergeCheck && !mergeCheck.clean && mergeCheck.conflicting_files.length > 0 && (
-        <div role="status" className="rounded-card border border-hairline bg-pill-pro-bg p-3 text-destructive-foreground">
-          <Expandable expandDirection="vertical" expandBehavior="push">
-            {({ isExpanded }) => (
-              <>
-                <ExpandableTrigger
-                  aria-label="Conflicting files list"
-                  className="flex w-full cursor-pointer items-center justify-between gap-2 text-left text-xs font-medium text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11"
-                >
-                  <span>
-                    Pre-merge dry-run found {mergeCheck.conflicting_files.length} conflicting{" "}
-                    {mergeCheck.conflicting_files.length === 1 ? "file" : "files"} against {session.merge_target || "base"}
-                  </span>
-                  <span className="font-normal text-destructive-foreground">{isExpanded ? "Hide" : "Show files"}</span>
-                </ExpandableTrigger>
-                <ExpandableContent preset="fade">
-                  <ul className="mt-2 space-y-1 border-t border-hairline pt-2 font-mono text-xs text-ink">
-                    {mergeCheck.conflicting_files.map((file) => (
-                      <li key={file} className="break-all">{file}</li>
-                    ))}
-                  </ul>
-                </ExpandableContent>
-              </>
-            )}
+        <div role="status" className="rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--bad-soft)] p-2.5 text-[var(--destructive-foreground)]">
+          <Expandable
+            triggerLabel={`Pre-merge dry-run found ${mergeCheck.conflicting_files.length} conflicting ${mergeCheck.conflicting_files.length === 1 ? "file" : "files"} against ${session.merge_target || "base"}`}
+            openLabel="Hide conflicting files"
+            className="border-0 bg-transparent"
+          >
+            <ul className="space-y-1 pt-1 mono text-[12px] text-[var(--ink)]">
+              {mergeCheck.conflicting_files.map((file) => (
+                <li key={file} className="break-all">{file}</li>
+              ))}
+            </ul>
           </Expandable>
         </div>
       )}

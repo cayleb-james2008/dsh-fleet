@@ -12,27 +12,22 @@ import {
   Plus,
   Save,
   Shield,
+  Sparkles,
   Trash2,
   Wrench,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { InputGroup, InputGroupInput } from "@/components/ui/input-group";
-import { Kbd } from "@/components/ui/kbd";
-import { Textarea } from "@/components/ui/textarea";
-import { SegmentedControl, SegmentedControlItem } from "@/components/ui/segmented-control";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
-  MorphingDialog,
-  MorphingDialogClose,
-  MorphingDialogContainer,
-  MorphingDialogContent,
-  MorphingDialogDescription,
-  MorphingDialogTitle,
-  MorphingDialogTrigger,
-} from "@/components/ui/morphing-dialog";
-import { Expandable, ExpandableContent, ExpandableTrigger } from "@/components/ui/expandable";
-import { glide } from "@/motion";
-import { cn } from "@/lib/utils";
+  Button,
+  Dialog,
+  Expandable,
+  Input,
+  Kbd,
+  PopoverPanel,
+  SegmentedControl,
+  Textarea,
+  cn,
+  toast,
+} from "./ui";
 import {
   deletePlaybook,
   dispatchBatchSessions,
@@ -40,6 +35,7 @@ import {
   isWebEngineMode,
   normalizeRepos,
   normalizeSessions,
+  planGoal,
   repoBasename,
   savePlaybook,
   type Agent,
@@ -50,7 +46,6 @@ import {
   type RepoInfo,
   type Session,
 } from "./api";
-import { toast } from "sonner";
 
 export type ComposerMode = "single" | "batch";
 
@@ -86,6 +81,7 @@ export function NewSession({
   supportsServerV060,
   initialModeRef,
   initialPlaybookRef,
+  openSignal,
   onHanded,
   onHandedBatch,
   onPlaybooksChanged,
@@ -99,49 +95,62 @@ export function NewSession({
   supportsServerV060: boolean;
   initialModeRef: React.MutableRefObject<ComposerMode>;
   initialPlaybookRef: React.MutableRefObject<PlaybookTemplate | null>;
+  openSignal?: number;
   onHanded: (s: Session) => void;
   onHandedBatch: (created: Session[]) => void;
   onPlaybooksChanged: () => void;
   thing?: string;
   className?: string;
 }) {
-  const wrap = useRef<HTMLSpanElement>(null);
-  const returnFocus = () => wrap.current?.querySelector<HTMLElement>("button")?.focus();
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (openSignal && openSignal > 0) setOpen(true);
+  }, [openSignal]);
+
+  const handleClose = () => {
+    setOpen(false);
+    initialModeRef.current = "single";
+    initialPlaybookRef.current = null;
+  };
+
   return (
-    <span ref={wrap} className="contents">
-      <MorphingDialog transition={glide}>
-        <MorphingDialogTrigger
-          thing={thing}
-          className={cn(
-            "inline-flex h-9 cursor-pointer items-center gap-2 whitespace-nowrap rounded-control bg-blue px-3.5 text-sm font-medium text-blue-fg outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:bg-blue-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface max-md:min-h-11",
-            className,
-          )}
-        >
-          <Plus className="size-4" strokeWidth={1.5} aria-hidden />
-          <span>New session</span>
-        </MorphingDialogTrigger>
-        <MorphingDialogContainer>
-          <MorphingDialogContent className="relative flex max-h-[calc(100dvh-32px)] w-full max-w-[660px] flex-col overflow-hidden rounded-dialog border border-hairline bg-surface text-ink">
-            <Composer
-              policy={policy}
-              sessions={sessions}
-              playbooks={playbooks}
-              supportsServerV050={supportsServerV050}
-              supportsServerV060={supportsServerV060}
-              initialModeRef={initialModeRef}
-              initialPlaybookRef={initialPlaybookRef}
-              onHanded={onHanded}
-              onHandedBatch={onHandedBatch}
-              onPlaybooksChanged={onPlaybooksChanged}
-              onClosed={() => {
-                initialModeRef.current = "single";
-                initialPlaybookRef.current = null;
-                returnFocus();
-              }}
-            />
-          </MorphingDialogContent>
-        </MorphingDialogContainer>
-      </MorphingDialog>
+    <span className="contents">
+      <Button
+        ref={triggerRef}
+        type="button"
+        variant="primary"
+        size="md"
+        data-thing={thing}
+        onClick={() => setOpen(true)}
+        className={className}
+      >
+        <Plus className="size-4" strokeWidth={1.5} aria-hidden />
+        <span>New session</span>
+      </Button>
+      <Dialog
+        open={open}
+        onClose={handleClose}
+        title="New session or DAG batch"
+        description="Launch an isolated worktree run, plan a multi-wave DAG from a plain goal, or reuse a playbook."
+        maxWidth="max-w-[680px]"
+        returnFocusTo={triggerRef.current}
+      >
+        <Composer
+          policy={policy}
+          sessions={sessions}
+          playbooks={playbooks}
+          supportsServerV050={supportsServerV050}
+          supportsServerV060={supportsServerV060}
+          initialModeRef={initialModeRef}
+          initialPlaybookRef={initialPlaybookRef}
+          onHanded={onHanded}
+          onHandedBatch={onHandedBatch}
+          onPlaybooksChanged={onPlaybooksChanged}
+          onClose={handleClose}
+        />
+      </Dialog>
     </span>
   );
 }
@@ -159,48 +168,56 @@ function AgentPicker({
   testDefault: boolean;
   ariaLabel?: string;
 }) {
+  const [open, setOpen] = useState(false);
   const items = ["", ...agents.filter((a) => a.found).map((a) => a.name)];
   const label = (v: string) => (v ? v : testDefault ? "Test script" : "Default");
   if (items.length === 1) {
-    return <p className="rounded-control border border-hairline bg-canvas px-3 py-2 text-sm text-ink">{label("")}</p>;
+    return (
+      <p className="rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--canvas)] px-3 py-2 text-[14px] text-[var(--ink)]">
+        {label("")}
+      </p>
+    );
   }
   if (items.length <= 3) {
     return (
-      <SegmentedControl aria-label={ariaLabel} size="sm">
-        {items.map((v) => (
-          <SegmentedControlItem
-            key={v || "default"}
-            aria-pressed={value === v}
-            data-checked={value === v ? "" : undefined}
-            onClick={() => onChange(v)}
-            className="max-md:!min-h-11"
-          >
-            {label(v)}
-          </SegmentedControlItem>
-        ))}
-      </SegmentedControl>
+      <SegmentedControl
+        label={ariaLabel}
+        value={value}
+        onChange={onChange}
+        options={items.map((v) => ({ value: v, label: label(v) }))}
+      />
     );
   }
   return (
-    <Popover>
-      <PopoverTrigger className="inline-flex h-9 w-full cursor-pointer items-center justify-between rounded-control border border-input bg-canvas px-3 text-sm text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11">
-        {label(value)}
-      </PopoverTrigger>
-      <PopoverContent align="start" className="w-64 rounded-control border border-hairline bg-surface p-1 text-ink">
+    <PopoverPanel
+      open={open}
+      onClose={() => setOpen(false)}
+      align="start"
+      className="w-64"
+      trigger={
+        <Button type="button" variant="outline" onClick={() => setOpen((v) => !v)} className="w-full justify-between">
+          <span>{label(value)}</span>
+        </Button>
+      }
+    >
+      <div className="space-y-1">
         {items.map((v) => (
           <Button
             key={v || "default"}
             type="button"
             variant="ghost"
             aria-pressed={value === v}
-            onClick={() => onChange(v)}
-            className={cn("h-9 w-full justify-start px-2.5 text-sm max-md:min-h-11", value === v && "font-medium")}
+            onClick={() => {
+              onChange(v);
+              setOpen(false);
+            }}
+            className={cn("w-full justify-start", value === v && "bg-[var(--blue-soft)] text-[var(--ink)]")}
           >
             {label(v)}
           </Button>
         ))}
-      </PopoverContent>
-    </Popover>
+      </div>
+    </PopoverPanel>
   );
 }
 
@@ -215,7 +232,7 @@ function Composer({
   onHanded,
   onHandedBatch,
   onPlaybooksChanged,
-  onClosed,
+  onClose,
 }: {
   policy: Policy | null;
   sessions: Session[];
@@ -227,9 +244,10 @@ function Composer({
   onHanded: (s: Session) => void;
   onHandedBatch: (created: Session[]) => void;
   onPlaybooksChanged: () => void;
-  onClosed: () => void;
+  onClose: () => void;
 }) {
-  useEffect(() => () => onClosed(), []); // eslint-disable-line react-hooks/exhaustive-deps
+  const [goalDraft, setGoalDraft] = useState("");
+  const [planningGoal, setPlanningGoal] = useState(false);
   const webEngine = isWebEngineMode();
   const [mode, setMode] = useState<ComposerMode>(() => {
     const pre = initialPlaybookRef.current;
@@ -613,8 +631,29 @@ function Composer({
     const raw = await r.json();
     const norm = normalizeSessions([raw])?.[0] ?? (raw as Session);
     toast.success(`Handed out: ${norm.task}`);
-    document.querySelector<HTMLButtonElement>(".new-cancel")?.click();
+    onClose();
     onHanded(norm);
+  };
+
+  const runGoalPlan = async () => {
+    if (!goalDraft.trim() || planningGoal) return;
+    setPlanningGoal(true);
+    setFormErr("");
+    const targetRepo = repo.trim() || repos[0]?.path || "/workspace/ledger-kit";
+    const res = await planGoal({ goal: goalDraft, repo: targetRepo, agent: agent || undefined });
+    setPlanningGoal(false);
+    setBatchRows(
+      res.tasks.map((t, idx) => ({
+        id: `plan-${idx}-${Date.now()}`,
+        repo: t.repo || targetRepo,
+        project: repoBasename(t.repo || targetRepo) || "default",
+        task: t.task,
+        agent: t.agent || "",
+        check: t.check || res.check_cmd || "",
+        dependsOn: t.depends_on || [],
+      })),
+    );
+    toast.success(`Planned ${res.tasks.length} DAG ${res.tasks.length === 1 ? "task" : "tasks"}`);
   };
 
   const submitBatch = async () => {
@@ -665,7 +704,7 @@ function Composer({
     } else {
       toast.success(`Batch dispatched ${res.created.length} ${res.created.length === 1 ? "session" : "sessions"} across worktrees.`);
     }
-    document.querySelector<HTMLButtonElement>(".new-cancel")?.click();
+    onClose();
     onHandedBatch(res.created);
   };
 
@@ -673,7 +712,7 @@ function Composer({
 
   return (
     <form
-      className="flex min-h-0 flex-col"
+      className="flex flex-col gap-5"
       noValidate
       onSubmit={(e) => {
         e.preventDefault();
@@ -681,57 +720,38 @@ function Composer({
         else void submitBatch();
       }}
     >
-      <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-6">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <MorphingDialogTitle className="font-heading text-xl font-medium text-ink">
-              {mode === "single" ? "New session" : "Batch fan-out dispatch"}
-            </MorphingDialogTitle>
-            <MorphingDialogDescription className="mt-1 text-sm leading-relaxed text-ink-2">
-              {mode === "single"
-                ? "Fleet runs the agent in its own git worktree of this repo. When the agent stops, Fleet runs your check. The session is done only when that check passes."
-                : `Fan out parallel tasks across one or multiple repos (up to ${policy?.max_parallel ?? 4} concurrent slots) and link depends_on DAG stages.`}
-            </MorphingDialogDescription>
-          </div>
-          <SegmentedControl aria-label="Dispatch mode" size="sm">
-            <SegmentedControlItem
-              aria-pressed={mode === "single"}
-              data-checked={mode === "single" ? "" : undefined}
-              onClick={() => {
-                setMode("single");
-                setFormErr("");
-              }}
-              className="text-xs max-md:!min-h-11"
-            >
-              Single task
-            </SegmentedControlItem>
-            <SegmentedControlItem
-              aria-pressed={mode === "batch"}
-              data-checked={mode === "batch" ? "" : undefined}
-              onClick={() => {
-                setMode("batch");
-                setFormErr("");
-              }}
-              className="gap-1 text-xs max-md:!min-h-11"
-            >
-              <Layers className="size-3.5" strokeWidth={1.5} aria-hidden />
-              <span>Batch fan-out</span>
-            </SegmentedControlItem>
-          </SegmentedControl>
+      <div className="space-y-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <p className="text-[13px] text-[var(--ink-2)]">
+            {mode === "single"
+              ? "Isolated git worktree run verified automatically by your check command."
+              : `Parallel DAG fan-out across repos (up to ${policy?.max_parallel ?? 4} active slots).`}
+          </p>
+          <SegmentedControl
+            label="Dispatch mode"
+            value={mode}
+            onChange={(m) => {
+              setMode(m);
+              setFormErr("");
+            }}
+            options={[
+              { value: "single", label: "Single task" },
+              { value: "batch", label: "Batch fan-out" },
+            ]}
+          />
         </div>
 
-        <section aria-label="Playbooks" className="space-y-2 rounded-card border border-hairline bg-canvas p-3">
+        <section aria-label="Playbooks" className="space-y-2.5 rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--canvas)] p-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="inline-flex items-center gap-1.5 text-xs font-medium text-ink">
-              <BookMarked className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
+            <span className="inline-flex items-center gap-1.5 text-[13px] font-medium text-[var(--ink)]">
+              <BookMarked className="size-4 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
               <span>Playbooks</span>
             </span>
             <Button
               type="button"
               size="sm"
-              variant={saveOpen ? "default" : "outline"}
+              variant={saveOpen ? "primary" : "outline"}
               onClick={() => setSaveOpen((v) => !v)}
-              className="h-7 px-2.5 text-xs max-md:min-h-11"
             >
               <Save className="size-3.5" strokeWidth={1.5} aria-hidden />
               <span>Save as playbook</span>
@@ -746,23 +766,21 @@ function Composer({
                   <Button
                     type="button"
                     size="sm"
-                    variant={active ? "default" : "outline"}
+                    variant={active ? "primary" : "outline"}
                     title={tpl.description}
                     onClick={() => applyPlaybook(tpl)}
-                    className="h-7 px-2.5 text-xs max-md:min-h-11"
                   >
                     {tpl.name}
                   </Button>
                   {!tpl.builtin && (
                     <Button
                       type="button"
-                      size="icon-sm"
+                      size="icon"
                       variant="ghost"
                       aria-label={`Delete playbook ${tpl.name}`}
                       onClick={() => void handleDeletePlaybook(tpl)}
-                      className="size-7 max-md:size-11"
                     >
-                      <Trash2 className="size-3.5 text-ink-3" strokeWidth={1.5} aria-hidden />
+                      <Trash2 className="size-3.5 text-[var(--ink-3)]" strokeWidth={1.5} aria-hidden />
                     </Button>
                   )}
                 </div>
@@ -771,46 +789,28 @@ function Composer({
           </div>
 
           {saveOpen && (
-            <div className="mt-2 space-y-2 border-t border-hairline pt-2.5" data-testid="save-playbook-form">
+            <div className="mt-2 space-y-2.5 border-t border-[var(--hairline)] pt-2.5" data-testid="save-playbook-form">
               <div className="grid gap-2 sm:grid-cols-2">
-                <InputGroup>
-                  <InputGroupInput
-                    id="playbook-name"
-                    aria-label="Playbook name"
-                    value={tplName}
-                    onChange={(e) => setTplName(e.target.value)}
-                    placeholder="Playbook name (e.g. API Security Fix)"
-                    className="text-xs max-md:!h-11"
-                  />
-                </InputGroup>
-                <InputGroup>
-                  <InputGroupInput
-                    id="playbook-desc"
-                    aria-label="Playbook description"
-                    value={tplDesc}
-                    onChange={(e) => setTplDesc(e.target.value)}
-                    placeholder="Short description (optional)"
-                    className="text-xs max-md:!h-11"
-                  />
-                </InputGroup>
+                <Input
+                  id="playbook-name"
+                  aria-label="Playbook name"
+                  value={tplName}
+                  onChange={(e) => setTplName(e.target.value)}
+                  placeholder="Playbook name (e.g. API Security Fix)"
+                />
+                <Input
+                  id="playbook-desc"
+                  aria-label="Playbook description"
+                  value={tplDesc}
+                  onChange={(e) => setTplDesc(e.target.value)}
+                  placeholder="Short description (optional)"
+                />
               </div>
               <div className="flex items-center justify-end gap-2">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => setSaveOpen(false)}
-                  className="h-7 px-2.5 text-xs max-md:min-h-11"
-                >
+                <Button type="button" size="sm" variant="ghost" onClick={() => setSaveOpen(false)}>
                   Cancel
                 </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  disabled={savingTpl}
-                  onClick={() => void handleSavePlaybook()}
-                  className="h-7 px-3 text-xs max-md:min-h-11"
-                >
+                <Button type="button" size="sm" variant="primary" disabled={savingTpl} onClick={() => void handleSavePlaybook()}>
                   {savingTpl ? "Saving..." : "Save playbook"}
                 </Button>
               </div>
@@ -830,21 +830,19 @@ function Composer({
               }
               err={repoErr}
             >
-              <InputGroup>
-                <InputGroupInput
-                  ref={repoRef}
-                  id="repo"
-                  value={repo}
-                  onChange={(e) => onRepoChange(e.target.value)}
-                  placeholder={repos[0]?.path || "/home/you/projects/app"}
-                  autoComplete="off"
-                  aria-invalid={repoErr ? true : undefined}
-                />
-              </InputGroup>
+              <Input
+                ref={repoRef}
+                id="repo"
+                value={repo}
+                onChange={(e) => onRepoChange(e.target.value)}
+                placeholder={repos[0]?.path || "/home/you/projects/app"}
+                autoComplete="off"
+                aria-invalid={repoErr ? true : undefined}
+              />
               {filteredRepos.length > 0 && (
                 <div
                   aria-label="Discovered repositories"
-                  className="mt-2 max-h-40 space-y-1 overflow-y-auto rounded-card border border-hairline bg-canvas p-1.5"
+                  className="mt-2 max-h-40 space-y-1 overflow-y-auto rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--canvas)] p-1.5"
                 >
                   {filteredRepos.map((r) => {
                     const active = repo.trim() === r.path;
@@ -854,18 +852,18 @@ function Composer({
                         type="button"
                         onClick={() => pickRepo(r)}
                         className={cn(
-                          "flex w-full cursor-pointer items-center gap-2 rounded-control px-2.5 py-2 text-left text-sm transition-colors duration-(--dur-press) ease-(--ease-house) outline-none focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11",
-                          active ? "bg-raised text-ink font-medium" : "text-ink-2 hover:bg-surface hover:text-ink",
+                          "flex w-full cursor-pointer items-center gap-2 rounded-[var(--radius-chip)] px-2.5 py-2 text-left text-[13px] transition outline-none focus-visible:outline-2 focus-visible:outline-[var(--ring)] max-md:min-h-11",
+                          active ? "bg-[var(--blue-soft)] text-[var(--ink)] font-medium" : "text-[var(--ink-2)] hover:bg-[var(--surface)] hover:text-[var(--ink)]",
                         )}
                       >
-                        <FolderGit2 className="size-4 shrink-0 text-icon" strokeWidth={1.5} aria-hidden />
-                        <span className="min-w-0 flex-1 truncate font-medium text-ink">{r.name}</span>
+                        <FolderGit2 className="size-4 shrink-0 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
+                        <span className="min-w-0 flex-1 truncate font-medium text-[var(--ink)]">{r.name}</span>
                         {r.branch && (
-                          <span className="shrink-0 rounded-chip bg-track px-1.5 py-0.5 font-mono text-xs text-ink-2">
+                          <span className="shrink-0 rounded-[var(--radius-chip)] bg-[var(--track)] px-1.5 py-0.5 mono text-[12px] text-[var(--ink-2)]">
                             {r.branch}
                           </span>
                         )}
-                        <span className="hidden max-w-[42%] truncate font-mono text-xs text-ink-3 sm:inline">
+                        <span className="hidden max-w-[42%] truncate mono text-[12px] text-[var(--ink-3)] sm:inline">
                           {r.path}
                         </span>
                       </button>
@@ -880,18 +878,16 @@ function Composer({
               label="Project"
               hint="Derived automatically from the repository folder name. Edit if your routing rules match a custom project key."
             >
-              <InputGroup>
-                <InputGroupInput
-                  id="project"
-                  value={project}
-                  placeholder={repoBasename(repo) || "default"}
-                  onChange={(e) => {
-                    setProjectTouched(true);
-                    setProject(e.target.value);
-                  }}
-                  autoComplete="off"
-                />
-              </InputGroup>
+              <Input
+                id="project"
+                value={project}
+                placeholder={repoBasename(repo) || "default"}
+                onChange={(e) => {
+                  setProjectTouched(true);
+                  setProject(e.target.value);
+                }}
+                autoComplete="off"
+              />
             </Field>
 
             <Field
@@ -934,38 +930,36 @@ function Composer({
               label="Check command (optional)"
               hint={
                 webEngine
-                  ? "Executed inside an isolated Web Worker against the branch's real files (e.g. npm test, or a JS assertion over files['src/ledger.js'])."
-                  : "Leave it empty to use the project’s check from the policy file. Its output becomes the receipt."
+                  ? "Executed inside an isolated Web Worker against the branch's real files (e.g. npm test)."
+                  : "Leave empty to use the project policy check. Its output becomes the receipt."
               }
             >
-              <InputGroup>
-                <InputGroupInput
-                  id="check"
-                  value={check}
-                  onChange={(e) => setCheck(e.target.value)}
-                  autoComplete="off"
-                  placeholder={webEngine ? "npm test" : "cargo test"}
-                />
-              </InputGroup>
-              <p className="text-xs text-ink-3">
+              <Input
+                id="check"
+                value={check}
+                onChange={(e) => setCheck(e.target.value)}
+                autoComplete="off"
+                placeholder={webEngine ? "npm test" : "cargo test"}
+              />
+              <p className="text-[12px] text-[var(--ink-3)]">
                 Example: <Kbd>{webEngine ? "npm test" : "cargo test"}</Kbd>
               </p>
             </Field>
 
             {upstreamCandidates.length > 0 && (
-              <div className="space-y-2 rounded-card border border-hairline bg-canvas p-3">
+              <div className="space-y-2 rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--canvas)] p-3">
                 <div className="flex items-center justify-between gap-2">
-                  <span className="inline-flex items-center gap-1.5 text-xs font-medium text-ink">
-                    <GitBranch className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
+                  <span className="inline-flex items-center gap-1.5 text-[13px] font-medium text-[var(--ink)]">
+                    <GitBranch className="size-3.5 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
                     <span>Depends on upstream sessions (DAG)</span>
                   </span>
                   {dependsOn.length > 0 && (
-                    <span className="rounded-chip bg-track px-1.5 py-0.5 font-mono text-xs text-ink-2">
+                    <span className="rounded-[var(--radius-chip)] bg-[var(--track)] px-1.5 py-0.5 mono text-[12px] text-[var(--ink-2)]">
                       {dependsOn.length} selected
                     </span>
                   )}
                 </div>
-                <p className="text-xs text-ink-3">
+                <p className="text-[12px] text-[var(--ink-3)]">
                   Waits until every selected upstream session reaches verified Done; marks Needs you if any fails.
                 </p>
                 <div className="flex flex-wrap gap-1.5">
@@ -976,13 +970,13 @@ function Composer({
                         key={cand.id}
                         type="button"
                         size="sm"
-                        variant={checked ? "default" : "outline"}
+                        variant={checked ? "primary" : "outline"}
                         aria-pressed={checked}
                         onClick={() => toggleSingleDep(cand.id)}
-                        className="h-7 max-w-full px-2 font-mono text-xs max-md:min-h-11"
+                        className="max-w-full mono"
                       >
                         <span className="shrink-0">{cand.id}</span>
-                        <span className="truncate font-sans font-normal">· {cand.task.slice(0, 26)}</span>
+                        <span className="truncate font-sans font-normal">{cand.task.slice(0, 26)}</span>
                       </Button>
                     );
                   })}
@@ -990,35 +984,46 @@ function Composer({
               </div>
             )}
 
-            <Field id="next" label="Then (optional)" hint="Starts on its own only when this session is verified done.">
-              <InputGroup>
-                <InputGroupInput
-                  id="next"
-                  value={next}
-                  onChange={(e) => setNext(e.target.value)}
-                  placeholder="The next task in the chain"
-                  autoComplete="off"
-                />
-              </InputGroup>
+            <Field id="next" label="Then (optional)" hint="Starts automatically once this session is verified done.">
+              <Input
+                id="next"
+                value={next}
+                onChange={(e) => setNext(e.target.value)}
+                placeholder="The next task in the chain"
+                autoComplete="off"
+              />
             </Field>
           </>
         ) : (
           <div className="space-y-4">
+            <div className="space-y-2 rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--board)] p-3">
+              <label htmlFor="goal-dag-input" className="flex items-center gap-1.5 text-[13px] font-medium text-[var(--ink)]">
+                <Sparkles className="size-4 text-[var(--blue)]" strokeWidth={1.5} aria-hidden />
+                <span>Goal to DAG planner</span>
+              </label>
+              <div className="flex flex-wrap gap-2">
+                <Input
+                  id="goal-dag-input"
+                  value={goalDraft}
+                  onChange={(e) => setGoalDraft(e.target.value)}
+                  placeholder="Describe a multi-step goal (separate steps with ';' or 'then')"
+                  className="flex-1 min-w-[200px]"
+                />
+                <Button type="button" variant="secondary" size="sm" disabled={planningGoal || !goalDraft.trim()} onClick={() => void runGoalPlan()}>
+                  <Sparkles className="size-3.5" strokeWidth={1.5} aria-hidden />
+                  <span>{planningGoal ? "Planning..." : "Plan DAG"}</span>
+                </Button>
+              </div>
+            </div>
+
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <p className="text-xs text-ink-2">
-                {batchRows.length} parallel task {batchRows.length === 1 ? "row" : "rows"} · reference earlier rows as{" "}
-                <span className="font-mono text-ink">#1</span>, <span className="font-mono text-ink">#2</span> in{" "}
-                <span className="font-mono text-ink">depends_on</span>.
+              <p className="text-[13px] text-[var(--ink-2)]">
+                {batchRows.length} task {batchRows.length === 1 ? "row" : "rows"}, reference earlier rows as{" "}
+                <span className="mono text-[var(--ink)]">#1</span>, <span className="mono text-[var(--ink)]">#2</span>.
               </p>
               <div className="flex flex-wrap gap-1.5">
                 {repos.length > 1 && (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    onClick={fanOutAllRepos}
-                    className="h-8 px-2.5 text-xs max-md:min-h-11"
-                  >
+                  <Button type="button" size="sm" variant="outline" onClick={fanOutAllRepos}>
                     <FolderGit2 className="size-3.5" strokeWidth={1.5} aria-hidden />
                     <span>Fan out {Math.min(repos.length, 8)} repos</span>
                   </Button>
@@ -1042,7 +1047,6 @@ function Composer({
                       },
                     ]);
                   }}
-                  className="h-8 px-2.5 text-xs max-md:min-h-11"
                 >
                   <Plus className="size-3.5" strokeWidth={1.5} aria-hidden />
                   <span>Add task</span>
@@ -1069,76 +1073,71 @@ function Composer({
                   );
                 };
                 return (
-                  <div key={row.id} className="space-y-2.5 rounded-card border border-hairline bg-canvas p-3">
+                  <div key={row.id} className="space-y-2.5 rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--canvas)] p-3">
                     <div className="flex items-center justify-between gap-2">
-                      <span className="rounded-chip bg-track px-2 py-0.5 font-mono text-xs font-medium text-ink">
+                      <span className="rounded-[var(--radius-chip)] bg-[var(--track)] px-2 py-0.5 mono text-[12px] font-medium text-[var(--ink)]">
                         Task #{idx + 1}
                       </span>
                       {batchRows.length > 1 && (
                         <Button
                           type="button"
-                          size="icon-sm"
+                          size="icon"
                           variant="ghost"
                           aria-label={`Remove batch task #${idx + 1}`}
                           onClick={() => setBatchRows((rows) => rows.filter((r) => r.id !== row.id))}
-                          className="size-7 max-md:size-11"
                         >
-                          <Trash2 className="size-3.5 text-ink-3" strokeWidth={1.5} aria-hidden />
+                          <Trash2 className="size-3.5 text-[var(--ink-3)]" strokeWidth={1.5} aria-hidden />
                         </Button>
                       )}
                     </div>
 
                     <div className="grid gap-2 sm:grid-cols-2">
                       <div className="space-y-1">
-                        <label htmlFor={`batch-repo-${idx}`} className="block text-xs font-medium text-ink-2">
+                        <label htmlFor={`batch-repo-${idx}`} className="block text-[12px] font-medium text-[var(--ink-2)]">
                           Repository path
                         </label>
-                        <InputGroup>
-                          <InputGroupInput
-                            id={`batch-repo-${idx}`}
-                            value={row.repo}
-                            placeholder={repos[0]?.path || "/workspace/ledger-kit"}
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              setBatchRows((rows) =>
-                                rows.map((r) =>
-                                  r.id === row.id ? { ...r, repo: val, project: repoBasename(val) || r.project } : r,
-                                ),
-                              );
-                            }}
-                            className="font-mono text-xs max-md:!h-11"
-                          />
-                        </InputGroup>
+                        <Input
+                          id={`batch-repo-${idx}`}
+                          value={row.repo}
+                          placeholder={repos[0]?.path || "/workspace/ledger-kit"}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setBatchRows((rows) =>
+                              rows.map((r) =>
+                                r.id === row.id ? { ...r, repo: val, project: repoBasename(val) || r.project } : r,
+                              ),
+                            );
+                          }}
+                          className="mono text-[13px]"
+                        />
                       </div>
                       <div className="space-y-1">
-                        <label htmlFor={`batch-check-${idx}`} className="block text-xs font-medium text-ink-2">
+                        <label htmlFor={`batch-check-${idx}`} className="block text-[12px] font-medium text-[var(--ink-2)]">
                           Check command (optional)
                         </label>
-                        <InputGroup>
-                          <InputGroupInput
-                            id={`batch-check-${idx}`}
-                            value={row.check}
-                            placeholder={webEngine ? "npm test" : "cargo test"}
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              setBatchRows((rows) =>
-                                rows.map((r) => (r.id === row.id ? { ...r, check: val } : r)),
-                              );
-                            }}
-                            className="font-mono text-xs max-md:!h-11"
-                          />
-                        </InputGroup>
+                        <Input
+                          id={`batch-check-${idx}`}
+                          value={row.check}
+                          placeholder={webEngine ? "npm test" : "cargo test"}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setBatchRows((rows) =>
+                              rows.map((r) => (r.id === row.id ? { ...r, check: val } : r)),
+                            );
+                          }}
+                          className="mono text-[13px]"
+                        />
                       </div>
                     </div>
 
                     {repos.length > 0 && (
-                      <div className="flex flex-wrap gap-1">
+                      <div className="flex flex-wrap gap-1.5">
                         {repos.slice(0, 5).map((r) => (
                           <Button
                             key={r.path}
                             type="button"
                             size="sm"
-                            variant={row.repo === r.path ? "default" : "outline"}
+                            variant={row.repo === r.path ? "primary" : "outline"}
                             onClick={() =>
                               setBatchRows((rows) =>
                                 rows.map((item) =>
@@ -1146,7 +1145,7 @@ function Composer({
                                 ),
                               )
                             }
-                            className="h-7 px-2 font-mono text-xs max-md:min-h-11"
+                            className="mono"
                           >
                             {r.name}
                           </Button>
@@ -1155,7 +1154,7 @@ function Composer({
                     )}
 
                     <div className="space-y-1">
-                      <label htmlFor={`batch-task-${idx}`} className="block text-xs font-medium text-ink-2">
+                      <label htmlFor={`batch-task-${idx}`} className="block text-[12px] font-medium text-[var(--ink-2)]">
                         Task #{idx + 1} prompt
                       </label>
                       <Textarea
@@ -1167,14 +1166,13 @@ function Composer({
                           const val = e.target.value;
                           setBatchRows((rows) => rows.map((r) => (r.id === row.id ? { ...r, task: val } : r)));
                         }}
-                        className="text-sm"
                       />
                     </div>
 
                     {depChoices.length > 0 && (
                       <div className="space-y-1">
-                        <span className="block text-xs text-ink-3">Depends on (optional DAG links):</span>
-                        <div className="flex flex-wrap gap-1">
+                        <span className="block text-[12px] text-[var(--ink-3)]">Depends on (optional DAG links):</span>
+                        <div className="flex flex-wrap gap-1.5">
                           {depChoices.map((dep) => {
                             const active = row.dependsOn.includes(dep);
                             return (
@@ -1182,10 +1180,10 @@ function Composer({
                                 key={dep}
                                 type="button"
                                 size="sm"
-                                variant={active ? "default" : "outline"}
+                                variant={active ? "primary" : "outline"}
                                 aria-pressed={active}
                                 onClick={() => toggleRowDep(dep)}
-                                className="h-7 px-2 font-mono text-xs max-md:min-h-11"
+                                className="mono"
                               >
                                 {dep}
                               </Button>
@@ -1201,181 +1199,147 @@ function Composer({
           </div>
         )}
 
-        <Expandable expandDirection="vertical" expandBehavior="push" className="rounded-card border border-hairline bg-canvas p-3">
-          {({ isExpanded }) => (
-            <>
-              <ExpandableTrigger
-                aria-label="Multi-step check pipeline, auto-heal budget, and file-scope guardrails"
-                className="flex w-full cursor-pointer items-center justify-between gap-2 text-left text-sm font-medium text-ink outline-none focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11"
-              >
-                <span className="inline-flex items-center gap-1.5">
-                  <ListChecks className="size-4 text-icon" strokeWidth={1.5} aria-hidden />
-                  <span>Check pipeline, auto-heal &amp; file-scope guardrails</span>
-                  {(steps.length > 0 || allowedGlobsText.trim() || forbiddenGlobsText.trim()) && (
-                    <span className="rounded-chip bg-track px-1.5 py-0.5 font-mono text-xs text-ink-2">
-                      {steps.length} {steps.length === 1 ? "step" : "steps"}
-                    </span>
-                  )}
+        <Expandable
+          triggerLabel="Check pipeline, auto-heal & file-scope guardrails"
+          openLabel="Hide check pipeline, auto-heal & guardrails"
+        >
+          <div className="space-y-4 pt-2">
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <span className="inline-flex items-center gap-1.5 text-[13px] font-medium text-[var(--ink-2)]">
+                  <ListChecks className="size-4 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
+                  <span>Ordered check pipeline steps</span>
                 </span>
-                <span className="text-xs font-normal text-ink-3">{isExpanded ? "Hide" : "Configure"}</span>
-              </ExpandableTrigger>
-              <ExpandableContent preset="fade">
-                <div className="mt-3 space-y-4 border-t border-hairline pt-3">
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-medium text-ink-2">Ordered check pipeline steps</span>
+                <Button type="button" size="sm" variant="outline" onClick={addStepRow}>
+                  <Plus className="size-3.5" strokeWidth={1.5} aria-hidden />
+                  <span>Add check step</span>
+                </Button>
+              </div>
+              {steps.length === 0 ? (
+                <p className="text-[12px] text-[var(--ink-3)]">
+                  Add named pipeline stages (e.g. typecheck, lint, unit tests) to record timed per-step receipts. Stops on first failure.
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  {steps.map((st, idx) => (
+                    <div key={st.id} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.6fr)_72px_auto] items-center gap-1.5">
+                      <Input
+                        aria-label={`Check step ${idx + 1} name`}
+                        value={st.name}
+                        placeholder="name"
+                        onChange={(e) =>
+                          setSteps((prev) =>
+                            prev.map((x) => (x.id === st.id ? { ...x, name: e.target.value } : x)),
+                          )
+                        }
+                        className="mono text-[13px]"
+                      />
+                      <Input
+                        aria-label={`Check step ${idx + 1} command`}
+                        value={st.cmd}
+                        placeholder="npm test"
+                        onChange={(e) =>
+                          setSteps((prev) =>
+                            prev.map((x) => (x.id === st.id ? { ...x, cmd: e.target.value } : x)),
+                          )
+                        }
+                        className="mono text-[13px]"
+                      />
+                      <Input
+                        aria-label={`Check step ${idx + 1} timeout seconds`}
+                        value={st.timeoutSecs}
+                        placeholder="300"
+                        onChange={(e) =>
+                          setSteps((prev) =>
+                            prev.map((x) => (x.id === st.id ? { ...x, timeoutSecs: e.target.value } : x)),
+                          )
+                        }
+                        className="mono text-[13px]"
+                      />
                       <Button
                         type="button"
-                        size="sm"
-                        variant="outline"
-                        onClick={addStepRow}
-                        className="h-7 px-2.5 text-xs max-md:min-h-11"
+                        size="icon"
+                        variant="ghost"
+                        aria-label={`Remove check step ${idx + 1}`}
+                        onClick={() => setSteps((prev) => prev.filter((x) => x.id !== st.id))}
                       >
-                        <Plus className="size-3.5" strokeWidth={1.5} aria-hidden />
-                        <span>Add check step</span>
+                        <Trash2 className="size-3.5 text-[var(--ink-3)]" strokeWidth={1.5} aria-hidden />
                       </Button>
                     </div>
-                    {steps.length === 0 ? (
-                      <p className="text-xs text-ink-3">
-                        Add named pipeline stages (e.g. typecheck, lint, unit tests) to record timed per-step receipts. Stops on first failure.
-                      </p>
-                    ) : (
-                      <div className="space-y-2">
-                        {steps.map((st, idx) => (
-                          <div key={st.id} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.6fr)_72px_auto] items-center gap-1.5">
-                            <InputGroup>
-                              <InputGroupInput
-                                aria-label={`Check step ${idx + 1} name`}
-                                value={st.name}
-                                placeholder="name"
-                                onChange={(e) =>
-                                  setSteps((prev) =>
-                                    prev.map((x) => (x.id === st.id ? { ...x, name: e.target.value } : x)),
-                                  )
-                                }
-                                className="font-mono text-xs max-md:!h-11"
-                              />
-                            </InputGroup>
-                            <InputGroup>
-                              <InputGroupInput
-                                aria-label={`Check step ${idx + 1} command`}
-                                value={st.cmd}
-                                placeholder="npm test"
-                                onChange={(e) =>
-                                  setSteps((prev) =>
-                                    prev.map((x) => (x.id === st.id ? { ...x, cmd: e.target.value } : x)),
-                                  )
-                                }
-                                className="font-mono text-xs max-md:!h-11"
-                              />
-                            </InputGroup>
-                            <InputGroup>
-                              <InputGroupInput
-                                aria-label={`Check step ${idx + 1} timeout seconds`}
-                                value={st.timeoutSecs}
-                                placeholder="300"
-                                onChange={(e) =>
-                                  setSteps((prev) =>
-                                    prev.map((x) => (x.id === st.id ? { ...x, timeoutSecs: e.target.value } : x)),
-                                  )
-                                }
-                                className="font-mono text-xs tabular-nums max-md:!h-11"
-                              />
-                            </InputGroup>
-                            <Button
-                              type="button"
-                              size="icon-sm"
-                              variant="ghost"
-                              aria-label={`Remove check step ${idx + 1}`}
-                              onClick={() => setSteps((prev) => prev.filter((x) => x.id !== st.id))}
-                              className="size-8 max-md:size-11"
-                            >
-                              <Trash2 className="size-3.5 text-ink-3" strokeWidth={1.5} aria-hidden />
-                            </Button>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="space-y-2 border-t border-hairline pt-3">
-                    <span className="inline-flex items-center gap-1.5 text-xs font-medium text-ink-2">
-                      <Wrench className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
-                      <span>Autonomous auto-heal budget</span>
-                    </span>
-                    <div className="flex flex-wrap items-center gap-3">
-                      <InputGroup className="w-24">
-                        <InputGroupInput
-                          id="auto-heal-budget"
-                          type="number"
-                          min={0}
-                          max={5}
-                          aria-label="Auto-heal retry budget"
-                          value={healBudget}
-                          onChange={(e) => setHealBudget(e.target.value)}
-                          className="font-mono text-xs tabular-nums max-md:!h-11"
-                        />
-                      </InputGroup>
-                      <p className="min-w-0 flex-1 text-xs text-ink-3">
-                        Maximum diagnostic auto-steer attempts when a check step fails (`0` disables auto-heal).
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="space-y-2 border-t border-hairline pt-3">
-                    <span className="inline-flex items-center gap-1.5 text-xs font-medium text-ink-2">
-                      <Shield className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
-                      <span>File-scope guardrails</span>
-                    </span>
-                    <div className="grid gap-2.5 sm:grid-cols-2">
-                      <div className="space-y-1">
-                        <label htmlFor="allowed-globs" className="block text-xs text-ink-2">
-                          Allowed file globs (comma-separated)
-                        </label>
-                        <InputGroup>
-                          <InputGroupInput
-                            id="allowed-globs"
-                            value={allowedGlobsText}
-                            onChange={(e) => setAllowedGlobsText(e.target.value)}
-                            placeholder="src/**, tests/**"
-                            className="font-mono text-xs max-md:!h-11"
-                          />
-                        </InputGroup>
-                      </div>
-                      <div className="space-y-1">
-                        <label htmlFor="forbidden-globs" className="block text-xs text-ink-2">
-                          Forbidden globs (optional)
-                        </label>
-                        <InputGroup>
-                          <InputGroupInput
-                            id="forbidden-globs"
-                            value={forbiddenGlobsText}
-                            onChange={(e) => setForbiddenGlobsText(e.target.value)}
-                            placeholder=".env*, Cargo.lock"
-                            className="font-mono text-xs max-md:!h-11"
-                          />
-                        </InputGroup>
-                      </div>
-                    </div>
-                  </div>
+                  ))}
                 </div>
-              </ExpandableContent>
-            </>
-          )}
+              )}
+            </div>
+
+            <div className="space-y-2 border-t border-[var(--hairline)] pt-3">
+              <span className="inline-flex items-center gap-1.5 text-[13px] font-medium text-[var(--ink-2)]">
+                <Wrench className="size-3.5 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
+                <span>Autonomous auto-heal budget</span>
+              </span>
+              <div className="flex flex-wrap items-center gap-3">
+                <Input
+                  id="auto-heal-budget"
+                  type="number"
+                  min={0}
+                  max={5}
+                  aria-label="Auto-heal retry budget"
+                  value={healBudget}
+                  onChange={(e) => setHealBudget(e.target.value)}
+                  className="w-24 mono text-[13px]"
+                />
+                <p className="min-w-0 flex-1 text-[12px] text-[var(--ink-3)]">
+                  Maximum diagnostic auto-steer attempts when a check step fails (0 disables auto-heal).
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-2 border-t border-[var(--hairline)] pt-3">
+              <span className="inline-flex items-center gap-1.5 text-[13px] font-medium text-[var(--ink-2)]">
+                <Shield className="size-3.5 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
+                <span>File-scope guardrails</span>
+              </span>
+              <div className="grid gap-2.5 sm:grid-cols-2">
+                <div className="space-y-1">
+                  <label htmlFor="allowed-globs" className="block text-[12px] text-[var(--ink-2)]">
+                    Allowed file globs (comma-separated)
+                  </label>
+                  <Input
+                    id="allowed-globs"
+                    value={allowedGlobsText}
+                    onChange={(e) => setAllowedGlobsText(e.target.value)}
+                    placeholder="src/**, tests/**"
+                    className="mono text-[13px]"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label htmlFor="forbidden-globs" className="block text-[12px] text-[var(--ink-2)]">
+                    Forbidden globs (optional)
+                  </label>
+                  <Input
+                    id="forbidden-globs"
+                    value={forbiddenGlobsText}
+                    onChange={(e) => setForbiddenGlobsText(e.target.value)}
+                    placeholder=".env*, Cargo.lock"
+                    className="mono text-[13px]"
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
         </Expandable>
       </div>
 
-      <div className="flex flex-col gap-3 border-t border-hairline bg-surface px-6 py-4">
+      <div className="flex flex-col gap-3 border-t border-[var(--hairline)] pt-4">
         {formErr && (
-          <p role="alert" className="text-sm text-destructive-foreground">
+          <p role="alert" className="text-[14px] text-[var(--destructive-foreground)]">
             {formErr}
           </p>
         )}
         <div className="flex justify-end gap-2">
-          <MorphingDialogClose className="new-cancel static inline-flex h-9 cursor-pointer items-center rounded-control border border-hairline px-3.5 text-sm font-medium text-ink outline-none hover:bg-raised focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11">
+          <Button type="button" variant="outline" onClick={onClose}>
             Cancel
-          </MorphingDialogClose>
-          <Button type="submit" disabled={busy} className="max-md:min-h-11 max-md:px-4">
+          </Button>
+          <Button type="submit" variant="primary" disabled={busy}>
             {mode === "single"
               ? busy
                 ? "Handing out..."
@@ -1404,14 +1368,14 @@ function Field({
   children: React.ReactNode;
 }) {
   return (
-    <div className="space-y-2">
-      <label htmlFor={id} className="block text-sm font-medium text-ink">
+    <div className="space-y-1.5">
+      <label htmlFor={id} className="block text-[13px] font-medium text-[var(--ink)]">
         {label}
       </label>
       {children}
-      <p className="text-xs leading-relaxed text-ink-3">{hint}</p>
+      <p className="text-[12px] leading-relaxed text-[var(--ink-3)]">{hint}</p>
       {err && (
-        <p role="alert" className="text-sm text-destructive-foreground">
+        <p role="alert" className="text-[13px] text-[var(--destructive-foreground)]">
           {err}
         </p>
       )}

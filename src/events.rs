@@ -12,6 +12,10 @@ use std::sync::Mutex;
 const SUBSCRIBER_BUFFER: usize = 256;
 /// Number of recent events retained for `Last-Event-ID` catch-up.
 const HISTORY_CAP: usize = 64;
+/// Maximum byte size of a single frame stored in replay history to bound memory.
+const MAX_HISTORY_FRAME_BYTES: usize = 256 * 1024;
+/// Maximum concurrent active SSE subscribers to prevent thread/memory exhaustion.
+const MAX_SUBSCRIBERS: usize = 64;
 
 pub struct Subscription {
     pub id: u64,
@@ -39,7 +43,7 @@ impl EventBus {
     pub fn publish(&self, event: &str, payload: &serde_json::Value) -> u64 {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let frame = format!("id: {seq}\nevent: {event}\ndata: {payload}\n\n");
-        {
+        if frame.len() <= MAX_HISTORY_FRAME_BYTES {
             let mut hist = self.history.lock().unwrap();
             if hist.len() >= HISTORY_CAP {
                 hist.pop_front();
@@ -54,7 +58,33 @@ impl EventBus {
         seq
     }
 
+    /// Register a new SSE subscriber if below [`MAX_SUBSCRIBERS`], returning any missed
+    /// frames strictly after `last_event_id`.
+    pub fn try_subscribe(
+        &self,
+        last_event_id: Option<u64>,
+    ) -> Result<(Subscription, Vec<String>), &'static str> {
+        let mut subs = self.subscribers.lock().unwrap();
+        if subs.len() >= MAX_SUBSCRIBERS {
+            return Err("too many concurrent SSE subscribers");
+        }
+        let id = self.next_sub.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_BUFFER);
+        let replay = if let Some(since) = last_event_id {
+            let hist = self.history.lock().unwrap();
+            hist.iter()
+                .filter(|(seq, _)| *seq > since)
+                .map(|(_, frame)| frame.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        subs.push((id, tx));
+        Ok((Subscription { id, rx }, replay))
+    }
+
     /// Register a new SSE subscriber and return any missed frames strictly after `last_event_id`.
+    #[cfg(test)]
     pub fn subscribe(&self, last_event_id: Option<u64>) -> (Subscription, Vec<String>) {
         let id = self.next_sub.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_BUFFER);

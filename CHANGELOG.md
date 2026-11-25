@@ -4,6 +4,13 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running app shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.9.0 - 2026-11-25
+
+- Desktop-Workbench UI Overhaul (`frontend/src/App.tsx`, `board.tsx`, `detail.tsx`, `ui.tsx`, `theme.css`): replaced multi-band stacked header chrome and card-in-card Kanban layout with a slim 44px top bar, collapsible left Session Inbox rail, central workspace switching between streaming Transcript (50k+ virtualized), Unified/Split Diff review, Check Pipeline Receipt, Interactive DAG Graph, and a 1-click Goal-to-DAG launchpad, plus a collapsible right Worktree/Checks/PR Inspector and quiet bottom telemetry bar.
+- Lean Zero-Bloat Frontend Bundle (`frontend/src/ui.tsx`, `frontend/package.json`): replaced external `motion`, `vaul`, `cmdk`, `@radix-ui/*`, `@base-ui/react`, and `sonner` wrappers with lean accessible primitives using Geist, Geist Mono, and `lucide-react` 1.5px stroke icons, cutting `assets/index.html` by >42% (~1.23 MB -> ~708 kB) under a crisp Neutral Slate + Electric Blue Light/Dark theme (`#67` Settings-only theme switch, `#155` zero `"Rune"` jargon).
+- Goal-to-DAG Planner Endpoint & Browser Engine (`POST /api/plan` in `src/main.rs` and `frontend/scripts/web-engine.js`): decomposes plain goals into parallel or sequential DAG tasks with policy routing and file-scope guardrails.
+- Backend Security & Memory Hardening (`src/main.rs`, `src/events.rs`, `src/checks.rs`): bounded HTTP worker pool (128 threads), bounded SSE subscriber slots (64), 256 KiB SSE replay-frame cap, bounded `run_bounded` / `run_shell_bounded` output buffers, strict IPv6/scheme `Host`/`Origin` checks, malformed `Content-Length` rejection, loopback enforcement on `/api/update/check`, and streaming `App::persist()` serialization.
+
 ## 0.8.0 - 2026-11-22
 
 - Full **Fleet** Rebrand (`Cargo.toml`, `src/`, `frontend/`, `assets/index.html`,

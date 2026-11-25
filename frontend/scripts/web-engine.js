@@ -1,5 +1,5 @@
 (() => {
-  const APP_VERSION = "0.8.0";
+  const APP_VERSION = "0.9.0";
   const DB_NAME = "fleet-worktrees-v4";
   const STORE_NAME = "state";
   const BYOK_KEY_SS = "fleet-byok-api-key";
@@ -2073,6 +2073,37 @@
       const id = u.pathname.slice("/api/sessions/".length);
       const s = state.sessions.find((x) => x.id === id);
       return s ? jsonResp(publicSession(s)) : jsonResp({ error: "no such session" }, 404);
+    }
+
+    if (method === "POST" && u.pathname === "/api/plan") {
+      const goal = String(body.goal || "").trim();
+      const repoPath = String(body.repo || "").trim() || Object.keys(state.repos)[0] || "/workspace/ledger-kit";
+      if (!goal) return jsonResp({ error: "Provide a goal to plan." }, 400);
+      const clauses = goal
+        .split(/\n+|;\s*|\s+then\s+/i)
+        .map((c) => c.replace(/^[-*\d.)\s]+/, "").trim())
+        .filter(Boolean);
+      const steps = clauses.length > 0 ? clauses.slice(0, 6) : [goal];
+      const chained = /\bthen\b/i.test(goal) || steps.length === 2;
+      const tasks = steps.map((step, idx) => ({
+        alias: "#" + (idx + 1),
+        repo: repoPath,
+        task: step,
+        check: "npm test",
+        depends_on: chained && idx > 0 ? ["#" + idx] : [],
+        allowed_globs: ["src/**", "tests/**"],
+        forbidden_globs: [".env*"],
+        auto_steer_budget: MAX_HEAL_ATTEMPTS
+      }));
+      return jsonResp({
+        goal,
+        repo: repoPath,
+        engine: String(body.agent || (getByokKey() ? "byok-llm" : "web-worker")),
+        model: state.config.effective_models?.opencode || null,
+        check_cmd: "npm test",
+        auto_steer_budget: MAX_HEAL_ATTEMPTS,
+        tasks
+      });
     }
 
     if (method === "POST" && u.pathname === "/api/sessions/batch") {

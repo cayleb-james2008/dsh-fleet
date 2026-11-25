@@ -1,1120 +1,814 @@
-// Fleet Mission Control: Latest Verified Receipt hero + Filter/Bulk Action Strip + Three-Lane Board.
-// Motion layoutId glides sessions across lanes when state changes; BorderTrail + TextShimmer appear strictly on running sessions.
 import { useState } from "react";
-import { AnimatePresence, motion } from "motion/react";
 import {
-  Activity,
-  Check,
+  BookMarked,
   CheckCircle2,
   CheckSquare,
-  Cpu,
+  Clock,
+  Download,
   FileDiff,
   FolderGit2,
-  Gauge,
   GitBranch,
-  GitMerge,
-  LayoutGrid,
-  Network,
+  GitPullRequest,
+  Layers,
+  Play,
+  RefreshCw,
   RotateCcw,
-  ShieldAlert,
-  Square,
-  Terminal,
+  Shield,
+  Sparkles,
   Wrench,
   X,
+  XCircle,
 } from "lucide-react";
-import { BorderTrail } from "@/components/ui/border-trail";
-import { TextShimmer } from "@/components/ui/text-shimmer";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { SegmentedControl, SegmentedControlItem } from "@/components/ui/segmented-control";
-import { Pill, PillIndicator } from "@/components/kibo-ui/pill";
-import { layout } from "@/motion";
-import { cn } from "@/lib/utils";
+import { Badge, Button, Input, StatusDot, Textarea, cn, toast } from "./ui";
 import {
   diffStat,
+  dispatchBatchSessions,
+  downloadSessionPatch,
   formatDurationMs,
   healBadgeInfo,
-  HONEST,
   isActivelyRunning,
   isFailed,
-  isHonest,
   isQueuedOrBlocked,
   isVerified,
+  planGoal,
   receiptLine,
+  repoBasename,
   statusText,
   type BoardMetrics,
+  type GoalPlanTask,
+  type MergeCheckResult,
+  type PlaybookTemplate,
+  type Policy,
+  type RepoInfo,
   type Session,
   type StatusFilter,
   type TabId,
-  type ViewMode,
 } from "./api";
 
-const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
-
-function Corners({ size = 8 }: { size?: number }) {
-  const s = `${size}px`;
-  const c = "pointer-events-none absolute border-ink-3/45";
-  return (
-    <>
-      <span aria-hidden className={cn(c, "left-2 top-2 border-l border-t")} style={{ width: s, height: s }} />
-      <span aria-hidden className={cn(c, "right-2 top-2 border-r border-t")} style={{ width: s, height: s }} />
-      <span aria-hidden className={cn(c, "bottom-2 left-2 border-b border-l")} style={{ width: s, height: s }} />
-      <span aria-hidden className={cn(c, "bottom-2 right-2 border-b border-r")} style={{ width: s, height: s }} />
-    </>
-  );
-}
-
-const TAG_SKINS = [
-  "bg-tag-ops-bg text-tag-ops-fg",
-  "bg-tag-mint-bg text-tag-mint-fg",
-  "bg-tag-research-bg text-tag-research-fg",
-  "bg-tag-dev-bg text-tag-dev-fg",
-  "bg-tag-plan-bg text-tag-plan-fg",
+const STATUS_TABS: Array<{ id: StatusFilter; label: string }> = [
+  { id: "all", label: "All" },
+  { id: "needs-you", label: "Needs you" },
+  { id: "working", label: "Working" },
+  { id: "done", label: "Done" },
 ];
 
-function projectSkin(project: string): string {
-  let h = 0;
-  for (let i = 0; i < project.length; i++) h = (h * 31 + project.charCodeAt(i)) >>> 0;
-  return TAG_SKINS[h % TAG_SKINS.length];
-}
-
-export function BoardMetricsStrip({ metrics }: { metrics: BoardMetrics }) {
-  const settled = metrics.first_pass_count + metrics.auto_healed_count + metrics.needs_you_count;
-  const firstPassLabel = settled > 0 ? `${Math.round(metrics.first_pass_rate_pct)}%` : "—";
-  const effectiveLabel = settled > 0 ? `${Math.round(metrics.effective_pass_rate_pct)}% effective` : "awaiting runs";
-  const medianLabel = metrics.median_check_ms !== null ? formatDurationMs(metrics.median_check_ms) : "—";
-
-  return (
-    <section
-      aria-label="Board metrics"
-      data-testid="board-metrics-strip"
-      className="flex flex-wrap items-center gap-x-5 gap-y-2 border-b border-hairline bg-canvas/70 px-4 py-2 text-xs md:px-6"
-    >
-      <span className="order-1 inline-flex items-center gap-1.5 font-medium text-ink-2">
-        <Activity className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
-        <span>Telemetry</span>
-      </span>
-
-      <div className="order-3 flex w-full flex-wrap items-center gap-x-4 gap-y-1.5 font-mono tabular-nums md:order-2 md:w-auto">
-        <span className="inline-flex items-center gap-1.5 text-ink-2">
-          <span className="font-sans text-ink-3">First-pass</span>
-          <span className="font-medium text-ink" data-testid="metric-first-pass">{firstPassLabel}</span>
-          {settled > 0 && <span className="text-ink-3">({metrics.first_pass_count}/{settled})</span>}
-        </span>
-
-        <span className="inline-flex items-center gap-1.5 text-ink-2">
-          <Wrench className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
-          <span className="font-sans text-ink-3">Auto-healed</span>
-          <span
-            data-testid="metric-auto-healed"
-            className={cn(
-              "rounded-chip px-1.5 py-0.5 font-medium",
-              metrics.auto_healed_count > 0 ? "bg-pill-active-bg text-pill-active-fg" : "bg-track text-ink",
-            )}
-          >
-            {metrics.auto_healed_count}
-          </span>
-          <span className="hidden text-ink-3 sm:inline">{effectiveLabel}</span>
-        </span>
-
-        <span className="inline-flex items-center gap-1.5 text-ink-2">
-          <span className="font-sans text-ink-3">Median check</span>
-          <span className="font-medium text-ink" data-testid="metric-median-check">{medianLabel}</span>
-        </span>
-
-        <span className="inline-flex items-center gap-1.5 text-ink-2">
-          <span className="font-sans text-ink-3">Active / Max</span>
-          <span className="rounded-chip bg-track px-1.5 py-0.5 font-medium text-ink" data-testid="metric-slots">
-            {metrics.active_slots} / {metrics.max_parallel}
-          </span>
-          {metrics.queued_count > 0 && <span className="text-ink-3">· {metrics.queued_count} queued</span>}
-        </span>
-
-        {metrics.budget && (
-          <span className="inline-flex items-center gap-1.5 text-ink-2" data-testid="metric-budget">
-            <Gauge className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
-            <span className="font-sans text-ink-3">Daily budget</span>
-            <span
-              className={cn(
-                "rounded-chip px-1.5 py-0.5 font-medium",
-                metrics.budget.limit_reached
-                  ? "bg-pill-pro-bg text-destructive-foreground"
-                  : "bg-track text-ink",
-              )}
-            >
-              {metrics.budget.sessions_today} / {metrics.budget.daily_session_limit}
-            </span>
-          </span>
-        )}
-      </div>
-
-      {metrics.per_repo_breakdown.length > 0 && (
-        <div className="order-2 ml-auto md:order-3">
-          <Popover>
-            <PopoverTrigger className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-control border border-hairline bg-surface px-2.5 text-xs font-medium text-ink-2 outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:bg-raised hover:text-ink focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11 max-md:px-3">
-              <FolderGit2 className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
-              <span>By repo ({metrics.per_repo_breakdown.length})</span>
-            </PopoverTrigger>
-            <PopoverContent
-              align="end"
-              className="z-30 w-80 max-w-[calc(100%-24px)] rounded-card border border-hairline bg-surface p-3 text-ink shadow-lift"
-            >
-              <p className="mb-2 text-xs font-medium text-ink">Per-repository telemetry</p>
-              <ul className="divide-y divide-hairline font-mono text-xs tabular-nums">
-                {metrics.per_repo_breakdown.map((row) => (
-                  <li key={row.repo} className="flex items-center justify-between gap-2 py-1.5">
-                    <span className="min-w-0 truncate text-ink">{row.repo}</span>
-                    <span className="shrink-0 text-ink-2">
-                      {row.first_pass} pass · {row.auto_healed} heal · {row.needs_you} halt
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </PopoverContent>
-          </Popover>
-        </div>
-      )}
-    </section>
-  );
-}
-
-export function HeroVerifiedReceipt({
-  latest,
-  needsTop,
-  workingCount,
-  totalCount,
-  onInspect,
-  onMerge,
-  onRetry,
-}: {
-  latest: Session | null;
-  needsTop: Session | null;
-  workingCount: number;
-  totalCount: number;
-  onInspect: (id: string, tab?: TabId) => void;
-  onMerge: (s: Session) => Promise<void>;
-  onRetry: (id: string) => void;
-}) {
-  const [confirming, setConfirming] = useState(false);
-  const [merging, setMerging] = useState(false);
-
-  if (!latest) {
-    return (
-      <section
-        aria-label="Latest verified receipt"
-        data-answers="3"
-        className="border-b border-hairline bg-surface px-4 py-4 md:px-6"
-      >
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="min-w-0 space-y-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <Pill variant="secondary" className="py-0.5 text-xs">
-                <PillIndicator variant={needsTop ? "warning" : "info"} pulse={workingCount > 0} />
-                <span>{totalCount === 0 ? "No verified receipt yet" : "Awaiting verified receipt"}</span>
-              </Pill>
-              {workingCount > 0 && (
-                <span className="font-mono text-xs text-ink-2 tabular-nums">
-                  {plural(workingCount, "session")} in progress
-                </span>
-              )}
-            </div>
-            <p className="text-sm text-ink-2 [overflow-wrap:anywhere]">
-              {totalCount === 0
-                ? "Hand out a task with New session. Fleet runs the agent in an isolated git worktree and writes its receipt here only after your check command passes."
-                : needsTop
-                  ? `No check has passed yet — "${needsTop.task}" is waiting in Needs you.`
-                  : "Agents are working in isolated git worktrees. The first session whose check passes lands here with its diff and command receipt."}
-            </p>
-          </div>
-          {needsTop && (
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => onInspect(needsTop.id, "rc")}
-                className="max-md:min-h-11 max-md:px-4"
-              >
-                Inspect failure
-              </Button>
-              <Button size="sm" onClick={() => onRetry(needsTop.id)} className="max-md:min-h-11 max-md:px-4">
-                <RotateCcw className="size-4" strokeWidth={1.5} aria-hidden />Retry
-              </Button>
-            </div>
-          )}
-        </div>
-      </section>
-    );
-  }
-
-  const ds = diffStat(latest.diff);
-  const merged = latest.status === "merged";
-  const heroHeal = healBadgeInfo(latest);
-  const mergePrompt = latest.merge_target
-    ? `Merge ${latest.branch || "this branch"} into ${latest.merge_target}? Fleet refuses if the target is dirty.`
-    : `Merge ${latest.branch || "this branch"}? Fleet refuses if the target is dirty.`;
-
-  return (
-    <section
-      aria-label="Latest verified receipt"
-      data-answers="3"
-      className="border-b border-hairline bg-surface px-4 py-3 md:px-6 md:py-4"
-    >
-      <div className="relative rounded-card border border-hairline bg-canvas px-4 py-3.5 md:p-5">
-        <Corners size={9} />
-        <div className="flex flex-wrap items-center gap-2">
-          <Pill variant="success" className="py-0.5 text-xs font-medium">
-            <PillIndicator variant="success" />
-            <span>{merged ? "Latest receipt · merged" : "Latest verified receipt"}</span>
-          </Pill>
-          {heroHeal && (
-            <span className="inline-flex items-center gap-1 rounded-chip bg-pill-active-bg px-2 py-0.5 font-mono text-xs font-medium text-pill-active-fg">
-              <Wrench className="size-3" strokeWidth={1.5} aria-hidden />
-              <span>{heroHeal.fullLabel}</span>
-            </span>
-          )}
-          <span
-            className={cn(
-              "inline-flex items-center rounded-chip px-2 py-0.5 text-xs font-medium [overflow-wrap:anywhere]",
-              projectSkin(latest.project),
-            )}
-          >
-            {latest.project}
-          </span>
-          {latest.branch && (
-            <span className="inline-flex min-w-0 items-center gap-1 rounded-chip bg-track px-2 py-0.5 font-mono text-xs text-ink-2">
-              <GitBranch className="size-3.5 shrink-0 text-icon" strokeWidth={1.5} aria-hidden />
-              <span className="truncate">{latest.branch}</span>
-            </span>
-          )}
-          <span className="ml-auto hidden font-mono text-xs text-ink-3 sm:inline">
-            verified by: <span className="text-ink">{latest.check_cmd || "policy check"}</span>
-          </span>
-        </div>
-
-        <div className="mt-2.5 flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-          <div className="min-w-0 flex-1 space-y-2">
-            <h2 className="font-heading text-lg font-medium leading-snug text-ink md:text-[23px] [overflow-wrap:anywhere]">
-              {latest.task}
-            </h2>
-            <div className="flex flex-wrap items-center gap-x-4 gap-y-2 font-mono text-xs tabular-nums">
-              <span className="inline-flex min-w-0 items-center gap-1.5 border-l-2 border-dot-green pl-2.5 text-sm text-ink [overflow-wrap:anywhere]">
-                <CheckCircle2 className="size-4 shrink-0 text-success-foreground" strokeWidth={1.5} aria-hidden />
-                <span className="truncate">{receiptLine(latest)}</span>
-              </span>
-              <span className="rounded-chip bg-track px-2 py-0.5 text-ink-2">{plural(ds.files, "file")}</span>
-              <span className="rounded-chip bg-diff-add-bg px-2 py-0.5 font-medium text-diff-add-fg">+{ds.add}</span>
-              <span className="rounded-chip bg-diff-del-bg px-2 py-0.5 font-medium text-diff-del-fg">−{ds.del}</span>
-              <span className="text-ink-3 sm:hidden [overflow-wrap:anywhere]">
-                verified by: <span className="text-ink">{latest.check_cmd || "policy check"}</span>
-              </span>
-            </div>
-          </div>
-
-          {!confirming ? (
-            <div className="flex flex-wrap items-center gap-2 shrink-0">
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => onInspect(latest.id, "rc")}
-                className="max-md:min-h-11 max-md:px-3.5"
-              >
-                <Terminal className="size-4" strokeWidth={1.5} aria-hidden />Inspect receipt
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => onInspect(latest.id, "df")}
-                className="max-md:min-h-11 max-md:px-3.5"
-              >
-                <FileDiff className="size-4" strokeWidth={1.5} aria-hidden />View diff
-              </Button>
-              {!merged && (
-                <Button size="sm" onClick={() => setConfirming(true)} className="max-md:min-h-11 max-md:px-3.5">
-                  <GitMerge className="size-4" strokeWidth={1.5} aria-hidden />Merge
-                </Button>
-              )}
-            </div>
-          ) : (
-            <div
-              role="group"
-              aria-label="Confirm hero merge"
-              className="flex flex-wrap items-center gap-2 rounded-control border border-hairline bg-surface p-2.5"
-            >
-              <span className="text-xs text-ink-2 [overflow-wrap:anywhere]">{mergePrompt}</span>
-              <Button
-                size="sm"
-                disabled={merging}
-                onClick={async () => {
-                  setMerging(true);
-                  await onMerge(latest);
-                  setMerging(false);
-                  setConfirming(false);
-                }}
-                className="max-md:min-h-11 max-md:px-3.5"
-              >
-                {merging ? "Merging..." : "Merge now"}
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => setConfirming(false)}
-                className="max-md:min-h-11 max-md:px-3.5"
-              >
-                Keep it
-              </Button>
-            </div>
-          )}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-export function BoardFilterBulkBar({
-  viewMode,
+export function SessionInboxRail({
+  sessions,
+  allSessions,
+  unreachable,
+  selectedId,
   statusFilter,
   repoFilter,
-  engineFilter,
   repos,
-  engines,
-  hasActiveFilters,
+  query,
   multiSelect,
-  selectedIds,
-  visibleSessions,
+  bulkSelected,
   bulkBusy,
-  onViewMode,
+  onQuery,
   onStatusFilter,
   onRepoFilter,
-  onEngineFilter,
   onClearFilters,
   onToggleMultiSelect,
+  onToggleBulk,
   onSelectVisible,
   onClearSelection,
   onBulkRetry,
   onBulkDismiss,
   onBulkMerge,
+  onOpen,
+  onRetry,
+  onDismiss,
+  searchInputRef,
 }: {
-  viewMode: ViewMode;
+  sessions: Session[] | null;
+  allSessions: Session[];
+  unreachable: boolean;
+  selectedId: string | null;
   statusFilter: StatusFilter;
   repoFilter: string;
-  engineFilter: string;
   repos: string[];
-  engines: string[];
-  hasActiveFilters: boolean;
+  query: string;
   multiSelect: boolean;
-  selectedIds: Set<string>;
-  visibleSessions: Session[];
+  bulkSelected: Set<string>;
   bulkBusy: boolean;
-  onViewMode: (v: ViewMode) => void;
-  onStatusFilter: (s: StatusFilter) => void;
+  onQuery: (q: string) => void;
+  onStatusFilter: (f: StatusFilter) => void;
   onRepoFilter: (r: string) => void;
-  onEngineFilter: (e: string) => void;
   onClearFilters: () => void;
   onToggleMultiSelect: () => void;
+  onToggleBulk: (id: string) => void;
   onSelectVisible: () => void;
   onClearSelection: () => void;
-  onBulkRetry: (ids: string[]) => Promise<void>;
-  onBulkDismiss: (ids: string[]) => Promise<void>;
-  onBulkMerge: (ids: string[]) => Promise<void>;
+  onBulkRetry: (ids: string[]) => void;
+  onBulkDismiss: (ids: string[]) => void;
+  onBulkMerge: (ids: string[]) => void;
+  onOpen: (id: string, tab?: TabId) => void;
+  onRetry: (id: string) => void;
+  onDismiss: (id: string) => void;
+  searchInputRef: React.RefObject<HTMLInputElement | null>;
 }) {
-  const [confirmBulk, setConfirmBulk] = useState<"dismiss" | "merge" | null>(null);
+  const hasFilters = Boolean(query.trim() || statusFilter !== "all" || repoFilter);
+  const selectedArr = Array.from(bulkSelected);
+  const needsSelected = selectedArr.filter((id) => allSessions.find((s) => s.id === id)?.bucket === "needs-you");
+  const mergeableSelected = selectedArr.filter((id) => {
+    const s = allSessions.find((x) => x.id === id);
+    return Boolean(s && isVerified(s) && s.status === "done");
+  });
 
-  const selectedSessions = visibleSessions.filter((s) => selectedIds.has(s.id));
-  const retryable = selectedSessions.filter((s) => s.status === "needs-you").map((s) => s.id);
-  const dismissable = retryable;
-  const mergeable = selectedSessions.filter((s) => isVerified(s) && s.status === "done").map((s) => s.id);
+  const sorted = (sessions ?? []).slice().sort((a, b) => {
+    const rank = (s: Session) => (s.bucket === "needs-you" ? 0 : isActivelyRunning(s) ? 1 : isQueuedOrBlocked(s) ? 2 : 3);
+    return rank(a) - rank(b);
+  });
 
   return (
-    <section
-      aria-label="Filter and bulk actions"
-      className="border-b border-hairline bg-surface/80 px-4 py-2.5 md:px-6"
-    >
-      <div className="flex flex-wrap items-center gap-2">
-        <SegmentedControl aria-label="Filter by status" size="sm" className="max-w-full overflow-x-auto">
-          {(
-            [
-              ["all", "All"],
-              ["needs-you", "Needs you"],
-              ["working", "Working"],
-              ["queued", "Queued"],
-              ["done", "Done"],
-            ] as const
-          ).map(([id, label]) => (
-            <SegmentedControlItem
-              key={id}
-              aria-pressed={statusFilter === id}
-              data-checked={statusFilter === id ? "" : undefined}
-              onClick={() => onStatusFilter(id)}
-              className="whitespace-nowrap px-2.5 text-xs max-md:!min-h-11 max-md:!min-w-11"
-            >
-              {label}
-            </SegmentedControlItem>
-          ))}
-        </SegmentedControl>
-
-        {repos.length > 0 && (
-          <Popover>
-            <PopoverTrigger className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-control border border-hairline bg-canvas px-2.5 text-xs font-medium text-ink outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:bg-raised focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11 max-md:px-3">
-              <FolderGit2 className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
-              <span>{repoFilter || "All repos"}</span>
-            </PopoverTrigger>
-            <PopoverContent align="start" className="z-30 w-56 rounded-card border border-hairline bg-surface p-1 text-ink shadow-lift">
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={() => onRepoFilter("")}
-                className={cn("w-full justify-start text-xs max-md:min-h-11", !repoFilter && "bg-board font-medium")}
-              >
-                All repos
-              </Button>
-              {repos.map((r) => (
-                <Button
-                  key={r}
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => onRepoFilter(r)}
-                  className={cn("w-full justify-start font-mono text-xs max-md:min-h-11", repoFilter === r && "bg-board font-medium")}
-                >
-                  <span className="truncate">{r}</span>
-                </Button>
-              ))}
-            </PopoverContent>
-          </Popover>
-        )}
-
-        {engines.length > 0 && (
-          <Popover>
-            <PopoverTrigger className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-control border border-hairline bg-canvas px-2.5 text-xs font-medium text-ink outline-none transition-colors duration-(--dur-press) ease-(--ease-house) hover:bg-raised focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11 max-md:px-3">
-              <Cpu className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
-              <span>{engineFilter || "All engines"}</span>
-            </PopoverTrigger>
-            <PopoverContent align="start" className="z-30 w-48 rounded-card border border-hairline bg-surface p-1 text-ink shadow-lift">
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={() => onEngineFilter("")}
-                className={cn("w-full justify-start text-xs max-md:min-h-11", !engineFilter && "bg-board font-medium")}
-              >
-                All engines
-              </Button>
-              {engines.map((eng) => (
-                <Button
-                  key={eng}
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => onEngineFilter(eng)}
-                  className={cn("w-full justify-start font-mono text-xs max-md:min-h-11", engineFilter === eng && "bg-board font-medium")}
-                >
-                  {eng}
-                </Button>
-              ))}
-            </PopoverContent>
-          </Popover>
-        )}
-
-        {hasActiveFilters && (
+    <div className="flex h-full min-h-0 flex-col bg-[var(--board)]">
+      <div className="space-y-2 border-b border-[var(--hairline)] p-2.5">
+        <div className="flex items-center gap-2">
+          <Input
+            ref={searchInputRef}
+            type="search"
+            aria-label="Search sessions"
+            placeholder="Filter runs (/)"
+            value={query}
+            onChange={(e) => onQuery(e.target.value)}
+            className="flex-1 h-8 text-[13px]"
+          />
           <Button
             type="button"
             size="sm"
-            variant="ghost"
-            onClick={onClearFilters}
-            className="h-8 px-2 text-xs max-md:min-h-11 max-md:px-3"
-          >
-            <X className="size-3.5" strokeWidth={1.5} aria-hidden />
-            <span>Reset filters</span>
-          </Button>
-        )}
-
-        <div className="ml-auto flex flex-wrap items-center gap-2">
-          <SegmentedControl aria-label="Workspace view" size="sm">
-            <SegmentedControlItem
-              data-testid="view-toggle-board"
-              aria-pressed={viewMode === "board"}
-              data-checked={viewMode === "board" ? "" : undefined}
-              onClick={() => onViewMode("board")}
-              className="gap-1.5 whitespace-nowrap px-2.5 text-xs max-md:!min-h-11 max-md:!min-w-11"
-            >
-              <LayoutGrid className="size-3.5" strokeWidth={1.5} aria-hidden />
-              <span>Board</span>
-            </SegmentedControlItem>
-            <SegmentedControlItem
-              data-testid="view-toggle-dag"
-              aria-pressed={viewMode === "dag"}
-              data-checked={viewMode === "dag" ? "" : undefined}
-              onClick={() => onViewMode("dag")}
-              className="gap-1.5 whitespace-nowrap px-2.5 text-xs max-md:!min-h-11 max-md:!min-w-11"
-            >
-              <Network className="size-3.5" strokeWidth={1.5} aria-hidden />
-              <span>DAG Graph</span>
-            </SegmentedControlItem>
-          </SegmentedControl>
-
-          <Button
-            type="button"
-            size="sm"
-            variant={multiSelect ? "default" : "outline"}
+            variant={multiSelect ? "primary" : "outline"}
             aria-pressed={multiSelect}
-            onClick={() => {
-              setConfirmBulk(null);
-              onToggleMultiSelect();
-            }}
-            className="h-8 px-2.5 text-xs max-md:min-h-11 max-md:px-3"
+            onClick={onToggleMultiSelect}
+            aria-label="Select multiple sessions"
           >
             <CheckSquare className="size-3.5" strokeWidth={1.5} aria-hidden />
-            <span>{multiSelect ? `Selecting (${selectedIds.size})` : "Multi-select"}</span>
           </Button>
         </div>
+
+        <div className="flex flex-wrap items-center gap-1" role="group" aria-label="Status filter">
+          {STATUS_TABS.map((t) => {
+            const active = statusFilter === t.id;
+            return (
+              <button
+                key={t.id}
+                type="button"
+                aria-pressed={active}
+                onClick={() => onStatusFilter(t.id)}
+                className={cn(
+                  "inline-flex items-center justify-center rounded-[var(--radius-chip)] px-2.5 h-8 text-[12px] font-medium cursor-pointer transition active:bg-[var(--track)] max-md:min-h-11 max-md:min-w-11 max-md:px-3",
+                  "focus-visible:outline-2 focus-visible:outline-[var(--ring)]",
+                  active
+                    ? "bg-[var(--surface)] text-[var(--ink)] border border-[var(--input)]"
+                    : "text-[var(--ink-2)] border border-transparent hover:text-[var(--ink)] hover:bg-[var(--track)]",
+                )}
+              >
+                {t.label}
+              </button>
+            );
+          })}
+        </div>
+
+        {repos.length > 1 && (
+          <div className="flex items-center gap-2">
+            <select
+              aria-label="Filter by repository"
+              value={repoFilter}
+              onChange={(e) => onRepoFilter(e.target.value)}
+              className="w-full h-9 rounded-[var(--radius-chip)] border border-[var(--input)] bg-[var(--surface)] px-2.5 text-[12px] text-[var(--ink)] max-md:min-h-11"
+            >
+              <option value="">All repositories ({repos.length})</option>
+              {repos.map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </select>
+            {hasFilters && (
+              <Button type="button" size="sm" variant="ghost" onClick={onClearFilters} aria-label="Reset filters">
+                <X className="size-3.5" strokeWidth={1.5} />
+              </Button>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="flex-1 min-h-0 overflow-y-auto" aria-label="Session lanes">
+        {sessions === null ? (
+          <div className="p-4 text-[13px] text-[var(--ink-2)]">
+            {unreachable ? (
+              <p role="status">Fleet has not answered yet. Retrying in the background.</p>
+            ) : (
+              <p>Loading sessions...</p>
+            )}
+          </div>
+        ) : sorted.length === 0 ? (
+          <div className="p-4 text-[13px] text-[var(--ink-2)] space-y-2">
+            <p role="status">
+              {allSessions.length === 0
+                ? "No sessions yet. Plan a goal or launch a run."
+                : `No session matches ${query.trim() ? `"${query.trim()}"` : "active filters"}.`}
+            </p>
+            {hasFilters && (
+              <Button type="button" size="sm" variant="outline" onClick={onClearFilters}>
+                Clear filters
+              </Button>
+            )}
+          </div>
+        ) : (
+          <div className="divide-y divide-[var(--hairline)]">
+            {sorted.map((s) => {
+              const isSelected = selectedId === s.id;
+              const ds = diffStat(s.diff);
+              const verified = isVerified(s);
+              const failed = isFailed(s);
+              const running = isActivelyRunning(s);
+              const queued = isQueuedOrBlocked(s);
+              const heal = healBadgeInfo(s);
+              const tail = running && s.transcript.length > 0 ? s.transcript[s.transcript.length - 1] : "";
+              const checked = bulkSelected.has(s.id);
+              const tone = verified ? "green" : failed ? "red" : running ? "blue" : queued ? "amber" : "muted";
+
+              return (
+                <article
+                  key={s.id}
+                  aria-label={s.task || "Untitled session"}
+                  className={cn(
+                    "group relative px-3 py-2 transition",
+                    isSelected ? "bg-[var(--blue-soft)]" : "hover:bg-[var(--surface)]/80",
+                  )}
+                >
+                  {isSelected && (
+                    <span
+                      aria-hidden="true"
+                      className="absolute inset-y-1 left-0 w-[3px] rounded-r bg-[var(--blue)]"
+                    />
+                  )}
+
+                  <div className="flex items-start gap-2">
+                    {multiSelect && (
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        aria-label={`Select ${s.task}`}
+                        onChange={() => onToggleBulk(s.id)}
+                        className="mt-1 size-4 shrink-0 accent-[var(--blue)]"
+                      />
+                    )}
+                    <div className="min-w-0 flex-1 space-y-0.5">
+                      <div className="flex items-center gap-1.5 text-[12px] text-[var(--ink-3)]">
+                        <StatusDot tone={tone} pulse={running} />
+                        <span className="truncate font-medium text-[var(--ink-2)]">{s.project}</span>
+                        <span className="ml-auto shrink-0 mono">{s.id}</span>
+                      </div>
+
+                      <p className="text-[14px] font-medium leading-snug text-[var(--ink)] [overflow-wrap:anywhere]">
+                        {s.task}
+                      </p>
+
+                      {tail && (
+                        <p data-testid="live-tail" className="mono text-[12px] text-[var(--ink-3)] break-words">
+                          {tail.length > 72 ? `${tail.slice(0, 69)}...` : tail}
+                        </p>
+                      )}
+
+                      {s.status === "needs-you" && s.reason && (
+                        <p
+                          className={cn(
+                            "text-[12px] break-words",
+                            failed ? "text-[var(--destructive-foreground)]" : "text-[var(--info-foreground)]",
+                          )}
+                        >
+                          {s.reason.length > 88 ? `${s.reason.slice(0, 85)}...` : s.reason}
+                        </p>
+                      )}
+
+                      <div className="pt-0.5 flex flex-wrap items-center gap-2 mono text-[12px]">
+                        <span className="text-[var(--ink-3)]">
+                          {verified ? (s.status === "merged" ? "merged" : "verified") : statusText(s)}
+                        </span>
+                        {heal && (
+                          <span className="rounded-[var(--radius-chip)] bg-[var(--ok-soft)] px-1.5 py-0.5 text-[var(--success-foreground)]">
+                            {heal.shortLabel}
+                          </span>
+                        )}
+                        {ds.files > 0 && (
+                          <span className="inline-flex items-center gap-1">
+                            <span className="text-[var(--diff-add-fg)]">+{ds.add}</span>
+                            <span className="text-[var(--diff-del-fg)]">-{ds.del}</span>
+                          </span>
+                        )}
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant={isSelected ? "primary" : "ghost"}
+                          data-open={s.id}
+                          aria-label={`Open ${s.task}`}
+                          onClick={() => onOpen(s.id, "tr")}
+                          className="ml-auto font-sans"
+                        >
+                          {isSelected ? "Active" : "Open"}
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {s.bucket === "needs-you" && (
+                    <div className="mt-2 flex items-center gap-1.5">
+                      <Button type="button" size="sm" variant="outline" onClick={() => onRetry(s.id)}>
+                        <RotateCcw className="size-3.5" strokeWidth={1.5} aria-hidden />
+                        <span>Retry</span>
+                      </Button>
+                      <Button type="button" size="sm" variant="ghost" onClick={() => onDismiss(s.id)}>
+                        Dismiss
+                      </Button>
+                    </div>
+                  )}
+                </article>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {multiSelect && (
         <div
-          role="region"
-          aria-label="Bulk selection controls"
-          className="mt-2.5 flex flex-wrap items-center gap-2 border-t border-hairline pt-2.5"
+          data-testid="bulk-action-bar"
+          className="border-t border-[var(--hairline)] bg-[var(--surface)] p-2.5 space-y-2"
         >
-          <span className="font-mono text-xs tabular-nums text-ink-2">
-            {selectedIds.size} selected
+          <div className="flex items-center justify-between text-[12px] text-[var(--ink-2)]">
+            <span className="mono">{bulkSelected.size} selected</span>
+            <div className="flex items-center gap-1.5">
+              <Button type="button" size="sm" variant="ghost" onClick={onSelectVisible}>
+                All
+              </Button>
+              <Button type="button" size="sm" variant="ghost" onClick={onClearSelection}>
+                None
+              </Button>
+            </div>
+          </div>
+          {bulkSelected.size > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {needsSelected.length > 0 && (
+                <>
+                  <Button type="button" size="sm" variant="outline" disabled={bulkBusy} onClick={() => onBulkRetry(needsSelected)}>
+                    Retry ({needsSelected.length})
+                  </Button>
+                  <Button type="button" size="sm" variant="ghost" disabled={bulkBusy} onClick={() => onBulkDismiss(needsSelected)}>
+                    Dismiss ({needsSelected.length})
+                  </Button>
+                </>
+              )}
+              {mergeableSelected.length > 0 && (
+                <Button type="button" size="sm" variant="primary" disabled={bulkBusy} onClick={() => onBulkMerge(mergeableSelected)}>
+                  Merge ({mergeableSelected.length})
+                </Button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function GoalLaunchpad({
+  repos,
+  playbooks,
+  policy,
+  supportsServerV050,
+  onDispatched,
+  onApplyPlaybook,
+}: {
+  repos: RepoInfo[];
+  playbooks: PlaybookTemplate[];
+  policy: Policy | null;
+  supportsServerV050: boolean;
+  onDispatched: (created: Session[]) => void;
+  onApplyPlaybook: (tpl: PlaybookTemplate) => void;
+}) {
+  const [goal, setGoal] = useState("");
+  const [selectedRepo, setSelectedRepo] = useState("");
+  const [planning, setPlanning] = useState(false);
+  const [dispatching, setDispatching] = useState(false);
+  const [planned, setPlanned] = useState<GoalPlanTask[] | null>(null);
+
+  const activeRepo = selectedRepo || repos[0]?.path || "/workspace/ledger-kit";
+
+  const handlePlan = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!goal.trim() || planning) return;
+    setPlanning(true);
+    const res = await planGoal({ goal: goal.trim(), repo: activeRepo });
+    setPlanned(res.tasks);
+    setPlanning(false);
+  };
+
+  const handleLaunch = async () => {
+    if (!planned || planned.length === 0 || dispatching) return;
+    setDispatching(true);
+    const items = planned.map((t, idx) => ({
+      alias: t.alias || `#${idx + 1}`,
+      repo: t.repo || activeRepo,
+      project: repoBasename(t.repo || activeRepo) || "default",
+      task: t.task,
+      check: t.check,
+      depends_on: t.depends_on,
+      allowed_globs: t.allowed_globs,
+      forbidden_globs: t.forbidden_globs,
+      auto_steer_budget: t.auto_steer_budget ?? policy?.auto_steer_budget ?? 2,
+    }));
+    const res = await dispatchBatchSessions(items, supportsServerV050);
+    setDispatching(false);
+    if (res.created.length > 0) {
+      toast.success(`Dispatched ${res.created.length} isolated worktree ${res.created.length === 1 ? "run" : "runs"}.`);
+      setGoal("");
+      setPlanned(null);
+      onDispatched(res.created);
+    } else {
+      toast.error(res.errors.join(" ") || "Could not dispatch planned tasks.");
+    }
+  };
+
+  return (
+    <div data-testid="goal-launchpad" className="mx-auto max-w-3xl w-full space-y-6 py-4">
+      <div className="space-y-1.5">
+        <h2 className="text-[20px] font-semibold text-[var(--ink)]">Goal to parallel worktrees</h2>
+        <p className="text-[14px] text-[var(--ink-2)]">
+          Describe an outcome. Fleet splits it into isolated worktree tasks, checks every change automatically, and opens a reviewable diff.
+        </p>
+      </div>
+
+      <form onSubmit={handlePlan} className="space-y-3 rounded-[var(--radius-panel)] border border-[var(--hairline)] bg-[var(--board)] p-4">
+        {repos.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="inline-flex items-center gap-1.5 text-[12px] font-medium text-[var(--ink-2)] mr-1">
+              <FolderGit2 className="size-3.5 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
+              <span>Repository:</span>
+            </span>
+            {repos.slice(0, 6).map((r) => (
+              <Button
+                key={r.path}
+                type="button"
+                size="sm"
+                variant={activeRepo === r.path ? "primary" : "outline"}
+                onClick={() => setSelectedRepo(r.path)}
+                className="mono"
+              >
+                {r.name}
+              </Button>
+            ))}
+          </div>
+        )}
+
+        <Textarea
+          id="launchpad-goal"
+          aria-label="Goal description"
+          rows={3}
+          value={goal}
+          onChange={(e) => setGoal(e.target.value)}
+          placeholder="Example: Add input validation to createLedger; write edge-case tests; then verify ledger formatting"
+        />
+
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-[12px] text-[var(--ink-3)]">
+            Separate parallel steps with semicolons or newlines; use &quot;then&quot; for sequential DAG waves.
           </span>
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            onClick={onSelectVisible}
-            className="h-8 px-2.5 text-xs max-md:min-h-11"
-          >
-            Select visible ({visibleSessions.length})
+          <Button type="submit" variant="primary" size="md" disabled={planning || !goal.trim()}>
+            <Sparkles className="size-4" strokeWidth={1.5} aria-hidden />
+            <span>{planning ? "Planning..." : "Plan DAG"}</span>
           </Button>
-          {selectedIds.size > 0 && (
+        </div>
+      </form>
+
+      {planned && planned.length > 0 && (
+        <div data-testid="planned-dag-preview" className="space-y-3 rounded-[var(--radius-panel)] border border-[var(--hairline-s)] bg-[var(--surface)] p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-[15px] font-semibold text-[var(--ink)]">
+              Planned execution graph ({planned.length} {planned.length === 1 ? "task" : "tasks"})
+            </h3>
+            <Button type="button" variant="primary" size="md" disabled={dispatching} onClick={() => void handleLaunch()}>
+              <Play className="size-4" strokeWidth={1.5} aria-hidden />
+              <span>{dispatching ? "Launching..." : `Launch ${planned.length} worktree ${planned.length === 1 ? "run" : "runs"}`}</span>
+            </Button>
+          </div>
+          <ol className="space-y-2">
+            {planned.map((t, idx) => (
+              <li key={idx} className="flex flex-wrap items-center gap-2.5 rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--canvas)] p-3">
+                <Badge tone="info" className="mono">{t.alias}</Badge>
+                <input
+                  aria-label={`Planned task ${t.alias}`}
+                  value={t.task}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setPlanned((prev) => prev?.map((row, k) => (k === idx ? { ...row, task: val } : row)) ?? null);
+                  }}
+                  className="min-w-0 flex-1 bg-transparent text-[14px] text-[var(--ink)] outline-none focus-visible:underline"
+                />
+                {t.depends_on && t.depends_on.length > 0 && (
+                  <Badge tone="neutral" className="mono">
+                    after {t.depends_on.join(", ")}
+                  </Badge>
+                )}
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
+
+      {playbooks.length > 0 && (
+        <section aria-label="Quick playbooks" className="space-y-2.5">
+          <div className="flex items-center gap-2 text-[13px] font-medium text-[var(--ink-2)]">
+            <BookMarked className="size-4 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
+            <span>Playbooks</span>
+          </div>
+          <div className="grid gap-2.5 sm:grid-cols-2">
+            {playbooks.slice(0, 4).map((tpl) => (
+              <button
+                key={tpl.id}
+                type="button"
+                onClick={() => onApplyPlaybook(tpl)}
+                className="flex flex-col items-start gap-1 rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--board)] p-3 text-left cursor-pointer transition hover:border-[var(--hairline-s)] hover:bg-[var(--surface)] max-md:min-h-11"
+              >
+                <div className="flex w-full items-center justify-between gap-2">
+                  <span className="text-[14px] font-medium text-[var(--ink)]">{tpl.name}</span>
+                  <Badge tone="neutral" className="mono">
+                    {(tpl.tasks?.length ?? 1) > 1 ? `${tpl.tasks!.length} waves` : "single"}
+                  </Badge>
+                </div>
+                <p className="text-[12px] text-[var(--ink-2)] line-clamp-2">{tpl.description}</p>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
+export function RightInspectorRail({
+  session,
+  mergeCheck,
+  checkingMerge,
+  supportsServerV050,
+  onRecheckMerge,
+  onOpenTab,
+  onOpenPrPreview,
+}: {
+  session: Session | null;
+  mergeCheck: MergeCheckResult | null;
+  checkingMerge: boolean;
+  supportsServerV050: boolean;
+  onRecheckMerge: () => void;
+  onOpenTab: (tab: TabId) => void;
+  onOpenPrPreview: (s: Session) => void;
+}) {
+  if (!session) {
+    return (
+      <aside aria-label="Session inspector" className="flex h-full flex-col justify-center bg-[var(--board)] p-5 text-[13px] text-[var(--ink-3)]">
+        <p>Select a run from the inbox to inspect its isolated worktree, verification steps, and PR readiness.</p>
+      </aside>
+    );
+  }
+
+  const healBadge = healBadgeInfo(session);
+  const ds = diffStat(session.diff);
+  const steps = session.check_steps ?? [];
+  const conflictCount = mergeCheck?.conflicting_files.length ?? 0;
+  const ranCheck = session.check_ran !== undefined ? Boolean(session.check_ran) : session.check_passed === true || session.check_passed === false;
+
+  const handlePatch = async () => {
+    const res = await downloadSessionPatch(session, supportsServerV050);
+    if (res.ok) toast.success(`Downloaded ${res.filename}`);
+    else toast.error(res.error || "Could not export patch.");
+  };
+
+  return (
+    <aside aria-label="Session inspector" className="flex h-full min-h-0 flex-col overflow-y-auto bg-[var(--board)] p-4 space-y-5">
+      <section className="space-y-2.5">
+        <div className="flex items-center justify-between gap-2">
+          <h3 className="text-[13px] font-semibold text-[var(--ink)]">Worktree</h3>
+          {healBadge && (
+            <Badge
+              tone={healBadge.tone === "healed" ? "success" : healBadge.tone === "healing" ? "warning" : "danger"}
+              className="mono"
+              data-testid="inspector-heal-badge"
+            >
+              <Wrench className="size-3" strokeWidth={1.5} aria-hidden />
+              <span>{healBadge.fullLabel}</span>
+            </Badge>
+          )}
+        </div>
+        <dl className="space-y-2 rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--surface)] p-3 text-[12px]">
+          <div>
+            <dt className="text-[var(--ink-3)]">Branch</dt>
+            <dd className="mt-0.5 flex items-center gap-1.5 mono text-[var(--ink)] break-all">
+              <GitBranch className="size-3.5 shrink-0 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
+              <span>{session.branch || "none"}</span>
+            </dd>
+          </div>
+          {session.merge_target && (
+            <div>
+              <dt className="text-[var(--ink-3)]">Target</dt>
+              <dd className="mt-0.5 mono text-[var(--ink)]">{session.merge_target}</dd>
+            </div>
+          )}
+          {session.repo && (
+            <div>
+              <dt className="text-[var(--ink-3)]">Repository</dt>
+              <dd className="mt-0.5 mono text-[var(--ink-2)] break-all">{session.repo}</dd>
+            </div>
+          )}
+          {session.model && (
+            <div>
+              <dt className="text-[var(--ink-3)]">Model</dt>
+              <dd className="mt-0.5 mono text-[var(--ink)] break-all">{session.model}</dd>
+            </div>
+          )}
+          {session.allowed_globs && session.allowed_globs.length > 0 && (
+            <div>
+              <dt className="text-[var(--ink-3)] flex items-center gap-1">
+                <Shield className="size-3 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
+                <span>Allowed scope</span>
+              </dt>
+              <dd className="mt-0.5 mono text-[var(--ink-2)] break-all">{session.allowed_globs.join(", ")}</dd>
+            </div>
+          )}
+        </dl>
+      </section>
+
+      <section className="space-y-2.5 border-t border-[var(--hairline)] pt-4">
+        <div className="flex items-center justify-between gap-2">
+          <h3 className="text-[13px] font-semibold text-[var(--ink)]">Verification</h3>
+          <Button type="button" size="sm" variant="ghost" onClick={() => onOpenTab("rc")}>
+            View receipt
+          </Button>
+        </div>
+
+        <div className="rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--surface)] p-3 space-y-2">
+          {steps.length > 0 ? (
+            <ul className="space-y-1.5">
+              {steps.map((st, idx) => {
+                const passed = st.status === "passed" || st.passed === true;
+                const failed = st.status === "failed" || st.passed === false;
+                return (
+                  <li key={`${st.name}-${idx}`} className="flex items-center justify-between gap-2 text-[12px]">
+                    <span className="inline-flex min-w-0 items-center gap-1.5">
+                      {passed ? (
+                        <CheckCircle2 className="size-3.5 shrink-0 text-[var(--success-foreground)]" strokeWidth={1.5} aria-hidden />
+                      ) : failed ? (
+                        <XCircle className="size-3.5 shrink-0 text-[var(--destructive-foreground)]" strokeWidth={1.5} aria-hidden />
+                      ) : (
+                        <Clock className="size-3.5 shrink-0 text-[var(--icon)]" strokeWidth={1.5} aria-hidden />
+                      )}
+                      <span className="truncate font-medium text-[var(--ink)]">{st.name}</span>
+                    </span>
+                    <span className="shrink-0 mono text-[var(--ink-3)]">
+                      {st.elapsed_ms !== null ? formatDurationMs(st.elapsed_ms) : st.status}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          ) : (
+            <p className="text-[12px] text-[var(--ink-2)] [overflow-wrap:anywhere]">
+              {ranCheck ? receiptLine(session) : "Check executes automatically once the agent finishes."}
+            </p>
+          )}
+        </div>
+      </section>
+
+      <section className="space-y-2.5 border-t border-[var(--hairline)] pt-4">
+        <div className="flex items-center justify-between gap-2">
+          <h3 className="text-[13px] font-semibold text-[var(--ink)]">Diff and PR</h3>
+          <Button type="button" size="sm" variant="ghost" onClick={() => onOpenTab("df")}>
+            <FileDiff className="size-3.5" strokeWidth={1.5} aria-hidden />
+            <span>Diff</span>
+          </Button>
+        </div>
+
+        <div className="rounded-[var(--radius)] border border-[var(--hairline)] bg-[var(--surface)] p-3 space-y-2.5 text-[12px]">
+          <div className="flex items-center justify-between gap-2 mono">
+            <span className="text-[var(--ink-2)]">
+              {ds.files} {ds.files === 1 ? "file" : "files"}
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="text-[var(--diff-add-fg)]">+{ds.add}</span>
+              <span className="text-[var(--diff-del-fg)]">-{ds.del}</span>
+            </span>
+          </div>
+
+          {session.status !== "merged" && (
+            <div className="flex items-center justify-between gap-2">
+              <Badge tone={!mergeCheck ? "neutral" : mergeCheck.clean ? "success" : "danger"} className="mono">
+                {!mergeCheck
+                  ? checkingMerge
+                    ? "Checking..."
+                    : "Not checked"
+                  : mergeCheck.clean
+                    ? "Clean merge"
+                    : `${conflictCount || 1} ${conflictCount === 1 ? "conflict" : "conflicts"}`}
+              </Badge>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                aria-label="Re-check merge status"
+                disabled={checkingMerge}
+                onClick={onRecheckMerge}
+              >
+                <RefreshCw className={cn("size-3.5", checkingMerge && "animate-spin")} strokeWidth={1.5} />
+              </Button>
+            </div>
+          )}
+
+          <div className="flex flex-col gap-2 pt-1">
+            {session.branch && (
+              <Button
+                type="button"
+                variant="primary"
+                size="sm"
+                data-testid="open-pr-preview"
+                onClick={() => onOpenPrPreview(session)}
+                className="w-full"
+              >
+                <GitPullRequest className="size-3.5" strokeWidth={1.5} aria-hidden />
+                <span>PR preview</span>
+              </Button>
+            )}
             <Button
               type="button"
+              variant="outline"
               size="sm"
-              variant="ghost"
-              onClick={() => {
-                setConfirmBulk(null);
-                onClearSelection();
-              }}
-              className="h-8 px-2.5 text-xs max-md:min-h-11"
+              disabled={ds.files === 0}
+              onClick={() => void handlePatch()}
+              className="w-full"
             >
-              Clear
+              <Download className="size-3.5" strokeWidth={1.5} aria-hidden />
+              <span>Export .patch</span>
             </Button>
-          )}
-
-          {!confirmBulk ? (
-            <div className="ml-auto flex flex-wrap items-center gap-2">
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                disabled={bulkBusy || retryable.length === 0}
-                onClick={() => void onBulkRetry(retryable)}
-                className="h-8 px-2.5 text-xs max-md:min-h-11"
-              >
-                <RotateCcw className="size-3.5" strokeWidth={1.5} aria-hidden />
-                <span>Bulk Retry ({retryable.length})</span>
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                disabled={bulkBusy || dismissable.length === 0}
-                onClick={() => setConfirmBulk("dismiss")}
-                className="h-8 px-2.5 text-xs max-md:min-h-11"
-              >
-                <X className="size-3.5" strokeWidth={1.5} aria-hidden />
-                <span>Bulk Dismiss ({dismissable.length})</span>
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                disabled={bulkBusy || mergeable.length === 0}
-                onClick={() => setConfirmBulk("merge")}
-                className="h-8 px-2.5 text-xs max-md:min-h-11"
-              >
-                <GitMerge className="size-3.5" strokeWidth={1.5} aria-hidden />
-                <span>Bulk Merge ({mergeable.length})</span>
-              </Button>
-            </div>
-          ) : (
-            <div
-              role="group"
-              aria-label="Confirm bulk action"
-              className="ml-auto flex flex-wrap items-center gap-2 rounded-control border border-hairline bg-canvas px-2.5 py-1.5"
-            >
-              <span className="text-xs text-ink-2">
-                {confirmBulk === "merge"
-                  ? `Merge ${mergeable.length} clean verified ${mergeable.length === 1 ? "session" : "sessions"}?`
-                  : `Dismiss ${dismissable.length} Needs-you ${dismissable.length === 1 ? "session" : "sessions"}?`}
-              </span>
-              <Button
-                type="button"
-                size="sm"
-                variant={confirmBulk === "merge" ? "default" : "destructive-outline"}
-                disabled={bulkBusy}
-                onClick={async () => {
-                  const action = confirmBulk;
-                  setConfirmBulk(null);
-                  if (action === "merge") await onBulkMerge(mergeable);
-                  else await onBulkDismiss(dismissable);
-                }}
-                className="h-8 px-2.5 text-xs max-md:min-h-11"
-              >
-                {confirmBulk === "merge" ? "Merge selected" : "Dismiss selected"}
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={() => setConfirmBulk(null)}
-                className="h-8 px-2.5 text-xs max-md:min-h-11"
-              >
-                Cancel
-              </Button>
-            </div>
-          )}
+          </div>
         </div>
-      )}
-    </section>
+      </section>
+    </aside>
   );
 }
 
-const TAIL_LINES = 2;
-function RunningTail({ s }: { s: Session }) {
-  const lines = Array.isArray(s.transcript) ? s.transcript : [];
-  const from = Math.max(0, lines.length - TAIL_LINES);
-  return (
-    <div className="rounded-control border border-hairline bg-board p-2.5">
-      <ol
-        aria-label={`Newest lines of the transcript of ${s.task}`}
-        className="space-y-1 font-mono text-xs leading-relaxed text-ink-2"
-      >
-        {lines.length === 0 && <li>Waiting for first output line...</li>}
-        {lines.slice(from).map((l, i) => (
-          <li key={from + i} className="break-words">
-            {l}
-          </li>
-        ))}
-      </ol>
-    </div>
-  );
-}
-
-function SessionCard({
-  s,
-  selected,
-  bulkMode,
-  bulkChecked,
-  isLatestHero,
-  onOpen,
-  onToggleCheck,
-  onRetry,
-  onDismiss,
+export function BoardMetricsStrip({
+  metrics,
+  streamLabel,
+  reachable,
 }: {
-  s: Session;
-  selected: boolean;
-  bulkMode: boolean;
-  bulkChecked: boolean;
-  isLatestHero: boolean;
-  onOpen: (tab?: TabId) => void;
-  onToggleCheck: () => void;
-  onRetry: () => void;
-  onDismiss: () => void;
+  metrics: BoardMetrics;
+  streamLabel: string;
+  reachable: boolean;
 }) {
-  const ds = diffStat(s.diff);
-  const running = isActivelyRunning(s);
-  const verified = isVerified(s);
-  const honest = isHonest(s);
-  const failed = isFailed(s);
-  const badgeVariant = verified
-    ? "success"
-    : failed
-      ? "error"
-      : s.bucket === "needs-you"
-        ? "info"
-        : isQueuedOrBlocked(s)
-          ? "warning"
-          : s.bucket === "done"
-            ? "success"
-            : "secondary";
-
-  const stepSummary =
-    s.check_steps && s.check_steps.length > 1
-      ? `${s.check_steps.filter((st) => st.status === "passed" || st.passed === true).length}/${s.check_steps.length} steps`
-      : null;
-  const healBadge = healBadgeInfo(s);
-
   return (
-    <motion.article
-      layout
-      layoutId={"card-" + s.id}
-      transition={layout}
-      aria-label={s.task}
-      className={cn(
-        "relative flex min-w-0 flex-col gap-2.5 overflow-hidden rounded-card border p-3.5 transition-colors duration-(--dur-press) ease-(--ease-house) md:p-4",
-        bulkChecked
-          ? "border-blue bg-blue-soft/35"
-          : selected
-            ? "border-ink bg-raised"
-            : "border-hairline bg-surface hover:bg-raised",
-      )}
+    <section
+      aria-label="Scan"
+      data-testid="board-metrics-strip"
+      className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-t border-[var(--hairline)] bg-[var(--surface)] px-4 py-1.5 text-[12px] text-[var(--ink-2)]"
     >
-      {running && <BorderTrail className="bg-ink" size={110} />}
-
-      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-        {bulkMode && (
-          <button
-            type="button"
-            role="checkbox"
-            aria-checked={bulkChecked}
-            aria-label={`Select session ${s.task}`}
-            onClick={onToggleCheck}
-            className={cn(
-              "inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-chip border outline-none transition-colors duration-(--dur-press) ease-(--ease-house) focus-visible:ring-2 focus-visible:ring-ring max-md:size-11",
-              bulkChecked
-                ? "border-blue bg-blue text-blue-fg"
-                : "border-edge bg-canvas text-ink-2 hover:bg-raised",
-            )}
-          >
-            {bulkChecked ? (
-              <Check className="size-3.5" strokeWidth={2} aria-hidden />
-            ) : (
-              <Square className="size-3.5 text-icon" strokeWidth={1.5} aria-hidden />
-            )}
-          </button>
-        )}
-        <span
-          className={cn(
-            "inline-flex max-w-full truncate rounded-chip px-2 py-0.5 text-xs font-medium",
-            projectSkin(s.project),
-          )}
-        >
-          {s.project}
+      <div className="flex flex-wrap items-center gap-4">
+        <span className="inline-flex items-center gap-1.5" data-testid="stream-pill">
+          <StatusDot tone={reachable ? "green" : "amber"} />
+          <span className="mono">{streamLabel}</span>
         </span>
-        {isLatestHero && (
-          <span className="rounded-chip bg-track px-1.5 py-0.5 font-mono text-xs text-ink-2">hero</span>
-        )}
-        {s.depends_on && s.depends_on.length > 0 && (
-          <span className="inline-flex items-center gap-1 rounded-chip bg-track px-1.5 py-0.5 font-mono text-xs text-ink-2">
-            <GitBranch className="size-3 text-icon" strokeWidth={1.5} aria-hidden />
-            <span>{s.depends_on.length} dep{s.depends_on.length === 1 ? "" : "s"}</span>
+        <span data-testid="concurrency-indicator" className="mono">
+          {metrics.active_slots} / {metrics.max_parallel} slots
+        </span>
+        <span>
+          First-pass{" "}
+          <span className="mono font-medium text-[var(--ink)]">
+            {metrics.total > 0 ? `${Math.round(metrics.first_pass_rate_pct)}%` : "n/a"}
           </span>
-        )}
-        {healBadge && (
+        </span>
+        <span>
+          Auto-healed{" "}
+          <span data-testid="metric-auto-healed" className="mono font-medium text-[var(--ink)]">
+            {metrics.auto_healed_count}
+          </span>
+        </span>
+        <span>
+          Median check{" "}
+          <span className="mono font-medium text-[var(--ink)]">
+            {metrics.median_check_ms !== null ? formatDurationMs(metrics.median_check_ms) : "n/a"}
+          </span>
+        </span>
+      </div>
+
+      {metrics.budget && (
+        <div className="flex items-center gap-3 mono">
           <span
-            data-testid="card-heal-badge"
             className={cn(
-              "inline-flex items-center gap-1 rounded-chip px-1.5 py-0.5 font-mono text-xs font-medium",
-              healBadge.tone === "healed"
-                ? "bg-pill-active-bg text-pill-active-fg"
-                : healBadge.tone === "healing"
-                  ? "bg-pill-warn-bg text-pill-warn-fg"
-                  : "bg-pill-pro-bg text-pill-pro-fg",
+              metrics.budget.limit_reached ? "text-[var(--destructive-foreground)] font-medium" : "text-[var(--ink-2)]",
             )}
           >
-            <Wrench className="size-3" strokeWidth={1.5} aria-hidden />
-            <span>{healBadge.shortLabel}</span>
+            Budget {metrics.budget.sessions_today} / {metrics.budget.daily_session_limit}
           </span>
-        )}
-        <Badge variant={badgeVariant} size="sm" className="ml-auto shrink-0">
-          {verified ? (s.status === "merged" ? "merged" : "verified") : statusText(s)}
-        </Badge>
-      </div>
-
-      <Button
-        variant="ghost"
-        data-open={s.id}
-        aria-current={selected ? "true" : undefined}
-        aria-label={`Open ${s.task}`}
-        onClick={() => onOpen("tr")}
-        className="h-auto sm:h-auto min-h-11 w-full justify-start whitespace-normal px-1.5 py-1.5 text-left font-heading text-[15px] font-medium leading-snug text-ink hover:bg-board [overflow-wrap:anywhere]"
-      >
-        <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{s.task}</span>
-      </Button>
-
-      {s.bucket === "needs-you" && (
-        <div className="space-y-2">
-          {honest ? (
-            <p className="rounded-control bg-pill-warn-bg px-2.5 py-1.5 text-xs font-medium text-pill-warn-fg [overflow-wrap:anywhere]">
-              {HONEST}
-            </p>
-          ) : null}
-          {s.guardrail_violations && s.guardrail_violations.length > 0 && (
-            <p className="inline-flex items-center gap-1.5 rounded-control bg-pill-pro-bg px-2 py-1 text-xs font-medium text-destructive-foreground">
-              <ShieldAlert className="size-3.5 shrink-0" strokeWidth={1.5} aria-hidden />
-              <span>File-scope guardrail blocked ({s.guardrail_violations.length})</span>
-            </p>
-          )}
-          <p
-            className={cn(
-              "text-sm leading-relaxed [overflow-wrap:anywhere]",
-              failed ? "text-destructive-foreground" : "text-info-foreground",
-            )}
-          >
-            {s.reason || "Stopped and waiting on your review."}
-          </p>
-          {s.check_cmd && (
-            <p className="truncate font-mono text-xs text-ink-3">
-              check: <span className="text-ink-2">{s.check_cmd}</span>
-            </p>
-          )}
-          <div className="flex flex-wrap items-center gap-2 pt-0.5">
-            <Button size="sm" variant="outline" onClick={onRetry} className="max-md:min-h-11 max-md:px-3.5">
-              <RotateCcw className="size-3.5" strokeWidth={1.5} aria-hidden />Retry
-            </Button>
-            <Button size="sm" variant="ghost" onClick={onDismiss} className="max-md:min-h-11 max-md:px-3">
-              <X className="size-3.5" strokeWidth={1.5} aria-hidden />Dismiss
-            </Button>
-          </div>
         </div>
       )}
-
-      {s.bucket === "working" && (
-        <div className="space-y-2">
-          {running ? (
-            <>
-              <div className="flex items-center justify-between gap-2">
-                <TextShimmer className="text-xs font-medium" duration={2.2}>
-                  {s.status === "checking" ? "The agent finished · running check" : "Agent running"}
-                </TextShimmer>
-                {s.check_cmd && <span className="truncate font-mono text-xs text-ink-3">{s.check_cmd}</span>}
-              </div>
-              <RunningTail s={s} />
-            </>
-          ) : s.status === "blocked" ? (
-            <p className="text-sm text-ink-2">
-              Blocked by upstream DAG: {(s.blocked_by || s.depends_on || []).join(", ")}.
-            </p>
-          ) : (
-            <p className="text-sm text-ink-2">
-              Waiting for a free slot (number {s.queue_position ?? "?"} in the queue).
-            </p>
-          )}
-        </div>
-      )}
-
-      {s.bucket === "done" && (
-        <div className="space-y-2">
-          <p className="truncate border-l-2 border-dot-green pl-2 font-mono text-xs tabular-nums text-ink">
-            {receiptLine(s)}
-          </p>
-          <div className="flex flex-wrap items-center gap-1.5 font-mono text-xs tabular-nums">
-            <span className="rounded-chip bg-track px-1.5 py-0.5 text-ink-2">{plural(ds.files, "file")}</span>
-            <span className="rounded-chip bg-diff-add-bg px-1.5 py-0.5 text-diff-add-fg">+{ds.add}</span>
-            <span className="rounded-chip bg-diff-del-bg px-1.5 py-0.5 text-diff-del-fg">−{ds.del}</span>
-            {stepSummary && (
-              <span className="rounded-chip bg-pill-active-bg px-1.5 py-0.5 text-pill-active-fg">
-                {stepSummary}
-              </span>
-            )}
-            {s.check_cmd && <span className="ml-auto truncate text-ink-3">{s.check_cmd}</span>}
-          </div>
-        </div>
-      )}
-
-      {(s.steer || []).length > 0 && (
-        <p className="text-xs font-medium text-warning-foreground">
-          {plural(s.steer!.length, "steering message")} queued
-        </p>
-      )}
-
-      <div className="mt-auto flex min-w-0 items-center gap-2 border-t border-hairline pt-2 font-mono text-xs text-ink-3">
-        <span className="shrink-0 text-ink-2">{s.test_mode ? "custom" : s.engine || s.agent || "agent"}</span>
-        <span className="ml-auto min-w-0 truncate">{s.branch || s.id}</span>
-      </div>
-    </motion.article>
-  );
-}
-
-function LaneSkeleton({ label, cards }: { label: string; cards: number }) {
-  return (
-    <section aria-label={`${label} loading`} className="flex min-w-0 flex-col gap-3 bg-canvas p-4 md:p-5">
-      <div className="flex items-center justify-between gap-2">
-        <h2 className="font-heading text-base font-medium text-ink">{label}</h2>
-        <span className="h-6 w-8 rounded-full bg-track" aria-hidden />
-      </div>
-      {Array.from({ length: cards }).map((_, i) => (
-        <div key={i} className="space-y-3 rounded-card border border-hairline bg-surface p-4">
-          <div className="flex items-center justify-between">
-            <span className="h-4 w-16 rounded-chip bg-track" />
-            <span className="h-5 w-14 rounded-chip bg-track" />
-          </div>
-          <div className="h-5 w-4/5 rounded-chip bg-track" />
-          <div className="h-10 w-full rounded-control bg-board" />
-        </div>
-      ))}
     </section>
   );
 }
 
-function Lane({
-  id,
-  label,
-  tone,
-  pulse,
-  count,
-  empty,
-  answers,
-  children,
-}: {
-  id: string;
-  label: string;
-  tone: "error" | "info" | "success";
-  pulse?: boolean;
-  count: number;
-  empty: string;
-  answers: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <section aria-labelledby={`lane-${id}-h`} data-answers={answers} className="flex min-w-0 flex-col gap-3 bg-canvas p-4 md:p-5">
-      <div className="flex items-center justify-between gap-2">
-        <h2 id={`lane-${id}-h`} tabIndex={-1} className="font-heading text-base font-medium text-ink outline-none">
-          {label}
-        </h2>
-        <Pill variant="secondary" className="px-2.5 py-0.5 font-mono text-xs tabular-nums">
-          <PillIndicator variant={tone} pulse={pulse} />
-          <span>{count}</span>
-        </Pill>
-      </div>
-      <div className="flex min-w-0 flex-col gap-3">
-        <AnimatePresence initial={false}>{children}</AnimatePresence>
-        {count === 0 && (
-          <p className="rounded-card border border-dashed border-hairline bg-surface/60 p-4 text-sm leading-relaxed text-ink-2">
-            {empty}
-          </p>
-        )}
-      </div>
-    </section>
-  );
-}
-
-export function ThreeLaneBoard({
-  sessions,
-  unreachable,
-  selected,
-  bulkMode,
-  bulkSelected,
-  latestHeroId,
-  onOpen,
-  onToggleBulk,
-  onRetry,
-  onDismiss,
-}: {
-  sessions: Session[] | null;
-  unreachable: boolean;
-  selected: string | null;
-  bulkMode: boolean;
-  bulkSelected: Set<string>;
-  latestHeroId: string | null;
-  onOpen: (id: string, tab?: TabId) => void;
-  onToggleBulk: (id: string) => void;
-  onRetry: (id: string) => void;
-  onDismiss: (id: string) => void;
-}) {
-  if (sessions === null && unreachable) {
-    return (
-      <p role="alert" className="m-4 rounded-card border border-hairline bg-surface p-4 text-sm text-ink md:m-6">
-        Fleet has not answered yet, so there is no session list to show. Check that Fleet is running; this page asks again every two seconds.
-      </p>
-    );
-  }
-
-  if (sessions === null) {
-    return (
-      <div aria-label="Board loading" className="grid gap-px border-b border-hairline bg-hairline md:grid-cols-3">
-        <LaneSkeleton label="Needs you" cards={2} />
-        <LaneSkeleton label="Working" cards={1} />
-        <LaneSkeleton label="Done" cards={2} />
-      </div>
-    );
-  }
-
-  const needs = sessions.filter((s) => s.bucket === "needs-you");
-  const working = sessions.filter((s) => s.bucket === "working");
-  const done = sessions.filter((s) => s.bucket === "done");
-  const anyRunning = working.some(isActivelyRunning);
-
-  return (
-    <div
-      aria-label="Session lanes"
-      className="grid gap-px border-b border-hairline bg-hairline md:grid-cols-[minmax(0,1.12fr)_minmax(0,1fr)_minmax(0,1fr)]"
-    >
-      <Lane
-        id="needs"
-        label="Needs you"
-        tone={needs.length > 0 ? "error" : "info"}
-        count={needs.length}
-        empty="Nothing needs you. Failed checks and stopped runs land here with the reason."
-        answers="1"
-      >
-        {needs.map((s) => (
-          <SessionCard
-            key={s.id}
-            s={s}
-            selected={selected === s.id}
-            bulkMode={bulkMode}
-            bulkChecked={bulkSelected.has(s.id)}
-            isLatestHero={false}
-            onOpen={(tab) => onOpen(s.id, tab)}
-            onToggleCheck={() => onToggleBulk(s.id)}
-            onRetry={() => onRetry(s.id)}
-            onDismiss={() => onDismiss(s.id)}
-          />
-        ))}
-      </Lane>
-
-      <Lane
-        id="working"
-        label="Working"
-        tone="info"
-        pulse={anyRunning}
-        count={working.length}
-        empty="No agent is running right now."
-        answers="2"
-      >
-        {working.map((s) => (
-          <SessionCard
-            key={s.id}
-            s={s}
-            selected={selected === s.id}
-            bulkMode={bulkMode}
-            bulkChecked={bulkSelected.has(s.id)}
-            isLatestHero={false}
-            onOpen={(tab) => onOpen(s.id, tab)}
-            onToggleCheck={() => onToggleBulk(s.id)}
-            onRetry={() => onRetry(s.id)}
-            onDismiss={() => onDismiss(s.id)}
-          />
-        ))}
-      </Lane>
-
-      <Lane
-        id="done"
-        label="Done"
-        tone="success"
-        count={done.length}
-        empty="Work appears here once its check passes, with the check line as its receipt."
-        answers="3"
-      >
-        {done.map((s) => (
-          <SessionCard
-            key={s.id}
-            s={s}
-            selected={selected === s.id}
-            bulkMode={bulkMode}
-            bulkChecked={bulkSelected.has(s.id)}
-            isLatestHero={s.id === latestHeroId}
-            onOpen={(tab) => onOpen(s.id, tab)}
-            onToggleCheck={() => onToggleBulk(s.id)}
-            onRetry={() => onRetry(s.id)}
-            onDismiss={() => onDismiss(s.id)}
-          />
-        ))}
-      </Lane>
-    </div>
-  );
-}
+export { Layers };

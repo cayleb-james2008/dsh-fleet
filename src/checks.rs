@@ -609,7 +609,10 @@ fn run_shell_bounded(
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(timeout_secs))
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(MAX_CHECK_TIMEOUT_SECS));
+    const MAX_COLLECTED_CHARS: usize = STEP_OUTPUT_CAP + 4096;
     let mut lines: Vec<String> = Vec::new();
+    let mut collected_chars: usize = 0;
+    let mut output_capped = false;
     let mut child_status: Option<bool> = None;
     let mut child_code: Option<i32> = None;
     let mut exited_at: Option<Instant> = None;
@@ -650,7 +653,16 @@ fn run_shell_bounded(
         match rx.recv_timeout(Duration::from_millis(25)) {
             Ok(line) => {
                 last_line_at = Instant::now();
-                lines.push(line);
+                if !output_capped {
+                    let add = line.chars().count() + 1;
+                    if collected_chars + add <= MAX_COLLECTED_CHARS {
+                        collected_chars += add;
+                        lines.push(line);
+                    } else {
+                        output_capped = true;
+                        lines.push("…[check output truncated above cap]".to_string());
+                    }
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {

@@ -879,7 +879,11 @@ fn run_bounded(
             std::time::Instant::now()
                 + std::time::Duration::from_secs(MAX_TIMEOUT_SECS)
         });
+    const RUN_LINES_CAP: usize = 4000;
+    const RUN_BYTES_CAP: usize = 512 * 1024;
     let mut lines: Vec<String> = Vec::new();
+    let mut lines_bytes: usize = 0;
+    let mut lines_capped = false;
     let mut child_status: Option<bool> = None;
     let mut child_code: Option<i32> = None;
     // After the child exits, the pipes get a grace — but measured as
@@ -929,7 +933,15 @@ fn run_bounded(
             Ok((is_err, line)) => {
                 last_line_at = std::time::Instant::now();
                 on_line(is_err, &line);
-                lines.push(line);
+                if !lines_capped {
+                    let add = line.len() + 1;
+                    if lines.len() < RUN_LINES_CAP && lines_bytes + add <= RUN_BYTES_CAP {
+                        lines_bytes += add;
+                        lines.push(line);
+                    } else {
+                        lines_capped = true;
+                    }
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -1446,10 +1458,19 @@ impl App {
             let mut d = self.dirty_records.lock().unwrap();
             std::mem::take(&mut *d)
         };
-        let (snapshot, records) = {
+        #[derive(Serialize)]
+        struct SnapshotRef<'a> {
+            counter: u64,
+            sessions: &'a [Session],
+        }
+        let (snapshot_json, records) = {
             let sessions = self.sessions.lock().unwrap();
             let counter = self.counter.lock().unwrap();
-            let snapshot = serde_json::json!({ "counter": *counter, "sessions": *sessions });
+            let snapshot_json = serde_json::to_string(&SnapshotRef {
+                counter: *counter,
+                sessions: &sessions,
+            })
+            .unwrap_or_else(|_| "{}".to_string());
             // Write `.record.json` only for modified sessions or any session
             // missing its record file on disk (preserves crash-recovery tests
             // while avoiding 2,000+ redundant renames on every log flush).
@@ -1464,7 +1485,7 @@ impl App {
                     r
                 })
                 .collect();
-            (snapshot, records)
+            (snapshot_json, records)
         };
         static PERSIST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = PERSIST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1472,7 +1493,7 @@ impl App {
             .data_dir
             .join(format!("sessions.json.tmp.{}-{}", std::process::id(), seq));
         let dst = self.data_dir.join("sessions.json");
-        if std::fs::write(&tmp, snapshot.to_string()).is_ok() {
+        if std::fs::write(&tmp, snapshot_json).is_ok() {
             let _ = std::fs::rename(&tmp, &dst);
         }
         for r in records {
@@ -2095,7 +2116,7 @@ impl App {
             .lines_since_persist
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        if since >= 25 {
+        if since >= 100 {
             self.lines_since_persist
                 .store(0, std::sync::atomic::Ordering::Relaxed);
             self.persist();
@@ -4055,10 +4076,21 @@ fn read_request_full(
             }
         };
     let request_line = read_line_by_byte(&mut reader, stream)?;
+    if request_line.len() > 16384 {
+        return Some((
+            "__headers_too_large__".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            None,
+        ));
+    }
     let mut parts = request_line.split_whitespace();
     let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
-    let mut content_length = 0usize;
+    let mut content_length: Option<usize> = None;
     let mut content_type = String::new();
     let mut origin = String::new();
     let mut host = String::new();
@@ -4085,7 +4117,32 @@ fn read_request_full(
         }
         let lower = line.to_lowercase();
         if let Some(v) = lower.strip_prefix("content-length:") {
-            content_length = v.trim().parse().unwrap_or(0);
+            let trimmed = v.trim();
+            let Ok(parsed) = trimmed.parse::<usize>() else {
+                return Some((
+                    "__bad_request__".to_string(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    host,
+                    None,
+                ));
+            };
+            if let Some(prev) = content_length {
+                if prev != parsed {
+                    return Some((
+                        "__bad_request__".to_string(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        host,
+                        None,
+                    ));
+                }
+            }
+            content_length = Some(parsed);
         } else if let Some(v) = lower.strip_prefix("content-type:") {
             content_type = v.trim().to_string();
         } else if let Some(v) = lower.strip_prefix("origin:") {
@@ -4096,6 +4153,7 @@ fn read_request_full(
             last_event_id = v.trim().parse::<u64>().ok();
         }
     }
+    let content_length = content_length.unwrap_or(0);
     if content_length > MAX_BODY_BYTES {
         return Some((
             "__too_large__".to_string(),
@@ -4175,13 +4233,18 @@ fn serve_sse(
     stream: &mut std::net::TcpStream,
     last_event_id: Option<u64>,
 ) {
+    let Ok((sub, replay)) = app.events.try_subscribe(last_event_id) else {
+        let resp = error_response(503, "too many active SSE streams");
+        let _ = stream.write_all(resp.as_bytes());
+        return;
+    };
     let _ = stream.set_read_timeout(None);
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
     let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n";
     if stream.write_all(headers.as_bytes()).is_err() {
+        app.events.unsubscribe(sub.id);
         return;
     }
-    let (sub, replay) = app.events.subscribe(last_event_id);
     let (active, queued, total) = app.queue_counts();
     let hello = format!(
         "event: connected\ndata: {}\n\n",
@@ -4221,19 +4284,67 @@ fn serve_sse(
     app.events.unsubscribe(sub.id);
 }
 
+/// Extract and validate the normalized host name (without port) from a `Host` header
+/// or URL authority, properly supporting bracketed IPv6 (`[::1]:8471`).
+fn extract_host_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('@')
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let (addr, after) = rest.split_once(']')?;
+        if addr.is_empty() {
+            return None;
+        }
+        if !after.is_empty() {
+            let port = after.strip_prefix(':')?;
+            if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+        }
+        return Some(format!("[{}]", addr.to_ascii_lowercase()));
+    }
+    let (host, port_opt) = match trimmed.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (trimmed, None),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    if let Some(port) = port_opt {
+        if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(host.to_ascii_lowercase())
+}
+
 /// An Origin is acceptable only when it names this machine: the
-/// board's own page (127.0.0.1 / localhost / ::1). Any other web
+/// board's own page (127.0.0.1 / localhost / [::1]). Any other web
 /// origin is a drive-by — a page the operator happens to have open
 /// must not be able to hand out work to a command-executing server.
 fn origin_is_local(origin: &str) -> bool {
-    let host = origin
-        .split("://")
-        .nth(1)
-        .unwrap_or("")
-        .split([':', '/'])
-        .next()
-        .unwrap_or("");
-    matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
+    let trimmed = origin.trim();
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let trailing = &rest[authority.len()..];
+    if !trailing.is_empty() && trailing != "/" {
+        return false;
+    }
+    let Some(host) = extract_host_name(authority) else {
+        return false;
+    };
+    matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]")
 }
 
 /// Is a Host header one this server answers to? Its hostname (port
@@ -4241,15 +4352,13 @@ fn origin_is_local(origin: &str) -> bool {
 /// comma-separated FLEET_ALLOWED_HOSTS. Anything else is a name a
 /// browser was pointed at by someone other than the operator.
 fn host_allowed(host: &str, extra: &str) -> bool {
-    let name = match host.strip_prefix('[') {
-        Some(rest) => format!("[{}]", rest.split(']').next().unwrap_or("")),
-        None => host.split(':').next().unwrap_or("").to_string(),
-    }
-    .to_lowercase();
+    let Some(name) = extract_host_name(host) else {
+        return false;
+    };
     matches!(name.as_str(), "localhost" | "127.0.0.1" | "[::1]")
         || extra
             .split(',')
-            .map(|h| h.trim().to_lowercase())
+            .map(|h| h.trim().to_ascii_lowercase())
             .any(|h| !h.is_empty() && h == name)
 }
 
@@ -4283,6 +4392,8 @@ fn respond(
         error_response(431, "request headers are too large")
     } else if !host_allowed(host, allowed_hosts) {
         error_response(403, "this board answers only to its own host name")
+    } else if method == "__bad_request__" {
+        error_response(400, "malformed HTTP request")
     } else if method == "__too_large__" {
         error_response(413, "request body too large")
     } else if method == "POST" && !content_type.starts_with("application/json") {
@@ -4841,7 +4952,15 @@ fn update_route(
             json_response(200, &snap.to_string())
         }
         ("GET", "/api/update") => json_response(200, &app.updater.snapshot().to_string()),
-        ("POST", "/api/update/check") => json_response(200, &app.updater.check_now().to_string()),
+        ("POST", "/api/update/check") => {
+            if !host_allowed(host, "") {
+                return Some(error_response(
+                    403,
+                    "checking for updates is only allowed from this machine, not through a shared address",
+                ));
+            }
+            json_response(200, &app.updater.check_now().to_string())
+        }
         ("POST", "/api/update/apply") | ("POST", "/api/update/restart") => {
             if !host_allowed(host, "") {
                 return Some(error_response(
@@ -5327,6 +5446,112 @@ fn validate_git_repo(repo: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn handle_goal_plan(app: &Arc<App>, body: &str) -> String {
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return error_response(400, &format!("bad json: {e}")),
+    };
+    let Some(obj) = req.as_object() else {
+        return error_response(400, "plan payload must be a JSON object");
+    };
+    let goal = obj
+        .get("goal")
+        .or_else(|| obj.get("task"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if goal.is_empty() {
+        return error_response(400, "goal is required");
+    }
+    if goal.contains('\0') || goal.len() > MAX_TASK_BYTES {
+        return error_response(400, "goal is invalid or exceeds byte limit");
+    }
+    let repo = obj
+        .get("repo")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let agent_opt = obj
+        .get("agent")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let decision = app.policy.test_policy(repo, goal, agent_opt);
+
+    let clauses: Vec<String> = goal
+        .split(['\n', ';'])
+        .flat_map(|s| s.split(" then "))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    let mut tasks: Vec<serde_json::Value> = Vec::new();
+    if clauses.len() >= 2 {
+        for (idx, clause) in clauses.iter().take(6).enumerate() {
+            let alias = format!("w{}", idx + 1);
+            let deps: Vec<String> = if idx == 0 {
+                Vec::new()
+            } else {
+                vec![format!("w{}", idx)]
+            };
+            tasks.push(serde_json::json!({
+                "alias": alias,
+                "repo": repo,
+                "task": clause,
+                "agent": agent_opt.unwrap_or(""),
+                "check": decision.check_cmd,
+                "check_steps": decision.check_steps,
+                "depends_on": deps,
+                "allowed_globs": decision.allowed_globs,
+                "forbidden_globs": decision.forbidden_globs,
+                "auto_steer_budget": decision.auto_steer_budget,
+            }));
+        }
+    } else {
+        let impl_task = format!("{goal} — implement core changes in an isolated worktree");
+        let verify_task = format!("Verify and add regression tests for: {goal}");
+        tasks.push(serde_json::json!({
+            "alias": "implement",
+            "repo": repo,
+            "task": impl_task,
+            "agent": agent_opt.unwrap_or(""),
+            "check": decision.check_cmd,
+            "check_steps": decision.check_steps,
+            "depends_on": [],
+            "allowed_globs": decision.allowed_globs,
+            "forbidden_globs": decision.forbidden_globs,
+            "auto_steer_budget": decision.auto_steer_budget,
+        }));
+        tasks.push(serde_json::json!({
+            "alias": "verify",
+            "repo": repo,
+            "task": verify_task,
+            "agent": agent_opt.unwrap_or(""),
+            "check": decision.check_cmd,
+            "check_steps": decision.check_steps,
+            "depends_on": ["implement"],
+            "allowed_globs": decision.allowed_globs,
+            "forbidden_globs": decision.forbidden_globs,
+            "auto_steer_budget": decision.auto_steer_budget,
+        }));
+    }
+
+    json_response(
+        200,
+        &serde_json::json!({
+            "goal": goal,
+            "repo": repo,
+            "project": decision.project,
+            "engine": decision.engine,
+            "check_cmd": decision.check_cmd,
+            "auto_steer_budget": decision.auto_steer_budget,
+            "tasks": tasks,
+        })
+        .to_string(),
+    )
 }
 
 fn handle_policy_test(app: &Arc<App>, body: &str) -> String {
@@ -5943,6 +6168,7 @@ fn handle(app: &Arc<App>, method: &str, path: &str, body: &str) -> String {
             }
         }
         ("POST", "/api/policies/test") => handle_policy_test(app, body),
+        ("POST", "/api/plan") => handle_goal_plan(app, body),
         ("GET", "/api/sessions") => {
             if params.is_empty() {
                 json_response(200, &app.sessions_view_cached())
@@ -6978,12 +7204,28 @@ fn main() {
         std::env::var("FLEET_UPDATE_MODE").unwrap_or_else(|_| "notify".to_string())
     );
     open_in_browser(&format!("http://127.0.0.1:{port}/"));
+    const MAX_HTTP_WORKERS: usize = 128;
+    let active_workers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    struct WorkerGuard(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for WorkerGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
+                if active_workers.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_HTTP_WORKERS {
+                    active_workers.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    let resp = error_response(503, "server busy");
+                    let _ = stream.write_all(resp.as_bytes());
+                    continue;
+                }
+                let guard = WorkerGuard(active_workers.clone());
                 let app = app.clone();
                 let allowed_hosts = allowed_hosts.clone();
                 std::thread::spawn(move || {
+                    let _guard = guard;
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(
                         READ_TIMEOUT_SECS,
                     )));
@@ -9524,6 +9766,65 @@ fi
         assert_eq!(met["budget"]["daily_limit_reached"], true);
         assert_eq!(met["budget"]["limit_reached"], true);
         assert_eq!(met["budget"]["usage_pct"], 100);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v090_security_origin_host_ipv6_and_plan_endpoint() {
+        // IPv6 loopback Origin & Host with port must be accepted; userinfo/spoofed origins rejected.
+        assert!(origin_is_local("http://127.0.0.1:8471"));
+        assert!(origin_is_local("http://LOCALHOST:8471"));
+        assert!(origin_is_local("http://[::1]:8471"));
+        assert!(origin_is_local("https://[::1]"));
+        assert!(!origin_is_local("http://127.0.0.1@evil.com"));
+        assert!(!origin_is_local("http://localhost.evil.com"));
+        assert!(!origin_is_local("javascript://127.0.0.1"));
+        assert!(!origin_is_local("null"));
+
+        assert!(host_allowed("127.0.0.1:8471", ""));
+        assert!(host_allowed("LOCALHOST:8471", ""));
+        assert!(host_allowed("[::1]:8471", ""));
+        assert!(!host_allowed("127.0.0.1@evil.com", ""));
+        assert!(!host_allowed("127.0.0.1:notaport", ""));
+        assert!(!host_allowed("[::1]:bad", ""));
+
+        // Invalid or conflicting Content-Length headers must yield 400 (never silent 0).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            let mut client = std::net::TcpStream::connect(addr).unwrap();
+            client
+                .write_all(b"POST /api/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: nope\r\n\r\n")
+                .unwrap();
+        });
+        let (mut srv, _) = listener.accept().unwrap();
+        let req = read_request_full(&mut srv).unwrap();
+        t.join().unwrap();
+        assert_eq!(req.0, "__bad_request__");
+
+        // POST /api/plan decomposes multi-clause or single goals into ready-to-dispatch DAG waves.
+        let dir = std::env::temp_dir().join(format!("fleet-v090-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = test_app(dir.clone(), Vec::new());
+
+        let r1 = handle(
+            &app,
+            "POST",
+            "/api/plan",
+            r#"{"goal":"Add auth middleware then add integration tests","repo":"/work/api"}"#,
+        );
+        assert!(r1.starts_with("HTTP/1.1 200"), "{r1}");
+        let b1 = response_body(&r1);
+        let tasks = b1["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0]["alias"], "w1");
+        assert_eq!(tasks[1]["alias"], "w2");
+        assert_eq!(tasks[1]["depends_on"], serde_json::json!(["w1"]));
+
+        let r2 = handle(&app, "POST", "/api/plan", r#"{"goal":""}"#);
+        assert!(r2.starts_with("HTTP/1.1 400"), "{r2}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
