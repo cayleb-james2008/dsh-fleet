@@ -3,6 +3,12 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as a
 ready-to-install Antigravity plugin bundle (`tar.gz` + `zip`) with `SHA256SUMS`.
 
+## 1.4.0 - 2026-11-25
+
+- **Keyboard-First Sidebar Triage (`frontend/src/App.tsx`, `frontend/src/components/TriageView.tsx`)**: added keyboard navigation across Needs-You items (`j`/`k` move focus, `o`/`Enter` open worker chat, `p` pin/unpin `#seq`, `1`–`5` jump tabs) while preserving input focus safety and compact shortcut hints.
+- **Worktree Changed-File Links (`sidecars/fleet_pane/git_probe.mjs`, `frontend/src/components/WorktreesView.tsx`)**: expanded `git status --porcelain=v1 -z` inspection with strict path/symlink confinement inside each worktree root and 1-click **Open file** (`toggleAuxPane`) rows per modified/untracked/staged file.
+- **Bundle & Peak RSS Diet (`frontend/src/`, `sidecars/fleet_pane/{swarm_store.mjs,main.mjs}`)**: removed `@radix-ui/react-dialog` overhead around `cmdk` and replaced `motion/react` runtime with zero-dep GPU `Element.animate` (`src/motion.ts`) to trim the sidecar bundle below `410 KB` raw (`~120 KB` gzip), plus bounded LRU caches and fixed 32-slot ring buffering in `swarm_store.mjs` for lower V8 Peak `VmHWM`.
+
 ## 1.3.0 - 2026-11-25
 
 - **Live SSE Push Stream (`/api/swarm/stream`, `sidecars/fleet_pane/main.mjs`, `frontend/src/App.tsx`)**: added bounded `text/event-stream` endpoint pushing instant `etag` deltas via `computeSwarmFingerprint` (64-client cap, shared 150ms watcher active only while subscribers are connected, 15s keepalive, clean disconnect teardown) with automatic `EventSource` subscription in standalone mode and graceful polling fallback inside `SidecarApp`, verified under 5/5 concurrent SSE client survival.

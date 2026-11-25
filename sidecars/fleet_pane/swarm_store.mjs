@@ -60,6 +60,12 @@ export function statOf(path) {
   }
 }
 
+function lruSet(cache, key, val, limit) {
+  if (cache.has(key)) cache.delete(key);
+  else if (cache.size >= limit) cache.delete(cache.keys().next().value);
+  cache.set(key, val);
+}
+
 function readSmallCached(path, cache, maxBytes = VIEW_MAX_BYTES) {
   const s = statOf(path);
   if (s.size < 0) {
@@ -76,8 +82,7 @@ function readSmallCached(path, cache, maxBytes = VIEW_MAX_BYTES) {
   } catch {
     return { text: null, ...s };
   }
-  if (cache.size > 400) cache.clear();
-  cache.set(path, { key, text });
+  lruSet(cache, path, { key, text }, 64);
   return { text, ...s };
 }
 
@@ -413,6 +418,7 @@ export function summarizeTranscript(appData, conv) {
     startedAt: '',
     lastStepAt: '',
     rawTail: [],
+    tailCursor: 0,
   });
 
   if (!state.acc) state.acc = initAcc();
@@ -427,9 +433,9 @@ export function summarizeTranscript(appData, conv) {
       const a = state.acc;
       a.lineCount++;
 
-      // Keep only the last TAIL_CAP raw lines for structured tail analysis
-      a.rawTail.push(line);
-      if (a.rawTail.length > TAIL_CAP) a.rawTail.shift();
+      // Fixed 32-slot ring buffer avoids O(n) shift allocations over 50k+ lines
+      a.rawTail[a.tailCursor % TAIL_CAP] = line;
+      a.tailCursor++;
 
       if (preParsed) {
         if (Number.isFinite(preParsed.step_index)) a.maxStepIndex = Math.max(a.maxStepIndex, preParsed.step_index + 1);
@@ -501,11 +507,14 @@ export function summarizeTranscript(appData, conv) {
   state.meta = res.meta;
   const a = state.acc;
 
-  // Parse ONLY the 32-line tail window for rich UI state
+  // Parse ONLY the 32-line tail window in chronological ring order
   const tailSteps = [];
   const recentTools = [];
   let latestThinking = '';
-  for (const line of a.rawTail) {
+  const tailCount = a.rawTail.length;
+  const tailStart = a.tailCursor >= TAIL_CAP ? a.tailCursor % TAIL_CAP : 0;
+  for (let ti = 0; ti < tailCount; ti++) {
+    const line = a.rawTail[(tailStart + ti) % tailCount];
     let step;
     try {
       step = JSON.parse(line);
@@ -601,8 +610,7 @@ export function summarizeTranscript(appData, conv) {
     },
   };
 
-  if (transcriptCache.size > 500) transcriptCache.clear();
-  transcriptCache.set(path, state);
+  lruSet(transcriptCache, path, state, 64);
   return state.result;
 }
 
@@ -692,7 +700,7 @@ function parseViewJson(id, f) {
       }
     }
     c = { key, error, good: parsed ? { json: parsed, mtime: f.mtime } : c?.good || null };
-    viewJsonCache.set(id, c);
+    lruSet(viewJsonCache, id, c, 32);
   }
   return { json: c.good?.json || null, mtime: c.good?.mtime || 0, error: c.error };
 }
@@ -1087,8 +1095,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
   const killedCount = members.filter((m) => m.killed).length;
   const lastActivityTs = Math.max(boardStat.mtime || 0, membersFile.mtime || 0, ...members.map((m) => m.transcriptMtime || 0));
 
-  if (summaryMetaCache.size > 128) summaryMetaCache.clear();
-  summaryMetaCache.set(cacheKey, {
+  lruSet(summaryMetaCache, cacheKey, {
     checkedAt: now,
     membersKey,
     boardKey,
@@ -1108,7 +1115,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
       hasPlan: Boolean(plan),
       lastActivityTs,
     },
-  });
+  }, 32);
 
   const snap = {
     id,

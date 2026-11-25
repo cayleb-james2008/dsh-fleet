@@ -5,11 +5,12 @@
  */
 import { execFile } from 'node:child_process';
 import { realpathSync, statSync } from 'node:fs';
-import { basename, isAbsolute } from 'node:path';
+import { basename, isAbsolute, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const MAX_ROOTS = 16;
 const MAX_WORKTREES_PER_ROOT = 24;
+const MAX_CHANGED_FILES = 24;
 const GIT_TIMEOUT_MS = 2500;
 const DEFAULT_TTL_MS = 3000;
 
@@ -135,6 +136,21 @@ export function parsePorcelainWorktrees(stdout) {
   return out;
 }
 
+function safeWorktreeFileUri(wtReal, relPath) {
+  if (!relPath || relPath.includes('\0') || isAbsolute(relPath)) return '';
+  if (relPath.split('/').some((seg) => seg === '..' || seg === '.')) return '';
+  const abs = resolve(wtReal, relPath);
+  const prefix = wtReal.endsWith(sep) ? wtReal : `${wtReal}${sep}`;
+  if (!abs.startsWith(prefix)) return '';
+  try {
+    const real = realpathSync(abs);
+    if (!real.startsWith(prefix)) return '';
+    return statSync(real).isFile() ? pathToFileURL(real).href : '';
+  } catch {
+    return '';
+  }
+}
+
 async function inspectWorktree(rootPath, wt, index) {
   let wtReal = wt.path;
   let exists = true;
@@ -148,22 +164,36 @@ async function inspectWorktree(rootPath, wt, index) {
   let dirtyFiles = 0;
   let untrackedFiles = 0;
   let stagedFiles = 0;
+  const files = [];
+  let totalChanged = 0;
   let lastCommitSha = wt.head ? wt.head.slice(0, 8) : '';
   let lastCommitSubject = '';
   let lastCommitAt = 0;
 
   if (exists && !wt.bare) {
     const [statusRes, logRes] = await Promise.all([
-      execGit(wtReal, ['status', '--porcelain']),
+      execGit(wtReal, ['status', '--porcelain=v1', '-z']),
       execGit(wtReal, ['log', '-n', '1', '--format=%h%x09%s%x09%ct']),
     ]);
     if (statusRes.ok && statusRes.stdout) {
-      for (const l of statusRes.stdout.split('\n')) {
-        if (!l) continue;
-        if (l.startsWith('??')) untrackedFiles++;
+      const tokens = statusRes.stdout.split('\0');
+      for (let i = 0; i < tokens.length; ) {
+        const rec = tokens[i++];
+        if (!rec || rec.length < 4) continue;
+        const x = rec[0];
+        const y = rec[1];
+        const relPath = rec.slice(3);
+        if (x === 'R' || x === 'C') i++;
+        if (x === '?' && y === '?') untrackedFiles++;
         else {
-          if (l[0] && l[0] !== ' ') stagedFiles++;
-          if (l[1] && l[1] !== ' ') dirtyFiles++;
+          if (x !== ' ') stagedFiles++;
+          if (y !== ' ') dirtyFiles++;
+        }
+        totalChanged++;
+        if (files.length < MAX_CHANGED_FILES) {
+          const state = x === '?' && y === '?' ? '??' : x !== ' ' ? x : y;
+          const uri = state === 'D' ? '' : safeWorktreeFileUri(wtReal, relPath);
+          files.push({ path: relPath, state, uri });
         }
       }
     }
@@ -193,6 +223,8 @@ async function inspectWorktree(rootPath, wt, index) {
     dirtyFiles,
     untrackedFiles,
     stagedFiles,
+    files,
+    filesTruncated: totalChanged > MAX_CHANGED_FILES,
     lastCommitSha,
     lastCommitSubject,
     lastCommitAt,

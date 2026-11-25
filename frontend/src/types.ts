@@ -161,6 +161,12 @@ export interface SwarmSnapshot {
   };
 }
 
+export interface WorktreeChangedFile {
+  path: string;
+  state: string;
+  uri: string;
+}
+
 export interface WorktreeInfo {
   id: string;
   root: string;
@@ -179,6 +185,8 @@ export interface WorktreeInfo {
   dirtyFiles: number;
   untrackedFiles: number;
   stagedFiles: number;
+  files?: WorktreeChangedFile[];
+  filesTruncated?: boolean;
   lastCommitSha: string;
   lastCommitSubject: string;
   lastCommitAt: number;

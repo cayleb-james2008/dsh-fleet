@@ -52,6 +52,33 @@ await runChecks("replay", async (check) => {
     return checked === "true";
   });
 
+  await check("keyboard triage j/k/o/p and 1-5 tab shortcuts work cleanly", async () => {
+    await page.evaluate(() => {
+      window.__convCalls = [];
+      if (window.sidecar?.ui) window.sidecar.ui.toggleConversation = (id) => window.__convCalls.push(id);
+    });
+    await page.keyboard.press("5");
+    const onGit = (await page.locator('#tab-worktrees[aria-selected="true"]').count()) === 1;
+    await page.keyboard.press("1");
+    await page.waitForSelector('#panel-triage [data-selected="true"]');
+    await page.keyboard.press("j");
+    const secondSelected = await page
+      .locator('#panel-triage section[aria-labelledby="triage-heading"] > div.space-y-2 > div')
+      .nth(1)
+      .getAttribute("data-selected");
+    await page.keyboard.press("o");
+    const chatOpened = await page.evaluate(() => Array.isArray(window.__convCalls) && window.__convCalls.length === 1);
+    await page.keyboard.press("p");
+    const pinnedVisible = (await page.locator("#panel-triage").textContent()).includes("Pinned posts (1)");
+    await page.keyboard.press("p");
+    await page.keyboard.press("k");
+    const firstSelected = await page
+      .locator('#panel-triage section[aria-labelledby="triage-heading"] > div.space-y-2 > div')
+      .nth(0)
+      .getAttribute("data-selected");
+    return onGit && secondSelected === "true" && chatOpened && pinnedVisible && firstSelected === "true";
+  });
+
   await check("zero uncaught runtime errors during replay", () => errs.length === 0);
   await ctx.close();
 });

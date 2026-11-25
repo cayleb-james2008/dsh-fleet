@@ -136,7 +136,7 @@ export function createFleetHandlers({
       healthPacked = packJsonPayload({
         ok: true,
         name: 'fleet',
-        version: '1.3.0',
+        version: '1.4.0',
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
         sseStream: !isSidecar,
@@ -282,7 +282,8 @@ export function createFleetHandlers({
     );
     if (!includeRaw) {
       const unchangedPacked = packJsonPayload({ conversationId: conv, swarm: res.swarm, member: res.member, unchanged: true, etag });
-      if (swarmPayloadCache.size > 64) swarmPayloadCache.clear();
+      if (swarmPayloadCache.has(cacheKey)) swarmPayloadCache.delete(cacheKey);
+      else if (swarmPayloadCache.size >= 16) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
       swarmPayloadCache.set(cacheKey, {
         checkedAt: now,
         appData: res.appData,
@@ -305,7 +306,8 @@ export function createFleetHandlers({
     if (hit && now - hit.at < 3000) return hit.packed;
     const data = await probeWorktrees(rootsKey);
     const packed = packJsonPayload(data);
-    if (worktreesPayloadCache.size > 32) worktreesPayloadCache.clear();
+    if (worktreesPayloadCache.has(rootsKey)) worktreesPayloadCache.delete(rootsKey);
+    else if (worktreesPayloadCache.size >= 16) worktreesPayloadCache.delete(worktreesPayloadCache.keys().next().value);
     worktreesPayloadCache.set(rootsKey, { at: now, packed });
     return packed;
   }

@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { m } from "motion/react";
 import {
   Activity,
   ClipboardCopy,
@@ -19,7 +18,6 @@ import { GraphView } from "./components/GraphView";
 import { RosterView } from "./components/RosterView";
 import { TriageView } from "./components/TriageView";
 import { WorktreesView } from "./components/WorktreesView";
-import { glide } from "./motion";
 import {
   applyTheme,
   fetchSwarmSnapshot,
@@ -27,6 +25,7 @@ import {
   fetchWorktrees,
   inferThemeFromCssColor,
   isEmbeddedHost,
+  openWorkerConversation,
   readStoredTheme,
   startSwarmPreset,
 } from "./sidecar";
@@ -99,6 +98,7 @@ export function App() {
   const [wtLoading, setWtLoading] = useState(false);
 
   const [highlightSeq, setHighlightSeq] = useState<number | null>(null);
+  const [selectedTriageIdx, setSelectedTriageIdx] = useState(0);
   const [sseConnected, setSseConnected] = useState(false);
   const [pinnedMap, setPinnedMap] = useState<Record<string, number[]>>(() => {
     try {
@@ -250,6 +250,11 @@ export function App() {
 
   const activeSwarmKey = snap?.swarm || selectedSwarmId || "default";
   const pinnedSeqs = pinnedMap[activeSwarmKey] || [];
+  const triageItems = snap?.triage || [];
+
+  useEffect(() => {
+    setSelectedTriageIdx((idx) => (triageItems.length ? Math.min(idx, triageItems.length - 1) : 0));
+  }, [triageItems.length, activeSwarmKey]);
 
   const handleTogglePin = useCallback(
     (seq: number) => {
@@ -265,6 +270,48 @@ export function App() {
     },
     [activeSwarmKey],
   );
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey || paletteOpen || settingsOpen) return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable)) {
+        return;
+      }
+      if (e.key >= "1" && e.key <= "5") {
+        const nextTab = TABS[Number(e.key) - 1];
+        if (nextTab) {
+          e.preventDefault();
+          setTab(nextTab.id);
+        }
+        return;
+      }
+      if (tab !== "triage" || triageItems.length === 0) return;
+      if (e.key === "j") {
+        e.preventDefault();
+        setSelectedTriageIdx((i) => Math.min(triageItems.length - 1, i + 1));
+      } else if (e.key === "k") {
+        e.preventDefault();
+        setSelectedTriageIdx((i) => Math.max(0, i - 1));
+      } else if (e.key === "o" || (e.key === "Enter" && !target?.closest("button,a,select,input,textarea"))) {
+        const item = triageItems[selectedTriageIdx];
+        if (!item?.conversationId) return;
+        e.preventDefault();
+        if (!openWorkerConversation(item.conversationId)) {
+          toast.message(`Worker @${item.member} chat link unavailable standalone`);
+        }
+      } else if (e.key === "p") {
+        const item = triageItems[selectedTriageIdx];
+        if (!item || item.seq <= 0) return;
+        e.preventDefault();
+        const wasPinned = pinnedSeqs.includes(item.seq);
+        handleTogglePin(item.seq);
+        toast.success(wasPinned ? `Unpinned #${item.seq}` : `Pinned #${item.seq}`);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [tab, triageItems, selectedTriageIdx, paletteOpen, settingsOpen, pinnedSeqs, handleTogglePin]);
 
   const handleSelectSwarm = (id: string) => {
     etagRef.current = "";
@@ -480,9 +527,8 @@ export function App() {
                       </span>
                     )}
                     {selected && (
-                      <m.span
-                        layoutId="fleet-tab-underline"
-                        transition={glide}
+                      <span
+                        aria-hidden="true"
                         className="absolute inset-x-0.5 bottom-0 h-[2px] rounded-full bg-[var(--blue)]"
                       />
                     )}
@@ -578,6 +624,8 @@ export function App() {
                 <TriageView
                   snap={snap!}
                   pinnedSeqs={pinnedSeqs}
+                  selectedIdx={selectedTriageIdx}
+                  onSelectIdx={setSelectedTriageIdx}
                   onTogglePin={handleTogglePin}
                   onJumpToBoardSeq={(seq) => {
                     setHighlightSeq(seq);
@@ -662,7 +710,7 @@ export function App() {
           <div className="rounded-[var(--radius-card)] bg-[var(--board)] p-3 text-[12px] text-[var(--ink-2)] space-y-1">
             <div className="flex items-center gap-1.5 font-medium text-[var(--ink)]">
               <CommandIcon className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Fleet Antigravity Plugin v1.3.0</span>
+              <span>Fleet Antigravity Plugin v1.4.0</span>
             </div>
             <p>
               Reads Antigravity native swarm boards and transcripts locally on loopback with zero external telemetry.

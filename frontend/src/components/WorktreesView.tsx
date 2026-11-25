@@ -1,8 +1,16 @@
 import { useState } from "react";
-import { ExternalLink, FolderGit2, GitBranch, RefreshCw } from "lucide-react";
+import { ExternalLink, FileCode2, FolderGit2, GitBranch, RefreshCw } from "lucide-react";
 import { openFileInAuxPane } from "../sidecar";
 import type { WorktreesPayload } from "../types";
-import { Badge, Button, Card, Input, fmtTimeAgo } from "../ui";
+import { Badge, Button, Card, Input, fmtTimeAgo, toast } from "../ui";
+
+const FILE_TONE: Record<string, "success" | "warning" | "danger" | "neutral"> = {
+  "??": "neutral",
+  A: "success",
+  M: "warning",
+  D: "danger",
+  R: "warning",
+};
 
 export function WorktreesView({
   workspaceUris,
@@ -113,6 +121,58 @@ export function WorktreesView({
                     <span>{wt.lastCommitAt ? fmtTimeAgo(wt.lastCommitAt) : "n/a"}</span>
                   </span>
                 </div>
+              )}
+
+              {wt.files && wt.files.length > 0 && (
+                <ul
+                  aria-label={`Changed files in ${wt.branch}`}
+                  className="divide-y divide-[var(--hairline)] rounded-[var(--radius-chip)] border border-[var(--hairline)] bg-[var(--board)] px-2.5 py-1"
+                >
+                  {wt.files.map((f) => {
+                    const canOpenAux = Boolean(f.uri && window.sidecar?.ui?.toggleAuxPane);
+                    const handleOpenFile = async () => {
+                      if (canOpenAux && openFileInAuxPane(f.uri)) {
+                        toast.success(`Opened ${f.path.split("/").pop() || f.path}`);
+                        return;
+                      }
+                      try {
+                        await navigator.clipboard.writeText(f.path);
+                        toast.success(`Copied ${f.path}`);
+                      } catch {
+                        toast.error("Clipboard unavailable");
+                      }
+                    };
+                    return (
+                      <li key={f.path} className="flex items-center justify-between gap-2 py-1.5 first:pt-1 last:pb-1">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <Badge tone={FILE_TONE[f.state] || "neutral"} className="mono px-1.5 py-0 text-[12px]">
+                            {f.state}
+                          </Badge>
+                          <span className="text-[12px] text-[var(--ink)] mono truncate" title={f.path}>
+                            {f.path}
+                          </span>
+                        </div>
+                        {f.uri && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            aria-label={`Open file ${f.path}`}
+                            onClick={handleOpenFile}
+                            className="shrink-0 h-7 px-2"
+                          >
+                            <FileCode2 className="h-3.5 w-3.5" aria-hidden="true" />
+                            <span>Open file</span>
+                          </Button>
+                        )}
+                      </li>
+                    );
+                  })}
+                  {wt.filesTruncated && (
+                    <li className="py-1 text-[12px] text-[var(--ink-3)]">
+                      Showing first {wt.files.length} changed files
+                    </li>
+                  )}
+                </ul>
               )}
             </Card>
           ))}

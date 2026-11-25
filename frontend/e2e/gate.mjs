@@ -194,7 +194,20 @@ await runChecks("gate", async (check) => {
 
   await check("worktrees probes main and isolated branch cleanly", async () => {
     const txt = await page.locator("#panel-worktrees").textContent();
-    return txt.includes("main") && txt.includes("lane/verify") && txt.includes("Initial fixture commit");
+    return txt.includes("main") && txt.includes("lane/verify") && txt.includes("Initial fixture commit") && txt.includes("untracked.txt");
+  });
+
+  await check("worktrees Open file calls toggleAuxPane with fileView uri", async () => {
+    await page.evaluate(() => {
+      window.__auxCalls = [];
+      if (window.sidecar?.ui) {
+        window.sidecar.ui.toggleAuxPane = (req) => window.__auxCalls.push(req);
+      }
+    });
+    await page.locator('button[aria-label="Open file untracked.txt"]').click();
+    return await page.evaluate(
+      () => Array.isArray(window.__auxCalls) && window.__auxCalls.some((c) => c?.tabType === "fileView" && String(c?.uri).endsWith("/untracked.txt")),
+    );
   });
 
   await check("zero horizontal overflow on Worktrees at 380px", async () => {

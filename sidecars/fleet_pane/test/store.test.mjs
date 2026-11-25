@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parsePorcelainWorktrees, probeWorktrees } from '../git_probe.mjs';
@@ -218,6 +218,7 @@ test('git_probe parses porcelain output, inspects real git worktrees, and reject
     try {
       execFileSync('git', ['-C', repoDir, 'worktree', 'add', '-b', 'feat/test', wtDir], { stdio: 'ignore' });
       writeFileSync(join(wtDir, 'dirty.txt'), 'change');
+      symlinkSync('/etc/hosts', join(wtDir, 'escape-link'));
 
       const res = await probeWorktrees([repoDir, 'file:///etc/../etc/passwd', '../relative'], { ttlMs: 0 });
       assert.equal(res.rejected.length, 2);
@@ -225,8 +226,12 @@ test('git_probe parses porcelain output, inspects real git worktrees, and reject
       const feat = res.worktrees.find((w) => w.branch === 'feat/test');
       assert.ok(feat);
       assert.equal(feat.clean, false);
-      assert.equal(feat.untrackedFiles, 1);
+      assert.equal(feat.untrackedFiles, 2);
       assert.equal(feat.lastCommitSubject, 'Initial commit');
+      const dirtyEntry = feat.files.find((f) => f.path === 'dirty.txt');
+      const escapeEntry = feat.files.find((f) => f.path === 'escape-link');
+      assert.ok(dirtyEntry && dirtyEntry.state === '??' && dirtyEntry.uri.endsWith('/dirty.txt'));
+      assert.ok(escapeEntry && escapeEntry.uri === '');
     } finally {
       execFileSync('git', ['-C', repoDir, 'worktree', 'remove', '--force', wtDir], { stdio: 'ignore' });
       rmSync(wtDir, { recursive: true, force: true });
