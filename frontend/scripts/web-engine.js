@@ -88,6 +88,11 @@
             transcriptMtime: t(22),
             startedAt: new Date(t(850)).toISOString(),
             lastStepAt: new Date(t(22)).toISOString(),
+            thinkingHeading: "Verifying Host-403 and CWE-59 frame guard",
+            recentTools: [
+              { name: "run_command", summary: "Run unit and security tests", time: new Date(t(30)).toISOString() },
+              { name: "edit_file", summary: "Edit swarm_store.mjs", time: new Date(t(90)).toISOString() },
+            ],
             usage: { inputTokens: 24200, cacheReadTokens: 19400, outputTokens: 2850, totalTokens: 46450 },
             workspace_mode: "share",
             posts: 2,
@@ -509,7 +514,7 @@
     };
 
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.0.0", mode: "live-web", canSendMessage: true });
+      return jsonResp({ ok: true, name: "fleet", version: "1.1.0", mode: "live-web", canSendMessage: true });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });

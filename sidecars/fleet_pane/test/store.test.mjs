@@ -71,13 +71,26 @@ test('summarizeTranscript extracts activity, tokens, replyAsk, and ignores torn 
     // A trailing torn line does not crash or corrupt cumulative token telemetry
     writeFileSync(
       join(logsDir, 'transcript.jsonl'),
-      JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', input_tokens: 100, output_tokens: 20, tool_calls: [] }) +
+      JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', input_tokens: 100, output_tokens: 20, tool_calls: [{ name: 'read_file', args: { Path: '/a.ts' } }] }) +
         '\n{"broken_torn_line": true',
     );
     const torn = summarizeTranscript(dir, conv);
     assert.ok(torn.summary);
     assert.equal(torn.summary.usage.totalTokens, 120);
     assert.equal(torn.summary.replied, false);
+
+    // Completing the torn line incrementally updates tokens and recentTools without full rescan
+    const appendLine = ', "step_index": 1, "type": "PLANNER_RESPONSE", "input_tokens": 50, "output_tokens": 10, "tool_calls": [{"name": "edit_file", "args": {"Path": "/b.ts"}}]}\n';
+    writeFileSync(
+      join(logsDir, 'transcript.jsonl'),
+      JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', input_tokens: 100, output_tokens: 20, tool_calls: [{ name: 'read_file', args: { Path: '/a.ts' } }] }) +
+        '\n{"broken_torn_line": true' + appendLine,
+    );
+    const resumed = summarizeTranscript(dir, conv);
+    assert.ok(resumed.summary);
+    assert.equal(resumed.summary.usage.totalTokens, 180);
+    assert.equal(resumed.summary.recentTools.length, 2);
+    assert.equal(resumed.summary.recentTools[0].summary, 'Edit b.ts');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

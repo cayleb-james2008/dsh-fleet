@@ -41,6 +41,7 @@ import {
   StatusDot,
   cn,
   fmtTokens,
+  formatSwarmDigest,
   toast,
 } from "./ui";
 
@@ -73,7 +74,7 @@ const TABS: Array<{ id: TabId; label: string; Icon: typeof Inbox }> = [
   { id: "board", label: "Board", Icon: Activity },
   { id: "roster", label: "Roster", Icon: Users },
   { id: "graph", label: "Graph", Icon: Network },
-  { id: "worktrees", label: "Worktrees", Icon: GitBranch },
+  { id: "worktrees", label: "Git", Icon: GitBranch },
 ];
 
 export function App() {
@@ -103,7 +104,6 @@ export function App() {
 
   const embedded = isEmbeddedHost();
 
-  // Sync theme with Antigravity host `theme-change` messages when embedded.
   useEffect(() => {
     applyTheme(theme, !hostSynced);
   }, [theme, hostSynced]);
@@ -124,7 +124,6 @@ export function App() {
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
-  // Subscribe to Antigravity workspace folder changes.
   useEffect(() => {
     let active = true;
     window.sidecar?.getWorkspaceUris?.().then((uris) => {
@@ -212,6 +211,17 @@ export function App() {
     setSelectedSwarmId(id);
   };
 
+  const handleCopyDigest = async () => {
+    if (!snap?.swarm) return;
+    const md = formatSwarmDigest(snap);
+    try {
+      await navigator.clipboard.writeText(md);
+      toast.success("Swarm digest copied");
+    } catch {
+      toast.error("Clipboard unavailable");
+    }
+  };
+
   const handleTabKeyDown = (e: React.KeyboardEvent, idx: number) => {
     if (e.key === "ArrowRight") {
       e.preventDefault();
@@ -279,7 +289,7 @@ export function App() {
                       aria-label="Active swarm"
                       value={snap?.swarm || selectedSwarmId || ""}
                       onChange={(e) => handleSelectSwarm(e.target.value)}
-                      className="h-7 max-w-[180px] sm:max-w-[320px] truncate rounded-[var(--radius-chip)] border border-[var(--input)] bg-[var(--board)] px-2 text-[14px] font-semibold text-[var(--ink)] focus-visible:outline-2 focus-visible:outline-[var(--ring)] cursor-pointer"
+                      className="h-7 max-w-[165px] min-[380px]:max-w-[190px] sm:max-w-[320px] truncate rounded-[var(--radius-chip)] border border-[var(--input)] bg-[var(--board)] px-2 text-[14px] font-semibold text-[var(--ink)] focus-visible:outline-2 focus-visible:outline-[var(--ring)] cursor-pointer"
                     >
                       {swarms.map((sw) => (
                         <option key={sw.id} value={sw.id}>
@@ -296,14 +306,25 @@ export function App() {
               </div>
             </div>
 
-            <div className="flex items-center gap-1 shrink-0">
+            <div className="flex items-center gap-0.5 shrink-0">
               {hasSwarm && (
                 <span
-                  className="hidden xs:inline-flex sm:inline-flex items-center rounded-[var(--radius-chip)] bg-[var(--board)] px-2 py-1 text-[12px] font-medium text-[var(--ink-2)] num"
+                  className="hidden sm:inline-flex items-center rounded-[var(--radius-chip)] bg-[var(--board)] px-2 py-1 text-[12px] font-medium text-[var(--ink-2)] num mr-0.5"
                   title="Total tokens across swarm transcripts"
                 >
                   {fmtTokens(snap?.usage?.totalTokens)} tok
                 </span>
+              )}
+              {hasSwarm && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Copy swarm digest"
+                  title="Copy Markdown swarm digest"
+                  onClick={handleCopyDigest}
+                >
+                  <ClipboardCopy className="h-4 w-4" aria-hidden="true" />
+                </Button>
               )}
               <Button
                 variant="ghost"
@@ -338,14 +359,14 @@ export function App() {
             </div>
           </div>
 
-          {/* Row 2: Compact Status Telemetry */}
+          {/* Row 2: Compact Status Telemetry (clean spaced tokens, zero middle dots) */}
           {hasSwarm && (
             <div className="flex flex-wrap items-center justify-between gap-2 pb-2 text-[12px] text-[var(--ink-2)]">
-              <div className="flex items-center gap-2 min-w-0">
+              <div className="flex flex-wrap items-center gap-2 min-w-0">
                 <StatusDot state={activeCount > 0 ? "working" : waitingCount > 0 ? "waiting" : "killed"} />
-                <span className="num">
-                  {activeCount} working · {waitingCount} waiting · #{snap?.head || 0}
-                </span>
+                <span className="num">{activeCount} working</span>
+                <span className="num">{waitingCount} waiting</span>
+                <span className="num text-[var(--ink-3)]">#{snap?.head || 0}</span>
               </div>
               <div className="flex items-center gap-1.5">
                 {snap?.member && <Badge tone="neutral">you: {snap.member}</Badge>}
@@ -356,9 +377,13 @@ export function App() {
             </div>
           )}
 
-          {/* Row 3: Underline Tabs */}
-          <nav aria-label="Primary views" className="-mb-px flex items-center gap-1 overflow-x-auto">
-            <div role="tablist" aria-label="Fleet views" className="flex items-center gap-0.5 min-w-full">
+          {/* Row 3: Zero-Clip 340px–380px Underline Tabs */}
+          <nav aria-label="Primary views" className="-mb-px">
+            <div
+              role="tablist"
+              aria-label="Fleet views"
+              className="flex items-center justify-between sm:justify-start sm:gap-2 w-full"
+            >
               {TABS.map(({ id, label, Icon }, idx) => {
                 const selected = tab === id;
                 const count = tabCounts[id];
@@ -374,12 +399,12 @@ export function App() {
                     onClick={() => setTab(id)}
                     onKeyDown={(e) => handleTabKeyDown(e, idx)}
                     className={cn(
-                      "relative inline-flex items-center gap-1.5 whitespace-nowrap px-2.5 py-2 text-[13px] font-medium cursor-pointer transition",
+                      "relative inline-flex items-center justify-center gap-1 whitespace-nowrap px-1.5 sm:px-2.5 py-2 text-[12px] sm:text-[13px] font-medium cursor-pointer transition shrink-0",
                       "focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[var(--ring)]",
                       selected ? "text-[var(--ink)]" : "text-[var(--ink-2)] hover:text-[var(--ink)]",
                     )}
                   >
-                    <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                    <Icon className="h-3.5 w-3.5 shrink-0 hidden min-[440px]:inline-block" aria-hidden="true" />
                     <span>{label}</span>
                     {typeof count === "number" && count > 0 && (
                       <span
@@ -397,7 +422,7 @@ export function App() {
                       <m.span
                         layoutId="fleet-tab-underline"
                         transition={glide}
-                        className="absolute inset-x-1 bottom-0 h-[2px] rounded-full bg-[var(--blue)]"
+                        className="absolute inset-x-0.5 bottom-0 h-[2px] rounded-full bg-[var(--blue)]"
                       />
                     )}
                   </button>
@@ -429,14 +454,14 @@ export function App() {
           </div>
         ) : !hasSwarm ? (
           <div className="space-y-4">
-            <Card className="p-4 space-y-2">
-              <h2 className="text-[16px] font-semibold text-[var(--ink)]">Launch an Antigravity Swarm</h2>
+            <div className="space-y-2.5">
+              <h2 className="text-[16px] font-semibold text-[var(--ink)]">Launch an Antigravity swarm</h2>
               <p className="text-[14px] text-[var(--ink-2)]">
                 No active swarm is attached to this conversation yet. Start a coordinated swarm with one click or inspect any recent swarm below.
               </p>
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-2">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
                 {SWARM_PRESETS.map((preset) => (
-                  <Card key={preset.id} className="p-3 flex flex-col justify-between gap-2.5 bg-[var(--board)]">
+                  <Card key={preset.id} className="p-3 flex flex-col justify-between gap-2.5">
                     <div className="space-y-1">
                       <p className="text-[14px] font-semibold text-[var(--ink)]">{preset.title}</p>
                       <p className="text-[13px] text-[var(--ink-2)]">{preset.summary}</p>
@@ -457,21 +482,24 @@ export function App() {
                   </Card>
                 ))}
               </div>
-            </Card>
+            </div>
 
             {swarms.length > 0 && (
               <section aria-labelledby="recent-swarms-heading" className="space-y-2">
-                <h2 id="recent-swarms-heading" className="text-[13px] font-semibold uppercase tracking-wide text-[var(--ink-2)]">
-                  Recent Swarms ({swarms.length})
+                <h2 id="recent-swarms-heading" className="text-[14px] font-semibold text-[var(--ink)]">
+                  Recent swarms ({swarms.length})
                 </h2>
                 <div className="space-y-2">
                   {swarms.map((sw) => (
                     <Card key={sw.id} className="p-3 flex items-center justify-between gap-2">
-                      <div className="min-w-0">
+                      <div className="min-w-0 space-y-0.5">
                         <p className="text-[14px] font-semibold text-[var(--ink)] truncate">{sw.title || sw.id}</p>
-                        <p className="text-[12px] text-[var(--ink-2)] num">
-                          {sw.activeCount} active · {sw.memberCount} members · #{sw.head} · {fmtTokens(sw.totalTokens)} tok
-                        </p>
+                        <div className="flex flex-wrap items-center gap-2 text-[12px] text-[var(--ink-2)] num">
+                          <span>{sw.activeCount} active</span>
+                          <span>{sw.memberCount} members</span>
+                          <span>#{sw.head}</span>
+                          <span>{fmtTokens(sw.totalTokens)} tok</span>
+                        </div>
                       </div>
                       <Button variant="outline" size="sm" onClick={() => handleSelectSwarm(sw.id)}>
                         Open
@@ -526,6 +554,7 @@ export function App() {
         swarms={swarms}
         onSelectTab={setTab}
         onSelectSwarm={handleSelectSwarm}
+        onCopyDigest={handleCopyDigest}
         onOpenSettings={() => setSettingsOpen(true)}
       />
 
@@ -568,7 +597,7 @@ export function App() {
           <div className="rounded-[var(--radius-card)] bg-[var(--board)] p-3 text-[12px] text-[var(--ink-2)] space-y-1">
             <div className="flex items-center gap-1.5 font-medium text-[var(--ink)]">
               <CommandIcon className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Fleet Antigravity Plugin v1.0.0</span>
+              <span>Fleet Antigravity Plugin v1.1.0</span>
             </div>
             <p>
               Reads Antigravity native swarm boards and transcripts locally on loopback with zero external telemetry.

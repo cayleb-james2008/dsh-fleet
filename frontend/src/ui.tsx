@@ -13,11 +13,56 @@ import { AnimatePresence, m } from "motion/react";
 import { Toaster, toast } from "sonner";
 import { X } from "lucide-react";
 import { enter, glide, reveal } from "./motion";
+import type { SwarmSnapshot } from "./types";
 
 export { toast };
 
 export function cn(...parts: Array<string | false | null | undefined>): string {
   return parts.filter(Boolean).join(" ");
+}
+
+export function humanizeStatus(raw: string | undefined): string {
+  const s = String(raw || "pending").trim();
+  if (!s) return "Pending";
+  const cleaned = s.replace(/[_-]+/g, " ").toLowerCase();
+  return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+}
+
+export function formatSwarmDigest(snap: SwarmSnapshot): string {
+  const members = snap.members || [];
+  const working = members.filter((m) => !m.killed && m.status === "working").length;
+  const waiting = members.filter((m) => !m.killed && m.status === "waiting").length;
+  const lines: string[] = [];
+  lines.push(`# ${snap.title || "Fleet Swarm"}`);
+  lines.push(
+    `- Status: ${working} working, ${waiting} waiting, ${members.length} members, #${snap.head || 0} posts, ${fmtTokens(snap.usage?.totalTokens)} tokens`,
+  );
+  if (snap.plan?.goal) {
+    lines.push(`- Goal: ${snap.plan.goal}`);
+  }
+  if (snap.plan?.gate) {
+    lines.push(`- Gate: \`${snap.plan.gate}\``);
+  }
+  if (snap.plan?.workstreams?.length) {
+    lines.push("", "## Workstreams");
+    for (const ws of snap.plan.workstreams) {
+      lines.push(`- [${humanizeStatus(ws.status)}] ${ws.title}${ws.owner ? ` (@${ws.owner})` : ""}`);
+    }
+  }
+  if (snap.triage?.length) {
+    lines.push("", "## Needs you");
+    for (const item of snap.triage) {
+      lines.push(`- **${item.title}**: ${item.detail}`);
+    }
+  }
+  const deliverables = (snap.messages || []).filter((m) => !m.control && /\[(done|verified|blocked)\]/i.test(m.text));
+  if (deliverables.length) {
+    lines.push("", "## Recent deliverables");
+    for (const msg of deliverables.slice(-5)) {
+      lines.push(`- #${msg.seq} @${msg.agent}: ${msg.text.replace(/\s+/g, " ").slice(0, 140)}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 export function fmtTokens(n: number | undefined): string {

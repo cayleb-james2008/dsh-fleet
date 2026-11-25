@@ -8,9 +8,8 @@ Fleet lives directly in Antigravity's auxiliary side pane (`SIDECAR_UI_ENTRYPOIN
 
 ## What It Gives You
 
-- **Needs-You Triage Inbox & Plan Tracking:** Surfaces stalled workers, model/quota errors, open worker questions, `[blocked]` escalations, unverified `[done]` deliverables, `plan.json` workstreams/milestones/gates, and worker-flagged `Screenshot:` captures.
-- **1-Click Antigravity Controls:** Jump straight into any worker's chat (`toggleConversation`), open workspace worktree directories (`toggleAuxPane`), or send confirmation-gated nudges (`agent.sendMessage`).
-- **Live Worker Telemetry & Cost/Token Breakdown:** Reads each member's `transcript.jsonl` to display live shimmering tool/thinking activity, step counts, and real `input` / `cache_read` / `output` token totals.
+- **Needs-You Triage Inbox & Plan Tracking:** Surfaces stalled workers, model/quota errors, open worker questions, `[blocked]` escalations, unverified `[done]` deliverables, `plan.json` workstreams/milestones/gates, worker-flagged `Screenshot:` captures, and 1-click **Copy swarm digest** Markdown summaries.
+- **Worker Activity Peek & Live Token Telemetry:** Incrementally tails each member's `transcript.jsonl` to display live shimmering tool/thinking activity, expandable **Activity Peek** (last 5 tool calls + thinking heading), step counts, and real `input` / `cache_read` / `output` token totals.
 - **Board Feed & `@mention` Graph:** Filterable, `#seq`-clickable board stream with unread `New` dividers plus an interactive `@mention` topology graph with timeline replay.
 - **Workspace Git Worktrees:** Subscribes to `sidecar.getWorkspaceUris()` / `onWorkspaceChange()` and probes git worktree branches, dirty/staged/untracked counts, and latest commit metadata with debounced caching.
 - **Multi-Swarm Switcher & Empty-State Presets:** Switch across active or recent swarms in `<appData>/brain/` or launch `/fleet` swarm presets (`Feature + Verifier`, `Audit & Harden`, `Multi-Lane Ship`).

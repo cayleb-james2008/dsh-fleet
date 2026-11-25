@@ -3,6 +3,12 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as a
 ready-to-install Antigravity plugin bundle (`tar.gz` + `zip`) with `SHA256SUMS`.
 
+## 1.1.0 - 2026-11-25
+
+- **340px–380px Sidebar Tab & House-Frontend Craft (`frontend/src/`)**: sized and spaced all 5 tabs (`Triage`, `Board`, `Roster`, `Graph`, `Git`) to fit `340px` and `380px` sidebars with zero text clipping or horizontal scroll; switched section headings (`Needs you`, `Swarm plan`, `Roster`, `@Mention graph`, `Git worktrees`) to crisp sentence-case; replaced middle-dot metadata separators with spaced pills/badges; removed nested card-in-card borders inside Swarm plan and empty-state presets; and humanized workflow statuses (`In progress`, `Done`, `Running`).
+- **Worker Activity Peek & Swarm Digest (`sidecars/fleet_pane/swarm_store.mjs`, `frontend/src/components/{TriageView,RosterView}.tsx`, `ui.tsx`, `App.tsx`, `CommandPalette.tsx`)**: added inline **Activity Peek** drawers revealing each worker's newest thinking heading, last 5 tool calls, and `input` / `cache` / `output` token breakdown before opening chat, plus 1-click **Copy swarm digest** (`CommandPalette` + header action) generating a clean Markdown swarm summary.
+- **Incremental Byte-Offset JSONL Tailing (`sidecars/fleet_pane/swarm_store.mjs`)**: replaced full-file reads on `board.jsonl` and `transcript.jsonl` with 128 KB chunked incremental byte-offset tailing (`openSync` / `readSync`) and inode/truncation reset, reducing Peak RSS (`VmHWM`) and boosting concurrent poll throughput.
+
 ## 1.0.0 - 2026-11-25
 
 - **Antigravity-Native Sidecar Plugin (`plugin.json`, `sidecars/fleet_pane/`, `skills/fleet/SKILL.md`, `rules/AGENTS.md`, `install.sh`)**: pivoted Fleet from an external-CLI standalone Rust server to a first-class Antigravity `SIDECAR_UI_ENTRYPOINT_AUX_PANE` plugin integrating `SidecarApp` + `/preload.js` host theme/workspace/conversation bridges, `/fleet` coordinator skill, standing swarm rules, and atomic `./install.sh` (`~/.gemini/config/plugins/fleet/`).

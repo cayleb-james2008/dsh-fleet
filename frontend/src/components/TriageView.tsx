@@ -3,6 +3,8 @@ import {
   AlertTriangle,
   ArrowUpRight,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   ClipboardCopy,
   Image as ImageIcon,
   Layers,
@@ -12,8 +14,8 @@ import {
   Sparkles,
 } from "lucide-react";
 import { openWorkerConversation, sendConfirmedNudge } from "../sidecar";
-import type { SwarmSnapshot, TriageItem } from "../types";
-import { Badge, Button, Card, StatusDot, Textarea, fmtTimeAgo, toast } from "../ui";
+import type { SwarmMember, SwarmSnapshot, TriageItem } from "../types";
+import { Badge, Button, Card, StatusDot, Textarea, fmtTimeAgo, fmtTokens, humanizeStatus, toast } from "../ui";
 
 const SEVERITY_BADGE: Record<TriageItem["severity"], { tone: "danger" | "warning" | "info"; label: string }> = {
   urgent: { tone: "danger", label: "Urgent" },
@@ -43,10 +45,12 @@ export function TriageView({
   const [nudgeTarget, setNudgeTarget] = useState<TriageItem | null>(null);
   const [nudgeDraft, setNudgeDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const [peekId, setPeekId] = useState<string | null>(null);
 
   const triage = snap.triage || [];
   const plan = snap.plan;
   const frames = snap.frames || [];
+  const memberByName = new Map((snap.members || []).map((m) => [m.name, m]));
   const canNudge = Boolean(snap.capabilities?.canSendMessage || window.sidecar?.agent?.sendMessage);
 
   const openNudge = (item: TriageItem) => {
@@ -84,8 +88,8 @@ export function TriageView({
       {/* Needs-You Triage Inbox */}
       <section aria-labelledby="triage-heading" className="space-y-2.5">
         <div className="flex items-center justify-between gap-2">
-          <h2 id="triage-heading" className="text-[13px] font-semibold uppercase tracking-wide text-[var(--ink-2)]">
-            Needs You ({triage.length})
+          <h2 id="triage-heading" className="text-[14px] font-semibold text-[var(--ink)]">
+            Needs you ({triage.length})
           </h2>
           {triage.length === 0 && (
             <Badge tone="success">
@@ -106,6 +110,9 @@ export function TriageView({
             {triage.map((item) => {
               const sev = SEVERITY_BADGE[item.severity];
               const editingThis = nudgeTarget?.id === item.id;
+              const worker: SwarmMember | undefined = memberByName.get(item.member);
+              const peeking = peekId === item.id;
+              const tools = worker?.recentTools || [];
               return (
                 <Card key={item.id} className="p-3 space-y-2">
                   <div className="flex items-start justify-between gap-2">
@@ -161,6 +168,18 @@ export function TriageView({
                       </Button>
                     )}
 
+                    {worker && (tools.length > 0 || worker.thinkingHeading) && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        aria-expanded={peeking}
+                        onClick={() => setPeekId(peeking ? null : item.id)}
+                      >
+                        {peeking ? <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" /> : <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />}
+                        Peek
+                      </Button>
+                    )}
+
                     {item.seq > 0 && (
                       <Button
                         variant="ghost"
@@ -173,6 +192,31 @@ export function TriageView({
                       </Button>
                     )}
                   </div>
+
+                  {peeking && worker && (
+                    <div className="rounded-[var(--radius-chip)] bg-[var(--board)] p-2.5 space-y-1.5 text-[12px]">
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-[var(--ink-2)] num">
+                        <span className="font-medium text-[var(--ink)]">{worker.steps} steps</span>
+                        <span>
+                          {fmtTokens(worker.usage.totalTokens)} tok (in {fmtTokens(worker.usage.inputTokens)} / cache{" "}
+                          {fmtTokens(worker.usage.cacheReadTokens)} / out {fmtTokens(worker.usage.outputTokens)})
+                        </span>
+                      </div>
+                      {worker.thinkingHeading && (
+                        <p className="text-[var(--ink-2)] truncate">Thinking: {worker.thinkingHeading}</p>
+                      )}
+                      {tools.length > 0 && (
+                        <ul className="space-y-1 text-[var(--ink-2)]" aria-label={`Recent tool calls for ${worker.name}`}>
+                          {tools.map((tc, idx) => (
+                            <li key={idx} className="flex items-center justify-between gap-2">
+                              <span className="truncate">{tc.summary}</span>
+                              <span className="text-[var(--ink-3)] shrink-0 mono">{tc.name}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
 
                   {editingThis && (
                     <div className="pt-2 border-t border-[var(--hairline)] space-y-2">
@@ -208,13 +252,13 @@ export function TriageView({
         )}
       </section>
 
-      {/* Coordinator Plan & Workstreams */}
+      {/* Coordinator Plan & Workstreams (single tonal card, hairline dividers — zero card-in-card) */}
       {plan && (
         <section aria-labelledby="plan-heading" className="space-y-2.5">
           <div className="flex items-center gap-1.5">
             <Layers className="h-4 w-4 text-[var(--ink-3)]" aria-hidden="true" />
-            <h2 id="plan-heading" className="text-[13px] font-semibold uppercase tracking-wide text-[var(--ink-2)]">
-              Swarm Plan
+            <h2 id="plan-heading" className="text-[14px] font-semibold text-[var(--ink)]">
+              Swarm plan
             </h2>
           </div>
 
@@ -227,19 +271,16 @@ export function TriageView({
               </div>
             )}
             {Array.isArray(plan.workstreams) && plan.workstreams.length > 0 && (
-              <ul className="space-y-1.5" aria-label="Workstreams">
+              <ul className="divide-y divide-[var(--hairline)]" aria-label="Workstreams">
                 {plan.workstreams.map((ws, i) => {
                   const st = String(ws.status || "pending").toLowerCase();
                   return (
-                    <li
-                      key={ws.id || i}
-                      className="flex items-center justify-between gap-2 rounded-[var(--radius-chip)] border border-[var(--hairline)] px-2.5 py-1.5"
-                    >
+                    <li key={ws.id || i} className="flex items-center justify-between gap-2 py-2 first:pt-1 last:pb-0">
                       <div className="min-w-0">
                         <p className="text-[13px] font-medium text-[var(--ink)] truncate">{ws.title}</p>
                         {ws.owner && <p className="text-[12px] text-[var(--ink-3)]">@{ws.owner}</p>}
                       </div>
-                      <Badge tone={WORKSTREAM_TONE[st] || "neutral"}>{ws.status || "pending"}</Badge>
+                      <Badge tone={WORKSTREAM_TONE[st] || "neutral"}>{humanizeStatus(ws.status)}</Badge>
                     </li>
                   );
                 })}
@@ -250,7 +291,7 @@ export function TriageView({
                 {plan.milestones.map((ms, idx) => (
                   <Badge key={idx} tone={WORKSTREAM_TONE[String(ms.status || "").toLowerCase()] || "neutral"}>
                     <StatusDot state={ms.status === "done" || ms.status === "completed" ? "ok" : "waiting"} />
-                    {ms.title}
+                    {ms.title} ({humanizeStatus(ms.status)})
                   </Badge>
                 ))}
               </div>
@@ -264,8 +305,8 @@ export function TriageView({
         <section aria-labelledby="reel-heading" className="space-y-2.5">
           <div className="flex items-center gap-1.5">
             <ImageIcon className="h-4 w-4 text-[var(--ink-3)]" aria-hidden="true" />
-            <h2 id="reel-heading" className="text-[13px] font-semibold uppercase tracking-wide text-[var(--ink-2)]">
-              Verified Captures ({frames.length})
+            <h2 id="reel-heading" className="text-[14px] font-semibold text-[var(--ink)]">
+              Verified captures ({frames.length})
             </h2>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">

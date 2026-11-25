@@ -37,12 +37,49 @@ await runChecks("gate", async (check) => {
 
   await check("triage inbox renders Needs You items", async () => {
     const txt = await page.locator("#panel-triage").textContent();
-    return txt.includes("Needs You") && txt.includes("builder asked a question") && txt.includes("awaits cold verification");
+    return txt.includes("Needs you") && txt.includes("builder asked a question") && txt.includes("awaits cold verification");
   });
 
-  await check("plan.json goal and workstreams render", async () => {
+  await check("all 5 tabs fit within 380px header with zero clipping", async () => {
+    const ok380 = await page.evaluate(() => {
+      const hdr = document.querySelector("header")?.getBoundingClientRect();
+      if (!hdr) return false;
+      const tabs = [...document.querySelectorAll('[role="tab"]')];
+      return (
+        tabs.length === 5 &&
+        tabs.every((t) => {
+          const r = t.getBoundingClientRect();
+          return r.left >= hdr.left - 1 && r.right <= hdr.right + 1 && t.scrollWidth <= t.clientWidth + 1;
+        })
+      );
+    });
+    if (!ok380) return false;
+    await page.setViewportSize({ width: 340, height: 900 });
+    const ok340 = await page.evaluate(() => {
+      const hdr = document.querySelector("header")?.getBoundingClientRect();
+      if (!hdr) return false;
+      const tabs = [...document.querySelectorAll('[role="tab"]')];
+      return tabs.every((t) => t.getBoundingClientRect().right <= hdr.right + 1);
+    });
+    await page.setViewportSize({ width: 380, height: 900 });
+    return ok340;
+  });
+
+  await check("plan.json goal, workstreams, and humanized statuses render", async () => {
     const txt = await page.locator("#panel-triage").textContent();
-    return txt.includes("Verify Antigravity-native sidebar UX") && txt.includes("Sidecar Node store & routes");
+    return (
+      txt.includes("Verify Antigravity-native sidebar UX") &&
+      txt.includes("Sidecar Node store & routes") &&
+      txt.includes("In progress") &&
+      !txt.includes("in_progress")
+    );
+  });
+
+  await check("Worker Activity Peek expands in Triage and Copy digest button exists", async () => {
+    await page.locator('#panel-triage button:has-text("Peek")').first().click();
+    const txt = await page.locator("#panel-triage").textContent();
+    const hasDigestBtn = (await page.locator('button[aria-label="Copy swarm digest"]').count()) === 1;
+    return hasDigestBtn && txt.includes("Run sidecar security tests");
   });
 
   await check("screenshot frame loads cleanly with naturalWidth > 0", async () => {
@@ -95,9 +132,12 @@ await runChecks("gate", async (check) => {
   await page.locator("#tab-roster").click();
   await page.waitForSelector("#panel-roster");
 
-  await check("roster shows active shimmering activity and real tokens", async () => {
+  await check("roster shows active shimmering activity, Peek drawer, and real tokens", async () => {
     const txt = await page.locator("#panel-roster").textContent();
-    return txt.includes("builder") && txt.includes("23.4k tok") && txt.includes("Read main.mjs");
+    if (!txt.includes("builder") || !txt.includes("23.4k tok") || !txt.includes("Read main.mjs")) return false;
+    await page.locator('button[aria-label="Peek activity for builder"]').click();
+    const after = await page.locator("#panel-roster").textContent();
+    return after.includes("Recent worker activity") && after.includes("Run sidecar security tests");
   });
 
   await check("killed members hidden by default and revealed by Show killed toggle", async () => {

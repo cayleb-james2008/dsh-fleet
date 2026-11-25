@@ -35,6 +35,8 @@ export interface SwarmMember {
   transcriptMtime: number;
   startedAt: string;
   lastStepAt: string;
+  thinkingHeading?: string;
+  recentTools?: Array<{ name: string; summary: string; time: string }>;
   usage: TokenUsage;
   workspace_mode?: string;
   workspace?: string;
