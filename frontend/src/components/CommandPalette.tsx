@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "../hooks";
 import { Search } from "../icons";
 import { openWorkerConversation } from "../sidecar";
 import type { SwarmSnapshot, SwarmSummary, TabId } from "../types";
@@ -59,36 +59,35 @@ export function CommandPalette({
 
   const items = useMemo<PaletteItem[]>(() => {
     const list: PaletteItem[] = [
-      { id: "v-triage", group: "Views", label: "Needs-you Triage", onSelect: () => onSelectTab("triage") },
-      { id: "v-board", group: "Views", label: "Swarm Board", onSelect: () => onSelectTab("board") },
-      { id: "v-roster", group: "Views", label: "Worker Roster", onSelect: () => onSelectTab("roster") },
-      { id: "v-graph", group: "Views", label: "@Mention Graph", onSelect: () => onSelectTab("graph") },
-      { id: "v-worktrees", group: "Views", label: "Git Worktrees", onSelect: () => onSelectTab("worktrees") },
-      ...(snap?.swarm ? [{ id: "a-digest", group: "Views", label: "Wave digest", onSelect: onCopyDigest }] : []),
-      { id: "a-settings", group: "Views", label: "Settings", onSelect: onOpenSettings },
-      { id: "a-keys", group: "Views", label: "Keyboard shortcuts", meta: "?", onSelect: onOpenShortcuts },
-    ];
-    for (const sw of swarms) {
-      list.push({
+      ...([
+        ["v-triage", "Needs-you Triage", () => onSelectTab("triage")],
+        ["v-board", "Swarm Board", () => onSelectTab("board")],
+        ["v-roster", "Worker Roster", () => onSelectTab("roster")],
+        ["v-graph", "@Mention Graph", () => onSelectTab("graph")],
+        ["v-worktrees", "Git Worktrees", () => onSelectTab("worktrees")],
+        ...(snap?.swarm ? [["a-digest", "Wave digest", onCopyDigest] as const] : []),
+        ["a-settings", "Settings", onOpenSettings],
+        ["a-keys", "Keyboard shortcuts", onOpenShortcuts, "?"],
+      ] as const).map(([id, label, onSelect, meta]) => ({ id, group: "Views", label, meta, onSelect })),
+      ...swarms.map((sw) => ({
         id: `sw-${sw.id}`,
         group: "Swarms",
         label: sw.title || sw.id,
         meta: `${sw.activeCount}/${sw.memberCount}`,
         onSelect: () => onSelectSwarm(sw.id),
-      });
-    }
-    if (window.sidecar?.ui?.toggleConversation) {
-      for (const m of snap?.members || []) {
-        if (!m.conversation_id) continue;
-        list.push({
-          id: `ch-${m.name}`,
-          group: "Worker Chat",
-          label: m.name,
-          meta: m.status,
-          onSelect: () => openWorkerConversation(m.conversation_id),
-        });
-      }
-    }
+      })),
+      ...(window.sidecar?.ui?.toggleConversation
+        ? (snap?.members || [])
+            .filter((m) => m.conversation_id)
+            .map((m) => ({
+              id: `ch-${m.name}`,
+              group: "Worker Chat",
+              label: m.name,
+              meta: m.status,
+              onSelect: () => openWorkerConversation(m.conversation_id),
+            }))
+        : []),
+    ];
     const q = query.trim().toLowerCase();
     if (!q) return list;
     const terms = q.split(/\s+/);
@@ -104,16 +103,6 @@ export function CommandPalette({
 
   if (!open) return null;
 
-  const groups: Array<{ name: string; rows: Array<{ item: PaletteItem; idx: number }> }> = [];
-  items.forEach((item, idx) => {
-    let g = groups.find((x) => x.name === item.group);
-    if (!g) {
-      g = { name: item.group, rows: [] };
-      groups.push(g);
-    }
-    g.rows.push({ item, idx });
-  });
-
   const runItem = (item?: PaletteItem) => {
     if (!item) return;
     onOpenChange(false);
@@ -125,7 +114,7 @@ export function CommandPalette({
       role="dialog"
       aria-modal="true"
       aria-label="Fleet command palette"
-      className="fixed inset-0 z-50 flex items-start justify-center bg-black/45 p-3 pt-[12vh]"
+      className="fixed inset-0 z-50 flex items-start justify-center bg-[var(--scrim)] p-3 pt-[12vh]"
       onClick={(e) => {
         if (e.target === e.currentTarget) onOpenChange(false);
       }}
@@ -161,32 +150,29 @@ export function CommandPalette({
             className="h-11 w-full bg-transparent text-[14px] text-ink placeholder:text-ink-3 focus:outline-none"
           />
         </div>
-        <div role="listbox" className="max-h-[320px] overflow-y-auto p-1.5">
+        <div role="listbox" className="max-h-[320px] overflow-y-auto p-1">
           {items.length === 0 ? (
             <p className="py-6 text-center text-[13px] text-ink-3">No matches.</p>
           ) : (
-            groups.map((g) => (
-              <div key={g.name}>
-                <div className="px-2 py-1 text-[12px] font-medium text-ink-3">{g.name}</div>
-                {g.rows.map(({ item, idx }) => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    role="option"
-                    aria-selected={idx === activeIdx}
-                    onMouseEnter={() => setActiveIdx(idx)}
-                    onClick={() => runItem(item)}
-                    className={cn(
-                      "flex w-full items-center justify-between gap-2 rounded-chip px-2.5 py-2 text-left text-[13px] cursor-pointer",
-                      idx === activeIdx
-                        ? "bg-blue-soft text-info"
-                        : "text-ink hover:bg-track",
-                    )}
-                  >
-                    <span className="truncate">{item.label}</span>
-                    {item.meta && <span className="text-[12px] text-ink-3 num shrink-0">{item.meta}</span>}
-                  </button>
-                ))}
+            items.map((item, idx) => (
+              <div key={item.id}>
+                {(idx === 0 || items[idx - 1].group !== item.group) && (
+                  <div className="px-2 py-1 text-[12px] font-medium text-ink-3">{item.group}</div>
+                )}
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={idx === activeIdx}
+                  onMouseEnter={() => setActiveIdx(idx)}
+                  onClick={() => runItem(item)}
+                  className={cn(
+                    "flex w-full items-center justify-between gap-2 rounded-chip px-2 py-2 text-left text-[13px] cursor-pointer",
+                    idx === activeIdx ? "bg-blue-soft text-info" : "text-ink hover:bg-track",
+                  )}
+                >
+                  <span className="truncate">{item.label}</span>
+                  {item.meta && <span className="text-[12px] text-ink-3 num shrink-0">{item.meta}</span>}
+                </button>
               </div>
             ))
           )}

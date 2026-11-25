@@ -3,6 +3,12 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as a
 ready-to-install Antigravity plugin bundle (`tar.gz` + `zip`) with `SHA256SUMS`.
 
+## 1.10.0 - 2026-11-25
+
+- **Multi-Worker Broadcast Composer & Filtered Board Export (`RosterView.tsx`, `BoardView.tsx`, `ui.tsx`, `sidecar.ts`, `sidecars/fleet_pane/main.mjs`, `web-engine.js`):** Added an inline confirmation-gated Broadcast Composer inside **Roster** with `@all` / `working` / `waiting` preset target pills, per-worker selection toggles, control-character & `<= 4000` char validation, and multi-target `POST /api/nudge` (`conversationIds: string[]`, `1..24` unique IDs) with offline `web-engine.js` parity; added 1-click `.md` and `.json` Filtered Board Export buttons beside **Wave digest** respecting active Board filters with `~/`-masked paths (`0` `/home/` leaks).
+- **Sub-`65 MB` `--jitless` RSS, Snapshot Buffer Caching & Bundle Diet (`sidecars/fleet_pane/{main.mjs,swarm_store.mjs}`, `frontend/`):** Eliminated per-request `gunzipSync` decompression on `/api/swarm` by keeping raw serialized payload buffers (`4.6k–27.0k req/s` keep-alive, `1,360.7 req/s` cold Python audit), lazy-loaded `git_probe.mjs`, `node:v8`, and `/fonts` directory scans (`63.03 ms` cold boot), cached `findAppDataDirs` for `1s`, reduced LRU map caps, and cut single-line `Buffer` slice overhead (`64.90 MB` / `66,456 KB` `--jitless` Peak `VmHWM` under `#154` isolation). Trimmed embedded UI to **`298,839 B` raw (`291.8 KiB`) / `93,061 B` gz (`90.88 KiB`)** (`480,316 B` standalone `dist-live-web/index.html`) and fixed icon `ic()` default sizing when overriding `className`.
+- **Verified E2E, Security, Sloplint & Visual Refresh (`docs/screenshots/*.png`, `sidecars/fleet_pane/test/server.test.mjs`, `frontend/e2e/{gate,check,test-live-web}.mjs`):** Refreshed all 8 Light/Dark `380x900` `@2x` screenshots (showing Broadcast Composer, `.md`/`.json` Export, and fixed `RefreshCw` icon); verified `9/9` backend tests, `40/40` gate, `8/8` replay, `11/11` live-web, `0 FAIL / 0 REFLEX / 0 WARN` Sloplint, `28/28` raw-TCP CWE-22/CWE-59 fuzz checks, and `5/5` SSE streams.
+
 ## 1.9.0 - 2026-11-25
 
 - **Swarm Bottleneck Heat Bar & 1-Click Copy Blocker (`TriageView.tsx`, `ui.tsx`):** Added a proportional `working` / `waiting` / `blocked` Swarm Bottleneck Heat Bar to Needs You with a clickable `Top #seq` jump chip to Board and a 1-click **Copy blocker** action that copies a concise `~/`-masked Markdown escalation (`0` raw `/home/` paths).

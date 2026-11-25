@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "../hooks";
 import { Pause, Play, Radio, SkipBack, SkipForward } from "../icons";
 import type { BoardMessage, SwarmMember, SwarmSnapshot } from "../types";
 import { Badge, Button, Card, cn } from "../ui";
@@ -35,10 +35,7 @@ export function GraphView({ snap }: { snap: SwarmSnapshot }) {
   }, [playing, nonControlMsgs.length]);
 
   const members = snap.members || [];
-  const visibleMsgs = useMemo(
-    () => (activeIdx >= 0 ? nonControlMsgs.slice(0, activeIdx + 1) : []),
-    [nonControlMsgs, activeIdx],
-  );
+  const visibleMsgs = useMemo(() => (activeIdx >= 0 ? nonControlMsgs.slice(0, activeIdx + 1) : []), [nonControlMsgs, activeIdx]);
 
   const nodes = useMemo(() => {
     const active = new Set<string>();
@@ -46,12 +43,12 @@ export function GraphView({ snap }: { snap: SwarmSnapshot }) {
       active.add(m.agent);
       for (const t of m.mentions) active.add(t);
     }
-    const list = members.filter((m: SwarmMember) => {
-      if (m.roleWorker) return false;
-      if (!hideInactive) return true;
-      if (currentMsg && (currentMsg.agent === m.name || currentMsg.mentions.includes(m.name))) return true;
-      return !m.killed && (active.has(m.name) || m.status === "working");
-    });
+    const list = members.filter((m: SwarmMember) =>
+      !m.roleWorker &&
+      (!hideInactive ||
+        (currentMsg && (currentMsg.agent === m.name || currentMsg.mentions.includes(m.name))) ||
+        (!m.killed && (active.has(m.name) || m.status === "working"))),
+    );
     const r = Math.min(102, Math.max(64, list.length * 15));
     return list.map((m, idx) => {
       const a = (idx / Math.max(list.length, 1)) * Math.PI * 2 - Math.PI / 2;
@@ -63,27 +60,36 @@ export function GraphView({ snap }: { snap: SwarmSnapshot }) {
   const edges = useMemo(() => {
     const map = new Map<string, { from: string; to: string; count: number; viaAll: boolean }>();
     const nodeNames = new Set(nodes.map((n) => n.name));
+    const addEdge = (from: string, to: string, direct: boolean) => {
+      if (to === from) return;
+      const key = `${from}\0${to}`;
+      const cur = map.get(key) || { from, to, count: 0, viaAll: true };
+      cur.count++;
+      if (direct) cur.viaAll = false;
+      map.set(key, cur);
+    };
     for (const msg of visibleMsgs) {
       if (!nodeNames.has(msg.agent)) continue;
-      const targets = new Set(msg.mentions.filter((t) => nodeNames.has(t)));
-      if (expandAll && msg.all) {
-        for (const n of nodeNames) {
-          if (n !== msg.agent) targets.add(n);
+      const seen = new Set<string>();
+      for (const t of msg.mentions) {
+        if (nodeNames.has(t) && !seen.has(t)) {
+          seen.add(t);
+          addEdge(msg.agent, t, true);
         }
       }
-      for (const to of targets) {
-        if (to === msg.agent) continue;
-        const key = `${msg.agent}\0${to}`;
-        const cur = map.get(key) || { from: msg.agent, to, count: 0, viaAll: true };
-        cur.count++;
-        if (msg.mentions.includes(to)) cur.viaAll = false;
-        map.set(key, cur);
+      if (expandAll && msg.all) {
+        for (const t of nodeNames) {
+          if (!seen.has(t)) {
+            seen.add(t);
+            addEdge(msg.agent, t, false);
+          }
+        }
       }
     }
     return [...map.values()];
   }, [visibleMsgs, nodes, expandAll]);
 
-  const nodeMap = useMemo(() => new Map(nodes.map((n) => [n.name, n])), [nodes]);
+  const nodeMap = new Map(nodes.map((n) => [n.name, n]));
 
   return (
     <div className="space-y-3">
@@ -91,7 +97,7 @@ export function GraphView({ snap }: { snap: SwarmSnapshot }) {
         <h2 className="text-[14px] font-semibold text-ink">
           @Mention graph ({nodes.length} nodes)
         </h2>
-        <div className="flex flex-wrap items-center gap-1.5">
+        <div className="wrap">
           <Button
             variant={hideInactive ? "secondary" : "outline"}
             onClick={() => setHideInactive((v) => !v)}
@@ -158,37 +164,12 @@ export function GraphView({ snap }: { snap: SwarmSnapshot }) {
 
             {nodes.map((n) => {
               const isSelected = selectedNode === n.name || currentMsg?.agent === n.name;
-              const dotFill = n.killed
-                ? "var(--edge)"
-                : n.status === "working"
-                  ? "var(--dot-green)"
-                  : "var(--ink-3)";
+              const dotFill = n.killed ? "var(--edge)" : n.status === "working" ? "var(--dot-green)" : "var(--ink-3)";
               return (
-                <g
-                  key={n.name}
-                  transform={`translate(${n.x},${n.y})`}
-                  onClick={() => setSelectedNode((cur) => (cur === n.name ? null : n.name))}
-                  className="cursor-pointer"
-                >
-                  <rect
-                    x={-44}
-                    y={-15}
-                    width={88}
-                    height={30}
-                    rx={15}
-                    fill="var(--surface)"
-                    stroke={isSelected ? "var(--blue)" : "var(--hairline-s)"}
-                    strokeWidth={isSelected ? 2 : 1}
-                  />
+                <g key={n.name} transform={`translate(${n.x},${n.y})`} onClick={() => setSelectedNode((cur) => (cur === n.name ? null : n.name))} className="cursor-pointer">
+                  <rect x={-44} y={-15} width={88} height={30} rx={15} fill="var(--surface)" stroke={isSelected ? "var(--blue)" : "var(--hairline-s)"} strokeWidth={isSelected ? 2 : 1} />
                   <circle cx={-30} cy={0} r={4} fill={dotFill} />
-                  <text
-                    x={-21}
-                    y={4}
-                    fontSize={12}
-                    fontWeight={500}
-                    fill="var(--ink)"
-                    fontFamily="var(--font-sans)"
-                  >
+                  <text x={-21} y={4} fontSize={12} fontWeight={500} fill="var(--ink)" fontFamily="var(--font-sans)">
                     {n.name.length > 9 ? `${n.name.slice(0, 8)}…` : n.name}
                   </text>
                 </g>
@@ -200,39 +181,15 @@ export function GraphView({ snap }: { snap: SwarmSnapshot }) {
 
       {/* Replay Controls */}
       {nonControlMsgs.length > 0 && (
-        <Card className="p-2.5 space-y-2">
-          <div className="flex items-center justify-between gap-2">
+        <Card className="p-2 space-y-2">
+          <div className="row">
             <div className="flex items-center gap-1">
-              {[
-                {
-                  label: "Previous post",
-                  disabled: activeIdx <= 0,
-                  icon: <SkipBack className="h-3.5 w-3.5" />,
-                  onClick: () => (setPlaying(false), setReplayIndex(Math.max(0, activeIdx - 1))),
-                },
-                {
-                  label: playing ? "Pause replay" : "Play replay",
-                  disabled: false,
-                  icon: playing ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />,
-                  onClick: () => {
-                    if (isLive && !playing) setReplayIndex(0);
-                    setPlaying((p) => !p);
-                  },
-                },
-                {
-                  label: "Next post",
-                  disabled: activeIdx >= nonControlMsgs.length - 1,
-                  icon: <SkipForward className="h-3.5 w-3.5" />,
-                  onClick: () => {
-                    setPlaying(false);
-                    const next = activeIdx + 1;
-                    setReplayIndex(next >= nonControlMsgs.length - 1 ? null : next);
-                  },
-                },
-              ].map((b) => (
-                <Button key={b.label} size="icon" aria-label={b.label} disabled={b.disabled} onClick={b.onClick}>
-                  {b.icon}
-                </Button>
+              {([
+                ["Previous post", activeIdx <= 0, SkipBack, () => (setPlaying(false), setReplayIndex(Math.max(0, activeIdx - 1)))],
+                [playing ? "Pause replay" : "Play replay", false, playing ? Pause : Play, () => { if (isLive && !playing) setReplayIndex(0); setPlaying((p) => !p); }],
+                ["Next post", activeIdx >= nonControlMsgs.length - 1, SkipForward, () => { setPlaying(false); const n = activeIdx + 1; setReplayIndex(n >= nonControlMsgs.length - 1 ? null : n); }],
+              ] as const).map(([label, disabled, Icon, onClick]) => (
+                <Button key={label} size="icon" aria-label={label} disabled={disabled} onClick={onClick}><Icon /></Button>
               ))}
             </div>
 
@@ -247,7 +204,7 @@ export function GraphView({ snap }: { snap: SwarmSnapshot }) {
                   setReplayIndex(null);
                 }}
               >
-                <Radio className="h-3.5 w-3.5" />
+                <Radio />
                 Live
               </Button>
             </div>
@@ -267,7 +224,7 @@ export function GraphView({ snap }: { snap: SwarmSnapshot }) {
             className="w-full accent-blue cursor-pointer"
           />
           {currentMsg && (
-            <div className="flex items-center justify-between gap-2 text-[12px] text-ink-2">
+            <div className="row text-[12px] text-ink-2">
               <span className="truncate">{currentMsg.text}</span>
               <Badge tone="neutral" className="shrink-0 num">
                 {activeIdx + 1}/{nonControlMsgs.length}

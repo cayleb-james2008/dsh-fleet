@@ -82,7 +82,7 @@ function readSmallCached(path, cache, maxBytes = VIEW_MAX_BYTES) {
   } catch {
     return { text: null, ...s };
   }
-  lruSet(cache, path, { key, text }, 64);
+  lruSet(cache, path, { key, text }, 24);
   return { text, ...s };
 }
 
@@ -98,20 +98,16 @@ const B_CACHE_CAMEL = Buffer.from('"cacheReadTokens":');
 const B_OUTPUT_TOK = Buffer.from('"output_tokens":');
 const B_OUTPUT_CAMEL = Buffer.from('"outputTokens":');
 
-function bufIndexOfRange(buf, needle, start, end) {
-  const idx = buf.subarray(start, end).indexOf(needle);
-  return idx >= 0 ? start + idx : -1;
-}
-
-function extractIntBuf(buf, start, end, keyBuf) {
-  const idx = bufIndexOfRange(buf, keyBuf, start, end);
+function extractIntBuf(lineBuf, keyBuf) {
+  const idx = lineBuf.indexOf(keyBuf);
   if (idx < 0) return -1;
   let pos = idx + keyBuf.length;
-  while (pos < end && (buf[pos] === 32 || buf[pos] === 9)) pos++;
+  const end = lineBuf.length;
+  while (pos < end && (lineBuf[pos] === 32 || lineBuf[pos] === 9)) pos++;
   let val = 0;
   let digits = 0;
   while (pos < end) {
-    const c = buf[pos];
+    const c = lineBuf[pos];
     if (c < 48 || c > 57) break;
     val = val * 10 + (c - 48);
     digits++;
@@ -120,18 +116,19 @@ function extractIntBuf(buf, start, end, keyBuf) {
   return digits > 0 ? val : -1;
 }
 
-function extractStrBuf(buf, start, end, keyBuf) {
-  const idx = bufIndexOfRange(buf, keyBuf, start, end);
+function extractStrBuf(lineBuf, keyBuf) {
+  const idx = lineBuf.indexOf(keyBuf);
   if (idx < 0) return '';
   let pos = idx + keyBuf.length;
-  while (pos < end && (buf[pos] === 32 || buf[pos] === 9)) pos++;
-  if (pos >= end || buf[pos] !== 34) return '';
+  const end = lineBuf.length;
+  while (pos < end && (lineBuf[pos] === 32 || lineBuf[pos] === 9)) pos++;
+  if (pos >= end || lineBuf[pos] !== 34) return '';
   const qStart = pos + 1;
-  const relEnd = buf.subarray(qStart, end).indexOf(34);
-  if (relEnd < 0) return '';
-  const qEnd = qStart + relEnd;
-  if (buf.subarray(qStart, qEnd).indexOf(92) >= 0) return '';
-  return buf.subarray(qStart, qEnd).toString('utf8');
+  const qEnd = lineBuf.indexOf(34, qStart);
+  if (qEnd < 0) return '';
+  const bs = lineBuf.indexOf(92, qStart);
+  if (bs >= 0 && bs < qEnd) return '';
+  return lineBuf.toString('utf8', qStart, qEnd);
 }
 
 /**
@@ -523,7 +520,7 @@ export function summarizeTranscript(appData, conv) {
 
       // Only retain tail line slices near EOF (prevents 50k string allocations during initial scan)
       if (remBytes <= 16 * 1024 || preParsed) {
-        a.rawTail[a.tailCursor % TAIL_CAP] = buf.subarray(start, end).toString('utf8');
+        a.rawTail[a.tailCursor % TAIL_CAP] = buf.toString('utf8', start, end);
       }
       a.tailCursor++;
 
@@ -547,32 +544,33 @@ export function summarizeTranscript(appData, conv) {
         return;
       }
 
-      const si = extractIntBuf(buf, start, end, B_STEP_INDEX);
+      const lineBuf = buf.subarray(start, end);
+      const si = extractIntBuf(lineBuf, B_STEP_INDEX);
       if (si >= 0) a.maxStepIndex = Math.max(a.maxStepIndex, si + 1);
 
       if (!a.startedAt || remBytes <= 4096) {
-        const ts = extractStrBuf(buf, start, end, B_CREATED_AT);
+        const ts = extractStrBuf(lineBuf, B_CREATED_AT);
         if (ts) {
           if (!a.startedAt) a.startedAt = ts;
           a.lastStepAt = ts;
         }
       }
 
-      if (bufIndexOfRange(buf, B_PLANNER, start, end) >= 0) {
+      if (lineBuf.indexOf(B_PLANNER) >= 0) {
         if (!a.model || remBytes <= 8192) {
-          const m = extractStrBuf(buf, start, end, B_MODEL);
+          const m = extractStrBuf(lineBuf, B_MODEL);
           if (m) a.model = m;
         }
 
-        let inp = extractIntBuf(buf, start, end, B_INPUT_TOK);
-        if (inp < 0) inp = extractIntBuf(buf, start, end, B_INPUT_CAMEL);
-        let cac = extractIntBuf(buf, start, end, B_CACHE_SNAKE);
-        if (cac < 0) cac = extractIntBuf(buf, start, end, B_CACHE_CAMEL);
-        let out = extractIntBuf(buf, start, end, B_OUTPUT_TOK);
-        if (out < 0) out = extractIntBuf(buf, start, end, B_OUTPUT_CAMEL);
-        if (inp < 0 && cac < 0 && out < 0 && remBytes <= 16 * 1024 && bufIndexOfRange(buf, B_USAGE, start, end) >= 0) {
+        let inp = extractIntBuf(lineBuf, B_INPUT_TOK);
+        if (inp < 0) inp = extractIntBuf(lineBuf, B_INPUT_CAMEL);
+        let cac = extractIntBuf(lineBuf, B_CACHE_SNAKE);
+        if (cac < 0) cac = extractIntBuf(lineBuf, B_CACHE_CAMEL);
+        let out = extractIntBuf(lineBuf, B_OUTPUT_TOK);
+        if (out < 0) out = extractIntBuf(lineBuf, B_OUTPUT_CAMEL);
+        if (inp < 0 && cac < 0 && out < 0 && remBytes <= 16 * 1024 && lineBuf.indexOf(B_USAGE) >= 0) {
           try {
-            const parsed = JSON.parse(buf.subarray(start, end).toString('utf8'));
+            const parsed = JSON.parse(lineBuf.toString('utf8'));
             const u = parsed.usage && typeof parsed.usage === 'object' ? parsed.usage : parsed;
             inp = num(Number(u.input_tokens ?? u.inputTokens));
             cac = num(Number(u.cache_read_tokens ?? u.cacheReadTokens));
@@ -716,7 +714,7 @@ export function summarizeTranscript(appData, conv) {
     },
   };
 
-  lruSet(transcriptCache, path, state, 64);
+  lruSet(transcriptCache, path, state, 24);
   return state.result;
 }
 
@@ -1114,6 +1112,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
   const matchMentions = createMentionsMatcher(names);
 
   // Transform board messages in-place so peak heap does not hold 2x 2k-object graphs
+  const seen = new Set();
   for (let i = 0; i < msgs.length; i++) {
     const m = msgs[i];
     const seq = Number(m.seq) || 0;
@@ -1138,39 +1137,55 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     const { mentions, all } = matchMentions(text);
     const ch = byChannel ? byChannel(i, text) : null;
     const viaChannel = ch ? ch.members.filter((n) => n !== agent && !mentions.includes(n)) : [];
-    const p = posts.get(agent) || { posts: 0, lastPostSeq: 0, lastPostTime: '', lastPostTs: null };
-    posts.set(agent, { posts: p.posts + 1, lastPostSeq: seq, lastPostTime: time, lastPostTs: ts });
+    let p = posts.get(agent);
+    if (!p) {
+      p = { posts: 0, lastPostSeq: 0, lastPostTime: '', lastPostTs: null };
+      posts.set(agent, p);
+    }
+    p.posts++;
+    p.lastPostSeq = seq;
+    p.lastPostTime = time;
+    p.lastPostTs = ts;
     if (!isRoleWorker(agent, roster.members[agent]) && (all || mentions.length || viaChannel.length)) {
-      const seen = new Set();
+      seen.clear();
       if (all) {
         for (const to of names) {
           if (to === agent || isRoleWorker(to, roster.members[to]) || seen.has(to)) continue;
           seen.add(to);
           const key = `${agent}\0${to}`;
-          const e = edges.get(key) || { from: agent, to, count: 0, direct: 0, viaAll: 0 };
+          let e = edges.get(key);
+          if (!e) {
+            e = { from: agent, to, count: 0, direct: 0, viaAll: 0 };
+            edges.set(key, e);
+          }
           e.count++;
           if (mentions.includes(to) || viaChannel.includes(to)) e.direct++;
           else e.viaAll++;
-          edges.set(key, e);
         }
       } else {
         for (const to of mentions) {
           if (to === agent || isRoleWorker(to, roster.members[to]) || seen.has(to)) continue;
           seen.add(to);
           const key = `${agent}\0${to}`;
-          const e = edges.get(key) || { from: agent, to, count: 0, direct: 0, viaAll: 0 };
+          let e = edges.get(key);
+          if (!e) {
+            e = { from: agent, to, count: 0, direct: 0, viaAll: 0 };
+            edges.set(key, e);
+          }
           e.count++;
           e.direct++;
-          edges.set(key, e);
         }
         for (const to of viaChannel) {
           if (to === agent || isRoleWorker(to, roster.members[to]) || seen.has(to)) continue;
           seen.add(to);
           const key = `${agent}\0${to}`;
-          const e = edges.get(key) || { from: agent, to, count: 0, direct: 0, viaAll: 0 };
+          let e = edges.get(key);
+          if (!e) {
+            e = { from: agent, to, count: 0, direct: 0, viaAll: 0 };
+            edges.set(key, e);
+          }
           e.count++;
           e.direct++;
-          edges.set(key, e);
         }
       }
     }
@@ -1270,7 +1285,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
       hasPlan: Boolean(plan),
       lastActivityTs,
     },
-  }, 32);
+  }, 16);
 
   const snap = {
     id,

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "./hooks";
 import {
   Activity,
   ClipboardCopy,
@@ -46,33 +46,18 @@ import {
 } from "./ui";
 
 const SWARM_PRESETS = [
-  {
-    id: "feature-verifier",
-    title: "Feature + Verifier",
-    summary: "Worktree + cold verifier",
-    prompt: "/fleet Build on isolated worktree, add tests, hand off @verifier [done].",
-  },
-  {
-    id: "audit-harden",
-    title: "Audit & Harden",
-    summary: "Tests, security & UI audit",
-    prompt: "/fleet Audit tests, security boundaries, and UI craft with cold verification.",
-  },
-  {
-    id: "multi-lane",
-    title: "Multi-Lane Ship",
-    summary: "Parallel lanes + monitor",
-    prompt: "/fleet Shard across worktrees with monitor, gates, and plan.json.",
-  },
-];
+  ["feature-verifier", "Feature + Verifier", "Worktree + verifier", "/fleet Build on worktree, test, @verifier [done]."],
+  ["audit-harden", "Audit & Harden", "Tests & security", "/fleet Audit tests, security, UI craft."],
+  ["multi-lane", "Multi-Lane Ship", "Parallel lanes", "/fleet Shard worktrees with monitor + plan.json."],
+].map(([id, title, summary, prompt]) => ({ id, title, summary, prompt }));
 
 const TABS: Array<{ id: TabId; label: string; Icon: typeof Inbox }> = [
-  { id: "triage", label: "Triage", Icon: Inbox },
-  { id: "board", label: "Board", Icon: Activity },
-  { id: "roster", label: "Roster", Icon: Users },
-  { id: "graph", label: "Graph", Icon: Network },
-  { id: "worktrees", label: "Git", Icon: GitBranch },
-];
+  ["triage", "Triage", Inbox],
+  ["board", "Board", Activity],
+  ["roster", "Roster", Users],
+  ["graph", "Graph", Network],
+  ["worktrees", "Git", GitBranch],
+].map(([id, label, Icon]) => ({ id: id as TabId, label: label as string, Icon: Icon as typeof Inbox }));
 
 export function App() {
   const [theme, setTheme] = useState<ThemeMode>(() => readStoredTheme());
@@ -215,26 +200,14 @@ export function App() {
     };
   }, [canSse, pollMs, activeConvId]);
 
-  const allRoots = useMemo(
-    () => [...new Set([...workspaceUris, ...manualRoots])],
-    [workspaceUris, manualRoots],
-  );
+  const allRoots = [...new Set([...workspaceUris, ...manualRoots])];
+  const allRootsKey = allRoots.join("\0");
 
   const refreshWorktrees = useCallback(async () => {
-    if (allRoots.length === 0) {
-      setWorktrees(null);
-      return;
-    }
+    if (!allRootsKey) { setWorktrees(null); return; }
     setWtLoading(true);
-    try {
-      const res = await fetchWorktrees(allRoots);
-      setWorktrees(res);
-    } catch {
-      // keep stale result cleanly
-    } finally {
-      setWtLoading(false);
-    }
-  }, [allRoots]);
+    try { setWorktrees(await fetchWorktrees(allRootsKey.split("\0"))); } catch {} finally { setWtLoading(false); }
+  }, [allRootsKey]);
 
   useEffect(() => {
     refreshWorktrees();
@@ -273,9 +246,7 @@ export function App() {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey || paletteOpen || settingsOpen) return;
       const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable)) {
-        return;
-      }
+      if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) || target?.isContentEditable) return;
       if (e.key === "?") {
         e.preventDefault();
         setShortcutsOpen((v) => !v);
@@ -284,10 +255,7 @@ export function App() {
       if (shortcutsOpen) return;
       if (e.key >= "1" && e.key <= "5") {
         const nextTab = TABS[Number(e.key) - 1];
-        if (nextTab) {
-          e.preventDefault();
-          setTab(nextTab.id);
-        }
+        if (nextTab) { e.preventDefault(); setTab(nextTab.id); }
         return;
       }
       if (e.key === "f" && tab === "board") {
@@ -297,29 +265,22 @@ export function App() {
         return;
       }
       if (tab !== "triage" || triageItems.length === 0) return;
-      if (e.key === "j") {
+      const item = triageItems[selectedTriageIdx];
+      if (e.key === "j" || e.key === "k") {
         e.preventDefault();
-        setSelectedTriageIdx((i) => Math.min(triageItems.length - 1, i + 1));
-      } else if (e.key === "k") {
-        e.preventDefault();
-        setSelectedTriageIdx((i) => Math.max(0, i - 1));
+        setSelectedTriageIdx((i) => Math.max(0, Math.min(triageItems.length - 1, i + (e.key === "j" ? 1 : -1))));
       } else if (e.key === "r") {
         e.preventDefault();
         setTriageReplyNonce((n) => n + 1);
       } else if (e.key === "o" || (e.key === "Enter" && !target?.closest("button,a,select,input,textarea"))) {
-        const item = triageItems[selectedTriageIdx];
         if (!item?.conversationId) return;
         e.preventDefault();
-        if (!openWorkerConversation(item.conversationId)) {
-          toast.message(`Worker @${item.member} chat link unavailable standalone`);
-        }
-      } else if (e.key === "p") {
-        const item = triageItems[selectedTriageIdx];
-        if (!item || item.seq <= 0) return;
+        if (!openWorkerConversation(item.conversationId)) toast.message(`@${item.member} chat unavailable standalone`);
+      } else if (e.key === "p" && item && item.seq > 0) {
         e.preventDefault();
-        const wasPinned = pinnedSeqs.includes(item.seq);
+        const was = pinnedSeqs.includes(item.seq);
         handleTogglePin(item.seq);
-        toast.success(wasPinned ? `Unpinned #${item.seq}` : `Pinned #${item.seq}`);
+        toast.success(`${was ? "Unpinned" : "Pinned"} #${item.seq}`);
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -350,22 +311,16 @@ export function App() {
 
   const handleLaunchPreset = async (preset: (typeof SWARM_PRESETS)[number]) => {
     try {
-      const started = await startSwarmPreset(preset.prompt, preset.title);
-      if (started) {
-        toast.success(`Started "${preset.title}" swarm`);
+      if (await startSwarmPreset(preset.prompt, preset.title)) {
+        toast.success(`Started "${preset.title}"`);
         setTimeout(() => refreshSwarm(true), 400);
         return;
       }
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to launch swarm");
+      toast.error(err instanceof Error ? err.message : "Launch failed");
       return;
     }
-    try {
-      await navigator.clipboard.writeText(preset.prompt);
-      toast.success(`Copied "${preset.title}" /fleet prompt`);
-    } catch {
-      toast.message(preset.prompt);
-    }
+    void copyText(preset.prompt, `Copied "${preset.title}" prompt`);
   };
 
   const tabCounts: Partial<Record<TabId, number>> = {
@@ -381,93 +336,65 @@ export function App() {
 
       {/* Sticky Compact Sidecar Header */}
       <header className="sticky top-0 z-20 border-b border-hairline bg-surface">
-        <div className="mx-auto w-full max-w-[960px] px-3 pt-2.5">
+        <div className="mx-auto w-full max-w-[960px] px-3 pt-2">
           {/* Row 1: Brand + Swarm Switcher + Controls */}
-          <div className="flex items-center justify-between gap-2 pb-2">
+          <div className="row pb-2">
             <div className="flex items-center gap-2 min-w-0">
-              <span
-                aria-hidden="true"
-                className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-chip bg-[var(--ink-button)] text-[var(--ink-button-fg)]"
-              >
+              <span aria-hidden="true" className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-chip bg-[var(--ink-button)] text-[var(--ink-button-fg)]">
                 <Rocket className="h-4 w-4" />
               </span>
               <div className="min-w-0">
                 {swarms.length > 1 ? (
-                  <div className="flex items-center gap-1.5 min-w-0">
+                  <>
                     <h1 className="sr-only">{snap?.title || "Fleet"}</h1>
                     <select
                       aria-label="Active swarm"
                       value={snap?.swarm || selectedSwarmId || ""}
                       onChange={(e) => handleSelectSwarm(e.target.value)}
-                      className="h-7 max-w-[165px] min-[380px]:max-w-[190px] sm:max-w-[320px] truncate rounded-chip border border-[var(--input)] bg-board px-2 text-[14px] font-semibold text-ink cursor-pointer"
+                      className="h-7 max-w-[165px] min-[380px]:max-w-[190px] sm:max-w-[320px] truncate rounded-chip border border-[var(--edge)] bg-board px-2 text-[14px] font-semibold text-ink cursor-pointer"
                     >
                       {swarms.map((sw) => (
-                        <option key={sw.id} value={sw.id}>
-                          {sw.title || sw.id} ({sw.activeCount}/{sw.memberCount})
-                        </option>
+                        <option key={sw.id} value={sw.id}>{sw.title || sw.id} ({sw.activeCount}/{sw.memberCount})</option>
                       ))}
                     </select>
-                  </div>
+                  </>
                 ) : (
-                  <h1 className="text-[15px] font-semibold text-ink truncate">
-                    {snap?.title || "Fleet"}
-                  </h1>
+                  <h1 className="text-[14px] font-semibold text-ink truncate">{snap?.title || "Fleet"}</h1>
                 )}
               </div>
             </div>
 
-            <div className="flex items-center gap-0.5 shrink-0">
-              {hasSwarm && (
-                <Button variant="ghost" size="icon" aria-label="Copy swarm digest" onClick={handleCopyDigest}>
-                  <ClipboardCopy className="h-4 w-4" />
+            <div className="flex items-center gap-1 shrink-0">
+              {([
+                ...(hasSwarm ? [["Copy swarm digest", ClipboardCopy, handleCopyDigest, false] as const] : []),
+                ["Open command palette", Search, () => setPaletteOpen(true), false] as const,
+                ["Refresh swarm", RefreshCw, () => { refreshSwarm(true); refreshWorktrees(); }, loading] as const,
+                ["Open settings", Settings, () => setSettingsOpen(true), false] as const,
+              ]).map(([label, Icon, fn, spin]) => (
+                <Button key={label} variant="ghost" size="icon" aria-label={label} onClick={fn}>
+                  <Icon className={cn("h-4 w-4", spin && "motion-safe:animate-spin")} />
                 </Button>
-              )}
-              <Button variant="ghost" size="icon" aria-label="Open command palette" onClick={() => setPaletteOpen(true)}>
-                <Search className="h-4 w-4" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                aria-label="Refresh swarm"
-                onClick={() => {
-                  refreshSwarm(true);
-                  refreshWorktrees();
-                }}
-              >
-                <RefreshCw className={cn("h-4 w-4", loading && "motion-safe:animate-spin")} />
-              </Button>
-              <Button variant="ghost" size="icon" aria-label="Open settings" onClick={() => setSettingsOpen(true)}>
-                <Settings className="h-4 w-4" />
-              </Button>
+              ))}
             </div>
           </div>
 
-          {/* Row 2: Compact Status Telemetry (balanced padding on 380px tok pill) */}
           {hasSwarm && (
-            <div className="flex flex-wrap items-center justify-between gap-2 pb-2 text-[12px] text-ink-2">
-              <div className="flex flex-wrap items-center gap-2 min-w-0">
+            <div className="wrap justify-between gap-2 pb-2 text-[12px] text-ink-2">
+              <div className="wrap gap-2 min-w-0 num">
                 <StatusDot state={activeCount > 0 ? "working" : waitingCount > 0 ? "waiting" : "killed"} />
-                <span className="num">{activeCount} working</span>
-                <span className="num">{waitingCount} waiting</span>
-                <span className="num text-ink-3">#{snap?.head || 0}</span>
+                {activeCount} working · {waitingCount} waiting <span className="text-ink-3">#{snap?.head || 0}</span>
               </div>
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-1">
                 {sseConnected && <Badge tone="success">Live</Badge>}
-                {snap?.member && <Badge tone="neutral">you: {snap.member}</Badge>}
-                <span className="inline-flex items-center rounded-chip bg-board px-2 py-0.5 num font-medium text-ink-2">
-                  {fmtTokens(snap?.usage?.totalTokens)} tok
-                </span>
+                {snap?.member && <Badge>you: {snap.member}</Badge>}
+                <span className="inline-flex items-center rounded-chip bg-board px-2 py-1 num font-medium text-ink-2">{fmtTokens(snap?.usage?.totalTokens)} tok</span>
               </div>
             </div>
           )}
 
           {/* Row 3: Zero-Clip 340px–380px Underline Tabs */}
           <nav aria-label="Primary views" className="-mb-px">
-            <div
-              role="tablist"
-              aria-label="Fleet views"
-              className="flex items-center justify-between sm:justify-start sm:gap-2 w-full"
-            >
+            <div role="tablist" aria-label="Fleet views" className="flex items-center justify-between sm:justify-start sm:gap-2 w-full">
               {TABS.map(({ id, label, Icon }, idx) => {
                 const selected = tab === id;
                 const count = tabCounts[id];
@@ -482,31 +409,14 @@ export function App() {
                     tabIndex={selected ? 0 : -1}
                     onClick={() => setTab(id)}
                     onKeyDown={(e) => handleTabKeyDown(e, idx)}
-                    className={cn(
-                      "relative inline-flex items-center justify-center gap-1 whitespace-nowrap px-1.5 sm:px-2.5 py-2 text-[12px] sm:text-[13px] font-medium cursor-pointer transition shrink-0",
-                      selected ? "text-ink" : "text-ink-2 hover:text-ink",
-                    )}
+                    className={cn("relative inline-flex items-center justify-center gap-1 whitespace-nowrap px-2 py-2 text-[12px] sm:text-[13px] font-medium cursor-pointer transition shrink-0", selected ? "text-ink" : "text-ink-2 hover:text-ink")}
                   >
                     <Icon className="h-3.5 w-3.5 shrink-0 hidden min-[440px]:inline-block" />
-                    <span>{label}</span>
+                    {label}
                     {typeof count === "number" && count > 0 && (
-                      <span
-                        className={cn(
-                          "rounded-full px-1.5 text-[12px] leading-4 num",
-                          id === "triage"
-                            ? "bg-bad-soft text-danger"
-                            : "bg-track text-ink-2",
-                        )}
-                      >
-                        {count}
-                      </span>
+                      <span className={cn("rounded-full px-2 text-[12px] leading-4 num", id === "triage" ? "bg-bad-soft text-danger" : "bg-track text-ink-2")}>{count}</span>
                     )}
-                    {selected && (
-                      <span
-                        aria-hidden="true"
-                        className="absolute inset-x-0.5 bottom-0 h-[2px] rounded-full bg-blue"
-                      />
-                    )}
+                    {selected && <span aria-hidden="true" className="absolute inset-x-0 bottom-0 h-[2px] rounded-full bg-blue" />}
                   </button>
                 );
               })}
@@ -536,30 +446,18 @@ export function App() {
           </div>
         ) : !hasSwarm ? (
           <div className="space-y-4">
-            <div className="space-y-2.5">
+            <div className="space-y-2">
               <h2 className="text-[16px] font-semibold text-ink">Launch an Antigravity swarm</h2>
-              <p className="text-[14px] text-ink-2">
-                No active swarm yet. Launch a preset or open a recent swarm below.
-              </p>
+              <p className="text-[14px] text-ink-2">Launch a preset or open a recent swarm below.</p>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
-                {SWARM_PRESETS.map((preset) => (
-                  <Card key={preset.id} className="p-3 flex flex-col justify-between gap-2.5">
-                    <div className="space-y-1">
-                      <p className="text-[14px] font-semibold text-ink">{preset.title}</p>
-                      <p className="text-[13px] text-ink-2">{preset.summary}</p>
+                {SWARM_PRESETS.map((p) => (
+                  <Card key={p.id} className="p-3 flex flex-col justify-between gap-2">
+                    <div>
+                      <p className="text-[14px] font-semibold text-ink">{p.title}</p>
+                      <p className="text-[13px] text-ink-2">{p.summary}</p>
                     </div>
-                    <Button variant="primary" onClick={() => handleLaunchPreset(preset)}>
-                      {window.sidecar?.agent?.startConversation ? (
-                        <>
-                          <Rocket className="h-3.5 w-3.5" />
-                          Launch swarm
-                        </>
-                      ) : (
-                        <>
-                          <ClipboardCopy className="h-3.5 w-3.5" />
-                          Copy /fleet prompt
-                        </>
-                      )}
+                    <Button variant="primary" onClick={() => handleLaunchPreset(p)}>
+                      {window.sidecar?.agent?.startConversation ? <><Rocket />Launch swarm</> : <><ClipboardCopy />Copy /fleet prompt</>}
                     </Button>
                   </Card>
                 ))}
@@ -568,24 +466,17 @@ export function App() {
 
             {swarms.length > 0 && (
               <section aria-labelledby="recent-swarms-heading" className="space-y-2">
-                <h2 id="recent-swarms-heading" className="text-[14px] font-semibold text-ink">
-                  Recent swarms ({swarms.length})
-                </h2>
+                <h2 id="recent-swarms-heading" className="text-[14px] font-semibold text-ink">Recent swarms ({swarms.length})</h2>
                 <div className="space-y-2">
                   {swarms.map((sw) => (
-                    <Card key={sw.id} className="p-3 flex items-center justify-between gap-2">
-                      <div className="min-w-0 space-y-0.5">
+                    <Card key={sw.id} className="p-3 row">
+                      <div className="min-w-0">
                         <p className="text-[14px] font-semibold text-ink truncate">{sw.title || sw.id}</p>
-                        <div className="flex flex-wrap items-center gap-2 text-[12px] text-ink-2 num">
-                          <span>{sw.activeCount} active</span>
-                          <span>{sw.memberCount} members</span>
-                          <span>#{sw.head}</span>
-                          <span>{fmtTokens(sw.totalTokens)} tok</span>
+                        <div className="wrap gap-2 text-[12px] text-ink-2 num">
+                          <span>{sw.activeCount} active</span><span>{sw.memberCount} members</span><span>#{sw.head}</span><span>{fmtTokens(sw.totalTokens)} tok</span>
                         </div>
                       </div>
-                      <Button onClick={() => handleSelectSwarm(sw.id)}>
-                        Open
-                      </Button>
+                      <Button onClick={() => handleSelectSwarm(sw.id)}>Open</Button>
                     </Card>
                   ))}
                 </div>
@@ -643,68 +534,48 @@ export function App() {
       {/* Keyboard Shortcuts Cheatsheet (?) */}
       <Modal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} title="Keyboard shortcuts">
         <dl className="divide-y divide-hairline text-[13px]">
-          {[
-            ["j / k", "Move triage"],
-            ["o / Enter", "Open chat"],
-            ["p", "Pin #seq"],
-            ["r", "Reply / nudge"],
-            ["f", "Cycle filters"],
-            ["1 - 5", "Switch tab"],
-            ["Ctrl/Cmd+K", "Command palette"],
-            ["?", "Shortcuts"],
-          ].map(([key, desc]) => (
-            <div key={key} className="flex items-center justify-between gap-3 py-2 first:pt-0 last:pb-0">
-              <dt className="text-ink-2">{desc}</dt>
-              <dd className="rounded-chip border border-hairline bg-board px-1.5 py-0.5 text-[12px] text-ink mono shrink-0">
-                {key}
-              </dd>
-            </div>
-          ))}
+          {"j / k:Triage,o / Enter:Chat,p:Pin,r:Reply,f:Filter,1 - 5:Tab,Ctrl/Cmd+K:Palette,?:Help".split(",").map((row) => {
+            const [key, desc] = row.split(":");
+            return (
+              <div key={key} className="row py-2 first:pt-0 last:pb-0">
+                <dt className="text-ink-2">{desc}</dt>
+                <dd className="rounded-chip border border-hairline bg-board px-2 py-0 text-[12px] text-ink mono shrink-0">{key}</dd>
+              </div>
+            );
+          })}
         </dl>
       </Modal>
 
       {/* Settings Dialog (Guardrail #67: Theme switch lives strictly inside Settings) */}
       <Modal open={settingsOpen} onClose={() => setSettingsOpen(false)} title="Settings">
         <div className="space-y-4">
-          <div className="space-y-1.5">
-            <div className="flex items-center justify-between gap-2">
+          <div className="space-y-1">
+            <div className="row">
               <span className="text-[13px] font-medium text-ink">Appearance</span>
               {embedded && hostSynced && <Badge tone="info">Synced to Antigravity</Badge>}
             </div>
             <SegmentControl
               label="Appearance theme"
               value={theme}
-              onChange={(next) => {
-                setHostSynced(false);
-                setTheme(next);
-              }}
-              options={[
-                { value: "light", label: "Light" },
-                { value: "dark", label: "Dark" },
-              ]}
+              onChange={(next) => { setHostSynced(false); setTheme(next); }}
+              options={[{ value: "light", label: "Light" }, { value: "dark", label: "Dark" }]}
             />
           </div>
-
-          <div className="space-y-1.5">
+          <div className="space-y-1">
             <span className="block text-[13px] font-medium text-ink">Poll cadence</span>
             <SegmentControl
               label="Poll cadence"
               value={pollMs}
               onChange={setPollMs}
-              options={[
-                { value: "2000", label: "2s" },
-                { value: "5000", label: "5s" },
-                { value: "0", label: "Paused" },
-              ]}
+              options={[{ value: "2000", label: "2s" }, { value: "5000", label: "5s" }, { value: "0", label: "Paused" }]}
             />
           </div>
-
           <div className="rounded-card bg-board p-3 text-[12px] text-ink-2 space-y-1">
-            <div className="flex items-center gap-1.5 font-medium text-ink">
-              <CommandIcon className="h-3.5 w-3.5" />
-              <span>Fleet Antigravity Plugin v1.9.0</span>
+            <div className="flex items-center gap-1 font-medium text-ink">
+              <CommandIcon />
+              <span>Fleet Antigravity Plugin v1.10.0</span>
             </div>
-            <p>Local swarm boards &amp; transcripts on loopback. Zero external telemetry.</p>
+            <p>Loopback swarm &amp; worktree monitor. Zero telemetry.</p>
           </div>
         </div>
       </Modal>

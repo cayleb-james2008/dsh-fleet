@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
-import { ChevronDown, ChevronUp, ClipboardCopy, Cpu, Eye, EyeOff, MessageSquare, Send } from "../icons";
+import { useMemo, useState } from "../hooks";
+import { ChevronDown, ChevronUp, ClipboardCopy, Cpu, Eye, EyeOff, MessageSquare, Radio, Send } from "../icons";
 import { openWorkerConversation } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot } from "../types";
-import { ActivityPeek, Badge, Button, Card, InlineComposer, StatusDot, cn, copyText, fmtElapsed, fmtTokens, submitNudge } from "../ui";
+import { ActivityPeek, Badge, Button, Card, InlineComposer, Pill, StatusDot, canLiveNudge, cn, copyText, fmtTokens, hasControlChars, memberMeta, submitNudge, useNowMs } from "../ui";
 
 const ORDER: Record<SwarmMember["status"], number> = { working: 0, waiting: 1, killed: 2 };
 const CONTEXT_BUDGET_TOKENS = 200_000;
@@ -31,17 +31,53 @@ export function RosterView({
   const [peekMember, setPeekMember] = useState<string | null>(null);
   const [nudgeMember, setNudgeMember] = useState<string | null>(null);
   const [nudgeText, setNudgeText] = useState("");
+  const [broadcastOpen, setBroadcastOpen] = useState(false);
+  const [broadcastTargets, setBroadcastTargets] = useState<string[]>([]);
+  const [broadcastText, setBroadcastText] = useState("@all ");
   const [sending, setSending] = useState(false);
-  const [nowMs, setNowMs] = useState(() => Date.now());
-
-  useEffect(() => {
-    const id = setInterval(() => setNowMs(Date.now()), 30_000);
-    return () => clearInterval(id);
-  }, []);
+  const nowMs = useNowMs();
 
   const members = snap.members || [];
+  const liveTargets = members.filter((m) => !m.killed && m.conversation_id);
   const killedCount = members.filter((m) => m.killed).length;
-  const canNudge = Boolean(snap.capabilities?.canSendMessage || window.sidecar?.agent?.sendMessage);
+  const canNudge = canLiveNudge(snap);
+  const broadcastSet = new Set(broadcastTargets);
+  const broadcastConvs = liveTargets.filter((m) => broadcastSet.has(m.name)).map((m) => m.conversation_id);
+
+  const setBroadcastSelection = (names: string[], forceAll = false) => {
+    setBroadcastTargets(names);
+    const prefix = forceAll || (names.length === liveTargets.length && names.length > 1)
+      ? "@all "
+      : names.map((n) => `@${n}`).join(" ") + (names.length ? " " : "");
+    setBroadcastText((cur) => `${prefix}${cur.replace(/^(?:@[a-z0-9_-]+\s*)+/i, "")}`);
+  };
+
+  const applyBroadcastPreset = (mode: "all" | "working" | "waiting") => {
+    const names = liveTargets.filter((m) => mode === "all" || m.status === mode).map((m) => m.name);
+    setBroadcastSelection(names, mode === "all");
+  };
+
+  const toggleBroadcastName = (name: string) => {
+    setBroadcastSelection(
+      broadcastTargets.includes(name) ? broadcastTargets.filter((x) => x !== name) : [...broadcastTargets, name],
+    );
+  };
+
+  const badBroadcast = hasControlChars(broadcastText) || broadcastText.trim().length > 4000;
+
+  const handleBroadcastSubmit = () => {
+    if (badBroadcast || broadcastConvs.length === 0) return;
+    if (!canNudge) {
+      void copyText(broadcastText.trim(), "Broadcast copied");
+      setBroadcastOpen(false);
+      return;
+    }
+    return submitNudge(broadcastConvs, broadcastText, `Broadcast sent (${broadcastConvs.length})`, setSending, () => {
+      setBroadcastOpen(false);
+      setBroadcastText("@all ");
+      onRefresh();
+    });
+  };
 
   const sorted = useMemo(() => {
     return members
@@ -64,20 +100,80 @@ export function RosterView({
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-1.5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="wrap">
           <h2 className="text-[14px] font-semibold text-ink">
             Roster ({members.length - killedCount} active)
           </h2>
           {killedCount > 0 && <Badge tone="neutral">{killedCount} stopped</Badge>}
         </div>
-        {killedCount > 0 && (
-          <Button variant="ghost" onClick={() => setShowKilled((v) => !v)}>
-            {showKilled ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-            {showKilled ? "Hide killed" : `Show killed (${killedCount})`}
-          </Button>
-        )}
+        <div className="flex items-center gap-1">
+          {liveTargets.length > 0 && (
+            <Button
+              variant={broadcastOpen ? "secondary" : "outline"}
+              data-testid="toggle-broadcast"
+              onClick={() => {
+                if (!broadcastOpen) applyBroadcastPreset("all");
+                setBroadcastOpen((v) => !v);
+              }}
+            >
+              <Radio />
+              Broadcast
+            </Button>
+          )}
+          {killedCount > 0 && (
+            <Button variant="ghost" onClick={() => setShowKilled((v) => !v)}>
+              {showKilled ? <EyeOff /> : <Eye />}
+              {showKilled ? "Hide killed" : `Show killed (${killedCount})`}
+            </Button>
+          )}
+        </div>
       </div>
+
+      {broadcastOpen && (
+        <Card className="p-3 space-y-2 bg-board" data-testid="broadcast-composer">
+          <div className="wrap gap-1">
+            {(["all", "working", "waiting"] as const).map((mode) => (
+              <Pill
+                key={mode}
+                onClick={() => applyBroadcastPreset(mode)}
+                className="bg-surface border border-hairline text-ink hover:bg-track"
+              >
+                {mode === "all" ? `@all (${liveTargets.length})` : mode}
+              </Pill>
+            ))}
+            {liveTargets.map((m) => {
+              const on = broadcastTargets.includes(m.name);
+              return (
+                <Pill
+                  key={m.name}
+                  active={on}
+                  aria-pressed={on}
+                  onClick={() => toggleBroadcastName(m.name)}
+                >
+                  @{m.name}
+                </Pill>
+              );
+            })}
+          </div>
+          {hasControlChars(broadcastText) && (
+            <p className="text-[12px] text-danger">Control characters are not allowed.</p>
+          )}
+          <InlineComposer
+            id="roster-broadcast-msg"
+            label={`Confirm broadcast (${broadcastConvs.length} selected)`}
+            value={broadcastText}
+            onChange={setBroadcastText}
+            onCancel={() => setBroadcastOpen(false)}
+            onSubmit={handleBroadcastSubmit}
+            submitLabel={canNudge ? (sending ? "Sending..." : `Send (${broadcastConvs.length})`) : "Copy broadcast"}
+            copyOnly={!canNudge}
+            disabled={sending || badBroadcast || broadcastConvs.length === 0}
+            showCounter
+            className="border-t-0 pt-0"
+          />
+        </Card>
+      )}
 
       {sorted.length === 0 ? (
         <Card className="p-4 text-[14px] text-ink-2 bg-board">No workers yet.</Card>
@@ -85,130 +181,76 @@ export function RosterView({
         <div className="space-y-2">
           {sorted.map((m) => {
             const isYou = snap.member === m.name;
-            const lastTs = m.lastStepAt ? Date.parse(m.lastStepAt) : m.transcriptMtime || m.lastPostTs || 0;
-            const elapsedMs = lastTs > 0 ? Math.max(0, nowMs - lastTs) : 0;
-            const elapsed = lastTs > 0 ? fmtElapsed(lastTs, nowMs) : "";
-            const isStalled = !m.killed && m.status === "working" && !m.failure && elapsedMs >= STALL_MS;
+            const { elapsed, isStalled } = memberMeta(m, nowMs);
             const dotState = m.failure ? "danger" : isStalled ? "warn" : m.status;
-            const baseStatus = m.killed
-              ? "Killed"
-              : m.failure
-                ? `Paused (${m.failure.kind})`
-                : m.status === "working"
-                  ? "Working"
-                  : m.wake_mode
-                    ? `Waiting (${m.wake_mode})`
-                    : "Waiting";
+            const baseStatus = m.killed ? "Killed"
+              : m.failure ? `Paused (${m.failure.kind})`
+              : m.status === "working" ? "Working"
+              : m.wake_mode ? `Waiting (${m.wake_mode})` : "Waiting";
             const statusText = !m.killed && elapsed ? `${baseStatus} ${elapsed}` : baseStatus;
             const peeking = peekMember === m.name;
             const tools = m.recentTools || [];
             const pressure = contextPressure(m);
-            const askStatusPrompt = `@${m.name} Status & blockers?`;
-            const wrapUpPrompt = `@${m.name} Wrap up, verify, and post [done].`;
+            const askPrompt = `@${m.name} Status & blockers?`;
+            const wrapPrompt = `@${m.name} Wrap up, verify, and post [done].`;
 
             return (
               <Card key={m.name} className={cn("p-3 space-y-2", m.killed && "opacity-65")}>
-                {/* Line 1: Identity & Actions */}
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+                <div className="row">
+                  <div className="wrap gap-1 min-w-0">
                     <StatusDot state={dotState} />
-                    <span className={cn("text-[14px] font-semibold text-ink truncate", m.killed && "line-through")}>
-                      {m.name}
-                    </span>
+                    <span className={cn("text-[14px] font-semibold text-ink truncate", m.killed && "line-through")}>{m.name}</span>
                     {isYou && <Badge tone="info">you</Badge>}
                     {m.role && m.role !== "worker" && <Badge tone="neutral">{m.role}</Badge>}
-                    {m.workspace_mode && m.workspace_mode !== "inherit" && (
-                      <Badge tone="violet">{m.workspace_mode}</Badge>
-                    )}
+                    {m.workspace_mode && m.workspace_mode !== "inherit" && <Badge tone="violet">{m.workspace_mode}</Badge>}
                   </div>
 
                   <div className="flex items-center gap-1 shrink-0">
                     {(tools.length > 0 || m.thinkingHeading) && (
-                      <Button
-                        variant={peeking ? "secondary" : "ghost"}
-                        aria-label={`Peek activity for ${m.name}`}
-                        aria-expanded={peeking}
-                        onClick={() => setPeekMember(peeking ? null : m.name)}
-                      >
-                        {peeking ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                      <Button variant={peeking ? "secondary" : "ghost"} aria-label={`Peek activity for ${m.name}`} aria-expanded={peeking} onClick={() => setPeekMember(peeking ? null : m.name)}>
+                        {peeking ? <ChevronUp /> : <ChevronDown />}
                         Peek
                       </Button>
                     )}
                     {m.conversation_id && window.sidecar?.ui?.toggleConversation && (
-                      <Button
-                        aria-label={`Open ${m.name} chat`}
-                        onClick={() => openWorkerConversation(m.conversation_id)}
-                      >
-                        <MessageSquare className="h-3.5 w-3.5" />
+                      <Button aria-label={`Open ${m.name} chat`} onClick={() => openWorkerConversation(m.conversation_id)}>
+                        <MessageSquare />
                         Chat
                       </Button>
                     )}
                     {!m.killed && canNudge && m.conversation_id && (
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        aria-label={`Nudge ${m.name}`}
-                        onClick={() => {
-                          setNudgeMember(nudgeMember === m.name ? null : m.name);
-                          setNudgeText(`@${m.name} `);
-                        }}
-                      >
-                        <Send className="h-3.5 w-3.5" />
+                      <Button variant="ghost" size="icon" aria-label={`Nudge ${m.name}`} onClick={() => { setNudgeMember(nudgeMember === m.name ? null : m.name); setNudgeText(`@${m.name} `); }}>
+                        <Send />
                       </Button>
                     )}
                   </div>
                 </div>
 
-                {/* Line 2: Clean spaced pills + Context Pressure */}
-                <div className="flex flex-wrap items-center gap-1.5 text-[12px] text-ink-2">
-                  <Badge tone={m.status === "working" ? "success" : "neutral"} className="num">
-                    {statusText}
-                  </Badge>
+                <div className="wrap gap-1 text-[12px] text-ink-2">
+                  <Badge tone={m.status === "working" ? "success" : "neutral"}>{statusText}</Badge>
                   {isStalled && <Badge tone="danger">stalled</Badge>}
-                  {!m.killed && <Badge tone={pressure.tone} className="num">{pressure.label}</Badge>}
-                  <Badge tone="neutral" className="num">{m.steps} steps</Badge>
-                  <Badge tone="neutral" className="num">{m.posts} posts</Badge>
-                  {m.unread > 0 && (
-                    <Badge tone="danger" className="num">{m.unread} unread</Badge>
-                  )}
-                  {m.model && (
-                    <span className="inline-flex items-center gap-1 text-ink-3 px-1">
-                      <Cpu className="h-3 w-3" />
-                      {m.model}
-                    </span>
-                  )}
+                  {!m.killed && <Badge tone={pressure.tone}>{pressure.label}</Badge>}
+                  <Badge>{m.steps} steps</Badge>
+                  <Badge>{m.posts} posts</Badge>
+                  {m.unread > 0 && <Badge tone="danger">{m.unread} unread</Badge>}
+                  {m.model && <span className="inline-flex items-center gap-1 text-ink-3 px-1"><Cpu className="h-3 w-3" />{m.model}</span>}
                 </div>
 
-                {/* Quick-Action chips for active workers */}
                 {!m.killed && m.conversation_id && (
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <Button
-                      variant={canNudge ? "outline" : "ghost"}
-                      onClick={() =>
-                        canNudge
-                          ? (setNudgeMember(m.name), setNudgeText(askStatusPrompt))
-                          : void copyText(askStatusPrompt, `Copied status check for ${m.name}`)
-                      }
-                      className="h-7 px-2"
-                    >
+                  <div className="wrap gap-1">
+                    <Button variant={canNudge ? "outline" : "ghost"} onClick={() => canNudge ? (setNudgeMember(m.name), setNudgeText(askPrompt)) : void copyText(askPrompt, `Copied status check for ${m.name}`)} className="h-7 px-2">
                       {!canNudge && <ClipboardCopy className="h-3 w-3" />}
                       Ask status
                     </Button>
                     {canNudge && (
-                      <Button
-                        variant="ghost"
-                        onClick={() => (setNudgeMember(m.name), setNudgeText(wrapUpPrompt))}
-                        className="h-7 px-2"
-                      >
-                        Wrap up
-                      </Button>
+                      <Button variant="ghost" onClick={() => (setNudgeMember(m.name), setNudgeText(wrapPrompt))} className="h-7 px-2">Wrap up</Button>
                     )}
                   </div>
                 )}
 
                 {/* Line 3: Token telemetry & Context saturation bar */}
-                <div className="rounded-chip bg-board px-2.5 py-1.5 space-y-1.5">
-                  <div className="flex flex-wrap items-center gap-2.5 text-[12px] text-ink-2 num">
+                <div className="rounded-chip bg-board px-2 py-1 space-y-1">
+                  <div className="flex flex-wrap items-center gap-2 text-[12px] text-ink-2 num">
                     <span className="font-semibold text-ink">{fmtTokens(m.usage.totalTokens)} tok</span>
                     {([["in", m.usage.inputTokens], ["cache", m.usage.cacheReadTokens], ["out", m.usage.outputTokens]] as const).map(([k, v]) => (
                       <span key={k}>{k} {fmtTokens(v)}</span>

@@ -260,6 +260,7 @@ test('install.sh --dest deploys plugin bundle cleanly and installed main.mjs boo
     const json = await health.json();
     assert.equal(json.ok, true);
     assert.equal(json.name, 'fleet');
+    assert.equal(json.version, '1.10.0');
   } finally {
     if (child && child.exitCode === null) child.kill('SIGTERM');
     if (!hadDist) rmSync(distDir, { recursive: true, force: true });
@@ -312,6 +313,61 @@ test('GET /api/swarm/stream sustains 5 concurrent SSE clients and pushes live de
     assert.ok(finalCounts.every((c) => c >= 2), `Expected >=2 SSE events on all 5 clients, got ${JSON.stringify(finalCounts)}`);
   } finally {
     for (const s of socks) s.destroy();
+    await srv.close();
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test('POST /api/nudge supports confirmation-gated multi-worker conversationIds broadcast and validation', async () => {
+  const fx = setupFixtureAppData();
+  const nudged = [];
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+    sendMessageFn: async (conv, msg) => {
+      nudged.push({ conv, msg });
+      return { ok: true };
+    },
+  });
+
+  try {
+    const post = (body) =>
+      fetch(`${srv.url}/api/nudge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    // Empty / >24 / invalid ID / missing confirm / >4000 / control chars must all fail 400
+    assert.equal((await post({ confirm: true, conversationIds: [], message: 'hi' })).status, 400);
+    assert.equal(
+      (await post({ confirm: true, conversationIds: Array.from({ length: 25 }, (_, i) => `conv-${i}`), message: 'hi' })).status,
+      400,
+    );
+    assert.equal((await post({ confirm: true, conversationIds: [fx.worker, '../bad'], message: 'hi' })).status, 400);
+    assert.equal((await post({ conversationIds: [fx.coord, fx.worker], message: 'hi' })).status, 400);
+    assert.equal((await post({ confirm: true, conversationIds: [fx.coord, fx.worker], message: 'x'.repeat(4001) })).status, 400);
+    assert.equal((await post({ confirm: true, conversationIds: [fx.coord, fx.worker], message: 'hi\x07there' })).status, 400);
+    assert.equal(nudged.length, 0);
+
+    // Deduplicated valid multi-target broadcast succeeds
+    const okRes = await post({
+      confirm: true,
+      conversationIds: [fx.coord, fx.worker, fx.coord],
+      message: 'Wave status check',
+    });
+    assert.equal(okRes.status, 200);
+    const body = await okRes.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.delivered, 2);
+    assert.equal(body.results.length, 2);
+    assert.deepEqual(
+      nudged.map((x) => x.conv),
+      [fx.coord, fx.worker],
+    );
+  } finally {
     await srv.close();
     rmSync(fx.dir, { recursive: true, force: true });
   }
