@@ -1,0 +1,16 @@
+{
+  "name": "fleet",
+  "displayName": "Fleet",
+  "version": "1.0.0",
+  "description": "Antigravity-native Swarm Command Center sidecar plugin: Needs-You triage inbox, live worker token/step telemetry, workspace git worktrees, @mention graph, and instant swarm controls.",
+  "logo": "assets/logo.svg",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cayleb-james2008/fleet"
+  },
+  "suggestedPrompts": [
+    "/fleet Orchestrate a parallel Feature + Verifier swarm on my current workspace",
+    "/fleet Run an Audit & Harden swarm across tests, security boundaries, and UI polish",
+    "/fleet Launch a Multi-Lane Ship swarm with isolated worktrees and cold gate signoff"
+  ]
+}

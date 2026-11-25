@@ -1,8 +1,13 @@
 # Changelog
 
-Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases with
-binaries and a `SHA256SUMS` file. The running app shows its version and can update
-itself from the newest release (see README, "Versions and updates").
+Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as a
+ready-to-install Antigravity plugin bundle (`tar.gz` + `zip`) with `SHA256SUMS`.
+
+## 1.0.0 - 2026-11-25
+
+- **Antigravity-Native Sidecar Plugin (`plugin.json`, `sidecars/fleet_pane/`, `skills/fleet/SKILL.md`, `rules/AGENTS.md`, `install.sh`)**: pivoted Fleet from an external-CLI standalone Rust server to a first-class Antigravity `SIDECAR_UI_ENTRYPOINT_AUX_PANE` plugin integrating `SidecarApp` + `/preload.js` host theme/workspace/conversation bridges, `/fleet` coordinator skill, standing swarm rules, and atomic `./install.sh` (`~/.gemini/config/plugins/fleet/`).
+- **Swarm Store, Transcript Telemetry & Hardened Loopback Server (`sidecars/fleet_pane/`)**: added zero-external-dep Node ESM sidecar backend reading `<appData>/brain/<conv>/.system_generated/{swarm,logs}/` read-only with real per-worker token/cache/step aggregation, `plan.json` workstreams & verification gates, `Needs-You` triage computation, cached `git worktree` inspection (`GET /api/worktrees`), Multi-Swarm Switcher (`GET /api/swarms`), CWE-22/CWE-59 confined screenshot serving (`GET /api/frame`), pre-compressed gzip + strong SHA-256 `ETag`/`304` + `Vary` + CSP headers, loopback `Host`/`Origin` `403` guards, prompt `413` payload limits, and confirmation-gated `POST /api/nudge`.
+- **Sidebar-First Aux Pane Command Center (`frontend/`, `dist-live-web/index.html`)**: rebuilt UI for `340px–520px` Antigravity sidebar width (scaling smoothly to `1440px`) in House Frontend v2.0 (`data-world="codex"`, Geist + Geist Mono, live host `theme-change` luminance sync + Settings-only Light/Dark toggle `#67`), delivering Needs-You Triage + `plan.json` + Screenshot Reel, `#seq`-linked Board feed, shimmering Roster + token telemetry, interactive `@mention` Graph + replay scrubber, Workspace Git Worktrees, `cmdk` Command Palette, empty-state `/fleet` presets, `<500 KB` raw / `<160 KB` gzip sidecar bundle, and `0`-network-call offline `dist-live-web/index.html` simulator.
 
 ## 0.12.0 - 2026-11-25
 

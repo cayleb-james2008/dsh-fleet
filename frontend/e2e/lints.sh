@@ -1,20 +1,22 @@
 #!/bin/bash
 # lints.sh <url> <outdir>: taste lint (source), impeccable detect, taste inspect, Hallmark sloplint app scope (render).
-# Report only, never gating: the tools live outside this repo. `npm run check:ui -- --lints` runs it on the fixture.
-# Tool locations (override with the env var; a missing tool is skipped):
-#   TASTE_DIR   ~/refskills/taste/skills/taste-skill            IMPECCABLE  ~/refskills/impeccable/.claude/skills/impeccable/scripts/impeccable
-#   HALLMARK    ~/.agents/skills/hallmark/scripts/sloplint.mjs  HALLMARK_PUPPETEER  ~/.npm/_npx/17406ab935e1f629
 set -u
 U=$1; G=$2; mkdir -p "$G"
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 TASTE_DIR=${TASTE_DIR:-$HOME/refskills/taste/skills/taste-skill}
 IMPECCABLE=${IMPECCABLE:-$HOME/refskills/impeccable/.claude/skills/impeccable/scripts/impeccable}
 HALLMARK=${HALLMARK:-$HOME/.agents/skills/hallmark/scripts/sloplint.mjs}
-export CHROME_PATH=${E2E_CHROME:-$HOME/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome} HALLMARK_PUPPETEER=${HALLMARK_PUPPETEER:-$HOME/.npm/_npx/17406ab935e1f629}
+export CHROME_PATH=${E2E_CHROME:-$HOME/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome}
+export HALLMARK_PUPPETEER=${HALLMARK_PUPPETEER:-$HOME/.npm/_npx/17406ab935e1f629}
 have() { [ -e "$1" ] || { echo "SKIP $2: $1 not found"; return 1; }; }
-cd "$G" # sloplint writes .hallmark/ next to its input and in the working directory: keep both in the out dir
-cp "$ROOT/assets/index.html" "$G/index.html"
-have "$TASTE_DIR/scripts/lint.mjs" lint && timeout 120 node "$TASTE_DIR/scripts/lint.mjs" "$ROOT/frontend/src/board.tsx" "$ROOT/frontend/src/detail.tsx" "$ROOT/frontend/src/App.tsx" "$ROOT/frontend/src/ui.tsx" --json > "$G/lint.json" 2>&1
+cd "$G"
+cp "$ROOT/sidecars/fleet_pane/dist/index.html" "$G/index.html"
+cp -R "$ROOT/sidecars/fleet_pane/dist/fonts" "$G/fonts"
+have "$TASTE_DIR/scripts/lint.mjs" lint && timeout 120 node "$TASTE_DIR/scripts/lint.mjs" \
+  "$ROOT/frontend/src/App.tsx" "$ROOT/frontend/src/ui.tsx" \
+  "$ROOT/frontend/src/components/TriageView.tsx" "$ROOT/frontend/src/components/BoardView.tsx" \
+  "$ROOT/frontend/src/components/RosterView.tsx" "$ROOT/frontend/src/components/GraphView.tsx" \
+  "$ROOT/frontend/src/components/WorktreesView.tsx" --json > "$G/lint.json" 2>&1
 have "$IMPECCABLE" detect && timeout 120 "$IMPECCABLE" detect --json "$U" > "$G/detect.json" 2>/dev/null
 have "$TASTE_DIR/scripts/inspect.mjs" inspect && timeout 300 node "$TASTE_DIR/scripts/inspect.mjs" "$U" --out "$G/inspect" --json > "$G/inspect.json" 2>/dev/null
 have "$HALLMARK" sloplint && timeout 300 node "$HALLMARK" "$G/index.html" --url "$U" --scope app --json > "$G/slop.json" 2>/dev/null

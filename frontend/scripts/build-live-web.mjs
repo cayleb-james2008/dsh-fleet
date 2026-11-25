@@ -1,17 +1,14 @@
-// build-live-web.mjs: Produces the standalone real functional Fleet web app
-// (shared-live-web/fleet/index.html) by embedding ./web-engine.js (real
-// in-browser git worktree store, unified diff engine, IndexedDB persistence,
-// real sandboxed Web Worker check evaluator, optional BYOK OpenAI-compatible
-// agent in sessionStorage, and local Fleet connector) into assets/index.html.
+// Produces the 100% self-contained single-file interactive live-web demo
+// (dist-live-web/index.html) from sidecars/fleet_pane/dist/index.html +
+// ./web-engine.js + inlined Geist woff2 fonts. Zero external network calls.
 import fs from "node:fs";
 import path from "node:path";
 
 const root = path.resolve(import.meta.dirname, "../..");
-const srcHtml = path.join(root, "assets/index.html");
+const srcHtml = path.join(root, "sidecars/fleet_pane/dist/index.html");
+const fontsDir = path.join(root, "frontend/src/fonts");
 const engineJs = path.join(import.meta.dirname, "web-engine.js");
-const outDir =
-  process.env.LIVE_WEB_OUT_DIR ||
-  path.join(root, "dist-live-web");
+const outDir = process.env.LIVE_WEB_OUT_DIR || path.join(root, "dist-live-web");
 const outFile = path.join(outDir, "index.html");
 
 if (!fs.existsSync(srcHtml)) {
@@ -19,12 +16,23 @@ if (!fs.existsSync(srcHtml)) {
   process.exit(1);
 }
 
-const engineCode = fs.readFileSync(engineJs, "utf8");
-// Escape closing script tags safely if any appear in string literals
-const safeScript = `<script>\n${engineCode.replace(/<\/script>/gi, "<\\/script>")}\n</script>`;
-
+const engineCode = fs.readFileSync(engineJs, "utf8").replace(/<\/script>/gi, "<\\/script>");
 let html = fs.readFileSync(srcHtml, "utf8");
-html = html.replace("<head>", () => `<head>\n    ${safeScript}`);
+
+// Inline Geist & Geist Mono woff2 fonts into CSS so dist-live-web/index.html is 100% offline/file:// ready.
+for (const file of fs.readdirSync(fontsDir)) {
+  if (!file.endsWith(".woff2")) continue;
+  const b64 = fs.readFileSync(path.join(fontsDir, file)).toString("base64");
+  const dataUri = `data:font/woff2;base64,${b64}`;
+  html = html.replaceAll(`./fonts/${file}`, dataUri);
+}
+
+// Replace /preload.js script tag cleanly with our offline live-web engine simulator.
+html = html.replace(
+  /<script\s+src="\/preload\.js"\s*><\/script>/i,
+  () => `<script>\n${engineCode}\n</script>`,
+);
+
 fs.mkdirSync(outDir, { recursive: true });
 fs.writeFileSync(outFile, html);
-console.log(`live web bundle: ${outFile} (${(html.length / 1024).toFixed(0)} kB)`);
+console.log(`live web bundle: ${outFile} (${(html.length / 1024).toFixed(1)} kB)`);
