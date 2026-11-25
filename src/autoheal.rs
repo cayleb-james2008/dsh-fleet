@@ -73,6 +73,8 @@ pub struct HealSessionContext {
     pub diff_excerpt: String,
     #[serde(default)]
     pub prior_attempts_summary: Vec<String>,
+    #[serde(default)]
+    pub prior_lessons: Vec<String>,
 }
 
 /// Failing verification step details supplied to [`build_heal_prompt`] and [`evaluate_auto_heal`].
@@ -531,6 +533,16 @@ pub fn build_heal_prompt(
     prompt.push_str("\nDiagnostic output tail:\n```\n");
     prompt.push_str(&tail_block);
     prompt.push_str("\n```\n");
+
+    if !session.prior_lessons.is_empty() {
+        prompt.push_str("\nLearned repo fixes from past passing runs:\n");
+        for lesson in &session.prior_lessons {
+            let clean = lesson.trim();
+            if !clean.is_empty() {
+                prompt.push_str(&format!("- {clean}\n"));
+            }
+        }
+    }
 
     if !session.prior_attempts_summary.is_empty() {
         prompt.push_str("\nPrevious failed repair passes (try a different fix):\n");

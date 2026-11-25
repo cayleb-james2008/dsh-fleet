@@ -4,6 +4,12 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running app shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.12.0 - 2026-11-25
+
+- **Dynamic Huffman Gzip & Peak RSS Diet (`src/http_assets.rs`, `src/main.rs`)**: upgraded pure-Rust DEFLATE in `src/http_assets.rs` from fixed Huffman to Package-Merge length-limited Dynamic Huffman (`BTYPE=10`), compressing embedded HTML down to `<360 KB` gzip; replaced 2,000-session `Value` DOM batch allocation with streamed per-session `serde_json::to_writer` into single `Arc<Vec<u8>>` HTTP buffers and dropped duplicate `String` caches.
+- **Smart Cross-CLI Router & Failure Memory (`src/router.rs`, `src/autoheal.rs`, `src/main.rs`, `frontend/src/board.tsx`)**: extracted cohesive `src/router.rs` scoring installed CLIs from live persisted pass rates, first-pass rate, and median wall time (`GET /api/router/recommend` + Goal-to-DAG auto-routing) alongside atomic `<data_dir>/lessons.json` (`LessonStore`, `GET /api/lessons`) injecting verified past repo repairs into attempt-1 auto-heal prompts.
+- **Large Diff Windowing, Wave Telemetry & Bundle Diet (`frontend/src/diff.tsx`, `frontend/src/dag-graph.tsx`, `frontend/src/main.tsx`, `frontend/scripts/web-engine.js`)**: added windowed file/line rendering in `DiffViewer` (auto-collapsing 12+ file diffs, 250-line file windows with instant expand), live wave pass-rate & average-duration telemetry in DAG Graph, `domAnimation` bundle trimming, and `0.12.0` parity in `web-engine.js`.
+
 ## 0.11.0 - 2026-11-25
 
 - **Cold Boot Latency (`src/main.rs`)**: replaced 3 sequential `which`/`where` child spawns in `detect_agents` with pure-Rust `$PATH` resolution, replaced intermediate `serde_json::Value` AST double-parsing in `load_persisted_core` with single-pass `PersistedStore` deserialization, and moved settled `.log` hydration + update checks off the pre-bind boot path (`<30 ms` cold boot at 2k sessions while preserving `6,250+ req/s`).

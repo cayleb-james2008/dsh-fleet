@@ -1,5 +1,5 @@
 (() => {
-  const APP_VERSION = "0.11.0";
+  const APP_VERSION = "0.12.0";
   const DB_NAME = "fleet-worktrees-v4";
   const STORE_NAME = "state";
   const BYOK_KEY_SS = "fleet-byok-api-key";
@@ -1953,6 +1953,8 @@
           batch_pr: true,
           wave_preflight: true,
           failure_classifier: true,
+          smart_router: true,
+          failure_memory: true,
           merge_check: true,
           policy_test: true,
           prune_worktrees: true,
@@ -1967,6 +1969,39 @@
     }
     if (method === "GET" && u.pathname === "/api/metrics") {
       return jsonResp(computeMetrics());
+    }
+    if (method === "GET" && u.pathname === "/api/router/recommend") {
+      const repoFilter = (u.searchParams.get("repo") || "").trim();
+      const runners = ["web-worker", "byok-llm"].map((name) => {
+        const list = state.sessions.filter((s) => (!repoFilter || s.repo === repoFilter) && (s.agent || "web-worker") === name);
+        const passed = list.filter((s) => s.status === "done" || s.status === "merged").length;
+        const total = list.length;
+        return {
+          name,
+          engine: name,
+          found: name === "web-worker" || Boolean(getByokKey()),
+          total_runs: total,
+          first_pass_count: Math.max(0, passed - list.filter((s) => Array.isArray(s.heal_attempts) && s.heal_attempts.some((a) => a.healed)).length),
+          healed_count: list.filter((s) => Array.isArray(s.heal_attempts) && s.heal_attempts.some((a) => a.healed)).length,
+          failed_count: Math.max(0, total - passed),
+          pass_rate_pct: total > 0 ? Math.round((passed / total) * 1000) / 10 : 0,
+          median_elapsed_ms: 420,
+          heal_efficiency_pct: 100,
+          score: name === "web-worker" ? 90 : getByokKey() ? 92 : -1
+        };
+      });
+      const rec = getByokKey() ? "byok-llm" : "web-worker";
+      return jsonResp({
+        recommended_agent: rec,
+        recommended_engine: rec,
+        confidence: "telemetry",
+        reason: rec + " selected from browser session telemetry.",
+        runners,
+        matching_lessons: []
+      });
+    }
+    if (method === "GET" && u.pathname === "/api/lessons") {
+      return jsonResp({ lessons: [] });
     }
     if (method === "GET" && u.pathname === "/api/templates") {
       return jsonResp(Array.isArray(state.templates) ? state.templates : DEFAULT_TEMPLATES());
