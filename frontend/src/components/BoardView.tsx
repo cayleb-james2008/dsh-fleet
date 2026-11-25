@@ -87,10 +87,15 @@ function PostBody({
   );
 }
 
+export type BoardQuickFilter = "all" | "needs_reply" | "done" | "blocked";
+
 export function BoardView({
   snap,
   highlightSeq,
   pinnedSeqs,
+  quickFilter = "all",
+  onQuickFilterChange,
+  onCopyWaveDigest,
   onTogglePin,
   onClearHighlight,
   onRefresh,
@@ -98,6 +103,9 @@ export function BoardView({
   snap: SwarmSnapshot;
   highlightSeq: number | null;
   pinnedSeqs: number[];
+  quickFilter?: BoardQuickFilter;
+  onQuickFilterChange?: (f: BoardQuickFilter) => void;
+  onCopyWaveDigest?: () => void;
   onTogglePin: (seq: number) => void;
   onClearHighlight: () => void;
   onRefresh?: () => void;
@@ -123,18 +131,38 @@ export function BoardView({
   );
   const lastReadSeq = viewerMember?.last_read_seq ?? 0;
 
+  const quickCounts = useMemo(() => {
+    let all = 0;
+    let needs_reply = 0;
+    let done = 0;
+    let blocked = 0;
+    for (const m of messages) {
+      if (m.control || unseenSet.has(m.seq)) continue;
+      all++;
+      if (m.text.includes("?") || (snap.member && m.mentions.includes(snap.member))) needs_reply++;
+      if (/\[(done|verified)\]/i.test(m.text)) done++;
+      if (/\[blocked\]/i.test(m.text)) blocked++;
+    }
+    return { all, needs_reply, done, blocked };
+  }, [messages, unseenSet, snap.member]);
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return messages.filter((m) => {
       if (m.control) return false;
       if (unseenSet.has(m.seq)) return false;
+      if (quickFilter === "needs_reply" && !m.text.includes("?") && !(snap.member && m.mentions.includes(snap.member))) {
+        return false;
+      }
+      if (quickFilter === "done" && !/\[(done|verified)\]/i.test(m.text)) return false;
+      if (quickFilter === "blocked" && !/\[blocked\]/i.test(m.text)) return false;
       if (agentFilter !== "all" && m.agent !== agentFilter && !m.mentions.includes(agentFilter)) return false;
       if (q && !m.text.toLowerCase().includes(q) && !m.agent.toLowerCase().includes(q) && !`#${m.seq}`.includes(q)) {
         return false;
       }
       return true;
     });
-  }, [messages, agentFilter, query, unseenSet]);
+  }, [messages, agentFilter, query, unseenSet, quickFilter, snap.member]);
 
   const firstNewSeq = useMemo(() => {
     if (!viewerMember) return null;
@@ -212,7 +240,7 @@ export function BoardView({
     }
   };
 
-  const hasActiveFilter = query.trim().length > 0 || agentFilter !== "all";
+  const hasActiveFilter = query.trim().length > 0 || agentFilter !== "all" || quickFilter !== "all";
   const pinnedSet = useMemo(() => new Set(pinnedSeqs), [pinnedSeqs]);
   const pinnedMessages = useMemo(
     () => messages.filter((m) => !m.control && pinnedSet.has(m.seq)),
@@ -239,7 +267,7 @@ export function BoardView({
                 >
                   <span className="font-semibold num">#{pm.seq}</span>{" "}
                   <span className="font-medium">{pm.agent}:</span>{" "}
-                  <span className="text-[var(--ink-2)]">{pm.text}</span>
+                  <span className="text-[var(--ink-2)]">{parseScreenshotLines(pm.text).cleanText || pm.text.replace(/\/home\/[^/\s]+\//g, "~/")}</span>
                 </button>
                 <Button
                   variant="ghost"
@@ -309,6 +337,41 @@ export function BoardView({
           </Button>
         </div>
 
+        {/* Quick-filter strip + 1-click Wave Digest */}
+        <div className="flex flex-wrap items-center justify-between gap-1.5">
+          <div className="flex flex-wrap items-center gap-1" role="group" aria-label="Board quick filters">
+            {(
+              [
+                ["all", "All", quickCounts.all],
+                ["needs_reply", "Needs reply", quickCounts.needs_reply],
+                ["done", "[done]", quickCounts.done],
+                ["blocked", "[blocked]", quickCounts.blocked],
+              ] as const
+            ).map(([id, label, count]) => (
+              <button
+                key={id}
+                type="button"
+                aria-pressed={quickFilter === id}
+                onClick={() => onQuickFilterChange?.(id)}
+                className={cn(
+                  "rounded-[var(--radius-chip)] px-2 py-0.5 text-[12px] font-medium cursor-pointer transition num",
+                  quickFilter === id
+                    ? "bg-[var(--ink-button)] text-[var(--ink-button-fg)]"
+                    : "bg-[var(--track)] text-[var(--ink-2)] hover:text-[var(--ink)]",
+                )}
+              >
+                {label} ({count})
+              </button>
+            ))}
+          </div>
+          {onCopyWaveDigest && (
+            <Button variant="ghost" size="sm" onClick={onCopyWaveDigest} className="h-7 px-2">
+              <ClipboardCopy className="h-3.5 w-3.5" aria-hidden="true" />
+              Wave digest
+            </Button>
+          )}
+        </div>
+
         {showFilters && (
           <Card className="p-2.5 flex flex-wrap items-center gap-1.5">
             <button
@@ -355,6 +418,7 @@ export function BoardView({
               onClick={() => {
                 setQuery("");
                 setAgentFilter("all");
+                onQuickFilterChange?.("all");
               }}
             >
               Clear filters

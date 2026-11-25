@@ -486,8 +486,8 @@ export function summarizeTranscript(appData, conv) {
       const a = state.acc;
       a.lineCount++;
 
-      // Only retain tail line slices near EOF (prevents 50k string/Buffer allocations during initial scan)
-      if (remBytes <= 128 * 1024 || preParsed) {
+      // Only retain tail line slices near EOF (prevents 50k string allocations during initial scan)
+      if (remBytes <= 16 * 1024 || preParsed) {
         a.rawTail[a.tailCursor % TAIL_CAP] = buf.subarray(start, end).toString('utf8');
       }
       a.tailCursor++;
@@ -570,6 +570,10 @@ export function summarizeTranscript(appData, conv) {
   const parseFrom = Math.max(a.parsedTailCursor, a.tailCursor - TAIL_CAP);
   for (let ti = parseFrom; ti < a.tailCursor; ti++) {
     const line = a.rawTail[ti % TAIL_CAP];
+    if (typeof line !== 'string') {
+      a.tailSteps[ti % TAIL_CAP] = null;
+      continue;
+    }
     let step;
     try {
       step = JSON.parse(line);

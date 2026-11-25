@@ -1,7 +1,7 @@
 {
   "name": "fleet",
   "displayName": "Fleet",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Antigravity-native Swarm Command Center sidecar plugin: Needs-You triage inbox, live worker token/step telemetry, workspace git worktrees, @mention graph, and instant swarm controls.",
   "logo": "assets/logo.svg",
   "repository": {

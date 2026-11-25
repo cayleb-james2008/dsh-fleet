@@ -178,7 +178,8 @@ export function TriageView({
               <span>j/k move</span>
               <span>o chat</span>
               <span>p pin</span>
-              <span>1-5 tabs</span>
+              <span>r reply</span>
+              <span>? help</span>
             </div>
           )}
         </div>
@@ -460,7 +461,7 @@ export function TriageView({
                     <p className="text-[13px] font-medium text-[var(--ink)] truncate">
                       <span className="num">#{pm.seq}</span> {pm.agent}
                     </p>
-                    <p className="text-[12px] text-[var(--ink-2)] truncate">{pm.text}</p>
+                    <p className="text-[12px] text-[var(--ink-2)] truncate">{parseScreenshotLines(pm.text).cleanText || pm.text.replace(/\/home\/[^/\s]+\//g, "~/")}</p>
                   </div>
                   <div className="flex items-center gap-1 shrink-0">
                     <Button variant="ghost" size="sm" className="num" onClick={() => onJumpToBoardSeq(pm.seq)}>

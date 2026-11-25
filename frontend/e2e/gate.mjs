@@ -134,6 +134,32 @@ await runChecks("gate", async (check) => {
     return val.startsWith("@builder Re #2:");
   });
 
+  await check("board quick filters and Wave digest copy sanitized summary", async () => {
+    await page.evaluate(() => {
+      window.__copied = "";
+      try {
+        Object.defineProperty(navigator, "clipboard", {
+          configurable: true,
+          value: { writeText: async (txt) => { window.__copied = txt; } },
+        });
+      } catch {}
+    });
+    const grp = page.locator('[aria-label="Board quick filters"]');
+    await grp.locator('button:has-text("[done]")').click();
+    const doneTxt = await page.locator("#panel-board").textContent();
+    await grp.locator('button:has-text("Needs reply")').click();
+    await grp.locator('button:has-text("All")').click();
+    await page.locator('#panel-board button:has-text("Wave digest")').click();
+    await page.waitForFunction(() => Boolean(window.__copied));
+    const clip = await page.evaluate(() => window.__copied);
+    return (
+      doneTxt.includes("#4") &&
+      clip.includes("## Workers") &&
+      clip.includes("## Pinned") &&
+      !clip.includes("/home/")
+    );
+  });
+
   await page.fill('input[aria-label="Search board messages"]', "no-such-query-xyz");
   await check("empty search filter shows Clear filters action", async () => {
     return (await page.locator('#panel-board button:has-text("Clear filters")').count()) === 1;

@@ -12,7 +12,7 @@ import {
 } from "react";
 import { X } from "lucide-react";
 import { animatePanelEnter } from "./motion";
-import type { SwarmSnapshot } from "./types";
+import type { SwarmSnapshot, WorktreesPayload } from "./types";
 
 type ToastKind = "success" | "error" | "info";
 interface ToastEntry {
@@ -52,7 +52,12 @@ export function humanizeStatus(raw: string | undefined): string {
   return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
 }
 
-export function formatSwarmDigest(snap: SwarmSnapshot): string {
+export function formatSwarmDigest(
+  snap: SwarmSnapshot,
+  pinnedSeqs: number[] = [],
+  worktrees: WorktreesPayload | null = null,
+): string {
+  const maskHome = (s: string) => s.replace(/\/home\/[^/\s]+\//g, "~/");
   const members = snap.members || [];
   const working = members.filter((m) => !m.killed && m.status === "working").length;
   const waiting = members.filter((m) => !m.killed && m.status === "waiting").length;
@@ -67,6 +72,25 @@ export function formatSwarmDigest(snap: SwarmSnapshot): string {
   if (snap.plan?.gate) {
     lines.push(`- Gate: \`${snap.plan.gate}\``);
   }
+  if (pinnedSeqs.length) {
+    const pinSet = new Set(pinnedSeqs);
+    const pinned = (snap.messages || []).filter((m) => !m.control && pinSet.has(m.seq));
+    if (pinned.length) {
+      lines.push("", "## Pinned");
+      for (const pm of pinned) {
+        lines.push(`- #${pm.seq} @${pm.agent}: ${maskHome(pm.text).replace(/\s+/g, " ").slice(0, 140)}`);
+      }
+    }
+  }
+  const liveWorkers = members.filter((m) => !m.killed);
+  if (liveWorkers.length) {
+    lines.push("", "## Workers");
+    for (const m of liveWorkers) {
+      const ts = m.lastStepAt ? Date.parse(m.lastStepAt) : m.transcriptMtime || m.lastPostTs || 0;
+      const el = ts > 0 ? ` ${fmtElapsed(ts)}` : "";
+      lines.push(`- @${m.name}: ${m.status}${el} (${m.steps} steps, ${fmtTokens(m.usage.totalTokens)} tok)`);
+    }
+  }
   if (snap.plan?.workstreams?.length) {
     lines.push("", "## Workstreams");
     for (const ws of snap.plan.workstreams) {
@@ -76,14 +100,21 @@ export function formatSwarmDigest(snap: SwarmSnapshot): string {
   if (snap.triage?.length) {
     lines.push("", "## Needs you");
     for (const item of snap.triage) {
-      lines.push(`- **${item.title}**: ${item.detail}`);
+      lines.push(`- **${item.title}**: ${maskHome(item.detail)}`);
     }
   }
   const deliverables = (snap.messages || []).filter((m) => !m.control && /\[(done|verified|blocked)\]/i.test(m.text));
   if (deliverables.length) {
     lines.push("", "## Recent deliverables");
     for (const msg of deliverables.slice(-5)) {
-      lines.push(`- #${msg.seq} @${msg.agent}: ${msg.text.replace(/\s+/g, " ").slice(0, 140)}`);
+      lines.push(`- #${msg.seq} @${msg.agent}: ${maskHome(msg.text).replace(/\s+/g, " ").slice(0, 140)}`);
+    }
+  }
+  const dirtyWts = (worktrees?.worktrees || []).filter((w) => !w.clean && w.files?.length);
+  if (dirtyWts.length) {
+    lines.push("", "## Dirty worktrees");
+    for (const wt of dirtyWts) {
+      lines.push(`- \`${wt.branch}\` (${maskHome(wt.path)}): ${wt.files!.slice(0, 8).map((f) => `${f.state} ${f.path}`).join(", ")}`);
     }
   }
   return lines.join("\n");

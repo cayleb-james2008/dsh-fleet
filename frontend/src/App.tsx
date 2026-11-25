@@ -12,7 +12,7 @@ import {
   Settings,
   Users,
 } from "lucide-react";
-import { BoardView } from "./components/BoardView";
+import { BoardView, type BoardQuickFilter } from "./components/BoardView";
 import { CommandPalette } from "./components/CommandPalette";
 import { GraphView } from "./components/GraphView";
 import { RosterView } from "./components/RosterView";
@@ -98,6 +98,7 @@ export function App() {
   const [wtLoading, setWtLoading] = useState(false);
 
   const [highlightSeq, setHighlightSeq] = useState<number | null>(null);
+  const [boardQuickFilter, setBoardQuickFilter] = useState<BoardQuickFilter>("all");
   const [selectedTriageIdx, setSelectedTriageIdx] = useState(0);
   const [triageReplyNonce, setTriageReplyNonce] = useState(0);
   const [sseConnected, setSseConnected] = useState(false);
@@ -294,6 +295,12 @@ export function App() {
         }
         return;
       }
+      if (e.key === "f" && tab === "board") {
+        e.preventDefault();
+        const order: BoardQuickFilter[] = ["all", "needs_reply", "done", "blocked"];
+        setBoardQuickFilter((cur) => order[(order.indexOf(cur) + 1) % order.length]);
+        return;
+      }
       if (tab !== "triage" || triageItems.length === 0) return;
       if (e.key === "j") {
         e.preventDefault();
@@ -331,10 +338,10 @@ export function App() {
 
   const handleCopyDigest = async () => {
     if (!snap?.swarm) return;
-    const md = formatSwarmDigest(snap);
+    const md = formatSwarmDigest(snap, pinnedSeqs, worktrees);
     try {
       await navigator.clipboard.writeText(md);
-      toast.success("Swarm digest copied");
+      toast.success("Wave digest copied");
     } catch {
       toast.error("Clipboard unavailable");
     }
@@ -653,6 +660,9 @@ export function App() {
                   snap={snap!}
                   highlightSeq={highlightSeq}
                   pinnedSeqs={pinnedSeqs}
+                  quickFilter={boardQuickFilter}
+                  onQuickFilterChange={setBoardQuickFilter}
+                  onCopyWaveDigest={handleCopyDigest}
                   onTogglePin={handleTogglePin}
                   onClearHighlight={() => setHighlightSeq(null)}
                   onRefresh={() => refreshSwarm(true)}
@@ -693,6 +703,7 @@ export function App() {
             ["o / Enter", "Open worker chat"],
             ["p", "Pin or unpin selected #seq"],
             ["r", "Reply / nudge selected item"],
+            ["f", "Cycle Board quick filters"],
             ["1 - 5", "Jump across sidebar tabs"],
             ["Ctrl+K / Cmd+K", "Open command palette"],
             ["?", "Toggle keyboard shortcuts"],
@@ -746,7 +757,7 @@ export function App() {
           <div className="rounded-[var(--radius-card)] bg-[var(--board)] p-3 text-[12px] text-[var(--ink-2)] space-y-1">
             <div className="flex items-center gap-1.5 font-medium text-[var(--ink)]">
               <CommandIcon className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Fleet Antigravity Plugin v1.6.0</span>
+              <span>Fleet Antigravity Plugin v1.7.0</span>
             </div>
             <p>
               Reads Antigravity native swarm boards and transcripts locally on loopback with zero external telemetry.

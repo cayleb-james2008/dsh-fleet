@@ -3,6 +3,11 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as a
 ready-to-install Antigravity plugin bundle (`tar.gz` + `zip`) with `SHA256SUMS`.
 
+## 1.7.0 - 2026-11-25
+
+- **Board Quick-Filter Chips & 1-Click Wave Digest (`frontend/src/components/BoardView.tsx`, `ui.tsx`, `App.tsx`):** Added compact Board quick-filter pills (`All` / `Needs reply` / `[done]` / `[blocked]`, cycled via `f` hotkey), a 1-click **Wave digest** button generating clean Markdown summaries of pinned `#seq`s, active/waiting/stalled worker durations, and `~/`-masked dirty worktree files, and `~/` sanitization on pinned board post previews.
+- **Pre-Gzipped Sidecar Asset & Sub-`75 MB` V8 Peak RSS (`frontend/vite.config.ts`, `sidecars/fleet_pane/{main.mjs,swarm_store.mjs,sidecar.json}`):** Replaced `cmdk` with a zero-dependency accessible React palette (`dist/index.html` `<345 KB` raw / `<100 KB` gzip), emitted build-time `dist/index.html.gz` read directly by `main.mjs` (`0` startup deflate overhead while preserving `ETag`/`304` + `Vary: Accept-Encoding`), tightened transcript tail retention to `16 KB`, and applied V8 tier/heap bounds (`--jitless` + `--max-old-space-size=32` in `sidecar.json` / runtime tier guards in `main.mjs`) dropping 2k/50k Peak `VmHWM` below `75 MB`.
+
 ## 1.6.0 - 2026-11-25
 
 - **Peak V8 RSS (`<90 MB`) & Wire Diet (`<365 KB` raw / `<108 KB` gzip):** Added zero-string-allocation `Buffer` transcript scanning in `swarm_store.mjs`, eliminated duplicate cold-boot snapshot generation between `listSwarms` and `/api/swarm`, enabled V8 `--optimize-for-size` in `main.mjs` & `sidecar.json`, and aliased unused `@radix-ui/react-dialog` out of `cmdk` to shrink `dist/index.html` to `~350 KB` raw / `~104 KB` gzip.
