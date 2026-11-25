@@ -92,13 +92,15 @@ const B_PLANNER = Buffer.from('"PLANNER_RESPONSE"');
 const B_MODEL = Buffer.from('"model":');
 const B_USAGE = Buffer.from('"usage":');
 const B_INPUT_TOK = Buffer.from('"input_tokens":');
+const B_INPUT_CAMEL = Buffer.from('"inputTokens":');
 const B_CACHE_SNAKE = Buffer.from('"cache_read_tokens":');
 const B_CACHE_CAMEL = Buffer.from('"cacheReadTokens":');
 const B_OUTPUT_TOK = Buffer.from('"output_tokens":');
+const B_OUTPUT_CAMEL = Buffer.from('"outputTokens":');
 
 function bufIndexOfRange(buf, needle, start, end) {
-  const idx = buf.indexOf(needle, start);
-  return idx >= 0 && idx + needle.length <= end ? idx : -1;
+  const idx = buf.subarray(start, end).indexOf(needle);
+  return idx >= 0 ? start + idx : -1;
 }
 
 function extractIntBuf(buf, start, end, keyBuf) {
@@ -125,10 +127,10 @@ function extractStrBuf(buf, start, end, keyBuf) {
   while (pos < end && (buf[pos] === 32 || buf[pos] === 9)) pos++;
   if (pos >= end || buf[pos] !== 34) return '';
   const qStart = pos + 1;
-  const qEnd = buf.indexOf(34, qStart);
-  if (qEnd < 0 || qEnd >= end) return '';
-  const bs = buf.indexOf(92, qStart);
-  if (bs >= 0 && bs < qEnd) return '';
+  const relEnd = buf.subarray(qStart, end).indexOf(34);
+  if (relEnd < 0) return '';
+  const qEnd = qStart + relEnd;
+  if (buf.subarray(qStart, qEnd).indexOf(92) >= 0) return '';
   return buf.subarray(qStart, qEnd).toString('utf8');
 }
 
@@ -529,29 +531,30 @@ export function summarizeTranscript(appData, conv) {
           if (m) a.model = m;
         }
 
-        if (bufIndexOfRange(buf, B_USAGE, start, end) >= 0) {
+        let inp = extractIntBuf(buf, start, end, B_INPUT_TOK);
+        if (inp < 0) inp = extractIntBuf(buf, start, end, B_INPUT_CAMEL);
+        let cac = extractIntBuf(buf, start, end, B_CACHE_SNAKE);
+        if (cac < 0) cac = extractIntBuf(buf, start, end, B_CACHE_CAMEL);
+        let out = extractIntBuf(buf, start, end, B_OUTPUT_TOK);
+        if (out < 0) out = extractIntBuf(buf, start, end, B_OUTPUT_CAMEL);
+        if (inp < 0 && cac < 0 && out < 0 && remBytes <= 16 * 1024 && bufIndexOfRange(buf, B_USAGE, start, end) >= 0) {
           try {
             const parsed = JSON.parse(buf.subarray(start, end).toString('utf8'));
             const u = parsed.usage && typeof parsed.usage === 'object' ? parsed.usage : parsed;
-            const inp = num(Number(u.input_tokens));
-            const cac = num(Number(u.cache_read_tokens ?? u.cacheReadTokens));
-            const out = num(Number(u.output_tokens));
-            a.inputTokens += inp;
-            a.cacheReadTokens += cac;
-            a.outputTokens += out;
-            a.lastContextTokens = inp + cac;
+            inp = num(Number(u.input_tokens ?? u.inputTokens));
+            cac = num(Number(u.cache_read_tokens ?? u.cacheReadTokens));
+            out = num(Number(u.output_tokens ?? u.outputTokens));
           } catch {
             // torn line skipped
           }
-        } else {
-          const inp = Math.max(0, extractIntBuf(buf, start, end, B_INPUT_TOK));
-          const cac = Math.max(0, extractIntBuf(buf, start, end, B_CACHE_SNAKE), extractIntBuf(buf, start, end, B_CACHE_CAMEL));
-          const out = Math.max(0, extractIntBuf(buf, start, end, B_OUTPUT_TOK));
-          a.inputTokens += inp;
-          a.cacheReadTokens += cac;
-          a.outputTokens += out;
-          if (inp + cac > 0) a.lastContextTokens = inp + cac;
         }
+        inp = Math.max(0, inp);
+        cac = Math.max(0, cac);
+        out = Math.max(0, out);
+        a.inputTokens += inp;
+        a.cacheReadTokens += cac;
+        a.outputTokens += out;
+        if (inp + cac > 0 || remBytes <= 16 * 1024) a.lastContextTokens = inp + cac;
       }
     },
     { rawSpan: true },

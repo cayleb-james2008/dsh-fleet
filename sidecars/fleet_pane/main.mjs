@@ -14,7 +14,7 @@ import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setFlagsFromString } from 'node:v8';
-import { gzipSync } from 'node:zlib';
+import { crc32, gzipSync } from 'node:zlib';
 import { probeWorktreeDiff, probeWorktrees } from './git_probe.mjs';
 import {
   ID_RE,
@@ -59,14 +59,9 @@ const STANDALONE_PRELOAD_JS = `(function(){
 
 function fastEtag(input) {
   const buf = typeof input === 'string' ? Buffer.from(input, 'utf8') : input;
-  let h1 = 0x811c9dc5;
-  let h2 = 0x9e3779b9;
-  for (let i = 0; i < buf.length; i++) {
-    const b = buf[i];
-    h1 = Math.imul(h1 ^ b, 0x01000193) >>> 0;
-    h2 = Math.imul(h2 ^ (b + i), 0x85ebca6b) >>> 0;
-  }
-  return `"${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}"`;
+  const c1 = crc32(buf);
+  const c2 = crc32(buf.subarray(0, Math.min(buf.length, 4096)), (c1 ^ buf.length) >>> 0);
+  return `"${c1.toString(16).padStart(8, '0')}${c2.toString(16).padStart(8, '0')}"`;
 }
 
 function loadDistAssets(distDir) {
