@@ -96,9 +96,9 @@ Measured under `#154` CPU isolation (`taskset -c 24-31`, `16` concurrent polling
 | Metric | v1.6.0 | v1.7.0 | **v1.8.0** |
 | --- | --- | --- | --- |
 | Embedded Sidecar UI (`/`) | `358,054 B` raw / `105,312 B` gz | `344,345 B` raw / `99,949 B` gz | **`322,939 B` raw (`315.4 KiB`) / `95,371 B` gz (`93.1 KiB`)** |
-| Peak RSS (`VmHWM`, 2k/50k) | `89.79 MB` | `66.23 MB` | **`66.96 MB`** |
-| Throughput (`req/s`, 16w) | `5,376.9 req/s` | `7,984.9 req/s` | **`8,478.7 req/s`** |
-| Latency (`p50` / `p95`) | `1.25 ms` / `8.70 ms` | `1.69 ms` / `3.69 ms` | **`1.63 ms` / `3.39 ms`** |
+| Peak RSS (`VmHWM`, 2k/50k) | `95.45 MB` | `80.98 MB` | **`80.49 MB` (`72.82 MB` sidecar `--jitless`)** |
+| Throughput (`req/s`, 16w) | `2,378.4 req/s` | `2,853.0 req/s` | **`2,766.0 req/s`** |
+| Latency (`p50` / `p95`) | `9.67 ms` p95 | `5.54 ms` / `8.49 ms` | **`5.64 ms` / `8.34 ms` (`15.38 ms` max)** |
 | Simultaneous SSE (`/api/swarm/stream` x5) | `5/5` (`0` drops) | `5/5` (`0` drops) | **`5/5` (`0` drops)** |
 | E2E Gate + Replay + Sloplint | `34/34` + `7/7` + `0 FAIL / 0 WARN` | `35/35` + `8/8` + `0 FAIL / 0 WARN` | **`36/36` + `8/8` + `0 FAIL / 0 WARN`** |
 
