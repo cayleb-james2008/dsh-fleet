@@ -305,12 +305,13 @@ worst-case data replay across desktop and mobile viewports in both themes.
 
 ## Layout
 
-- `src/main.rs`, `src/lib.rs`, `src/events.rs`, `src/dag.rs`, `src/checks.rs`,
-  `src/merge_check.rs`, `src/policy.rs`, `src/update.rs` — the single-binary
-  Rust server and engine library: SSE event bus, DAG/batch scheduler, multi-step
-  check pipelines & file-scope guardrails, non-destructive merge checker &
-  patch exporter, policy rules engine, worktree runner, persistence, and
-  self-updater.
+- `src/main.rs`, `src/lib.rs`, `src/http_assets.rs`, `src/events.rs`, `src/dag.rs`,
+  `src/checks.rs`, `src/autoheal.rs`, `src/merge_check.rs`, `src/pr.rs`,
+  `src/policy.rs`, `src/update.rs` — the single-binary Rust server and engine
+  library: compressed/ETag asset cache, SSE event bus, DAG/batch scheduler,
+  multi-step check pipelines & file-scope guardrails, auto-heal failure
+  classifier, non-destructive merge preflight & batch PR, policy rules engine,
+  worktree runner, fast single-pass persistence, and self-updater.
 - `frontend/` — the React + Tailwind 4 Mission Control Board, compiled into a
   single self-contained `assets/index.html` with self-hosted Geist and Geist
   Mono fonts embedded directly into the Rust binary. Light default + full dark

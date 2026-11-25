@@ -1,5 +1,5 @@
 (() => {
-  const APP_VERSION = "0.10.0";
+  const APP_VERSION = "0.11.0";
   const DB_NAME = "fleet-worktrees-v4";
   const STORE_NAME = "state";
   const BYOK_KEY_SS = "fleet-byok-api-key";
@@ -1725,6 +1725,23 @@
     };
   }
 
+  function classifyFailureText(stepName, output) {
+    const hay = (String(stepName || "") + "\n" + String(output || "")).toLowerCase();
+    if (/error\[e0|syntaxerror|type mismatch|cannot find|ts2\d+|unresolved import/.test(hay)) {
+      return { category: "compile-error", label: "Compile / type error", hint: "Fix compiler/type diagnostics first.", retryable: true };
+    }
+    if (/timed out|timeout/.test(hay)) {
+      return { category: "timeout", label: "Timeout", hint: "Eliminate hangs or long-running loops.", retryable: true };
+    }
+    if (/clippy|eslint|prettier|rustfmt|lint/.test(hay)) {
+      return { category: "lint-or-format", label: "Lint / format", hint: "Resolve linter/formatter diagnostics.", retryable: true };
+    }
+    if (/assert|expected|panicked at|failed/.test(hay)) {
+      return { category: "test-assertion", label: "Test assertion", hint: "Fix the underlying logic without weakening the test.", retryable: true };
+    }
+    return { category: "unknown", label: "Check failure", hint: "Diagnose the failing output and repair root cause.", retryable: true };
+  }
+
   function publicSession(s) {
     const out = { ...s };
     delete out._baseCommit;
@@ -1736,6 +1753,15 @@
     const healUsed = Array.isArray(s.heal_attempts) ? s.heal_attempts.length : 0;
     out.heal_budget_total = healTotal;
     out.heal_budget_remaining = Math.max(0, healTotal - healUsed);
+    if (Array.isArray(s.heal_attempts)) {
+      out.heal_attempts = s.heal_attempts.map((a) => {
+        const cls = classifyFailureText(a.trigger_step, a.stderr_tail);
+        return { ...a, failure_category: cls.category, failure_label: cls.label };
+      });
+    }
+    if (s.check_passed === false || (s.status === "needs-you" && s.reason)) {
+      out.failure_classification = classifyFailureText(s.check_cmd, s.check_output || s.reason);
+    }
     if (typeof s.elapsed_ms === "number") {
       out.duration_ms = s.elapsed_ms;
     }
@@ -1924,6 +1950,9 @@
           sse: true,
           batch: true,
           batch_merge: true,
+          batch_pr: true,
+          wave_preflight: true,
+          failure_classifier: true,
           merge_check: true,
           policy_test: true,
           prune_worktrees: true,
@@ -2114,6 +2143,44 @@
       });
     }
 
+    if (method === "POST" && u.pathname === "/api/sessions/batch-pr") {
+      const dryRun = Boolean(body.dry_run);
+      const confirm = Boolean(body.confirm);
+      const draft = Boolean(body.draft);
+      if (!dryRun && !confirm) {
+        return jsonResp({ error: "batch PR creation requires explicit confirmation (confirm: true)", code: "confirmation_required" }, 400);
+      }
+      const repoFilter = body.repo ? String(body.repo).trim() : "";
+      const idSet = Array.isArray(body.ids) && body.ids.length > 0 ? new Set(body.ids.map(String)) : null;
+      const candidates = state.sessions.filter(
+        (s) => (idSet ? idSet.has(s.id) : s.status === "done" && Boolean(s.verified_commit)) && (!repoFilter || s.repo === repoFilter)
+      );
+      const results = [];
+      let readyCount = 0;
+      let createdCount = 0;
+      let skippedCount = 0;
+      for (const s of candidates) {
+        if (s.status !== "done" || !s.verified_commit || !state.repos[s.repo]) {
+          skippedCount++;
+          results.push({ id: s.id, task: s.task, repo: s.repo, branch: s.branch, status: "skipped", ready: false, error: "Session not verified done." });
+          continue;
+        }
+        const repo = state.repos[s.repo];
+        const diffLines = String(s.diff || "").split("\n");
+        const diffFiles = diffLines.filter((l) => l.startsWith("diff --git ")).length;
+        const diffAdd = diffLines.filter((l) => l.startsWith("+") && !l.startsWith("+++")).length;
+        const diffDel = diffLines.filter((l) => l.startsWith("-") && !l.startsWith("---")).length;
+        if (dryRun) {
+          readyCount++;
+          results.push({ id: s.id, task: s.task, repo: s.repo, branch: s.branch, base_branch: repo.branch, title: s.task, ready: true, status: "ready", diff_files: diffFiles, diff_add: diffAdd, diff_del: diffDel });
+        } else {
+          createdCount++;
+          results.push({ id: s.id, task: s.task, repo: s.repo, branch: s.branch, base_branch: repo.branch, title: s.task, url: "https://github.com/browser-demo/repo/pull/" + (100 + createdCount), pushed: true, ready: true, status: "created" });
+        }
+      }
+      return jsonResp({ dry_run: dryRun, draft, total: results.length, ready_count: readyCount, created_count: createdCount, skipped_count: skippedCount, failed_count: 0, results });
+    }
+
     if (method === "POST" && u.pathname === "/api/sessions/batch-merge") {
       const dryRun = Boolean(body.dry_run);
       const strategy = String(body.strategy || "merge").toLowerCase();
@@ -2130,9 +2197,17 @@
       let skippedCount = 0;
       let failedCount = 0;
       const results = [];
+      const readyIds = [];
+      const conflictedIds = [];
+      const skippedIds = [];
       for (const s of candidates) {
+        const dl = String(s.diff || "").split("\n");
+        const diffFiles = dl.filter((l) => l.startsWith("diff --git ")).length;
+        const diffAdd = dl.filter((l) => l.startsWith("+") && !l.startsWith("+++")).length;
+        const diffDel = dl.filter((l) => l.startsWith("-") && !l.startsWith("---")).length;
         if (s.status !== "done" || !s.verified_commit || !state.repos[s.repo]) {
           skippedCount++;
+          skippedIds.push(s.id);
           results.push({
             id: s.id,
             task: s.task,
@@ -2141,6 +2216,9 @@
             status: "skipped",
             clean: false,
             can_apply: false,
+            diff_files: diffFiles,
+            diff_add: diffAdd,
+            diff_del: diffDel,
             conflicting_files: [],
             error: "Session is not verified done."
           });
@@ -2149,8 +2227,8 @@
         const chk = computeMergeCheck(s);
         const repo = state.repos[s.repo];
         const canApply = chk.clean && !(strategy === "ff" && chk.commits_behind > 0);
-        if (canApply) cleanCount++;
-        else conflictCount++;
+        if (canApply) { cleanCount++; readyIds.push(s.id); }
+        else { conflictCount++; conflictedIds.push(s.id); }
         if (dryRun) {
           results.push({
             id: s.id,
@@ -2161,6 +2239,9 @@
             status: canApply ? "ready" : "conflict",
             clean: chk.clean,
             can_apply: canApply,
+            diff_files: diffFiles,
+            diff_add: diffAdd,
+            diff_del: diffDel,
             conflicting_files: chk.conflicting_files || [],
             commits_ahead: chk.commits_ahead || 0,
             commits_behind: chk.commits_behind || 0,
@@ -2226,6 +2307,11 @@
         merged_count: mergedCount,
         skipped_count: skippedCount,
         failed_count: failedCount,
+        preflight: {
+          ready_ids: readyIds,
+          conflicted_ids: conflictedIds,
+          skipped_ids: skippedIds
+        },
         results
       });
     }

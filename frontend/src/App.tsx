@@ -71,7 +71,7 @@ import { DetailBody } from "./detail";
 import { useMergeCheck } from "./diff";
 import { NewSession, type ComposerMode } from "./composer";
 import { CommandPalette } from "./palette";
-import { PrPreviewModal } from "./pr-modal";
+import { PrPreviewModal, WaveShipModal } from "./pr-modal";
 import { PolicyTesterSection } from "./settings-policy";
 import { useFleetStream } from "./stream";
 import { onThisMachine, resultLine as resultLineOf, UpdateStrip, useUpdate } from "./update";
@@ -125,6 +125,7 @@ export function App() {
   const [bulkSelected, setBulkSelected] = useState<Set<string>>(() => new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
   const [waveMergeBusy, setWaveMergeBusy] = useState(false);
+  const [waveShipOpen, setWaveShipOpen] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -845,12 +846,12 @@ export function App() {
               variant="outline"
               data-testid="batch-merge-wave-btn"
               disabled={waveMergeBusy}
-              onClick={() => void handleBatchMergeWave()}
+              onClick={() => setWaveShipOpen(true)}
               className="hidden lg:inline-flex"
             >
               <GitMerge className="size-3.5 text-[var(--success-foreground)]" strokeWidth={1.5} aria-hidden />
               <span>
-                {waveMergeBusy ? "Merging..." : `Merge wave (${verifiedDoneSessions.length})`}
+                {waveMergeBusy ? "Merging..." : `Ship wave (${verifiedDoneSessions.length})`}
               </span>
             </Button>
           )}
@@ -1322,6 +1323,19 @@ export function App() {
           setPrSession(null);
         }}
         onCreated={refresh}
+      />
+
+      <WaveShipModal
+        open={waveShipOpen}
+        sessions={all}
+        supportsBatchMerge={Boolean(policy?.features?.batch_merge) || webEngine}
+        supportsBatchPr={Boolean(policy?.features?.batch_pr) || webEngine}
+        onClose={() => {
+          modalClosedAtRef.current = Date.now();
+          setWaveShipOpen(false);
+        }}
+        onOpenSession={(id) => openSession(id, "df")}
+        onCompleted={() => void refresh()}
       />
 
       <ToastRegion theme={theme} />

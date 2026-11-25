@@ -4,6 +4,12 @@ Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases wit
 binaries and a `SHA256SUMS` file. The running app shows its version and can update
 itself from the newest release (see README, "Versions and updates").
 
+## 0.11.0 - 2026-11-25
+
+- **Cold Boot Latency (`src/main.rs`)**: replaced 3 sequential `which`/`where` child spawns in `detect_agents` with pure-Rust `$PATH` resolution, replaced intermediate `serde_json::Value` AST double-parsing in `load_persisted_core` with single-pass `PersistedStore` deserialization, and moved settled `.log` hydration + update checks off the pre-bind boot path (`<30 ms` cold boot at 2k sessions while preserving `6,250+ req/s`).
+- **Wave Preflight & Batch Wave PR (`src/main.rs`, `frontend/src/pr-modal.tsx`, `frontend/src/App.tsx`, `frontend/src/api.ts`)**: added `WaveShipModal` featuring non-destructive `git merge-tree` per-session conflict/clean preview, strategy switching (`merge` / `squash` / `ff`), 1-click **Merge clean**, and confirmation-gated `POST /api/sessions/batch-pr` (`confirm: true` enforcement + `dry_run` preview) with full parity in `frontend/scripts/web-engine.js`.
+- **Smart Auto-Heal Failure Classifier (`src/autoheal.rs`, `src/main.rs`, `frontend/src/detail.tsx`)**: added deterministic `classify_failure` / `classify_heal_attempt` (`CompileError`, `TestAssertion`, `LintOrFormat`, `ScopeGuardrail`, `Timeout`, `TransientFlake`), injected failure category + repair strategy into autonomous retry prompts, and surfaced live failure-class badges in the Auto-Heal timeline and Needs You banner.
+
 ## 0.10.0 - 2026-11-25
 
 - **Runtime Speed & Asset Compression (`Cargo.toml`, `src/http_assets.rs`, `src/main.rs`)**: added `[profile.release]` (`lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`, `opt-level = 3`), pure-Rust RFC 1952 Gzip + strong SHA-256 `ETag` / `304 Not Modified` / `Vary: Accept-Encoding` + security headers (`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`), persistent 64-worker HTTP pool with `TCP_NODELAY`, buffered line parsing without per-byte `setsockopt` or `try_clone()`, zero-copy `Arc<Vec<u8>>` cached JSON responses, `.git/HEAD` fast-path for `merge_target`, single-flight repo discovery lock, and allocation-free transcript/session search.

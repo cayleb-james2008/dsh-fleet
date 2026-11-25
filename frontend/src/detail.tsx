@@ -194,6 +194,11 @@ function AutoHealTimeline({ s }: { s: Session }) {
                 <XCircle className="size-4 shrink-0 text-[var(--destructive-foreground)]" strokeWidth={1.5} aria-hidden />
               )}
               <span className="mono text-[12px] font-medium text-[var(--ink)]">{a.trigger_step}</span>
+              {a.failure_label && (
+                <Badge tone="neutral" data-testid="heal-failure-class">
+                  {a.failure_label}
+                </Badge>
+              )}
               <Badge tone={a.healed ? "success" : "warning"} className="ml-auto mono">
                 {a.healed ? "healed" : a.exit_code !== null ? `exit ${a.exit_code}` : "retried"}
               </Badge>
@@ -628,15 +633,25 @@ export function DetailBody({
       )}
 
       {s.status === "needs-you" && s.reason && !honest && (
-        <p
+        <div
           role="status"
           className={cn(
-            "rounded-[var(--radius)] border border-[var(--hairline)] border-l-2 bg-[var(--surface)] px-3.5 py-2.5 text-[13px] leading-relaxed text-[var(--ink)] [overflow-wrap:anywhere]",
+            "rounded-[var(--radius)] border border-[var(--hairline)] border-l-2 bg-[var(--surface)] px-3.5 py-2.5 text-[13px] leading-relaxed text-[var(--ink)] [overflow-wrap:anywhere] space-y-1.5",
             isFailed(s) ? "border-l-[var(--unread)]" : "border-l-[var(--blue)]",
           )}
         >
-          {s.reason}
-        </p>
+          {s.failure_classification && (
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge tone={isFailed(s) ? "danger" : "warning"} data-testid="session-failure-class">
+                {s.failure_classification.label}
+              </Badge>
+              {s.failure_classification.hint && (
+                <span className="text-[12px] text-[var(--ink-2)]">{s.failure_classification.hint}</span>
+              )}
+            </div>
+          )}
+          <p>{s.reason}</p>
+        </div>
       )}
 
       {act && (

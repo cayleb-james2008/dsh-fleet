@@ -208,6 +208,199 @@ impl HealDecision {
     }
 }
 
+/// Actionable root-cause category inferred from a failing check step.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailureCategory {
+    CompileError,
+    TestAssertion,
+    LintOrFormat,
+    ScopeGuardrail,
+    Timeout,
+    TransientFlake,
+    Unknown,
+}
+
+impl FailureCategory {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CompileError => "Compile / type error",
+            Self::TestAssertion => "Test assertion",
+            Self::LintOrFormat => "Lint / format",
+            Self::ScopeGuardrail => "Scope guardrail",
+            Self::Timeout => "Timeout",
+            Self::TransientFlake => "Transient / environment",
+            Self::Unknown => "Check failure",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::CompileError => {
+                "Fix the type, syntax, or missing symbol compiler errors first before re-running the test suite."
+            }
+            Self::TestAssertion => {
+                "Inspect the failing test assertion and fix the underlying logic or edge-case bug without weakening the assertion."
+            }
+            Self::LintOrFormat => {
+                "Resolve all linter, clippy, typecheck, or formatting diagnostics cleanly without suppressing rules."
+            }
+            Self::ScopeGuardrail => {
+                "Revert any changes outside allowed_globs / forbidden_globs and confine edits strictly to the allowed files."
+            }
+            Self::Timeout => {
+                "Eliminate infinite loops, blocking waits, or runaway work causing the check command to exceed its timeout."
+            }
+            Self::TransientFlake => {
+                "The failure looks transient (lock contention, rate limit, or connection reset); ensure clean workspace state and re-run."
+            }
+            Self::Unknown => {
+                "Diagnose the root cause from the failure output and fix it without loosening checks."
+            }
+        }
+    }
+}
+
+/// Structured classification returned by [`classify_failure`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FailureClassification {
+    pub category: FailureCategory,
+    pub label: String,
+    pub hint: String,
+    pub retryable: bool,
+}
+
+/// Classify a failing check context into an actionable failure category + repair strategy.
+pub fn classify_failure(failed_step: &FailedCheckContext) -> FailureClassification {
+    let retryable = failed_step.is_healable_failure();
+    if failed_step.status == Some(StepStatus::TimedOut) {
+        let cat = FailureCategory::Timeout;
+        return FailureClassification {
+            category: cat,
+            label: cat.label().to_string(),
+            hint: cat.hint().to_string(),
+            retryable,
+        };
+    }
+
+    let step_l = failed_step.step_name.to_ascii_lowercase();
+    let cmd_l = failed_step.cmd.to_ascii_lowercase();
+    let tail = failed_step.diagnostic_tail();
+    let out_l = format!("{step_l}\n{cmd_l}\n{}", tail.to_ascii_lowercase());
+
+    let category = if contains_any(
+        &out_l,
+        &[
+            "file-scope guardrail",
+            "outside allowed",
+            "forbidden_globs",
+            "allowed_globs",
+            "scope violation",
+        ],
+    ) {
+        FailureCategory::ScopeGuardrail
+    } else if contains_any(
+        &out_l,
+        &[
+            "timed out",
+            "timeout exceeded",
+            "deadline elapsed",
+            "killed after",
+        ],
+    ) {
+        FailureCategory::Timeout
+    } else if contains_any(
+        &out_l,
+        &[
+            "error[e0",
+            "cannot find ",
+            "type mismatch",
+            "mismatched types",
+            "syntaxerror",
+            "syntax error",
+            "unexpected token",
+            "failed to compile",
+            "undefined reference",
+            "error ts2",
+            "does not exist on type",
+            "unresolved import",
+        ],
+    ) {
+        FailureCategory::CompileError
+    } else if contains_any(
+        &out_l,
+        &[
+            "econnreset",
+            "etimedout",
+            "connection refused",
+            "temporarily unavailable",
+            "rate limit",
+            "too many requests",
+            "resource temporarily unavailable",
+            "unable to create '.git/index.lock'",
+            "another git process seems to be running",
+        ],
+    ) {
+        FailureCategory::TransientFlake
+    } else if contains_any(
+        &out_l,
+        &[
+            "assertion",
+            "assertionerror",
+            "test result: failed",
+            "panicked at",
+            "expect(",
+            "toequal(",
+            "tobe(",
+            "not equal",
+            "failed tests",
+        ],
+    ) {
+        FailureCategory::TestAssertion
+    } else if contains_any(
+        &out_l,
+        &[
+            "clippy",
+            "eslint",
+            "prettier",
+            "rustfmt",
+            "tsc --noemit",
+            "lint",
+            "unused variable",
+            "warnings denied",
+            "-d warnings",
+        ],
+    ) {
+        FailureCategory::LintOrFormat
+    } else {
+        FailureCategory::Unknown
+    };
+
+    FailureClassification {
+        category,
+        label: category.label().to_string(),
+        hint: category.hint().to_string(),
+        retryable,
+    }
+}
+
+/// Classify a historical [`HealAttempt`] from its recorded step/output telemetry.
+pub fn classify_heal_attempt(attempt: &HealAttempt) -> FailureClassification {
+    let ctx = FailedCheckContext {
+        step_name: attempt.trigger_step.clone(),
+        cmd: String::new(),
+        exit_code: attempt.exit_code,
+        status: Some(StepStatus::Failed),
+        output: attempt.stderr_tail.clone(),
+        tail_line: String::new(),
+    };
+    classify_failure(&ctx)
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|n| haystack.contains(n))
+}
+
 /// Budget and stop-flag gate for autonomous check repair.
 ///
 /// Use [`evaluate_auto_heal`] when prior [`HealAttempt`] history is available so the
@@ -315,6 +508,7 @@ pub fn build_heal_prompt(
 
     let task_excerpt = trim_chars(session.task.trim(), MAX_TASK_ECHO_CHARS);
     let tail = failed_step.diagnostic_tail();
+    let classification = classify_failure(failed_step);
     let tail_block = if tail.is_empty() {
         "(the verification command produced no output)".to_string()
     } else {
@@ -329,7 +523,9 @@ pub fn build_heal_prompt(
         prompt.push_str(&format!("\nOriginal task: {task_excerpt}\n"));
     }
     prompt.push_str(&format!(
-        "\nFailed step: {step_name}\nCommand: {}\nResult: {outcome_desc}\n",
+        "\nFailed step: {step_name}\nFailure class: {}\nRepair focus: {}\nCommand: {}\nResult: {outcome_desc}\n",
+        classification.label,
+        classification.hint,
         failed_step.cmd.trim()
     ));
     prompt.push_str("\nDiagnostic output tail:\n```\n");
@@ -740,5 +936,56 @@ index 111..222 100644
         assert!(prompt.contains("Current diff excerpt:"));
         assert!(prompt.contains("Previous failed repair passes"));
         assert!(prompt.contains("attempt 1 (unit-tests): exit 101"));
+    }
+
+    #[test]
+    fn classify_failure_distinguishes_root_cause_categories() {
+        let compile = FailedCheckContext::from_legacy(
+            "cargo test",
+            Some(101),
+            "error[E0308]: mismatched types in src/lib.rs",
+        );
+        assert_eq!(classify_failure(&compile).category, FailureCategory::CompileError);
+
+        let test_fail = FailedCheckContext::from_legacy(
+            "cargo test",
+            Some(101),
+            "thread 'main' panicked at assertion `left == right` failed",
+        );
+        assert_eq!(classify_failure(&test_fail).category, FailureCategory::TestAssertion);
+
+        let lint = FailedCheckContext::from_legacy(
+            "cargo clippy -- -D warnings",
+            Some(101),
+            "error: unused variable `x` [-D warnings]",
+        );
+        assert_eq!(classify_failure(&lint).category, FailureCategory::LintOrFormat);
+
+        let scope = FailedCheckContext::from_legacy(
+            "fleet scope check",
+            Some(1),
+            "file-scope guardrail blocked outside allowed_globs",
+        );
+        assert_eq!(classify_failure(&scope).category, FailureCategory::ScopeGuardrail);
+
+        let timed_out = FailedCheckContext {
+            step_name: "e2e".to_string(),
+            cmd: "npm test".to_string(),
+            exit_code: None,
+            status: Some(StepStatus::TimedOut),
+            output: String::new(),
+            tail_line: String::new(),
+        };
+        assert_eq!(classify_failure(&timed_out).category, FailureCategory::Timeout);
+
+        let flake = FailedCheckContext::from_legacy(
+            "npm test",
+            Some(1),
+            "Error: ECONNRESET socket hang up while fetching local mock",
+        );
+        assert_eq!(classify_failure(&flake).category, FailureCategory::TransientFlake);
+
+        let prompt = build_heal_prompt(&HealSessionContext::default(), &compile);
+        assert!(prompt.contains("Failure class: Compile / type error"));
     }
 }

@@ -6,7 +6,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
 const root = import.meta.dirname;
-const STAMP = "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v0.10.0 */";
+const STAMP = "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v0.11.0 */";
 
 function singleFile(): Plugin {
   return {
