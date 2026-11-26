@@ -245,6 +245,7 @@ export function createFleetHandlers({
     getSwarmRoster,
     listSwarms,
     oneLine,
+    readTranscriptSteps,
     resolveAllowedFrame,
     resolveConversationSwarm,
     roleOf,
@@ -305,6 +306,7 @@ export function createFleetHandlers({
           isSidecar,
           sseStream: !isSidecar,
           deltaStream: true,
+          transcriptInspector: true,
         },
         idleSleep,
         sseClients: sseCount,
@@ -341,7 +343,7 @@ export function createFleetHandlers({
           ...snap,
           ...unseenBy(snap, member),
           etag: fullEtag,
-          capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, sseStream: !isSidecar, deltaStream: true },
+          capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, sseStream: !isSidecar, deltaStream: true, transcriptInspector: true },
         },
         fastEtag(fullEtag),
       );
@@ -396,7 +398,7 @@ export function createFleetHandlers({
         swarm: null,
         member: null,
         resolvedFrom,
-        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, deltaStream: true },
+        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, deltaStream: true, transcriptInspector: true },
         swarms: getSwarmsEntry().swarms,
       });
     }
@@ -430,7 +432,7 @@ export function createFleetHandlers({
         swarm: null,
         member: null,
         resolvedFrom,
-        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, deltaStream: true },
+        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, deltaStream: true, transcriptInspector: true },
         swarms: getSwarmsEntry().swarms,
       });
     }
@@ -451,7 +453,7 @@ export function createFleetHandlers({
         swarm: null,
         member: null,
         resolvedFrom,
-        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, deltaStream: true },
+        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, deltaStream: true, transcriptInspector: true },
         swarms: getSwarmsEntry().swarms,
       });
     }
@@ -480,7 +482,7 @@ export function createFleetHandlers({
         ...snap,
         ...unseenBy(snap, res.member),
         etag,
-        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, sseStream: !isSidecar, deltaStream: true },
+        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, sseStream: !isSidecar, deltaStream: true, transcriptInspector: true },
       },
       fastEtag(etag),
     );
@@ -693,7 +695,7 @@ export function createFleetHandlers({
       swarm: res.swarm,
       member: res.member,
       etag: fullEtag,
-      capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, sseStream: !isSidecar, deltaStream: true },
+      capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, sseStream: !isSidecar, deltaStream: true, transcriptInspector: true },
     };
     if (delta.mode === 'full') {
       Object.assign(base, unseenBy(delta, res.member));
@@ -862,6 +864,21 @@ export function createFleetHandlers({
     });
     worktreesPayloadCache.clear();
     return { status: res.httpStatus, json: res.payload };
+  }
+
+  function getTranscript(query = {}) {
+    const q = query && typeof query === 'object' ? query : {};
+    const res = readTranscriptSteps(getAppDirs(), {
+      conversationId: q.conversationId,
+      member: q.member,
+      before: q.before,
+      limit: q.limit,
+      filter: q.filter,
+    });
+    if (!res.ok) {
+      return { status: res.status || 400, packed: pack({ ok: false, error: res.error }) };
+    }
+    return { status: 200, packed: pack(res) };
   }
 
   function getFrame(query = {}) {
@@ -1319,6 +1336,7 @@ export function createFleetHandlers({
     getWorktreesPackedSync,
     getWorktreesPacked,
     getWorktreeDiff,
+    getTranscript,
     getFrame,
     postNudge,
     postPlan,
@@ -1375,6 +1393,7 @@ export async function createStandaloneRouter({
         isSidecar: false,
         sseStream: true,
         deltaStream: true,
+        transcriptInspector: true,
       },
       idleSleep,
       sseClients: sseClients.size,
@@ -1674,6 +1693,13 @@ export async function createStandaloneRouter({
       const q = parseQueryFast(search);
       return withHandlers((h) => h.getWorktreeDiff(q).then((out) => sendPacked(req, res, out.status, out.packed)));
     }
+    if (req.method === 'GET' && pathname === '/api/transcript') {
+      const q = parseQueryFast(search);
+      return withHandlers((h) => {
+        const out = h.getTranscript(q);
+        sendPacked(req, res, out.status, out.packed);
+      });
+    }
     if (req.method === 'GET' && pathname === '/api/frame') {
       const q = parseQueryFast(search);
       return withHandlers((h) => {
@@ -1845,6 +1871,10 @@ export async function runSidecarApp({ appDataDir = '' } = {}) {
   app.api('/api/worktrees', async (data) => new Response((await handlers.getWorktreesPacked(data)).raw, { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
   app.api('/api/worktrees/diff', async (data) => {
     const out = await handlers.getWorktreeDiff(data);
+    return new Response(out.packed.raw, { status: out.status, contentType: 'application/json', headers: SECURITY_HEADERS });
+  }, 'GET');
+  app.api('/api/transcript', (data) => {
+    const out = handlers.getTranscript(data);
     return new Response(out.packed.raw, { status: out.status, contentType: 'application/json', headers: SECURITY_HEADERS });
   }, 'GET');
   app.api('/api/frame', (data) => {

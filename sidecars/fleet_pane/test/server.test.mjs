@@ -2,12 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { registerHooks } from 'node:module';
 import net from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { startStandaloneServer } from '../main.mjs';
-import { createFleetHandlers } from '../server_core.mjs';
+import { createFleetHandlers, runSidecarApp } from '../server_core.mjs';
 import * as store from '../swarm_store.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1508,6 +1509,201 @@ test('GET /api/swarm/delta supports full, incremental append, fs.watch wakeup (<
     assert.equal(sidecarDeltaJson.capabilities?.isSidecar, true);
     assert.equal(sidecarDeltaJson.capabilities?.deltaStream, true);
   } finally {
+    await srv.close();
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test('GET /api/transcript works across standalone HTTP and runSidecarApp RPC with pagination, filters, scrubbing, and confinement', async () => {
+  const fx = setupFixtureAppData();
+  const workerLogs = join(fx.appData, 'brain', fx.worker, '.system_generated', 'logs');
+  mkdirSync(workerLogs, { recursive: true });
+
+  const outsideFile = join(fx.dir, 'outside-transcript.jsonl');
+  writeFileSync(outsideFile, JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: 'SECRET' }) + '\n');
+  const evilMemberId = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
+  const evilLogs = join(fx.appData, 'brain', evilMemberId, '.system_generated', 'logs');
+  mkdirSync(evilLogs, { recursive: true });
+  symlinkSync(outsideFile, join(evilLogs, 'transcript.jsonl'));
+
+  const swDir = join(fx.appData, 'brain', fx.coord, '.system_generated', 'swarm');
+  writeFileSync(
+    join(swDir, 'members.json'),
+    JSON.stringify({
+      title: 'Transcript HTTP Test',
+      members: {
+        coordinator: { conversation_id: fx.coord, role: 'coordinator' },
+        worker: { conversation_id: fx.worker, role: 'worker' },
+        evil_sym: { conversation_id: evilMemberId, role: 'worker' },
+      },
+    }),
+  );
+
+  const bigStderr = 'E'.repeat(2600);
+  writeFileSync(
+    join(workerLogs, 'transcript.jsonl'),
+    [
+      JSON.stringify({
+        step_index: 0,
+        type: 'USER_INPUT',
+        status: 'DONE',
+        created_at: '2026-11-26T11:00:00Z',
+        content: 'Run tests in /home/cayleb/repo with ghp_abcdef1234567890',
+      }),
+      JSON.stringify({
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-11-26T11:00:01Z',
+        model: 'gemini-3-pro',
+        input_tokens: 400,
+        cache_read_tokens: 100,
+        output_tokens: 40,
+        tool_calls: [{ name: 'run_command', args: { CommandLine: 'npm test', token: 'Bearer secret-bearer-999' } }],
+      }),
+      JSON.stringify({
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'ERROR',
+        created_at: '2026-11-26T11:00:03Z',
+        content: `Created At: 2026-11-26T11:00:01Z\nCompleted At: 2026-11-26T11:00:03Z\nstderr: sk-ant-secret12345678\n${bigStderr}`,
+      }),
+      JSON.stringify({
+        step_index: 3,
+        type: 'ERROR_MESSAGE',
+        status: 'ERROR',
+        created_at: '2026-11-26T11:00:05Z',
+        error: 'Rate limit AIzaSyFakeKey1234567890',
+      }),
+    ].join('\n') + '\n',
+  );
+
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+  });
+
+  let hook = null;
+  try {
+    // 1. /api/health advertises capabilities.transcriptInspector
+    const health = await (await fetch(`${srv.url}/api/health`)).json();
+    assert.equal(health.capabilities?.transcriptInspector, true);
+    assert.equal(health.capabilities?.deltaStream, true);
+
+    // 2. Standalone HTTP GET /api/transcript pagination + correlation + scrubbing
+    const p1Res = await fetch(`${srv.url}/api/transcript?conversationId=${fx.coord}&member=worker&limit=2`);
+    assert.equal(p1Res.status, 200);
+    const p1 = await p1Res.json();
+    assert.equal(p1.ok, true);
+    assert.equal(p1.member, 'worker');
+    assert.equal(p1.conversationId, fx.worker);
+    assert.equal(p1.hasMore, true);
+    assert.equal(p1.nextBefore, 1);
+    assert.deepEqual(p1.steps.map((s) => s.stepIndex), [3, 1]);
+    assert.ok(!p1.steps[0].error.includes('AIzaSyFakeKey1234567890'));
+    assert.equal(p1.steps[1].durationMs, 2000);
+    assert.equal(p1.steps[1].toolCalls[0].status, 'ERROR');
+    assert.ok(!p1.steps[1].toolCalls[0].outputPreview.includes('sk-ant-secret12345678'));
+    assert.ok(!JSON.stringify(p1.steps[1].toolCalls[0].args).includes('secret-bearer-999'));
+    assert.ok(Buffer.byteLength(p1.steps[1].toolCalls[0].outputPreview, 'utf8') <= 2048);
+
+    const p2Res = await fetch(`${srv.url}/api/transcript?conversationId=${fx.coord}&member=worker&before=${p1.nextBefore}&limit=2`);
+    assert.equal(p2Res.status, 200);
+    const p2 = await p2Res.json();
+    assert.equal(p2.hasMore, false);
+    assert.equal(p2.nextBefore, null);
+    assert.deepEqual(p2.steps.map((s) => s.stepIndex), [0]);
+    assert.ok(p2.steps[0].content.includes('~/repo'));
+    assert.ok(!p2.steps[0].content.includes('ghp_abcdef1234567890'));
+
+    // 3. filter=errors and filter=tools
+    const errRes = await (await fetch(`${srv.url}/api/transcript?conversationId=${fx.coord}&member=worker&filter=errors`)).json();
+    assert.deepEqual(errRes.steps.map((s) => s.stepIndex), [3, 1]);
+    const toolRes = await (await fetch(`${srv.url}/api/transcript?conversationId=${fx.coord}&member=worker&filter=tools`)).json();
+    assert.deepEqual(toolRes.steps.map((s) => s.stepIndex), [1]);
+
+    // 3b. limit clamping (limit=0 -> 1, limit=200 -> accepted & bounded) and Host-403
+    const clampedMin = await (await fetch(`${srv.url}/api/transcript?conversationId=${fx.coord}&member=worker&limit=0`)).json();
+    assert.equal(clampedMin.steps.length, 1);
+    const clampedMax = await (await fetch(`${srv.url}/api/transcript?conversationId=${fx.coord}&member=worker&limit=200`)).json();
+    assert.equal(clampedMax.steps.length, 3);
+
+    // 4. Standalone validation & confinement rejections (400 / 404)
+    assert.equal((await fetch(`${srv.url}/api/transcript?member=worker`)).status, 400);
+    assert.equal((await fetch(`${srv.url}/api/transcript?conversationId=${fx.coord}`)).status, 400);
+    assert.equal((await fetch(`${srv.url}/api/transcript?conversationId=${fx.coord}&member=missing`)).status, 404);
+    assert.equal((await fetch(`${srv.url}/api/transcript?conversationId=${fx.coord}&member=evil_sym`)).status, 400);
+    assert.equal((await fetch(`${srv.url}/api/transcript?conversationId=${fx.coord}&member=worker&filter=bad`)).status, 400);
+    assert.equal((await fetch(`${srv.url}/api/transcript?conversationId=${fx.coord}&member=worker&before=abc`)).status, 400);
+
+    // 5. runSidecarApp RPC invocation via SidecarApp mock
+    const rpcState = { app: null };
+    globalThis.__FLEET_TEST_SIDECAR_RPC = rpcState;
+    globalThis.__FLEET_TEST_COORD = fx.coord;
+    hook = registerHooks({
+      resolve(specifier, ctx, next) {
+        if (specifier === 'sidecar_sdk') return { shortCircuit: true, url: 'sidecar_sdk:fleet-test-mock' };
+        return next(specifier, ctx);
+      },
+      load(url, ctx, next) {
+        if (url === 'sidecar_sdk:fleet-test-mock') {
+          return {
+            shortCircuit: true,
+            format: 'module',
+            source: `
+              export class Response {
+                constructor(body, opts = {}) {
+                  this.body = body;
+                  this.status = opts.status ?? 200;
+                  this.contentType = opts.contentType || 'application/json';
+                  this.headers = opts.headers || {};
+                }
+              }
+              export class SidecarApp {
+                constructor() {
+                  this.config = { conversationId: globalThis.__FLEET_TEST_COORD || '' };
+                  this.routes = new Map();
+                  globalThis.__FLEET_TEST_SIDECAR_RPC.app = this;
+                }
+                page() {}
+                api(route, fn, method = 'GET') { this.routes.set(method + ' ' + route, fn); }
+                async sendMessage() { return { ok: true }; }
+                async run() {}
+              }
+            `,
+          };
+        }
+        return next(url, ctx);
+      },
+    });
+
+    await runSidecarApp({ appDataDir: fx.appData });
+    const app = rpcState.app;
+    assert.ok(app, 'runSidecarApp should instantiate SidecarApp');
+    const healthHandler = app.routes.get('GET /api/health');
+    const trHandler = app.routes.get('GET /api/transcript');
+    assert.equal(typeof healthHandler, 'function');
+    assert.equal(typeof trHandler, 'function');
+
+    const rpcHealthResp = await healthHandler();
+    const rpcHealth = JSON.parse(Buffer.from(rpcHealthResp.body).toString('utf8'));
+    assert.equal(rpcHealth.capabilities?.isSidecar, true);
+    assert.equal(rpcHealth.capabilities?.transcriptInspector, true);
+
+    const rpcTrResp = await trHandler({ conversationId: fx.coord, member: 'worker', limit: 2, filter: 'errors' });
+    assert.equal(rpcTrResp.status, 200);
+    const rpcTr = JSON.parse(Buffer.from(rpcTrResp.body).toString('utf8'));
+    assert.equal(rpcTr.ok, true);
+    assert.deepEqual(rpcTr.steps.map((s) => s.stepIndex), [3, 1]);
+
+    const rpcSymResp = await trHandler({ conversationId: fx.coord, member: 'evil_sym' });
+    assert.equal(rpcSymResp.status, 400);
+  } finally {
+    hook?.deregister?.();
+    delete globalThis.__FLEET_TEST_SIDECAR_RPC;
+    delete globalThis.__FLEET_TEST_COORD;
     await srv.close();
     rmSync(fx.dir, { recursive: true, force: true });
   }

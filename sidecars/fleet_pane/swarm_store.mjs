@@ -10,6 +10,7 @@
 import {
   closeSync,
   existsSync,
+  lstatSync,
   openSync,
   readFileSync,
   readSync,
@@ -2912,4 +2913,725 @@ export function unseenBy(snap, member) {
   if (!me) return {};
   const { visible } = memberView(me.name, me.role, me.channels, snap.messages, snap.channels);
   return { unseen: snap.messages.filter((_, i) => !visible[i]).map((m) => m.seq) };
+}
+
+const TRANSCRIPT_PAGE_SCAN_BYTES = 512 * 1024;
+const TRANSCRIPT_BACK_CHUNK_BYTES = 64 * 1024;
+const TRANSCRIPT_TEXT_MAX_CHARS = 1200;
+const TRANSCRIPT_PREVIEW_MAX_BYTES = 2048;
+
+const PRIVATE_KEY_RE = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g;
+const BEARER_RE = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]{6,}/gi;
+const AUTH_HDR_RE = /\b(Authorization:\s*(?:Basic|Token)\s+)[A-Za-z0-9._~+/=-]{6,}/gi;
+const SK_TOKEN_RE = /\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{8,}/g;
+const GH_TOKEN_RE = /\b(?:ghp|gho|ghs|ghu)_[A-Za-z0-9_]{8,}|\bgithub_pat_[A-Za-z0-9_]{12,}/g;
+const AIZA_TOKEN_RE = /\bAIza[A-Za-z0-9_-]{8,}/g;
+const SLACK_TOKEN_RE = /\bxox[bpar]-[A-Za-z0-9-]{8,}/g;
+const AWS_TOKEN_RE = /\b(?:AKIA|ASIA)[A-Z0-9]{8,}/g;
+const ENV_SECRET_RE = /\b([A-Z][A-Z0-9_]*(?:API_KEY|SECRET_KEY|ACCESS_KEY|AUTH_TOKEN|BOT_TOKEN|PRIVATE_KEY|PASSWORD|SECRET|TOKEN)\s*=\s*)(?:"[^"\n]{4,}"|'[^'\n]{4,}'|[^\s"'`;,]{6,})/g;
+
+const transcriptCursorCache = new Map(); // realPath -> { ino, size, anchors: Map<stepIndex, byteOffset> }
+
+function scrubTranscriptText(s) {
+  if (s === undefined || s === null) return '';
+  const out = maskHomePath(safeStr(s));
+  if (!out) return '';
+  return out
+    .replace(PRIVATE_KEY_RE, '[REDACTED:PRIVATE_KEY]')
+    .replace(BEARER_RE, '$1[REDACTED]')
+    .replace(AUTH_HDR_RE, '$1[REDACTED]')
+    .replace(SK_TOKEN_RE, '[REDACTED:sk]')
+    .replace(GH_TOKEN_RE, '[REDACTED:github]')
+    .replace(AIZA_TOKEN_RE, '[REDACTED:AIza]')
+    .replace(SLACK_TOKEN_RE, '[REDACTED:slack]')
+    .replace(AWS_TOKEN_RE, '[REDACTED:AWS]')
+    .replace(ENV_SECRET_RE, '$1[REDACTED]');
+}
+
+function truncateChars(s, maxChars = TRANSCRIPT_TEXT_MAX_CHARS) {
+  if (!s || s.length <= maxChars) return s;
+  let end = Math.max(0, maxChars - 1);
+  if (end > 0) {
+    const code = s.charCodeAt(end - 1);
+    if (code >= 0xd800 && code <= 0xdbff) end--;
+  }
+  return `${s.slice(0, end)}…`;
+}
+
+function truncateUtf8Bytes(s, maxBytes = TRANSCRIPT_PREVIEW_MAX_BYTES) {
+  if (!s) return '';
+  if (Buffer.byteLength(s, 'utf8') <= maxBytes) return s;
+  const suffix = '…';
+  const budget = Math.max(0, maxBytes - Buffer.byteLength(suffix, 'utf8'));
+  const buf = Buffer.from(s, 'utf8');
+  let end = Math.min(budget, buf.length);
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+  return `${buf.toString('utf8', 0, end)}${suffix}`;
+}
+
+function scrubValue(val, depth = 0, strCap = 0) {
+  if (val === null || val === undefined) return val;
+  if (typeof val === 'string') {
+    const scrubbed = scrubTranscriptText(val);
+    return strCap > 0 ? truncateUtf8Bytes(scrubbed, strCap) : scrubbed;
+  }
+  if (typeof val === 'number' || typeof val === 'boolean') return val;
+  if (depth >= 6) return '[truncated]';
+  if (Array.isArray(val)) {
+    const cap = Math.min(val.length, 50);
+    const arr = [];
+    for (let i = 0; i < cap; i++) arr.push(scrubValue(val[i], depth + 1, strCap));
+    if (val.length > cap) arr.push(`…(+${val.length - cap})`);
+    return arr;
+  }
+  if (typeof val === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(val)) {
+      if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+      out[k] = scrubValue(v, depth + 1, strCap);
+    }
+    return out;
+  }
+  return safeStr(val);
+}
+
+function scrubAndBoundArgs(rawArgs) {
+  if (rawArgs === undefined || rawArgs === null) return {};
+  if (typeof rawArgs === 'string') {
+    return truncateUtf8Bytes(scrubTranscriptText(rawArgs), TRANSCRIPT_PREVIEW_MAX_BYTES);
+  }
+  if (typeof rawArgs !== 'object') return {};
+  const scrubbed = scrubValue(rawArgs, 0, 0);
+  let json = '';
+  try {
+    json = JSON.stringify(scrubbed) || '{}';
+  } catch {
+    return {};
+  }
+  if (Buffer.byteLength(json, 'utf8') <= TRANSCRIPT_PREVIEW_MAX_BYTES) return scrubbed;
+  if (!Array.isArray(scrubbed)) {
+    const trimmed = scrubValue(rawArgs, 0, 256);
+    trimmed._truncated = true;
+    try {
+      const tj = JSON.stringify(trimmed) || '{}';
+      if (Buffer.byteLength(tj, 'utf8') <= TRANSCRIPT_PREVIEW_MAX_BYTES) return trimmed;
+    } catch {}
+  }
+  return { _truncated: true, preview: truncateUtf8Bytes(json, TRANSCRIPT_PREVIEW_MAX_BYTES - 64) };
+}
+
+function extractCreatedAtMs(content) {
+  if (!content) return 0;
+  const m = /^Created At:\s*([^\r\n]+)/m.exec(content);
+  return m ? boardTimeMs(m[1].trim()) || 0 : 0;
+}
+
+function extractCompletedAtMs(content) {
+  if (!content) return 0;
+  const m = /^Completed At:\s*([^\r\n]+)/m.exec(content);
+  return m ? boardTimeMs(m[1].trim()) || 0 : 0;
+}
+
+function numOrNull(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+}
+
+function checkConfinedSegment(segPath, expectedReal, brainRoot) {
+  let lst;
+  try {
+    lst = lstatSync(segPath);
+  } catch (err) {
+    return err?.code === 'ENOENT' ? 'missing' : 'escape';
+  }
+  if (lst.isSymbolicLink()) return 'escape';
+  try {
+    const rp = realpathSync(segPath);
+    if (!rp.startsWith(brainRoot) || rp !== expectedReal) return 'escape';
+  } catch {
+    return 'escape';
+  }
+  return 'ok';
+}
+
+function resolveConfinedTranscriptPath(appData, swarmId, memberConv) {
+  let brainReal;
+  try {
+    brainReal = realpathSync(join(appData, 'brain'));
+  } catch {
+    return { ok: false, status: 404, error: 'Swarm not found' };
+  }
+  const brainRoot = brainReal.endsWith(sep) ? brainReal : brainReal + sep;
+  try {
+    const membersReal = realpathSync(join(swarmDir(appData, swarmId), 'members.json'));
+    if (!membersReal.startsWith(brainRoot)) {
+      return { ok: false, status: 400, error: 'Transcript path confinement violation' };
+    }
+  } catch {
+    return { ok: false, status: 404, error: 'Swarm not found' };
+  }
+
+  const memberDir = join(appData, 'brain', memberConv);
+  const sysDir = join(memberDir, '.system_generated');
+  const logsDir = join(sysDir, 'logs');
+  const trPath = join(logsDir, 'transcript.jsonl');
+
+  const expectedMember = join(brainReal, memberConv);
+  const expectedSys = join(expectedMember, '.system_generated');
+  const expectedLogs = join(expectedSys, 'logs');
+  const expectedTr = join(expectedLogs, 'transcript.jsonl');
+
+  for (const [seg, exp] of [
+    [memberDir, expectedMember],
+    [sysDir, expectedSys],
+    [logsDir, expectedLogs],
+  ]) {
+    const st = checkConfinedSegment(seg, exp, brainRoot);
+    if (st === 'escape') return { ok: false, status: 400, error: 'Transcript path confinement violation' };
+    if (st === 'missing') return { ok: true, missing: true, realTr: expectedTr };
+  }
+
+  const trState = checkConfinedSegment(trPath, expectedTr, brainRoot);
+  if (trState === 'escape') return { ok: false, status: 400, error: 'Transcript path confinement violation' };
+  if (trState === 'missing') return { ok: true, missing: true, realTr: expectedTr };
+
+  try {
+    const st = statSync(expectedTr);
+    if (!st.isFile()) return { ok: false, status: 400, error: 'Invalid transcript file' };
+    return { ok: true, missing: false, realTr: expectedTr, stat: st };
+  } catch {
+    return { ok: false, status: 400, error: 'Invalid transcript file' };
+  }
+}
+
+function getCursorAnchor(realTr, st, before) {
+  if (before === null || before === undefined) return st.size;
+  const cached = transcriptCursorCache.get(realTr);
+  if (!cached || cached.ino !== st.ino || st.size < cached.size) return st.size;
+  const exact = cached.anchors.get(before);
+  if (typeof exact === 'number' && exact <= st.size) return exact;
+  let bestStep = Infinity;
+  let bestOffset = st.size;
+  for (const [si, off] of cached.anchors.entries()) {
+    if (si >= before && si < bestStep && off <= st.size) {
+      bestStep = si;
+      bestOffset = off;
+    }
+  }
+  return bestOffset;
+}
+
+function recordCursorAnchor(realTr, st, stepIndex, byteOffset) {
+  if (!Number.isSafeInteger(stepIndex) || stepIndex < 0 || !Number.isFinite(byteOffset) || byteOffset < 0) return;
+  let cached = transcriptCursorCache.get(realTr);
+  if (!cached || cached.ino !== st.ino || st.size < cached.size) {
+    cached = { ino: st.ino, size: st.size, anchors: new Map() };
+  } else {
+    cached.size = st.size;
+  }
+  if (cached.anchors.has(stepIndex)) cached.anchors.delete(stepIndex);
+  else if (cached.anchors.size >= 64) cached.anchors.delete(cached.anchors.keys().next().value);
+  cached.anchors.set(stepIndex, byteOffset);
+  lruSet(transcriptCursorCache, realTr, cached, 16);
+}
+
+function readBackwardTranscriptLines(realTr, fileSize, readEndOffset, { before, limit, filter }) {
+  const revLines = [];
+  let pos = readEndOffset;
+  let bytesScanned = 0;
+  let trailingFrag = Buffer.alloc(0);
+  let oversizedDrop = false;
+  let stoppedEarly = false;
+  let oldestScannedStepIndex = null;
+  let oldestScannedByteOffset = pos;
+  let nonGenericBeforeCursor = 0;
+  let matchedEstimate = 0;
+  let pendingGenericError = false;
+  let pendingGenericTool = false;
+  let lastParsedType = '';
+
+  const chunkBuf = Buffer.allocUnsafe(TRANSCRIPT_BACK_CHUNK_BYTES);
+  let fd;
+  try {
+    fd = openSync(realTr, 'r');
+  } catch {
+    return { error: true };
+  }
+
+  const processLineBuf = (buf, lineStartOffset) => {
+    const line = buf.toString('utf8').trim();
+    if (!line) return false;
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      return false;
+    }
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+
+    const si = Number.isFinite(obj.step_index) ? obj.step_index : null;
+    if (si !== null && (oldestScannedStepIndex === null || si < oldestScannedStepIndex)) {
+      oldestScannedStepIndex = si;
+      oldestScannedByteOffset = lineStartOffset;
+    } else if (oldestScannedStepIndex === null) {
+      oldestScannedByteOffset = lineStartOffset;
+    }
+
+    const type = safeStr(obj.type);
+    lastParsedType = type;
+
+    if (before !== null && si !== null && si >= before) {
+      if (si < before + 32) {
+        revLines.push({ byteOffset: lineStartOffset, raw: obj });
+      }
+      return false;
+    }
+
+    revLines.push({ byteOffset: lineStartOffset, raw: obj });
+
+    if (type === 'GENERIC') {
+      pendingGenericTool = true;
+      if (safeStr(obj.status) === 'ERROR' || Boolean(obj.error)) pendingGenericError = true;
+      return false;
+    }
+
+    nonGenericBeforeCursor++;
+    if (filter === 'all') {
+      matchedEstimate++;
+    } else if (filter === 'tools') {
+      const hasCalls = Array.isArray(obj.tool_calls) && obj.tool_calls.length > 0;
+      if (hasCalls || pendingGenericTool) matchedEstimate++;
+    } else if (filter === 'errors') {
+      const isErr =
+        type === 'ERROR_MESSAGE' ||
+        safeStr(obj.status) === 'ERROR' ||
+        Boolean(obj.error) ||
+        pendingGenericError;
+      if (isErr) matchedEstimate++;
+    }
+    pendingGenericError = false;
+    pendingGenericTool = false;
+
+    return matchedEstimate >= limit + 1;
+  };
+
+  try {
+    while (pos > 0 && bytesScanned < TRANSCRIPT_PAGE_SCAN_BYTES && !stoppedEarly) {
+      const remainingBudget = TRANSCRIPT_PAGE_SCAN_BYTES - bytesScanned;
+      const toRead = Math.min(TRANSCRIPT_BACK_CHUNK_BYTES, pos, remainingBudget);
+      if (toRead <= 0) break;
+      const readStart = pos - toRead;
+      const bytesRead = readSync(fd, chunkBuf, 0, toRead, readStart);
+      if (bytesRead <= 0) break;
+      bytesScanned += bytesRead;
+      pos = readStart;
+
+      const chunk = chunkBuf.subarray(0, bytesRead);
+      const firstNl = chunk.indexOf(0x0a);
+
+      if (firstNl < 0) {
+        if (!oversizedDrop) {
+          if (chunk.length + trailingFrag.length > MAX_LINE_BYTES) {
+            oversizedDrop = true;
+            trailingFrag = Buffer.alloc(0);
+          } else {
+            trailingFrag = trailingFrag.length ? Buffer.concat([chunk, trailingFrag]) : Buffer.from(chunk);
+          }
+        }
+        continue;
+      }
+
+      const lastNl = chunk.lastIndexOf(0x0a);
+      const tailSeg = chunk.subarray(lastNl + 1);
+      if (!oversizedDrop) {
+        const totalLen = tailSeg.length + trailingFrag.length;
+        if (totalLen > 0 && totalLen <= MAX_LINE_BYTES) {
+          const assembled = trailingFrag.length ? Buffer.concat([tailSeg, trailingFrag]) : tailSeg;
+          if (processLineBuf(assembled, readStart + lastNl + 1)) {
+            stoppedEarly = true;
+            break;
+          }
+        }
+      }
+      oversizedDrop = false;
+      trailingFrag = Buffer.alloc(0);
+
+      let lineEnd = lastNl;
+      while (lineEnd > firstNl) {
+        const prevNl = chunk.lastIndexOf(0x0a, lineEnd - 1);
+        const lineStart = prevNl + 1;
+        const len = lineEnd - lineStart;
+        if (len > 0 && len <= MAX_LINE_BYTES) {
+          if (processLineBuf(chunk.subarray(lineStart, lineEnd), readStart + lineStart)) {
+            stoppedEarly = true;
+            break;
+          }
+        }
+        lineEnd = prevNl;
+      }
+      if (stoppedEarly) break;
+
+      if (firstNl > 0) {
+        if (firstNl > MAX_LINE_BYTES) {
+          oversizedDrop = true;
+          trailingFrag = Buffer.alloc(0);
+        } else {
+          trailingFrag = Buffer.from(chunk.subarray(0, firstNl));
+        }
+      }
+    }
+
+    if (!stoppedEarly && pos === 0 && !oversizedDrop && trailingFrag.length > 0 && trailingFrag.length <= MAX_LINE_BYTES) {
+      processLineBuf(trailingFrag, 0);
+    }
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {}
+  }
+
+  return {
+    error: false,
+    revLines,
+    reachedBeginning: !stoppedEarly && pos === 0,
+    stoppedEarly,
+    oldestScannedStepIndex,
+    oldestScannedByteOffset,
+    lastParsedType,
+    nonGenericBeforeCursor,
+  };
+}
+
+function correlateTranscriptSteps(revLines, reachedBeginning) {
+  const chrono = [];
+  for (let i = revLines.length - 1; i >= 0; i--) {
+    chrono.push(revLines[i]);
+  }
+
+  // Fill any missing step_index monotonically
+  let nextInfer = 0;
+  for (let i = 0; i < chrono.length; i++) {
+    const si = chrono[i].raw.step_index;
+    if (Number.isFinite(si) && si >= 0) {
+      chrono[i].stepIndex = si;
+      nextInfer = si + 1;
+    } else {
+      chrono[i].stepIndex = reachedBeginning ? nextInfer++ : nextInfer++;
+    }
+  }
+
+  const correlated = [];
+  let currentPlanner = null;
+
+  for (let i = 0; i < chrono.length; i++) {
+    const { raw, byteOffset, stepIndex } = chrono[i];
+    const type = safeStr(raw.type);
+
+    if (type === 'GENERIC') {
+      if (currentPlanner && currentPlanner.toolCalls.length > 0) {
+        let targetTc = null;
+        const callId = safeStr(raw.tool_call_id || raw.call_id);
+        if (callId) {
+          targetTc = currentPlanner.toolCalls.find((c) => c._id && c._id === callId && !c._paired);
+        }
+        if (!targetTc) {
+          while (currentPlanner._nextCallIdx < currentPlanner.toolCalls.length) {
+            const cand = currentPlanner.toolCalls[currentPlanner._nextCallIdx++];
+            if (!cand._paired) {
+              targetTc = cand;
+              break;
+            }
+          }
+        }
+        if (targetTc) {
+          targetTc._paired = true;
+          const genStatus = safeStr(raw.status) || 'DONE';
+          const genErr = safeStr(raw.error);
+          const genContent = safeStr(raw.content);
+          const combined = genErr && genContent ? `${genErr}\n${genContent}` : genErr || genContent;
+          targetTc.status = genStatus;
+          targetTc.outputPreview = truncateUtf8Bytes(scrubTranscriptText(combined), TRANSCRIPT_PREVIEW_MAX_BYTES);
+
+          const genTs = boardTimeMs(raw.created_at) || 0;
+          const completedTs = extractCompletedAtMs(genContent) || genTs;
+          if (currentPlanner.ts > 0 && completedTs >= currentPlanner.ts) {
+            const span = completedTs - currentPlanner.ts;
+            if (currentPlanner.durationMs === null || span > currentPlanner.durationMs) {
+              currentPlanner.durationMs = span;
+            }
+          }
+          continue;
+        }
+      }
+
+      const genErr = safeStr(raw.error);
+      const genContent = safeStr(raw.content);
+      const genTs = boardTimeMs(raw.created_at) || 0;
+      const createdIn = extractCreatedAtMs(genContent);
+      const completedIn = extractCompletedAtMs(genContent);
+      let durationMs = numOrNull(raw.duration_ms ?? raw.durationMs);
+      if (durationMs === null && createdIn > 0 && completedIn >= createdIn) {
+        durationMs = completedIn - createdIn;
+      }
+      correlated.push({
+        stepIndex,
+        type,
+        status: safeStr(raw.status),
+        ts: genTs,
+        durationMs,
+        model: safeStr(raw.model),
+        thinking: '',
+        content: truncateChars(scrubTranscriptText(genContent), TRANSCRIPT_TEXT_MAX_CHARS),
+        error: truncateChars(scrubTranscriptText(genErr), TRANSCRIPT_TEXT_MAX_CHARS),
+        toolCalls: [],
+        usage: { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0 },
+        _byteOffset: byteOffset,
+      });
+      continue;
+    }
+
+    if (currentPlanner) {
+      if (currentPlanner.durationMs === null && type !== 'USER_INPUT' && currentPlanner.ts > 0) {
+        const nextTs = boardTimeMs(raw.created_at) || 0;
+        if (nextTs >= currentPlanner.ts) currentPlanner.durationMs = nextTs - currentPlanner.ts;
+      }
+      currentPlanner = null;
+    }
+
+    const ts = boardTimeMs(raw.created_at) || 0;
+    const rawCalls = Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
+    const toolCalls = [];
+    for (const tc of rawCalls) {
+      if (!tc || typeof tc !== 'object') continue;
+      toolCalls.push({
+        name: safeStr(tc.name),
+        summary: truncateChars(scrubTranscriptText(describeToolCall(tc)), TRANSCRIPT_TEXT_MAX_CHARS),
+        args: scrubAndBoundArgs(tc.args),
+        status: safeStr(tc.status),
+        outputPreview: tc.output !== undefined ? truncateUtf8Bytes(scrubTranscriptText(safeStr(tc.output)), TRANSCRIPT_PREVIEW_MAX_BYTES) : '',
+        _id: safeStr(tc.id),
+        _paired: false,
+      });
+    }
+
+    const u = raw.usage && typeof raw.usage === 'object' ? raw.usage : raw;
+    const inputTokens = num(Number(u.input_tokens ?? u.inputTokens));
+    const cacheReadTokens = num(Number(u.cache_read_tokens ?? u.cacheReadTokens));
+    const outputTokens = num(Number(u.output_tokens ?? u.outputTokens));
+    const errRaw = safeStr(raw.error) || (type === 'ERROR_MESSAGE' ? safeStr(raw.content) : '');
+
+    const entry = {
+      stepIndex,
+      type,
+      status: safeStr(raw.status) || (type === 'ERROR_MESSAGE' ? 'ERROR' : ''),
+      ts,
+      durationMs: numOrNull(raw.duration_ms ?? raw.durationMs),
+      model: safeStr(raw.model),
+      thinking: truncateChars(scrubTranscriptText(safeStr(raw.thinking)), TRANSCRIPT_TEXT_MAX_CHARS),
+      content: truncateChars(scrubTranscriptText(safeStr(raw.content)), TRANSCRIPT_TEXT_MAX_CHARS),
+      error: truncateChars(scrubTranscriptText(errRaw), TRANSCRIPT_TEXT_MAX_CHARS),
+      toolCalls,
+      usage: { inputTokens, cacheReadTokens, outputTokens },
+      _byteOffset: byteOffset,
+      _nextCallIdx: 0,
+    };
+    correlated.push(entry);
+    if (type === 'PLANNER_RESPONSE' && toolCalls.length > 0) {
+      currentPlanner = entry;
+    }
+  }
+
+  return correlated;
+}
+
+function matchesTranscriptFilter(step, filter) {
+  if (filter === 'all') return true;
+  if (filter === 'tools') {
+    return step.toolCalls.length > 0 || step.type === 'GENERIC';
+  }
+  if (filter === 'errors') {
+    return (
+      step.type === 'ERROR_MESSAGE' ||
+      step.status === 'ERROR' ||
+      Boolean(step.error) ||
+      step.toolCalls.some((tc) => tc.status === 'ERROR')
+    );
+  }
+  return false;
+}
+
+function stripInternalStepFields(step) {
+  return {
+    stepIndex: step.stepIndex,
+    type: step.type,
+    status: step.status,
+    ts: step.ts,
+    durationMs: step.durationMs,
+    model: step.model,
+    thinking: step.thinking,
+    content: step.content,
+    error: step.error,
+    toolCalls: step.toolCalls.map((tc) => ({
+      name: tc.name,
+      summary: tc.summary,
+      args: tc.args,
+      status: tc.status,
+      outputPreview: tc.outputPreview,
+    })),
+    usage: step.usage,
+  };
+}
+
+/**
+ * Bounded backwards deep transcript inspector for a swarm member.
+ * Confines file access strictly via `members.json` -> `realpathSync` under `<appData>/brain/<memberConv>/.system_generated/logs/transcript.jsonl`.
+ */
+export function readTranscriptSteps(appDataDirs, opts = {}) {
+  const dirs = Array.isArray(appDataDirs) ? appDataDirs : typeof appDataDirs === 'string' && appDataDirs ? [appDataDirs] : [];
+  const o = opts && typeof opts === 'object' && !Array.isArray(opts) ? opts : {};
+
+  const conversationId = typeof o.conversationId === 'string' ? o.conversationId.trim() : '';
+  if (!conversationId || conversationId === '.' || conversationId === '..' || !ID_RE.test(conversationId)) {
+    return { ok: false, status: 400, error: 'Invalid conversationId' };
+  }
+
+  const member = typeof o.member === 'string' ? o.member.trim() : '';
+  if (
+    !member ||
+    member.length > 128 ||
+    /[\x00-\x1f\x7f/\\]/.test(member) ||
+    member === '__proto__' ||
+    member === 'constructor' ||
+    member === 'prototype'
+  ) {
+    return { ok: false, status: 400, error: 'Invalid member' };
+  }
+
+  let before = null;
+  if (o.before !== undefined && o.before !== null && o.before !== '') {
+    if (typeof o.before === 'boolean' || !/^\d+$/.test(String(o.before).trim())) {
+      return { ok: false, status: 400, error: 'Invalid before cursor' };
+    }
+    before = Number(String(o.before).trim());
+    if (!Number.isSafeInteger(before) || before < 0) {
+      return { ok: false, status: 400, error: 'Invalid before cursor' };
+    }
+  }
+
+  let limit = 25;
+  if (o.limit !== undefined && o.limit !== null && o.limit !== '') {
+    if (typeof o.limit === 'boolean' || (typeof o.limit === 'string' && !/^-?\d+$/.test(o.limit.trim()))) {
+      return { ok: false, status: 400, error: 'Invalid limit' };
+    }
+    const rawLimit = Number(o.limit);
+    if (!Number.isFinite(rawLimit) || !Number.isInteger(rawLimit)) {
+      return { ok: false, status: 400, error: 'Invalid limit' };
+    }
+    limit = Math.max(1, Math.min(50, rawLimit));
+  }
+
+  const filter = o.filter === undefined || o.filter === null || o.filter === '' ? 'all' : String(o.filter).trim();
+  if (filter !== 'all' && filter !== 'errors' && filter !== 'tools') {
+    return { ok: false, status: 400, error: 'filter must be all, errors, or tools' };
+  }
+
+  const resolved = resolveConversationSwarm(dirs, conversationId);
+  if (!resolved.swarm || !resolved.appData) {
+    return { ok: false, status: 404, error: 'Swarm not found' };
+  }
+
+  const roster = getSwarmRoster(resolved.appData, resolved.swarm);
+  if (!roster || !roster.members || !Object.hasOwn(roster.members, member)) {
+    return { ok: false, status: 404, error: 'Member not found' };
+  }
+
+  const mObj = roster.members[member];
+  const memberConv = typeof mObj?.conversation_id === 'string' ? mObj.conversation_id.trim() : '';
+  if (!memberConv || memberConv === '.' || memberConv === '..' || !ID_RE.test(memberConv) || /[\\/%]/.test(memberConv)) {
+    return { ok: false, status: 400, error: 'Invalid member conversationId' };
+  }
+
+  const confined = resolveConfinedTranscriptPath(resolved.appData, resolved.swarm, memberConv);
+  if (!confined.ok) return confined;
+
+  if (confined.missing || confined.stat.size === 0) {
+    return {
+      ok: true,
+      member,
+      conversationId: memberConv,
+      swarm: resolved.swarm,
+      totalSteps: 0,
+      nextBefore: null,
+      hasMore: false,
+      steps: [],
+    };
+  }
+
+  const trSummary = summarizeTranscript(resolved.appData, memberConv);
+  const totalSteps = trSummary?.summary?.steps || 0;
+
+  if (before === 0) {
+    return {
+      ok: true,
+      member,
+      conversationId: memberConv,
+      swarm: resolved.swarm,
+      totalSteps,
+      nextBefore: null,
+      hasMore: false,
+      steps: [],
+    };
+  }
+
+  const readEndOffset = getCursorAnchor(confined.realTr, confined.stat, before);
+  const scan = readBackwardTranscriptLines(confined.realTr, confined.stat.size, readEndOffset, {
+    before,
+    limit,
+    filter,
+  });
+  if (scan.error) {
+    return { ok: false, status: 404, error: 'Transcript unreadable' };
+  }
+
+  const correlated = correlateTranscriptSteps(scan.revLines, scan.reachedBeginning);
+  const eligible = correlated.filter((s) => (before === null || s.stepIndex < before) && matchesTranscriptFilter(s, filter));
+  const eligibleDesc = eligible.slice().reverse();
+  const pageRaw = eligibleDesc.slice(0, limit);
+  const steps = pageRaw.map(stripInternalStepFields);
+
+  let hasMore = false;
+  let nextBefore = null;
+  if (eligibleDesc.length > limit) {
+    const oldestReturned = pageRaw[pageRaw.length - 1];
+    if (oldestReturned.stepIndex > 0) {
+      hasMore = true;
+      nextBefore = oldestReturned.stepIndex;
+      recordCursorAnchor(confined.realTr, confined.stat, nextBefore, oldestReturned._byteOffset);
+    }
+  } else if (!scan.reachedBeginning) {
+    const cursorStep =
+      pageRaw.length > 0 && filter === 'all'
+        ? pageRaw[pageRaw.length - 1].stepIndex
+        : scan.oldestScannedStepIndex;
+    const cursorOffset =
+      pageRaw.length > 0 && filter === 'all'
+        ? pageRaw[pageRaw.length - 1]._byteOffset
+        : scan.oldestScannedByteOffset;
+    if (cursorStep !== null && cursorStep > 0) {
+      hasMore = true;
+      nextBefore = cursorStep;
+      recordCursorAnchor(confined.realTr, confined.stat, nextBefore, cursorOffset);
+    }
+  }
+
+  return {
+    ok: true,
+    member,
+    conversationId: memberConv,
+    swarm: resolved.swarm,
+    totalSteps: Math.max(totalSteps, correlated.length ? correlated[correlated.length - 1].stepIndex + 1 : 0),
+    nextBefore,
+    hasMore,
+    steps,
+  };
 }
