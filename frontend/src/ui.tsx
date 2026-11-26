@@ -731,11 +731,16 @@ export function TokenBurnStrip({ snap }: { snap: SwarmSnapshot }) {
   );
 }
 
-export function GateReadinessCard({ snap, onJump }: { snap: SwarmSnapshot; onJump: (seq: number) => void }) {
+export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnapshot; onJump: (seq: number) => void; onRefresh?: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
   const gate = snap.gateReadiness;
   if (!gate) return null;
   const tone = gate.state === "blocked" ? "danger" : gate.state === "ready" ? "success" : "info";
   const label = gate.state === "blocked" ? "Blocked" : gate.state === "ready" ? "Ready" : "Verifying";
+  const next = gate.nextAction;
+  const live = Boolean(next && canLiveNudge(snap) && next.conversationId);
 
   return (
     <Card className="p-2 space-y-1" data-testid="gate-readiness-card">
@@ -744,12 +749,24 @@ export function GateReadinessCard({ snap, onJump }: { snap: SwarmSnapshot; onJum
           <span className="font-semibold text-ink">Gate readiness</span>
           <Badge tone={tone}>{label}</Badge>
         </div>
-        {gate.pendingSeq > 0 && (
-          <Button data-testid="gate-pending-jump" onClick={() => onJump(gate.pendingSeq)} className="bg-board num">
-            Gate #{gate.pendingSeq}
-            <ArrowUpRight className="h-3 w-3" />
-          </Button>
-        )}
+        <div className="f1">
+          {next && (
+            <Button
+              variant="primary"
+              data-testid="gate-next-action"
+              onClick={() => live ? (setDraft(next.prompt), setOpen((v) => !v)) : void copyText(next.prompt, `Copied gate prompt for @${next.target}`)}
+            >
+              {live ? <Send /> : <ClipboardCopy />}
+              {next.label}
+            </Button>
+          )}
+          {gate.pendingSeq > 0 && (
+            <Button data-testid="gate-pending-jump" onClick={() => onJump(gate.pendingSeq)} className="bg-board num">
+              Gate #{gate.pendingSeq}
+              <ArrowUpRight className="h-3 w-3" />
+            </Button>
+          )}
+        </div>
       </div>
       <div className="wrap gap-1">
         {gate.stages.map((st) =>
@@ -769,6 +786,18 @@ export function GateReadinessCard({ snap, onJump }: { snap: SwarmSnapshot; onJum
           ),
         )}
       </div>
+      {open && next && (
+        <InlineComposer
+          id="gate-next-nudge"
+          label={`@${next.target}${next.seq ? ` · Re #${next.seq}` : ""}`}
+          value={draft}
+          onChange={setDraft}
+          onCancel={() => setOpen(false)}
+          onSubmit={() => submitNudge(next.conversationId, draft, `Nudged @${next.target}`, setSending, () => { setOpen(false); onRefresh?.(); })}
+          submitLabel={sending ? "Sending..." : "Confirm & send"}
+          disabled={sending}
+        />
+      )}
     </Card>
   );
 }

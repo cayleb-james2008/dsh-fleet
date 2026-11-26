@@ -443,18 +443,45 @@
       highBurnCount: burnRows.filter(function (r) { return r.level !== "normal"; }).length,
       workers: burnRows.slice(0, 6),
     };
-    var dC = 0, dS = 0, vC = 0, vS = 0, sC = 0, sS = 0, bC = 0, bS = 0;
+    var dC = 0, dS = 0, vC = 0, vS = 0, sC = 0, sS = 0, bC = 0, bS = 0, bAgent = "";
     sw.messages.forEach(function (m) {
-      if (!m || !m.text) return;
+      if (!m || !m.text || m.text.indexOf("[") < 0) return;
       if (/\[scale-verified\]/i.test(m.text)) { sC++; sS = Math.max(sS, m.seq); }
       else if (/\[verified\]/i.test(m.text)) { vC++; vS = Math.max(vS, m.seq); }
       else if (/\[done\]/i.test(m.text)) { dC++; dS = Math.max(dS, m.seq); }
-      if (/\[blocked\]/i.test(m.text)) { bC++; bS = Math.max(bS, m.seq); }
+      if (/\[blocked\]/i.test(m.text)) { bC++; if (m.seq >= bS) { bS = m.seq; bAgent = m.agent || ""; } }
     });
     var activeBlk = triage.find(function (x) { return (x.kind === "blocked" || x.severity === "urgent") && x.seq > 0; });
+    var maxSt = Math.max(dS, vS, sS);
+    var gState = activeBlk || bS > maxSt ? "blocked" : sC > 0 && dS <= vS && vS <= sS ? "ready" : "verifying";
+    var gSeq = activeBlk ? activeBlk.seq : dS > vS ? dS : vS > sS ? vS : bS > maxSt ? bS : sS || vS || dS || 0;
+    var pickM = function (prefs, fb) {
+      for (var pi = 0; pi < prefs.length; pi++) {
+        var hit = sw.members.find(function (m) { return !m.killed && (m.name === prefs[pi] || m.name.indexOf(prefs[pi]) === 0); });
+        if (hit) return hit;
+      }
+      return { name: prefs[0] || fb, conversation_id: "" };
+    };
+    var nextAction = null;
+    if (dC || vC || sC || bC || activeBlk) {
+      if (gState === "blocked") {
+        var bHit = pickM([activeBlk ? activeBlk.member : bAgent || "coordinator"], "coordinator");
+        nextAction = { kind: "unblock", target: bHit.name, conversationId: (activeBlk && activeBlk.conversationId) || bHit.conversation_id || "", seq: gSeq, label: "Unblock @" + bHit.name, prompt: "@" + bHit.name + (gSeq ? " Re #" + gSeq + ":" : "") + " Resolve blocker on " + sw.title + " and post updated [done]." };
+      } else if (dS > vS) {
+        var vHit = pickM(["ux-verifier", "verifier"], "ux-verifier");
+        nextAction = { kind: "verify", target: vHit.name, conversationId: vHit.conversation_id || "", seq: dS, label: "Nudge @" + vHit.name, prompt: "@" + vHit.name + " Re #" + dS + ": Cold-verify " + sw.title + " and post [verified]." };
+      } else if (vS > sS) {
+        var sHit = pickM(["scale-auditor", "auditor"], "scale-auditor");
+        nextAction = { kind: "scale", target: sHit.name, conversationId: sHit.conversation_id || "", seq: vS, label: "Nudge @" + sHit.name, prompt: "@" + sHit.name + " Re #" + vS + ": Run cold scale/security audit on " + sw.title + " and post [scale-verified]." };
+      } else {
+        var rHit = pickM(["release-ops", "coordinator"], "release-ops");
+        nextAction = { kind: "ship", target: rHit.name, conversationId: rHit.conversation_id || "", seq: sS || gSeq, label: "Nudge @" + rHit.name, prompt: "@" + rHit.name + " Re #" + (sS || gSeq) + ": " + sw.title + " is [scale-verified] — ready to ship." };
+      }
+    }
     var gateReadiness = (dC || vC || sC || bC || activeBlk) ? {
-      state: activeBlk || bS > Math.max(dS, vS, sS) ? "blocked" : sC > 0 && dS <= vS && vS <= sS ? "ready" : "verifying",
-      pendingSeq: activeBlk ? activeBlk.seq : dS > vS ? dS : vS > sS ? vS : bS > Math.max(dS, vS, sS) ? bS : sS || vS || dS || 0,
+      state: gState,
+      pendingSeq: gSeq,
+      nextAction: nextAction,
       stages: [
         { key: "done", label: "[done]", count: dC, seq: dS },
         { key: "verified", label: "[verified]", count: vC, seq: vS },
@@ -586,7 +613,7 @@
       return jsonResp({ ok: true, delivered: targets.length });
     }
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.12.0", mode: "live-web", canSendMessage: true, sseStream: false });
+      return jsonResp({ ok: true, name: "fleet", version: "1.13.0", mode: "live-web", canSendMessage: true, sseStream: false });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });

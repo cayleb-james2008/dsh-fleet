@@ -67,7 +67,7 @@ Fleet scales from `340px–380px` Antigravity auxiliary sidebars up to wide `144
 
 ## Capabilities
 
-- **1-Click Gate Readiness & Handoff Checklist:** Automatically tracks `[done]` -> `[verified]` -> `[scale-verified]` / `[blocked]` board gates into a compact **Gate readiness** strip in **Triage** with 1-click `#seq` jump buttons straight to any blocked or pending release gate.
+- **1-Click Gate Readiness & Context-Aware Next-Gate Action:** Automatically tracks `[done]` -> `[verified]` -> `[scale-verified]` / `[blocked]` board gates into a compact **Gate readiness** strip in **Triage** with 1-click `#seq` stage jumps plus a **Nudge / Unblock Next Gate** button pre-filling `Re #<seq>:` + branch/commit context into a confirmation-gated composer.
 - **Per-Worker Token & Burn-Rate Guard Strip:** Inspect proportional per-worker token consumption right in **Triage** and **Roster** with a live stacked segment bar, top-3 consumer share percentages, and automatic `High burn` alerts flagging runaway workers at a glance.
 - **Swarm Bottleneck Heat Bar & 1-Click Copy Blocker:** Spot swarm saturation at a glance from a proportional `working` / `waiting` / `blocked` strip on Needs You, jump straight to the highest-impact thread via `Top #seq`, and copy a concise `~/`-masked Markdown escalation with 1-click **Copy blocker**.
 - **Multi-Worker Broadcast & Filtered Board Export:** Select `@all`, `working`, `waiting`, or custom worker subsets inside **Roster -> Broadcast** to dispatch confirmation-gated multi-worker nudges (`conversationIds`), and export active **Board** filters in 1 click as sanitized `.md` or `.json` reports (`~/`-masked paths, zero `/home/` leaks).
@@ -84,7 +84,7 @@ Fleet scales from `340px–380px` Antigravity auxiliary sidebars up to wide `144
 ```mermaid
 flowchart LR
     Host["Antigravity Host<br/>(Aux Side Pane + /preload.js)"] <-->|"SidecarApp RPC + theme-change<br/>toggleConversation / toggleAuxPane"| Backend["Fleet Sidecar Backend<br/>(sidecars/fleet_pane/main.mjs)"]
-    UI["Embedded Sidebar SPA<br/>(293.8 KiB raw / 91.7 KiB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>Pre-Gzipped ETag/304 JSON"| Backend
+    UI["Embedded Sidebar SPA<br/>(294.4 KiB raw / 91.8 KiB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>Pre-Gzipped ETag/304 JSON"| Backend
     Backend -->|"Zero-String Buffer Scan + 16 KB Ring"| Store["swarm_store.mjs"]
     Backend -->|"Debounced TTL + CWE-22/59 Diff Peek"| Git["git_probe.mjs"]
     Store -.->|"Read-Only"| Brain["~/.gemini/antigravity/brain/&lt;conv&gt;<br/>.system_generated/{swarm,logs}"]
@@ -97,14 +97,14 @@ flowchart LR
 
 Measured under `#154` CPU isolation (`taskset -c 24-31`, `16` concurrent polling workers) on a 16–20 worker / 2,000-board-post / 50,000-transcript-line stress fixture:
 
-| Metric | v1.10.0 | v1.11.0 | **v1.12.0** |
+| Metric | v1.11.0 | v1.12.0 | **v1.13.0** |
 | --- | --- | --- | --- |
-| Embedded Sidecar UI (`/`) | `299,493 B` raw (`292.5 KiB`) / `93,290 B` gz (`91.10 KiB`) | `301,090 B` raw (`294.0 KiB`) / `93,839 B` gz (`91.64 KiB`) | **`300,853 B` raw (`293.8 KiB`) / `93,861 B` gz (`91.66 KiB`)** |
-| Peak RSS (`VmHWM`, `--jitless` 16w) | `72.46 MB` (`74,200 KB` `--jitless` audit) | `64.79 MB` (`66,340 KB` `--jitless` 2k/50k, `95.49 MB` default) | **`65.55 MB` (`67,128 KB` `--jitless` 2k/50k, `93.82 MB` default)** |
-| Throughput (`req/s`, 16w `taskset 24-31`) | `1,721.3 req/s` (audit) / `27,086.0 req/s` (keep-alive) | `8,257.6 req/s` (`--jitless` keep-alive) · `28,821.2 req/s` (keep-alive) | **`5,114.1 req/s` (`--jitless` keep-alive) · `21,926.4 req/s` (keep-alive) · `757.7 req/s` (contended audit)** |
-| Latency (`p50` / `p95`, `taskset 24-31`) | `9.23 ms` / `12.93 ms` (audit) | `1.67 ms` / `2.67 ms` (`--jitless`) · `9.22 ms` / `13.97 ms` (audit) | **`2.52 ms` / `4.24 ms` (`--jitless`) · `16.53 ms` / `23.45 ms` (contended audit)** |
+| Embedded Sidecar UI (`/`) | `301,090 B` raw (`294.0 KiB`) / `93,839 B` gz (`91.64 KiB`) | `300,853 B` raw (`293.8 KiB`) / `93,861 B` gz (`91.66 KiB`) | **`301,440 B` raw (`294.4 KiB`) / `94,030 B` gz (`91.83 KiB`)** |
+| Peak RSS (`VmHWM`, `--jitless` 16w) | `64.79 MB` (`66,340 KB` `--jitless` 2k/50k, `95.49 MB` default) | `65.55 MB` (`67,128 KB` `--jitless` 2k/50k, `69.16 MB` audit) | **`64.87 MB` (`66,424 KB` `--jitless` 2k/50k, `95.47 MB` default)** |
+| Throughput (`req/s`, 16w `taskset 24-31`) | `8,257.6 req/s` (`--jitless` keep-alive) · `28,821.2 req/s` (keep-alive) | `5,114.1 req/s` (`--jitless` keep-alive) · `21,926.4 req/s` (keep-alive) | **`7,257.0 req/s` (`--jitless` keep-alive) · `23,130.6 req/s` (keep-alive) · `1,211.0 req/s` (cold audit)** |
+| Latency (`p50` / `p95`, `taskset 24-31`) | `1.67 ms` / `2.67 ms` (`--jitless`) · `9.22 ms` / `13.97 ms` (audit) | `2.52 ms` / `4.24 ms` (`--jitless`) · `16.53 ms` / `23.45 ms` (audit) | **`1.85 ms` / `3.10 ms` (`--jitless`) · `11.35 ms` / `14.71 ms` (cold audit)** |
 | Simultaneous SSE (`/api/swarm/stream` x5) | `5/5` (`0` drops) | `5/5` (`0` drops) | **`5/5` (`0` drops)** |
-| E2E Gate + Replay + Sloplint | `40/40` + `8/8` + `0 FAIL / 0 REFLEX / 0 WARN` | `42/42` + `8/8` + `0 FAIL / 0 REFLEX / 0 WARN` | **`43/43` + `8/8` + `0 FAIL / 0 REFLEX / 0 WARN`** |
+| E2E Gate + Replay + Sloplint | `42/42` + `8/8` + `0 FAIL / 0 REFLEX / 0 WARN` | `43/43` + `8/8` + `0 FAIL / 0 REFLEX / 0 WARN` | **`43/43` + `8/8` + `0 FAIL / 0 REFLEX / 0 WARN`** |
 
 ---
 

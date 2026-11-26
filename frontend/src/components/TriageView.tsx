@@ -183,7 +183,7 @@ export function TriageView({
 
         <TokenBurnStrip snap={snap} />
 
-        <GateReadinessCard snap={snap} onJump={onJumpToBoardSeq} />
+        <GateReadinessCard snap={snap} onJump={onJumpToBoardSeq} onRefresh={onRefresh} />
 
         {triage.length === 0 ? (
           <Card className="p-3 bg-board">

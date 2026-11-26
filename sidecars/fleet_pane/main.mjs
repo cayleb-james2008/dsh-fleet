@@ -72,34 +72,46 @@ function fastEtag(input) {
 function loadDistAssets(distDir) {
   const indexPath = join(distDir, 'index.html');
   const indexGzPath = join(distDir, 'index.html.gz');
-  const hasIndex = existsSync(indexPath);
-  const hasGz = hasIndex && existsSync(indexGzPath);
-  let htmlRawCache = hasGz
-    ? null
-    : hasIndex
-      ? readFileSync(indexPath)
-      : Buffer.from('<!doctype html><html><body><p>Fleet dist/index.html missing. Run npm run build in frontend/.</p></body></html>');
-  const htmlGzip = hasGz ? readFileSync(indexGzPath) : gzipSync(htmlRawCache, { level: 9 });
-  const htmlEtag = fastEtag(htmlGzip);
-  const rootHdrBase = {
-    'Content-Type': 'text/html; charset=utf-8',
-    'Cache-Control': 'no-cache',
-    Vary: 'Accept-Encoding',
-    ETag: htmlEtag,
-    ...SECURITY_HEADERS,
-  };
-  const rootHdrGz = { ...rootHdrBase, 'Content-Encoding': 'gzip', 'Content-Length': htmlGzip.length };
-  let rootHdrRaw = htmlRawCache ? { ...rootHdrBase, 'Content-Length': htmlRawCache.length } : null;
-  const getHtmlRaw = () => {
-    if (!htmlRawCache) {
-      htmlRawCache = hasIndex ? readFileSync(indexPath) : gunzipSync(htmlGzip);
-      rootHdrRaw = { ...rootHdrBase, 'Content-Length': htmlRawCache.length };
+  let htmlRawCache = null;
+  let htmlGzCache = null;
+  let htmlEtagCache = '';
+  let rootHdrBaseCache = null;
+  let rootHdrGzCache = null;
+  let rootHdrRawCache = null;
+
+  const ensureGz = () => {
+    if (htmlGzCache) return;
+    const hasIndex = existsSync(indexPath);
+    const hasGz = hasIndex && existsSync(indexGzPath);
+    if (hasGz) {
+      htmlGzCache = readFileSync(indexGzPath);
+    } else {
+      htmlRawCache = hasIndex
+        ? readFileSync(indexPath)
+        : Buffer.from('<!doctype html><html><body><p>Fleet dist/index.html missing. Run npm run build in frontend/.</p></body></html>');
+      htmlGzCache = gzipSync(htmlRawCache, { level: 9 });
     }
+    htmlEtagCache = fastEtag(htmlGzCache);
+    rootHdrBaseCache = {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      Vary: 'Accept-Encoding',
+      ETag: htmlEtagCache,
+      ...SECURITY_HEADERS,
+    };
+    rootHdrGzCache = { ...rootHdrBaseCache, 'Content-Encoding': 'gzip', 'Content-Length': htmlGzCache.length };
+  };
+  const getHtmlRaw = () => {
+    ensureGz();
+    if (!htmlRawCache) {
+      htmlRawCache = existsSync(indexPath) ? readFileSync(indexPath) : gunzipSync(htmlGzCache);
+    }
+    if (!rootHdrRawCache) rootHdrRawCache = { ...rootHdrBaseCache, 'Content-Length': htmlRawCache.length };
     return htmlRawCache;
   };
   const getRootHdrRaw = () => {
-    if (!rootHdrRaw) getHtmlRaw();
-    return rootHdrRaw;
+    getHtmlRaw();
+    return rootHdrRawCache;
   };
 
   let fontsMap = null;
@@ -136,7 +148,16 @@ function loadDistAssets(distDir) {
     }
     return fontsMap;
   }
-  return { get htmlRaw() { return getHtmlRaw(); }, getHtmlRaw, htmlGzip, htmlEtag, rootHdrBase, rootHdrGz, getRootHdrRaw, get fonts() { return getFontsMap(); } };
+  return {
+    get htmlRaw() { return getHtmlRaw(); },
+    getHtmlRaw,
+    get htmlGzip() { ensureGz(); return htmlGzCache; },
+    get htmlEtag() { ensureGz(); return htmlEtagCache; },
+    get rootHdrBase() { ensureGz(); return rootHdrBaseCache; },
+    get rootHdrGz() { ensureGz(); return rootHdrGzCache; },
+    getRootHdrRaw,
+    get fonts() { return getFontsMap(); },
+  };
 }
 
 function packJsonPayload(obj, etagOverride = '') {
@@ -174,6 +195,7 @@ function packJsonPayload(obj, etagOverride = '') {
 
 function isLoopbackHostHeader(host) {
   if (!host) return true;
+  if (host.startsWith('127.0.0.1:') || host.startsWith('localhost:') || host === '127.0.0.1' || host === 'localhost') return true;
   const h = String(host).trim().toLowerCase();
   return (
     h === '127.0.0.1' ||
@@ -229,7 +251,7 @@ export function createFleetHandlers({
       healthPacked = pack({
         ok: true,
         name: 'fleet',
-        version: '1.12.0',
+        version: '1.13.0',
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
         sseStream: !isSidecar,
@@ -739,7 +761,7 @@ export async function startStandaloneServer({
       return;
     }
 
-    if (req.method === 'GET' && handlers.assets.fonts.has(pathname)) {
+    if (req.method === 'GET' && pathname.startsWith('/fonts/') && handlers.assets.fonts.has(pathname)) {
       const font = handlers.assets.fonts.get(pathname);
       if (req.headers['if-none-match'] === font.etag) {
         res.writeHead(304, font.hdr304);
