@@ -158,6 +158,21 @@ await runChecks("gate", async (check) => {
     if ((await card.count()) !== 1) return false;
     const txt = await card.textContent();
     if (!txt.includes("Gate readiness") || !txt.includes("[done]") || !txt.includes("[blocked]")) return false;
+    await page.evaluate(() => {
+      window.__gateCopied = "";
+      try {
+        Object.defineProperty(navigator, "clipboard", {
+          configurable: true,
+          value: { writeText: async (t) => { window.__gateCopied = t; } },
+        });
+      } catch {}
+    });
+    const nextBtn = card.locator('[data-testid="gate-next-action"]');
+    if ((await nextBtn.count()) !== 1) return false;
+    await nextBtn.click();
+    await page.waitForFunction(() => Boolean(window.__gateCopied));
+    const copiedPrompt = await page.evaluate(() => window.__gateCopied);
+    if (!copiedPrompt.includes("Re #")) return false;
     await card.locator('[data-testid="gate-pending-jump"]').click();
     await page.waitForSelector("#panel-board");
     const jumped = (await page.locator('#tab-board[aria-selected="true"]').count()) === 1;

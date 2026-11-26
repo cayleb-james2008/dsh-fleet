@@ -51,11 +51,15 @@ async function check(label, fn) {
 await page.goto(BASE, { waitUntil: "networkidle" });
 await page.waitForSelector('h1:has-text("Fleet v1.0 Antigravity Sidecar")');
 
-await check("loads simulated Antigravity swarm, Token Burn, and Gate Readiness in 380px sidebar", async () => {
+await check("loads simulated Antigravity swarm, Token Burn, and Gate Readiness Next-Gate Action in 380px sidebar", async () => {
   const txt = await page.locator("#panel-triage").textContent();
   const burn = await page.locator('#panel-triage [data-testid="token-burn-strip"]').textContent();
-  const gateTxt = await page.locator('#panel-triage [data-testid="gate-readiness-card"]').textContent();
-  return txt.includes("Needs you") && txt.includes("builder asked a question") && burn.includes("Token burn") && /\d+%/.test(burn) && gateTxt.includes("Gate readiness") && gateTxt.includes("[done]");
+  const card = page.locator('#panel-triage [data-testid="gate-readiness-card"]');
+  const gateTxt = await card.textContent();
+  await card.locator('[data-testid="gate-next-action"]').click();
+  const prefilled = await card.locator("#gate-next-nudge").inputValue();
+  await card.locator('button:has-text("Cancel")').click();
+  return txt.includes("Needs you") && txt.includes("builder asked a question") && burn.includes("Token burn") && /\d+%/.test(burn) && gateTxt.includes("Gate readiness") && prefilled.includes("Re #");
 });
 
 await check("plan.json goal & humanized workstreams visible", async () => {
@@ -71,7 +75,7 @@ await check("Geist woff2 fonts embedded & loaded with zero network font requests
 });
 
 // Send confirmed nudge to builder right inside Triage
-await page.locator('#panel-triage button:has-text("Nudge")').first().click();
+await page.locator('#panel-triage button:text-is("Nudge")').first().click();
 await page.locator('#panel-triage button:has-text("Confirm & send")').click();
 await page.waitForTimeout(150);
 

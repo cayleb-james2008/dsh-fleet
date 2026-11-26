@@ -292,29 +292,45 @@ test('computeBurnSummary flags top consumer share and high-burn levels cleanly',
   assert.equal(warnBurn.topWorker?.sharePct, 53);
 });
 
-test('computeGateReadiness tracks release gate progression and pending #seq jumps', () => {
+test('computeGateReadiness tracks release gate progression, pending #seq jumps, and nextAction context', () => {
+  const members = [
+    { name: 'ux-verifier', conversation_id: 'conv-ux', killed: false },
+    { name: 'scale-auditor', conversation_id: 'conv-sc', killed: false },
+    { name: 'release-ops', conversation_id: 'conv-rel', killed: false },
+    { name: 'builder', conversation_id: 'conv-bld', killed: false },
+  ];
   const verifying = computeGateReadiness(
     [
       { seq: 4, agent: 'builder', text: '@ux-verifier [done] Ready' },
       { seq: 5, agent: 'ux-verifier', text: '@scale-auditor [verified] OK' },
-      { seq: 8, agent: 'builder', text: '@ux-verifier [done] Followup' },
+      { seq: 8, agent: 'builder', text: '@ux-verifier [done] Followup\nBranch: release/1.13.0 | Commit: abcdef123456' },
     ],
     [],
+    { members, title: 'Fleet v1.13.0' },
   );
   assert.equal(verifying?.state, 'verifying');
   assert.equal(verifying?.pendingSeq, 8);
   assert.equal(verifying?.stages[0].count, 2);
   assert.equal(verifying?.stages[1].seq, 5);
+  assert.equal(verifying?.nextAction?.kind, 'verify');
+  assert.equal(verifying?.nextAction?.target, 'ux-verifier');
+  assert.equal(verifying?.nextAction?.conversationId, 'conv-ux');
+  assert.ok(verifying?.nextAction?.prompt.includes('Re #8:'));
+  assert.ok(verifying?.nextAction?.prompt.includes('release/1.13.0 @ abcdef12'));
 
   const blocked = computeGateReadiness(
     [
       { seq: 4, agent: 'builder', text: '@ux-verifier [done] Ready' },
       { seq: 6, agent: 'ux-verifier', text: '@builder [blocked] Fix header icon' },
     ],
-    [{ kind: 'blocked', severity: 'urgent', seq: 6 }],
+    [{ kind: 'blocked', severity: 'urgent', seq: 6, member: 'builder', conversationId: 'conv-bld' }],
+    { members, title: 'Fleet v1.13.0' },
   );
   assert.equal(blocked?.state, 'blocked');
   assert.equal(blocked?.pendingSeq, 6);
+  assert.equal(blocked?.nextAction?.kind, 'unblock');
+  assert.equal(blocked?.nextAction?.target, 'builder');
+  assert.equal(blocked?.nextAction?.conversationId, 'conv-bld');
 
   const ready = computeGateReadiness(
     [
@@ -323,7 +339,10 @@ test('computeGateReadiness tracks release gate progression and pending #seq jump
       { seq: 3, agent: 'c', text: '[scale-verified]' },
     ],
     [],
+    { members, title: 'Fleet v1.13.0' },
   );
   assert.equal(ready?.state, 'ready');
   assert.equal(ready?.pendingSeq, 3);
+  assert.equal(ready?.nextAction?.kind, 'ship');
+  assert.equal(ready?.nextAction?.target, 'release-ops');
 });

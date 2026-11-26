@@ -1065,34 +1065,99 @@ export function getSwarmMetaKeys(appData, id) {
   };
 }
 
-/** Compute release-gate handoff progression across [done] -> [verified] -> [scale-verified] / [blocked]. */
-export function computeGateReadiness(messages, triage = []) {
-  let doneC = 0, doneSeq = 0;
-  let verC = 0, verSeq = 0;
-  let scaleC = 0, scaleSeq = 0;
-  let blkC = 0, blkSeq = 0;
+function scanGateTags(messages) {
+  const g = { doneC: 0, doneSeq: 0, doneText: '', verC: 0, verSeq: 0, verText: '', scaleC: 0, scaleSeq: 0, scaleText: '', blkC: 0, blkSeq: 0, blkAgent: '' };
   for (const m of messages || []) {
-    if (!m || m.control || !m.text) continue;
-    const seq = Number(m.seq) || 0;
+    if (!m || m.control || !m.text || m.text.indexOf('[') < 0) continue;
     const t = m.text;
-    if (/\[scale-verified\]/i.test(t)) { scaleC++; scaleSeq = Math.max(scaleSeq, seq); }
-    else if (/\[verified\]/i.test(t)) { verC++; verSeq = Math.max(verSeq, seq); }
-    else if (/\[done\]/i.test(t)) { doneC++; doneSeq = Math.max(doneSeq, seq); }
-    if (/\[blocked\]/i.test(t)) { blkC++; blkSeq = Math.max(blkSeq, seq); }
+    const seq = Number(m.seq) || 0;
+    if (/\[scale-verified\]/i.test(t)) { g.scaleC++; if (seq >= g.scaleSeq) { g.scaleSeq = seq; g.scaleText = t; } }
+    else if (/\[verified\]/i.test(t)) { g.verC++; if (seq >= g.verSeq) { g.verSeq = seq; g.verText = t; } }
+    else if (/\[done\]/i.test(t)) { g.doneC++; if (seq >= g.doneSeq) { g.doneSeq = seq; g.doneText = t; } }
+    if (/\[blocked\]/i.test(t)) { g.blkC++; if (seq >= g.blkSeq) { g.blkSeq = seq; g.blkAgent = m.agent || ''; } }
   }
+  return g;
+}
+
+/** Compute release-gate handoff progression across [done] -> [verified] -> [scale-verified] / [blocked]. */
+export function computeGateReadiness(messages, triage = [], { precomputed = null, members = [], title = '' } = {}) {
+  const g = precomputed || scanGateTags(messages);
+  const { doneC, doneSeq, verC, verSeq, scaleC, scaleSeq, blkC, blkSeq, blkAgent } = g;
   const activeBlk = (triage || []).find((x) => (x.kind === 'blocked' || x.severity === 'urgent') && x.seq > 0);
   if (!doneC && !verC && !scaleC && !blkC && !activeBlk) return null;
+  const maxStage = Math.max(doneSeq, verSeq, scaleSeq);
   const pendingSeq = activeBlk ? activeBlk.seq
     : doneSeq > verSeq ? doneSeq
     : verSeq > scaleSeq ? verSeq
-    : blkSeq > Math.max(doneSeq, verSeq, scaleSeq) ? blkSeq
+    : blkSeq > maxStage ? blkSeq
     : scaleSeq || verSeq || doneSeq || 0;
-  const state = activeBlk || blkSeq > Math.max(doneSeq, verSeq, scaleSeq) ? 'blocked'
+  const state = activeBlk || blkSeq > maxStage ? 'blocked'
     : scaleC > 0 && doneSeq <= verSeq && verSeq <= scaleSeq ? 'ready'
     : 'verifying';
+
+  const pickTarget = (prefs, fallback) => {
+    for (const p of prefs) {
+      const hit = (members || []).find((m) => !m.killed && (m.name === p || m.name.startsWith(p)));
+      if (hit) return hit;
+    }
+    return { name: prefs[0] || fallback, conversation_id: '' };
+  };
+  const ctxFrom = (text) => {
+    if (!text) return '';
+    const br = /Branch:\s*`?([^\s|`]+)`?/i.exec(text)?.[1];
+    const cm = /Commit:\s*`?([0-9a-f]{7,40})`?/i.exec(text)?.[1]?.slice(0, 8);
+    return br && cm ? ` (${br} @ ${cm})` : br ? ` (${br})` : cm ? ` (${cm})` : '';
+  };
+
+  let nextAction;
+  const scope = title || 'release';
+  if (state === 'blocked') {
+    const tgtName = activeBlk?.member || blkAgent || 'coordinator';
+    const hit = pickTarget([tgtName], tgtName);
+    nextAction = {
+      kind: 'unblock',
+      target: hit.name,
+      conversationId: activeBlk?.conversationId || hit.conversation_id || '',
+      seq: pendingSeq,
+      label: `Unblock @${hit.name}`,
+      prompt: `@${hit.name}${pendingSeq ? ` Re #${pendingSeq}:` : ''} Resolve blocker on ${scope} and post updated [done].`,
+    };
+  } else if (doneSeq > verSeq) {
+    const hit = pickTarget(['ux-verifier', 'verifier'], 'ux-verifier');
+    nextAction = {
+      kind: 'verify',
+      target: hit.name,
+      conversationId: hit.conversation_id || '',
+      seq: doneSeq,
+      label: `Nudge @${hit.name}`,
+      prompt: `@${hit.name} Re #${doneSeq}: Cold-verify ${scope}${ctxFrom(g.doneText)} and post [verified].`,
+    };
+  } else if (verSeq > scaleSeq) {
+    const hit = pickTarget(['scale-auditor', 'auditor'], 'scale-auditor');
+    nextAction = {
+      kind: 'scale',
+      target: hit.name,
+      conversationId: hit.conversation_id || '',
+      seq: verSeq,
+      label: `Nudge @${hit.name}`,
+      prompt: `@${hit.name} Re #${verSeq}: Run cold scale/security audit on ${scope}${ctxFrom(g.verText)} and post [scale-verified].`,
+    };
+  } else {
+    const hit = pickTarget(['release-ops', 'coordinator'], 'release-ops');
+    nextAction = {
+      kind: 'ship',
+      target: hit.name,
+      conversationId: hit.conversation_id || '',
+      seq: scaleSeq || pendingSeq,
+      label: `Nudge @${hit.name}`,
+      prompt: `@${hit.name} Re #${scaleSeq || pendingSeq}: ${scope}${ctxFrom(g.scaleText || g.doneText)} is [scale-verified] — ready to ship.`,
+    };
+  }
+
   return {
     state,
     pendingSeq,
+    nextAction,
     stages: [
       { key: 'done', label: '[done]', count: doneC, seq: doneSeq },
       { key: 'verified', label: '[verified]', count: verC, seq: verSeq },
@@ -1173,6 +1238,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
 
   // Transform board messages in-place so peak heap does not hold 2x 2k-object graphs
   const seen = new Set();
+  const gateAcc = { doneC: 0, doneSeq: 0, doneText: '', verC: 0, verSeq: 0, verText: '', scaleC: 0, scaleSeq: 0, scaleText: '', blkC: 0, blkSeq: 0, blkAgent: '' };
   for (let i = 0; i < msgs.length; i++) {
     const m = msgs[i];
     const seq = Number(m.seq) || 0;
@@ -1193,6 +1259,12 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
       m.all = false;
       m.control = control;
       continue;
+    }
+    if (text.indexOf('[') >= 0) {
+      if (/\[scale-verified\]/i.test(text)) { gateAcc.scaleC++; if (seq >= gateAcc.scaleSeq) { gateAcc.scaleSeq = seq; gateAcc.scaleText = text; } }
+      else if (/\[verified\]/i.test(text)) { gateAcc.verC++; if (seq >= gateAcc.verSeq) { gateAcc.verSeq = seq; gateAcc.verText = text; } }
+      else if (/\[done\]/i.test(text)) { gateAcc.doneC++; if (seq >= gateAcc.doneSeq) { gateAcc.doneSeq = seq; gateAcc.doneText = text; } }
+      if (/\[blocked\]/i.test(text)) { gateAcc.blkC++; if (seq >= gateAcc.blkSeq) { gateAcc.blkSeq = seq; gateAcc.blkAgent = agent; } }
     }
     const { mentions, all } = matchMentions(text);
     const ch = byChannel ? byChannel(i, text) : null;
@@ -1320,7 +1392,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
   const triage = buildTriageItems({ members, messages, sysAttention });
   const totalTokens = totalInputTokens + totalCacheReadTokens + totalOutputTokens;
   const burnSummary = computeBurnSummary(members, totalTokens);
-  const gateReadiness = computeGateReadiness(messages, triage);
+  const gateReadiness = computeGateReadiness(messages, triage, { precomputed: gateAcc, members, title });
 
   const activeCount = members.filter((m) => !m.killed && m.status === 'working').length;
   const waitingCount = members.filter((m) => !m.killed && m.status === 'waiting').length;

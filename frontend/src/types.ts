@@ -148,9 +148,19 @@ export interface BurnSummary {
   workers: BurnWorker[];
 }
 
+export interface GateNextAction {
+  kind: string;
+  target: string;
+  conversationId: string;
+  seq: number;
+  label: string;
+  prompt: string;
+}
+
 export interface GateReadiness {
   state: "blocked" | "ready" | "verifying";
   pendingSeq: number;
+  nextAction?: GateNextAction;
   stages: Array<{ key: string; label: string; count: number; seq: number }>;
 }
 
