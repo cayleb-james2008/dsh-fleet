@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "../hooks";
 import { Search } from "../icons";
 import { openWorkerConversation } from "../sidecar";
-import type { SwarmSnapshot, SwarmSummary, TabId } from "../types";
-import { cn } from "../ui";
+import type { SwarmSnapshot, SwarmSummary, TabId, WorktreesPayload } from "../types";
+import { cn, maskHome } from "../ui";
 
 interface PaletteItem {
   id: string;
@@ -17,7 +17,9 @@ export function CommandPalette({
   onOpenChange,
   snap,
   swarms,
+  worktrees,
   onSelectTab,
+  onJumpToBoard,
   onSelectSwarm,
   onCopyDigest,
   onOpenSettings,
@@ -27,7 +29,9 @@ export function CommandPalette({
   onOpenChange: (open: boolean) => void;
   snap: SwarmSnapshot | null;
   swarms: SwarmSummary[];
+  worktrees?: WorktreesPayload | null;
   onSelectTab: (tab: TabId) => void;
+  onJumpToBoard: (seq: number, agent?: string) => void;
   onSelectSwarm: (id: string) => void;
   onCopyDigest: () => void;
   onOpenSettings: () => void;
@@ -58,6 +62,8 @@ export function CommandPalette({
   }, [open]);
 
   const items = useMemo<PaletteItem[]>(() => {
+    const members = (snap?.members || []).filter((m) => !m.killed);
+    const recentMsgs = (snap?.messages || []).filter((m) => !m.control).slice(-20).reverse();
     const list: PaletteItem[] = [
       ...([
         ["v-triage", "Needs you", () => onSelectTab("triage")],
@@ -69,24 +75,70 @@ export function CommandPalette({
         ["a-settings", "Settings", onOpenSettings],
         ["a-keys", "Keyboard shortcuts", onOpenShortcuts, "?"],
       ] as const).map(([id, label, onSelect, meta]) => ({ id, group: "Views", label, meta, onSelect })),
+      ...members.flatMap((m) => {
+        const rows: PaletteItem[] = [
+          {
+            id: `wf-${m.name}`,
+            group: "Workers",
+            label: `Filter Board: @${m.name}`,
+            meta: `${m.posts} posts`,
+            onSelect: () => onJumpToBoard(m.lastPostSeq || 0, m.name),
+          },
+          {
+            id: `wr-${m.name}`,
+            group: "Workers",
+            label: `Roster: @${m.name}`,
+            meta: m.status,
+            onSelect: () => onSelectTab("roster"),
+          },
+        ];
+        if (m.conversation_id && window.sidecar?.ui?.toggleConversation) {
+          rows.push({
+            id: `ch-${m.name}`,
+            group: "Workers",
+            label: `Open chat: @${m.name}`,
+            meta: m.status,
+            onSelect: () => openWorkerConversation(m.conversation_id),
+          });
+        }
+        return rows;
+      }),
+      ...(snap?.gateReadiness?.nextAction
+        ? [{
+            id: "tg-next",
+            group: "Triage & gates",
+            label: `Next gate: ${snap.gateReadiness.nextAction.label}`,
+            meta: snap.gateReadiness.nextAction.seq ? `#${snap.gateReadiness.nextAction.seq}` : undefined,
+            onSelect: () => onJumpToBoard(snap.gateReadiness?.nextAction?.seq || snap.gateReadiness?.pendingSeq || 0),
+          }]
+        : []),
+      ...(snap?.triage || []).map((it) => ({
+        id: `tg-${it.id}`,
+        group: "Triage & gates",
+        label: it.title,
+        meta: it.seq > 0 ? `#${it.seq}` : it.severity,
+        onSelect: () => (it.seq > 0 ? onJumpToBoard(it.seq) : onSelectTab("triage")),
+      })),
+      ...recentMsgs.map((m) => ({
+        id: `bm-${m.seq}`,
+        group: "Board posts",
+        label: `#${m.seq} @${m.agent}: ${m.text.replace(/\s+/g, " ").slice(0, 56)}`,
+        onSelect: () => onJumpToBoard(m.seq),
+      })),
+      ...(worktrees?.worktrees || []).map((wt) => ({
+        id: `wt-${wt.id}`,
+        group: "Worktrees",
+        label: `${wt.branch}${wt.landStatus && wt.landStatus !== "main" ? ` (${wt.landStatus})` : ""}`,
+        meta: maskHome(wt.path),
+        onSelect: () => onSelectTab("worktrees"),
+      })),
       ...swarms.map((sw) => ({
         id: `sw-${sw.id}`,
         group: "Swarms",
         label: sw.title || sw.id,
-        meta: `${sw.activeCount}/${sw.memberCount}`,
+        meta: `${sw.activeCount}/${sw.memberCount} · #${sw.head}`,
         onSelect: () => onSelectSwarm(sw.id),
       })),
-      ...(window.sidecar?.ui?.toggleConversation
-        ? (snap?.members || [])
-            .filter((m) => m.conversation_id)
-            .map((m) => ({
-              id: `ch-${m.name}`,
-              group: "Worker Chat",
-              label: m.name,
-              meta: m.status,
-              onSelect: () => openWorkerConversation(m.conversation_id),
-            }))
-        : []),
     ];
     const q = query.trim().toLowerCase();
     if (!q) return list;
@@ -95,7 +147,7 @@ export function CommandPalette({
       const hay = `${it.group} ${it.label} ${it.meta || ""}`.toLowerCase();
       return terms.every((t) => hay.includes(t));
     });
-  }, [query, snap, swarms, onSelectTab, onCopyDigest, onOpenSettings, onOpenShortcuts, onSelectSwarm]);
+  }, [query, snap, swarms, worktrees, onSelectTab, onJumpToBoard, onCopyDigest, onOpenSettings, onOpenShortcuts, onSelectSwarm]);
 
   useEffect(() => {
     setActiveIdx((i) => (items.length ? Math.min(i, items.length - 1) : 0));
@@ -129,7 +181,7 @@ export function CommandPalette({
             role="combobox"
             aria-expanded="true"
             aria-label="Fleet command palette"
-            placeholder="Jump to tab, swarm, or worker"
+            placeholder="Search tabs, @workers, #seq, worktrees, swarms"
             value={query}
             onChange={(e) => {
               setQuery(e.target.value);

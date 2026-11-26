@@ -228,6 +228,10 @@ export interface WorktreeInfo {
   branch: string;
   head: string;
   clean: boolean;
+  baseBranch?: string;
+  ahead?: number;
+  behind?: number;
+  landStatus?: "main" | "ready" | "rebase" | "dirty" | "merged";
   dirtyFiles: number;
   untrackedFiles: number;
   stagedFiles: number;

@@ -3,6 +3,12 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as an
 Antigravity plugin archive (`tar.gz` and `zip`) with `SHA256SUMS`.
 
+## 1.16.0 - 2026-11-25
+
+- Added worktree safe-land readiness (`baseBranch`, `ahead`, `behind`, and `landStatus` across `ready`, `rebase`, `dirty`, `merged`, and `main`) in `sidecars/fleet_pane/git_probe.mjs`, `frontend/src/{types.ts,components/WorktreesView.tsx}`, and `frontend/scripts/web-engine.js`, with 1-click copyable safe-merge, rebase, status, and cleanup commands (`[data-testid="wt-land-status-*"]`, `[data-testid="wt-land-cmd-*"]`) masking local home paths with `~/`.
+- Expanded `CommandPalette` (`Cmd/Ctrl+K` in `frontend/src/components/CommandPalette.tsx` and `App.tsx`) into a cross-swarm action index covering workers (`Filter Board: @worker`, `Roster: @worker`, `Open chat: @worker`), triage items and next-gate actions, the 20 newest board posts, workspace worktrees, and all active swarms.
+- Deferred `node:v8` `--jitless` tuning (`--max-semi-space-size=1 --optimize-for-size --memory-reducer`) and store loading until after standalone HTTP socket binding in `sidecars/fleet_pane/main.mjs`, widened `swarmPayloadCache` stat checks to 1s (`swarmsListCache` to 1.5s), refreshed all 8 Light and Dark screenshots (`docs/screenshots/*.png`), and verified `11/11` backend tests, `48/48` gate, `8/8` replay, `11/11` live-web, `0` Sloplint issues, `62.39 MB` (`63,888 KB`) `--jitless` `VmHWM` on `2k/50k` (`6,921.0 req/s`), `1,364.4 req/s` (`14.60 ms` p95, `64.64 ms` boot, `100.86 MB` default RSS, `30/30` fuzz, `5/5` SSE) on `audit_runner.py`, and `306,653 B` raw / `95,549 B` gz (`93.3 KiB`).
+
 ## 1.15.0 - 2026-11-25
 
 - Added 1-click stalled and idle worker recovery and direct member-filtered Board jumps across `[data-testid="worker-recovery-strip"]` in `TriageView.tsx`, `[data-testid="gate-target-jump"]` in `ui.tsx` (`GateReadinessCard`), `[data-testid="roster-recover-*"]` and `[data-testid="roster-board-*"]` in `RosterView.tsx`, lifted `boardAgentFilter` in `App.tsx` and `BoardView.tsx`, `buildRecoverPrompt` in `ui.tsx`, and `lastPostSeq` triage attachment in `swarm_store.mjs` and `web-engine.js`.

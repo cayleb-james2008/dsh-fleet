@@ -317,6 +317,10 @@
         branch: "main",
         head: "8c54f0ec",
         clean: true,
+        baseBranch: "main",
+        ahead: 0,
+        behind: 0,
+        landStatus: "main",
         dirtyFiles: 0,
         untrackedFiles: 0,
         stagedFiles: 0,
@@ -339,6 +343,10 @@
         branch: "lane/sidecar-backend",
         head: "9a31d4b0",
         clean: true,
+        baseBranch: "main",
+        ahead: 1,
+        behind: 0,
+        landStatus: "ready",
         dirtyFiles: 0,
         untrackedFiles: 0,
         stagedFiles: 0,
@@ -361,6 +369,10 @@
         branch: "lane/sidebar-ui",
         head: "c42e81f2",
         clean: false,
+        baseBranch: "main",
+        ahead: 2,
+        behind: 0,
+        landStatus: "dirty",
         dirtyFiles: 3,
         untrackedFiles: 1,
         stagedFiles: 0,
@@ -652,7 +664,7 @@
       return jsonResp({ ok: true, delivered: targets.length });
     }
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.15.0", mode: "live-web", canSendMessage: true, sseStream: false });
+      return jsonResp({ ok: true, name: "fleet", version: "1.16.0", mode: "live-web", canSendMessage: true, sseStream: false });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });

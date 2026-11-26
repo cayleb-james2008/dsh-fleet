@@ -115,10 +115,10 @@ await check("Graph renders nodes/edges and toggles", async () => {
   return (await page.locator("#panel-graph svg g").count()) >= 4;
 });
 
-await check("Worktrees shows simulated branch dirtiness", async () => {
+await check("Worktrees shows simulated branch dirtiness and safe-land readiness", async () => {
   await page.locator("#tab-worktrees").click();
   const txt = await page.locator("#panel-worktrees").textContent();
-  return txt.includes("lane/sidebar-ui") && txt.includes("4 changed");
+  return txt.includes("lane/sidebar-ui") && txt.includes("4 changed") && txt.includes("Ready to land") && txt.includes("Uncommitted edits");
 });
 
 await check("Multi-Swarm Switcher switches to secondary audit swarm", async () => {

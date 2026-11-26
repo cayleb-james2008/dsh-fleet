@@ -407,6 +407,24 @@ await runChecks("gate", async (check) => {
     return txt.includes("main") && txt.includes("lane/verify") && txt.includes("Initial fixture commit") && txt.includes("untracked.txt");
   });
 
+  await check("worktrees displays safe-land status and copies ~/ command cleanly", async () => {
+    const st = page.locator('[data-testid="wt-land-status-lane/verify"]');
+    if ((await st.count()) !== 1) return false;
+    await page.evaluate(() => {
+      window.__wtCopied = "";
+      try {
+        Object.defineProperty(navigator, "clipboard", {
+          configurable: true,
+          value: { writeText: async (t) => { window.__wtCopied = String(t); } },
+        });
+      } catch {}
+    });
+    await page.locator('[data-testid="wt-land-cmd-lane/verify"]').click();
+    await page.waitForFunction(() => Boolean(window.__wtCopied));
+    const cmd = await page.evaluate(() => window.__wtCopied);
+    return cmd.includes("git") && !cmd.includes("/home/cayleb");
+  });
+
   await check("worktrees Diff peek expands bounded diff hunk cleanly", async () => {
     await page.locator('button[aria-label="Diff peek untracked.txt"]').click();
     await page.waitForSelector('#panel-worktrees pre');
@@ -490,6 +508,19 @@ await runChecks("gate", async (check) => {
     await page.locator("#tab-triage").click();
     const txt = await page.locator("#panel-triage").textContent();
     return txt.includes("Pinned posts (1)");
+  });
+
+  await check("Command Palette cross-swarm index filters Board to @builder", async () => {
+    await page.locator('button[aria-label="Open command palette"]').click();
+    await page.waitForSelector('[cmdk-input]');
+    await page.fill("[cmdk-input]", "Filter Board: @builder");
+    await page.keyboard.press("Enter");
+    await page.waitForSelector("#panel-board");
+    const txt = await page.locator("#panel-board").textContent();
+    const ok = (await page.locator('#tab-board[aria-selected="true"]').count()) === 1 && txt.includes("Sidecar ready for cold check");
+    await page.locator('#panel-board button:has-text("All (4)")').last().click();
+    await page.locator("#tab-triage").click();
+    return ok;
   });
 
   // 26-28: Clean runtime guarantees

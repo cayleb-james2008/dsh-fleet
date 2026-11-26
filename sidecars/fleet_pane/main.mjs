@@ -256,7 +256,7 @@ export function createFleetHandlers({
       healthPacked = pack({
         ok: true,
         name: 'fleet',
-        version: '1.15.0',
+        version: '1.16.0',
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
         sseStream: !isSidecar,
@@ -271,7 +271,7 @@ export function createFleetHandlers({
     const appDataDirs = getAppDirs();
     const now = Date.now();
     const key = appDataDirs.join('\0');
-    if (swarmsListCache.packed && swarmsListCache.key === key && now - swarmsListCache.at < 1000) {
+    if (swarmsListCache.packed && swarmsListCache.key === key && now - swarmsListCache.at < 1500) {
       return swarmsListCache;
     }
     const swarms = listSwarms(appDataDirs, (appData, id, snap, keys) => {
@@ -360,7 +360,7 @@ export function createFleetHandlers({
     const now = Date.now();
     const hit = !includeRaw ? swarmPayloadCache.get(cacheKey) || swarmPayloadCache.get(convKey) : null;
     if (hit) {
-      if (now - hit.checkedAt < 500) {
+      if (now - hit.checkedAt < 1000) {
         if (query.etag && query.etag === hit.fullEtag) return hit.unchangedPacked;
         return hit.packed;
       }
@@ -619,18 +619,21 @@ export async function startStandaloneServer({
 } = {}) {
   const assets = loadDistAssets(distDir);
   let handlers = null;
-  const handlersPromise = getStore().then((store) => {
-    handlers = createFleetHandlers({
-      store,
-      assets,
-      distDir,
-      appDataDir,
-      defaultConversationId,
-      isSidecar: false,
-      sendMessageFn,
-    });
-    return handlers;
-  });
+  let handlersPromise = null;
+  const ensureHandlers = () =>
+    (handlersPromise ||= getStore().then((store) => {
+      handlers = createFleetHandlers({
+        store,
+        assets,
+        distDir,
+        appDataDir,
+        defaultConversationId,
+        isSidecar: false,
+        sendMessageFn,
+      });
+      return handlers;
+    }));
+  if (!deferStore) ensureHandlers();
 
   const bootDirs = appDataDir ? [appDataDir] : process.env.FLEET_APP_DATA_DIR ? [process.env.FLEET_APP_DATA_DIR] : [];
   let quickHealthPacked = null;
@@ -638,7 +641,7 @@ export async function startStandaloneServer({
     (quickHealthPacked ||= packJsonPayload({
       ok: true,
       name: 'fleet',
-      version: '1.15.0',
+      version: '1.16.0',
       mode: 'standalone',
       canSendMessage: Boolean(sendMessageFn),
       sseStream: true,
@@ -822,7 +825,7 @@ export async function startStandaloneServer({
 
     const withHandlers = (fn) => {
       if (handlers) return fn(handlers);
-      handlersPromise.then(fn, (err) => {
+      ensureHandlers().then(fn, (err) => {
         res.writeHead(500, { 'Content-Type': 'application/json', ...SECURITY_HEADERS });
         res.end(JSON.stringify({ error: String(err?.message || err) }));
       });
@@ -945,7 +948,7 @@ export async function startStandaloneServer({
             return sendPacked(req, res, 400, packJsonPayload({ error: 'invalid JSON body' }));
           }
         }
-        const h = handlers || (await handlersPromise);
+        const h = handlers || (await ensureHandlers());
         const out = await h.postNudge(parsed);
         sendPacked(req, res, out.status, packJsonPayload(out.json));
       });
@@ -956,11 +959,12 @@ export async function startStandaloneServer({
     res.end('Not found');
   });
 
-  if (!deferStore) await handlersPromise;
+  if (!deferStore) await ensureHandlers();
   await new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(port, host, () => resolve());
   });
+  if (deferStore) setImmediate(() => { void ensureHandlers(); });
   const addr = server.address();
   return {
     server,
@@ -980,12 +984,6 @@ export async function startStandaloneServer({
 }
 
 async function runCli() {
-  if (process.execArgv.includes('--jitless') && !process.execArgv.includes('--optimize-for-size')) {
-    try {
-      const { setFlagsFromString } = await import('node:v8');
-      setFlagsFromString('--max-semi-space-size=1 --optimize-for-size');
-    } catch {}
-  }
   const args = process.argv.slice(2);
   let port = Number(process.env.PORT || 18430);
   let appDataDir = process.env.FLEET_APP_DATA_DIR || '';
@@ -1002,7 +1000,17 @@ async function runCli() {
     }
   }
 
+  const applyJitlessFlags = async () => {
+    if (process.execArgv.includes('--jitless')) {
+      try {
+        const { setFlagsFromString } = await import('node:v8');
+        setFlagsFromString('--max-semi-space-size=1 --optimize-for-size --memory-reducer');
+      } catch {}
+    }
+  };
+
   if (!standalone && process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) {
+    await applyJitlessFlags();
     const [{ SidecarApp, Response }, store] = await Promise.all([import('sidecar_sdk'), getStore()]);
     const app = new SidecarApp();
     const handlers = createFleetHandlers({
@@ -1053,6 +1061,7 @@ async function runCli() {
 
   const srv = await startStandaloneServer({ port, appDataDir, deferStore: true });
   console.log(`[fleet_pane] standalone server listening on ${srv.url}`);
+  void applyJitlessFlags();
 }
 
 const isEntry =

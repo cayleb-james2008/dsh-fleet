@@ -1,8 +1,25 @@
 import { useState } from "../hooks";
-import { ChevronDown, ChevronUp, ExternalLink, FileCode2, FolderGit2, GitBranch, RefreshCw } from "../icons";
+import { ChevronDown, ChevronUp, ClipboardCopy, ExternalLink, FileCode2, FolderGit2, GitBranch, RefreshCw } from "../icons";
 import { fetchWorktreeDiff, openFileInAuxPane } from "../sidecar";
-import type { WorktreeDiffPayload, WorktreesPayload } from "../types";
-import { Badge, Button, Card, Input, fmtTimeAgo, maskHome, openOrCopyPath, toast } from "../ui";
+import type { WorktreeDiffPayload, WorktreeInfo, WorktreesPayload } from "../types";
+import { Badge, Button, Card, Input, copyText, fmtTimeAgo, maskHome, openOrCopyPath, toast } from "../ui";
+
+const LAND_META: Record<NonNullable<WorktreeInfo["landStatus"]>, { tone: "success" | "warning" | "neutral"; label: string; btn: string }> = {
+  main: { tone: "neutral", label: "main", btn: "" },
+  ready: { tone: "success", label: "Ready to land", btn: "Copy merge" },
+  rebase: { tone: "warning", label: "Needs rebase", btn: "Copy rebase" },
+  dirty: { tone: "warning", label: "Uncommitted edits", btn: "Copy status" },
+  merged: { tone: "neutral", label: "Landed / clean", btn: "Copy cleanup" },
+};
+
+function safeLandCommand(wt: WorktreeInfo): string {
+  const base = wt.baseBranch || "main";
+  const path = maskHome(wt.path);
+  if (wt.landStatus === "ready") return `git merge --ff-only ${wt.branch} && git worktree remove ${path}`;
+  if (wt.landStatus === "rebase") return `git -C ${path} rebase ${base}`;
+  if (wt.landStatus === "dirty") return `git -C ${path} status -s`;
+  return `git worktree remove ${path} && git branch -d ${wt.branch}`;
+}
 
 const FILE_TONE: Record<string, "success" | "warning" | "danger" | "neutral"> = {
   "??": "neutral",
@@ -65,9 +82,6 @@ export function WorktreesView({
     setRootInput("");
   };
 
-  const diffLineCls = (l: string) =>
-    l[0] === "+" && !l.startsWith("+++") ? "text-ok" : l[0] === "-" && !l.startsWith("---") ? "text-danger" : l.startsWith("@@") ? "text-info" : "text-ink-2";
-
   return (
     <div className="space-y-3">
       <div className="row">
@@ -103,7 +117,11 @@ export function WorktreesView({
         </Card>
       ) : (
         <div className="space-y-2">
-          {worktrees.map((wt) => (
+          {worktrees.map((wt) => {
+            const st = wt.landStatus && wt.landStatus !== "main" ? LAND_META[wt.landStatus] : null;
+            const ahead = wt.ahead || 0;
+            const behind = wt.behind || 0;
+            return (
             <Card key={wt.id} className="p-3 space-y-2">
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0 space-y-1">
@@ -116,6 +134,16 @@ export function WorktreesView({
                         ? "clean"
                         : `${wt.dirtyFiles + wt.stagedFiles + wt.untrackedFiles} changed`}
                     </Badge>
+                    {st && (
+                      <Badge tone={st.tone} data-testid={`wt-land-status-${wt.branch}`}>
+                        {st.label}
+                      </Badge>
+                    )}
+                    {!wt.isMain && (ahead > 0 || behind > 0) && (
+                      <Badge tone={behind > 0 ? "warning" : "info"} className="num">
+                        +{ahead} / -{behind} vs {wt.baseBranch || "main"}
+                      </Badge>
+                    )}
                   </div>
                   <p
                     className="t3 mono truncate"
@@ -126,15 +154,27 @@ export function WorktreesView({
                   </p>
                 </div>
 
-                {wt.uri && window.sidecar?.ui?.toggleAuxPane && (
-                  <Button
-                    onClick={() => openFileInAuxPane(wt.uri)}
-                    className="shrink-0"
-                  >
-                    <ExternalLink className="h-3.5 w-3.5" />
-                    Open
-                  </Button>
-                )}
+                <div className="f1 shrink-0">
+                  {st && (
+                    <Button
+                      variant={wt.landStatus === "ready" ? "primary" : "outline"}
+                      data-testid={`wt-land-cmd-${wt.branch}`}
+                      onClick={() => void copyText(safeLandCommand(wt), `Copied command for ${wt.branch}`)}
+                    >
+                      <ClipboardCopy />
+                      {st.btn}
+                    </Button>
+                  )}
+                  {wt.uri && window.sidecar?.ui?.toggleAuxPane && (
+                    <Button
+                      onClick={() => openFileInAuxPane(wt.uri)}
+                      className="shrink-0"
+                    >
+                      <ExternalLink className="h-3.5 w-3.5" />
+                      Open
+                    </Button>
+                  )}
+                </div>
               </div>
 
               {(wt.lastCommitSubject || wt.lastCommitSha) && (
@@ -208,7 +248,8 @@ export function WorktreesView({
                 </ul>
               )}
             </Card>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>

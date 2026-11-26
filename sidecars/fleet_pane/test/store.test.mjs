@@ -227,6 +227,7 @@ test('git_probe parses porcelain output, inspects real git worktrees, and reject
       const feat = res.worktrees.find((w) => w.branch === 'feat/test');
       assert.ok(feat);
       assert.equal(feat.clean, false);
+      assert.equal(feat.landStatus, 'dirty');
       assert.equal(feat.untrackedFiles, 2);
       assert.equal(feat.lastCommitSubject, 'Initial commit');
       const dirtyEntry = feat.files.find((f) => f.path === 'dirty.txt');
@@ -257,6 +258,26 @@ test('git_probe parses porcelain output, inspects real git worktrees, and reject
       const dOutsideWt = await probeWorktreeDiff({ root: repoDir, worktree: '/etc', file: 'passwd' });
       assert.equal(dOutsideWt.ok, false);
       assert.equal(dOutsideWt.status, 404);
+
+      // Commit dirty changes and remove untracked symlink -> becomes clean ahead of main ('ready')
+      rmSync(join(wtDir, 'escape-link'));
+      execFileSync('git', ['-C', wtDir, 'add', 'README.md', 'dirty.txt'], { stdio: 'ignore' });
+      execFileSync('git', ['-C', wtDir, 'commit', '-m', 'Ready branch'], { stdio: 'ignore' });
+      const resReady = await probeWorktrees([repoDir], { ttlMs: 0 });
+      const featReady = resReady.worktrees.find((w) => w.branch === 'feat/test');
+      assert.equal(featReady?.landStatus, 'ready');
+      assert.equal(featReady?.ahead, 1);
+      assert.equal(featReady?.behind, 0);
+
+      // Advance main by 1 commit -> feat/test becomes behind ('rebase')
+      writeFileSync(join(repoDir, 'main-only.txt'), 'advance');
+      execFileSync('git', ['-C', repoDir, 'add', 'main-only.txt'], { stdio: 'ignore' });
+      execFileSync('git', ['-C', repoDir, 'commit', '-m', 'Advance main'], { stdio: 'ignore' });
+      const resBehind = await probeWorktrees([repoDir], { ttlMs: 0 });
+      const featBehind = resBehind.worktrees.find((w) => w.branch === 'feat/test');
+      assert.equal(featBehind?.landStatus, 'rebase');
+      assert.equal(featBehind?.ahead, 1);
+      assert.equal(featBehind?.behind, 1);
     } finally {
       execFileSync('git', ['-C', repoDir, 'worktree', 'remove', '--force', wtDir], { stdio: 'ignore' });
       rmSync(wtDir, { recursive: true, force: true });

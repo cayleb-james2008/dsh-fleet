@@ -151,7 +151,15 @@ function safeWorktreeFileUri(wtReal, relPath) {
   }
 }
 
-async function inspectWorktree(rootPath, wt, index) {
+async function detectBaseBranch(rootPath) {
+  for (const name of ['main', 'master']) {
+    const res = await execGit(rootPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${name}`]);
+    if (res.ok && res.stdout.trim()) return name;
+  }
+  return '';
+}
+
+async function inspectWorktree(rootPath, wt, index, baseBranch = '') {
   let wtReal = wt.path;
   let exists = true;
   try {
@@ -169,11 +177,17 @@ async function inspectWorktree(rootPath, wt, index) {
   let lastCommitSha = wt.head ? wt.head.slice(0, 8) : '';
   let lastCommitSubject = '';
   let lastCommitAt = 0;
+  let ahead = 0;
+  let behind = 0;
+  const branch = wt.branch || (wt.detached ? 'detached' : 'unknown');
+  const isMain = index === 0 || wtReal === rootPath;
+  const checkDiv = Boolean(exists && !wt.bare && !isMain && baseBranch && branch !== baseBranch && !wt.detached);
 
   if (exists && !wt.bare) {
-    const [statusRes, logRes] = await Promise.all([
+    const [statusRes, logRes, divRes] = await Promise.all([
       execGit(wtReal, ['status', '--porcelain=v1', '-z']),
       execGit(wtReal, ['log', '-n', '1', '--format=%h%x09%s%x09%ct']),
+      checkDiv ? execGit(wtReal, ['rev-list', '--left-right', '--count', `${baseBranch}...HEAD`]) : Promise.resolve({ ok: false, stdout: '' }),
     ]);
     if (statusRes.ok && statusRes.stdout) {
       const tokens = statusRes.stdout.split('\0');
@@ -203,7 +217,23 @@ async function inspectWorktree(rootPath, wt, index) {
       lastCommitSubject = subject.slice(0, 120);
       lastCommitAt = Number(ts) ? Number(ts) * 1000 : 0;
     }
+    if (divRes.ok && divRes.stdout.trim()) {
+      const parts = divRes.stdout.trim().split(/\s+/);
+      behind = Number(parts[0]) || 0;
+      ahead = Number(parts[1]) || 0;
+    }
   }
+
+  const clean = dirtyFiles === 0 && untrackedFiles === 0 && stagedFiles === 0;
+  const landStatus = isMain || branch === baseBranch
+    ? 'main'
+    : !clean
+      ? 'dirty'
+      : behind > 0
+        ? 'rebase'
+        : ahead > 0
+          ? 'ready'
+          : 'merged';
 
   return {
     id: `${rootPath}::${wtReal}`,
@@ -211,15 +241,19 @@ async function inspectWorktree(rootPath, wt, index) {
     name: basename(wtReal) || wtReal,
     path: wtReal,
     uri: exists ? pathToFileURL(wtReal).href : '',
-    isMain: index === 0 || wtReal === rootPath,
+    isMain,
     exists,
     bare: wt.bare,
     detached: wt.detached,
     locked: wt.locked,
     prunable: wt.prunable,
-    branch: wt.branch || (wt.detached ? 'detached' : 'unknown'),
+    branch,
     head: wt.head.slice(0, 8),
-    clean: dirtyFiles === 0 && untrackedFiles === 0 && stagedFiles === 0,
+    clean,
+    baseBranch: baseBranch || 'main',
+    ahead,
+    behind,
+    landStatus,
     dirtyFiles,
     untrackedFiles,
     stagedFiles,
@@ -249,8 +283,9 @@ async function probeSingleRoot(root, ttlMs) {
         error: 'not a git repository',
       };
     }
+    const baseBranch = await detectBaseBranch(root.path);
     const parsed = parsePorcelainWorktrees(res.stdout).slice(0, MAX_WORKTREES_PER_ROOT);
-    const worktrees = await Promise.all(parsed.map((wt, idx) => inspectWorktree(root.path, wt, idx)));
+    const worktrees = await Promise.all(parsed.map((wt, idx) => inspectWorktree(root.path, wt, idx, baseBranch)));
     return {
       root: root.path,
       uri: root.uri,
