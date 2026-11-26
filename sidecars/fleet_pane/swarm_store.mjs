@@ -7,7 +7,19 @@
  *   older lines and parses JSON objects ONLY for the 32-line sliding tail window.
  * - Does not retain full parsed board message graphs in long-lived JS heap caches.
  */
-import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -927,21 +939,308 @@ function parseViewJson(id, f) {
   return { json: c.good?.json || null, mtime: c.good?.mtime || 0, error: c.error };
 }
 
+const PLAN_CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/;
+const WS_STATUSES = new Set(['pending', 'running', 'done', 'verified', 'blocked']);
+const MS_STATUSES = new Set(['pending', 'in_progress', 'done', 'blocked']);
+const RISK_SEVERITIES = new Set(['low', 'med', 'high']);
+const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const PLAN_KNOWN_KEYS = new Set([
+  'schema',
+  'etag',
+  'title',
+  'goal',
+  'goalTitle',
+  'goalLine',
+  'gate',
+  'repo',
+  'threads',
+  'tasks',
+  'workstreams',
+  'milestones',
+  'risks',
+]);
+
+function isPlainObj(v) {
+  return Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+}
+
+function normalizeWsStatus(s) {
+  if (s === 'in_progress') return 'running';
+  return WS_STATUSES.has(s) ? s : 'pending';
+}
+
+function normalizeMsStatus(s) {
+  if (s === 'running') return 'in_progress';
+  if (s === 'verified') return 'done';
+  return MS_STATUSES.has(s) ? s : 'pending';
+}
+
+/**
+ * Normalize native Antigravity (`goal: { title, line }`, `tasks`, `threads`) and Fleet
+ * (`workstreams`, `milestones`, `gate`, `risks`) `plan.json` objects into one crash-safe shape.
+ */
+export function normalizePlan(raw, etag = '') {
+  if (!isPlainObj(raw)) return null;
+  const hasNativeGoal = isPlainObj(raw.goal);
+  const hasNativeTasks = isPlainObj(raw.tasks);
+  const hasNativeThreads = Array.isArray(raw.threads);
+  const hasNative = hasNativeGoal || hasNativeTasks || hasNativeThreads;
+  const hasFleet =
+    Array.isArray(raw.workstreams) ||
+    Array.isArray(raw.milestones) ||
+    Array.isArray(raw.risks) ||
+    (typeof raw.gate === 'string' && raw.gate.trim().length > 0);
+  const schema = hasNative && hasFleet ? 'hybrid' : hasNative ? 'native' : 'fleet';
+
+  const goalTitle = hasNativeGoal
+    ? typeof raw.goal.title === 'string'
+      ? raw.goal.title
+      : typeof raw.goalTitle === 'string'
+        ? raw.goalTitle
+        : undefined
+    : typeof raw.goalTitle === 'string'
+      ? raw.goalTitle
+      : undefined;
+  const goalLine = hasNativeGoal
+    ? typeof raw.goal.line === 'string'
+      ? raw.goal.line
+      : typeof raw.goalLine === 'string'
+        ? raw.goalLine
+        : undefined
+    : typeof raw.goalLine === 'string'
+      ? raw.goalLine
+      : undefined;
+  const goal = hasNativeGoal
+    ? goalLine || goalTitle || ''
+    : typeof raw.goal === 'string'
+      ? raw.goal
+      : goalLine || goalTitle || '';
+  const title =
+    typeof raw.title === 'string' && raw.title
+      ? raw.title
+      : goalTitle || goalLine || '';
+  const gate = typeof raw.gate === 'string' ? raw.gate : '';
+  const repo = typeof raw.repo === 'string' && raw.repo ? raw.repo : undefined;
+
+  const threads = hasNativeThreads
+    ? raw.threads
+        .filter((t) => isPlainObj(t))
+        .map((t, idx) => ({
+          id: typeof t.id === 'string' && t.id ? t.id : `t-${idx + 1}`,
+          title: typeof t.title === 'string' ? t.title : '',
+          goal:
+            typeof t.goal === 'string'
+              ? t.goal
+              : isPlainObj(t.goal)
+                ? String(t.goal.line || t.goal.title || '')
+                : '',
+          tasks: Array.isArray(t.tasks) ? t.tasks.filter((x) => typeof x === 'string') : [],
+        }))
+    : [];
+
+  const tasks = {};
+  if (hasNativeTasks) {
+    for (const [k, v] of Object.entries(raw.tasks)) {
+      if (FORBIDDEN_KEYS.has(k)) continue;
+      tasks[k] = typeof v === 'string' ? v : v == null ? '' : String(v);
+    }
+  }
+
+  const workstreams = Array.isArray(raw.workstreams)
+    ? raw.workstreams
+        .filter((w) => isPlainObj(w))
+        .map((w, idx) => ({
+          id: typeof w.id === 'string' && w.id ? w.id : `ws-${idx + 1}`,
+          title: typeof w.title === 'string' ? w.title : '',
+          owner: typeof w.owner === 'string' ? w.owner : '',
+          status: normalizeWsStatus(w.status),
+          ...(typeof w.note === 'string' && w.note ? { note: w.note } : {}),
+          ...(typeof w.threadId === 'string' && w.threadId ? { threadId: w.threadId } : {}),
+        }))
+    : [];
+
+  const milestones = Array.isArray(raw.milestones)
+    ? raw.milestones
+        .filter((m) => isPlainObj(m))
+        .map((m) => ({
+          title: typeof m.title === 'string' ? m.title : '',
+          status: normalizeMsStatus(m.status),
+        }))
+    : [];
+
+  const risks = Array.isArray(raw.risks)
+    ? raw.risks
+        .map((r) => {
+          if (typeof r === 'string') return { title: r };
+          if (!isPlainObj(r)) return null;
+          const rTitle =
+            typeof r.title === 'string'
+              ? r.title
+              : typeof r.description === 'string'
+                ? r.description
+                : '';
+          const out = { title: rTitle };
+          if (RISK_SEVERITIES.has(r.severity)) out.severity = r.severity;
+          return out;
+        })
+        .filter(Boolean)
+    : [];
+
+  return {
+    schema,
+    etag: typeof etag === 'string' ? etag : '',
+    title,
+    goal,
+    ...(goalTitle !== undefined ? { goalTitle } : {}),
+    ...(goalLine !== undefined ? { goalLine } : {}),
+    gate,
+    ...(repo !== undefined ? { repo } : {}),
+    threads,
+    tasks,
+    workstreams,
+    milestones,
+    risks,
+  };
+}
+
+function scanPlanPatchSafety(val, depth = 0) {
+  if (depth > 8) return 'Plan patch exceeds maximum nesting depth';
+  if (typeof val === 'string') {
+    return PLAN_CTRL_RE.test(val) ? 'Control characters are not permitted in plan fields' : null;
+  }
+  if (Array.isArray(val)) {
+    for (const item of val) {
+      const err = scanPlanPatchSafety(item, depth + 1);
+      if (err) return err;
+    }
+    return null;
+  }
+  if (val && typeof val === 'object') {
+    for (const [k, v] of Object.entries(val)) {
+      if (FORBIDDEN_KEYS.has(k)) return 'Forbidden key in plan patch';
+      if (PLAN_CTRL_RE.test(k)) return 'Control characters are not permitted in plan fields';
+      const err = scanPlanPatchSafety(v, depth + 1);
+      if (err) return err;
+    }
+  }
+  return null;
+}
+
+/** Validate a `POST /api/plan` patch payload for types, enums, prototype keys, and control chars. */
+export function validatePlanPatch(patch) {
+  if (!isPlainObj(patch)) {
+    return { ok: false, status: 400, error: 'patch object required' };
+  }
+  const safetyErr = scanPlanPatchSafety(patch, 0);
+  if (safetyErr) return { ok: false, status: 400, error: safetyErr };
+
+  for (const field of ['title', 'goalTitle', 'goalLine', 'gate', 'repo']) {
+    if (patch[field] !== undefined && typeof patch[field] !== 'string') {
+      return { ok: false, status: 400, error: `${field} must be a string` };
+    }
+  }
+  if (patch.goal !== undefined) {
+    if (typeof patch.goal !== 'string') {
+      if (!isPlainObj(patch.goal)) {
+        return { ok: false, status: 400, error: 'goal must be a string or { title, line } object' };
+      }
+      if (patch.goal.title !== undefined && typeof patch.goal.title !== 'string') {
+        return { ok: false, status: 400, error: 'goal.title must be a string' };
+      }
+      if (patch.goal.line !== undefined && typeof patch.goal.line !== 'string') {
+        return { ok: false, status: 400, error: 'goal.line must be a string' };
+      }
+    }
+  }
+  if (patch.tasks !== undefined) {
+    if (!isPlainObj(patch.tasks)) {
+      return { ok: false, status: 400, error: 'tasks must be an object map of strings' };
+    }
+    for (const v of Object.values(patch.tasks)) {
+      if (typeof v !== 'string') {
+        return { ok: false, status: 400, error: 'tasks values must be strings' };
+      }
+    }
+  }
+  if (patch.threads !== undefined) {
+    if (!Array.isArray(patch.threads)) {
+      return { ok: false, status: 400, error: 'threads must be an array' };
+    }
+    for (const t of patch.threads) {
+      if (!isPlainObj(t)) return { ok: false, status: 400, error: 'each thread must be an object' };
+      for (const f of ['id', 'title', 'goal']) {
+        if (t[f] !== undefined && typeof t[f] !== 'string') {
+          return { ok: false, status: 400, error: `thread.${f} must be a string` };
+        }
+      }
+      if (t.tasks !== undefined && (!Array.isArray(t.tasks) || t.tasks.some((x) => typeof x !== 'string'))) {
+        return { ok: false, status: 400, error: 'thread.tasks must be an array of strings' };
+      }
+    }
+  }
+  if (patch.workstreams !== undefined) {
+    if (!Array.isArray(patch.workstreams)) {
+      return { ok: false, status: 400, error: 'workstreams must be an array' };
+    }
+    for (const w of patch.workstreams) {
+      if (!isPlainObj(w)) return { ok: false, status: 400, error: 'each workstream must be an object' };
+      for (const f of ['id', 'title', 'owner', 'note', 'threadId']) {
+        if (w[f] !== undefined && typeof w[f] !== 'string') {
+          return { ok: false, status: 400, error: `workstream.${f} must be a string` };
+        }
+      }
+      if (w.status !== undefined && !WS_STATUSES.has(w.status)) {
+        return { ok: false, status: 400, error: 'invalid workstream status' };
+      }
+    }
+  }
+  if (patch.milestones !== undefined) {
+    if (!Array.isArray(patch.milestones)) {
+      return { ok: false, status: 400, error: 'milestones must be an array' };
+    }
+    for (const m of patch.milestones) {
+      if (!isPlainObj(m)) return { ok: false, status: 400, error: 'each milestone must be an object' };
+      if (m.title !== undefined && typeof m.title !== 'string') {
+        return { ok: false, status: 400, error: 'milestone.title must be a string' };
+      }
+      if (m.status !== undefined && !MS_STATUSES.has(m.status)) {
+        return { ok: false, status: 400, error: 'invalid milestone status' };
+      }
+    }
+  }
+  if (patch.risks !== undefined) {
+    if (!Array.isArray(patch.risks)) {
+      return { ok: false, status: 400, error: 'risks must be an array' };
+    }
+    for (const r of patch.risks) {
+      if (typeof r === 'string') continue;
+      if (!isPlainObj(r)) return { ok: false, status: 400, error: 'each risk must be a string or object' };
+      if (r.title !== undefined && typeof r.title !== 'string') {
+        return { ok: false, status: 400, error: 'risk.title must be a string' };
+      }
+      if (r.severity !== undefined && !RISK_SEVERITIES.has(r.severity)) {
+        return { ok: false, status: 400, error: 'invalid risk severity' };
+      }
+    }
+  }
+  return { ok: true };
+}
+
 function readView(appData, id, dir, narrator) {
   let vdir = dir;
   let source = 'swarm';
   let jf = readSmallCached(join(dir, 'view.json'), smallFileCache, VIEW_MAX_BYTES);
   const conv = narrator?.conversation_id;
-  if (jf.size < 0 && typeof conv === 'string' && ID_RE.test(conv)) {
+  if (typeof conv === 'string' && ID_RE.test(conv)) {
     const alt = join(appData, 'brain', conv, 'swarm_view');
     const altJson = readSmallCached(join(alt, 'view.json'), smallFileCache, VIEW_MAX_BYTES);
-    if (altJson.size >= 0) {
+    if (altJson.size >= 0 && (jf.size < 0 || altJson.mtime > jf.mtime)) {
       vdir = alt;
       source = 'narrator';
       jf = altJson;
     }
   }
-  const { json, mtime, error } = parseViewJson(id, jf);
+  const { json, mtime, error } = parseViewJson(vdir, jf);
   return {
     etag: `${vdir}|${jf.mtime}:${jf.size}`,
     view: {
@@ -958,16 +1257,239 @@ function readView(appData, id, dir, narrator) {
 
 function readPlan(dir) {
   const pf = readSmallCached(join(dir, 'plan.json'), smallFileCache, VIEW_MAX_BYTES);
-  let plan = null;
+  let raw = null;
   if (pf.size >= 0 && !pf.tooLarge) {
     try {
       const v = JSON.parse(pf.text ?? '');
-      if (v && typeof v === 'object' && !Array.isArray(v)) plan = v;
+      if (isPlainObj(v)) raw = v;
     } catch {
-      plan = null;
+      raw = null;
     }
   }
-  return { plan, key: `${pf.mtime}:${pf.size}` };
+  const etag = pf.size >= 0 ? `${pf.mtime}:${pf.size}` : '';
+  const plan = raw ? normalizePlan(raw, etag) : null;
+  return { plan, etag, key: `${pf.mtime}:${pf.size}` };
+}
+
+/**
+ * Atomically update or create `<appData>/brain/<swarmId>/.system_generated/swarm/plan.json`
+ * with optimistic ETag CAS, strict path confinement, and native-schema preservation.
+ */
+export function writeSwarmPlan(appData, swarmId, { ifMatch = '', mode = 'patch', patch = {} } = {}) {
+  if (!appData || typeof swarmId !== 'string' || !ID_RE.test(swarmId) || swarmId === '.' || swarmId === '..') {
+    return { ok: false, status: 400, error: 'Valid swarmId required' };
+  }
+  if (mode !== 'patch' && mode !== 'replace') {
+    return { ok: false, status: 400, error: 'mode must be "patch" or "replace"' };
+  }
+  if (ifMatch !== undefined && typeof ifMatch !== 'string') {
+    return { ok: false, status: 400, error: 'ifMatch must be a string' };
+  }
+  if (PLAN_CTRL_RE.test(ifMatch || '')) {
+    return { ok: false, status: 400, error: 'Control characters are not permitted in ifMatch' };
+  }
+  const validPatch = validatePlanPatch(patch);
+  if (!validPatch.ok) return validPatch;
+
+  const dir = swarmDir(appData, swarmId);
+  if (!existsSync(join(dir, 'members.json'))) {
+    return { ok: false, status: 404, error: 'Swarm not found' };
+  }
+  let brainReal;
+  let dirReal;
+  try {
+    brainReal = realpathSync(join(appData, 'brain'));
+    dirReal = realpathSync(dir);
+  } catch {
+    return { ok: false, status: 404, error: 'Swarm directory not accessible' };
+  }
+  const brainPrefix = brainReal.endsWith(sep) ? brainReal : brainReal + sep;
+  if (!dirReal.startsWith(brainPrefix)) {
+    return { ok: false, status: 403, error: 'Swarm path outside brain root' };
+  }
+
+  const planPath = join(dirReal, 'plan.json');
+  if (existsSync(planPath)) {
+    try {
+      const planReal = realpathSync(planPath);
+      if (!planReal.startsWith(brainPrefix)) {
+        return { ok: false, status: 403, error: 'Plan path outside brain root' };
+      }
+    } catch {
+      return { ok: false, status: 403, error: 'Invalid plan path' };
+    }
+  }
+
+  smallFileCache.delete(join(dir, 'plan.json'));
+  smallFileCache.delete(planPath);
+  const pfStat = statOf(planPath);
+  const currentEtag = pfStat.size >= 0 ? `${pfStat.mtime}:${pfStat.size}` : '';
+  let existingRaw = null;
+  if (pfStat.size >= 0 && pfStat.size <= VIEW_MAX_BYTES) {
+    try {
+      const v = JSON.parse(readFileSync(planPath, 'utf-8'));
+      if (isPlainObj(v)) existingRaw = v;
+    } catch {
+      existingRaw = null;
+    }
+  }
+
+  const expected = (ifMatch || '').trim();
+  if (expected !== currentEtag) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'plan changed on disk',
+      plan: existingRaw ? normalizePlan(existingRaw, currentEtag) : null,
+      etag: currentEtag,
+    };
+  }
+
+  const base = existingRaw || {};
+  const existingHasNativeGoal = isPlainObj(base.goal);
+  const existingHasNative =
+    existingHasNativeGoal || isPlainObj(base.tasks) || Array.isArray(base.threads);
+  const patchHasNativeGoal =
+    isPlainObj(patch.goal) ||
+    typeof patch.goalTitle === 'string' ||
+    typeof patch.goalLine === 'string';
+
+  const next = {};
+  if (mode === 'patch') {
+    for (const [k, v] of Object.entries(base)) {
+      if (!FORBIDDEN_KEYS.has(k)) next[k] = v;
+    }
+  } else if (existingHasNative) {
+    for (const [k, v] of Object.entries(base)) {
+      if (!FORBIDDEN_KEYS.has(k) && !PLAN_KNOWN_KEYS.has(k)) next[k] = v;
+    }
+  }
+
+  const useNativeGoal = existingHasNativeGoal || patchHasNativeGoal;
+  if (useNativeGoal) {
+    const goalObj = existingHasNativeGoal ? { ...base.goal } : {};
+    if (!existingHasNativeGoal && typeof base.goal === 'string' && !goalObj.line) {
+      goalObj.line = base.goal;
+    }
+    if (isPlainObj(patch.goal)) {
+      if (typeof patch.goal.title === 'string') goalObj.title = patch.goal.title;
+      if (typeof patch.goal.line === 'string') goalObj.line = patch.goal.line;
+    } else if (typeof patch.goal === 'string') {
+      goalObj.line = patch.goal;
+    }
+    if (typeof patch.goalTitle === 'string') goalObj.title = patch.goalTitle;
+    if (typeof patch.goalLine === 'string') goalObj.line = patch.goalLine;
+    if (typeof patch.title === 'string') {
+      if (typeof patch.goalTitle !== 'string' && (existingHasNativeGoal || !goalObj.title)) {
+        goalObj.title = patch.title;
+      }
+      if (base.title !== undefined || !existingHasNative || (typeof patch.goalTitle === 'string' && patch.title !== patch.goalTitle)) {
+        next.title = patch.title;
+      }
+    }
+    if (goalObj.title === undefined) goalObj.title = typeof next.title === 'string' ? next.title : '';
+    if (goalObj.line === undefined) goalObj.line = '';
+    next.goal = goalObj;
+  } else {
+    if (typeof patch.title === 'string') next.title = patch.title;
+    if (typeof patch.goal === 'string') next.goal = patch.goal;
+  }
+
+  if (typeof patch.gate === 'string') next.gate = patch.gate;
+  if (typeof patch.repo === 'string') next.repo = patch.repo;
+
+  if (patch.tasks !== undefined) {
+    const cleanTasks = {};
+    for (const [k, v] of Object.entries(patch.tasks)) {
+      if (!FORBIDDEN_KEYS.has(k)) cleanTasks[k] = v;
+    }
+    next.tasks = cleanTasks;
+  } else if (mode === 'replace' && existingHasNative && isPlainObj(base.tasks)) {
+    next.tasks = { ...base.tasks };
+  }
+
+  if (patch.threads !== undefined) {
+    next.threads = patch.threads.map((t, idx) => {
+      const clean = {};
+      for (const [k, v] of Object.entries(t)) {
+        if (!FORBIDDEN_KEYS.has(k)) clean[k] = v;
+      }
+      return {
+        ...clean,
+        id: typeof t.id === 'string' && t.id ? t.id : `t-${idx + 1}`,
+        title: typeof t.title === 'string' ? t.title : '',
+        goal: typeof t.goal === 'string' ? t.goal : '',
+        tasks: Array.isArray(t.tasks) ? [...t.tasks] : [],
+      };
+    });
+  } else if (mode === 'replace' && existingHasNative && Array.isArray(base.threads)) {
+    next.threads = base.threads;
+  }
+
+  if (patch.workstreams !== undefined) {
+    next.workstreams = patch.workstreams.map((w, idx) => ({
+      id: typeof w.id === 'string' && w.id ? w.id : `ws-${idx + 1}`,
+      title: typeof w.title === 'string' ? w.title : '',
+      owner: typeof w.owner === 'string' ? w.owner : '',
+      status: normalizeWsStatus(w.status),
+      ...(typeof w.note === 'string' && w.note ? { note: w.note } : {}),
+      ...(typeof w.threadId === 'string' && w.threadId ? { threadId: w.threadId } : {}),
+    }));
+  }
+  if (patch.milestones !== undefined) {
+    next.milestones = patch.milestones.map((m) => ({
+      title: typeof m.title === 'string' ? m.title : '',
+      status: normalizeMsStatus(m.status),
+    }));
+  }
+  if (patch.risks !== undefined) {
+    next.risks = patch.risks.map((r) =>
+      typeof r === 'string'
+        ? { title: r }
+        : {
+            title: typeof r.title === 'string' ? r.title : '',
+            ...(RISK_SEVERITIES.has(r.severity) ? { severity: r.severity } : {}),
+          },
+    );
+  }
+
+  const serialized = JSON.stringify(next, null, 2) + '\n';
+  if (Buffer.byteLength(serialized, 'utf-8') > VIEW_MAX_BYTES) {
+    return { ok: false, status: 413, error: 'Serialized plan exceeds maximum allowed size' };
+  }
+
+  const tmpPath = `${planPath}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 10)}`;
+  try {
+    writeFileSync(tmpPath, serialized, 'utf-8');
+    renameSync(tmpPath, planPath);
+  } finally {
+    try {
+      if (existsSync(tmpPath)) unlinkSync(tmpPath);
+    } catch {}
+  }
+
+  smallFileCache.delete(join(dir, 'plan.json'));
+  smallFileCache.delete(planPath);
+  summaryMetaCache.delete(`${appData}\0${swarmId}`);
+
+  const afterStat = statOf(planPath);
+  const newEtag = afterStat.size >= 0 ? `${afterStat.mtime}:${afterStat.size}` : '';
+  return { ok: true, plan: normalizePlan(next, newEtag), etag: newEtag };
+}
+
+/** Return the coordinator conversation_id for a swarm (falling back to swarmId). */
+export function findCoordinatorConvId(appData, swarmId) {
+  const mf = readSmallCached(join(swarmDir(appData, swarmId), 'members.json'), smallFileCache, 1024 * 1024);
+  if (!mf.text) return null;
+  const roster = parseRoster(mf.text);
+  if (!roster?.members) return null;
+  for (const [name, m] of Object.entries(roster.members)) {
+    if (!m || typeof m !== 'object' || m.killed) continue;
+    if ((m.role === 'coordinator' || name === 'coordinator') && typeof m.conversation_id === 'string' && ID_RE.test(m.conversation_id)) {
+      return m.conversation_id;
+    }
+  }
+  return ID_RE.test(swarmId) ? swarmId : null;
 }
 
 /** Validate that a target file lies strictly inside `<appData>/brain/` with no traversal. */
@@ -1175,9 +1697,11 @@ export function getSwarmMetaKeys(appData, id) {
   const m = statOf(join(dir, 'members.json'));
   if (m.size < 0) return null;
   const b = statOf(join(dir, 'board.jsonl'));
+  const p = statOf(join(dir, 'plan.json'));
   return {
     membersKey: `${m.ino}:${m.mtime}:${m.size}`,
     boardKey: `${b.ino}:${b.mtime}:${b.size}`,
+    planKey: `${p.mtime}:${p.size}`,
   };
 }
 
@@ -1584,6 +2108,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     checkedAt: now,
     membersKey,
     boardKey,
+    planKey,
     trKeys,
     etag,
     summary: {
@@ -1696,7 +2221,7 @@ export function listSwarms(appDataDirs, onSnapshot = null) {
       continue;
     }
     const hit = summaryMetaCache.get(cacheKey);
-    if (hit && hit.membersKey === keys.membersKey && hit.boardKey === keys.boardKey) {
+    if (hit && hit.membersKey === keys.membersKey && hit.boardKey === keys.boardKey && hit.planKey === keys.planKey) {
       if (now - hit.checkedAt < SNAPSHOT_TRANSCRIPT_TTL_MS) {
         list.push(hit.summary);
         continue;

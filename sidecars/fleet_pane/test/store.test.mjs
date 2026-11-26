@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parsePorcelainWorktrees, probeWorktreeDiff, probeWorktrees } from '../git_probe.mjs';
@@ -10,8 +10,10 @@ import {
   computeBurnSummary,
   computeGateReadiness,
   listSwarms,
+  normalizePlan,
   readTranscriptActivityTail,
   summarizeTranscript,
+  writeSwarmPlan,
 } from '../swarm_store.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -437,6 +439,208 @@ test('readTranscriptActivityTail reads trailing 8 KB, masks /home/ paths, caches
     assert.equal(p2.status, 'waiting');
     assert.equal(p2.tool, 'swarm_wait');
     assert.equal(p2.label, 'Waiting for posts');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('normalizePlan flattens native, fleet, and hybrid plan.json safely and never returns an object goal', () => {
+  assert.equal(normalizePlan(null), null);
+  assert.equal(normalizePlan([]), null);
+
+  const nativeRaw = {
+    goal: {
+      title: 'Cycle 2 Wave E1',
+      line: 'Launch Fleet Native Plan Editor and OpenBell Shadow Runner.',
+    },
+    tasks: {
+      'e1-fleet-be': 'Zone A backend',
+      'e1-fleet-fe': 'Zone B frontend',
+    },
+    threads: [
+      {
+        id: 't-fleet',
+        title: 'Fleet E1',
+        goal: 'Fix crash + live editor',
+        tasks: ['e1-fleet-be', 'e1-fleet-fe'],
+      },
+    ],
+  };
+  const nativeNorm = normalizePlan(nativeRaw, '100:250');
+  assert.equal(nativeNorm.schema, 'native');
+  assert.equal(nativeNorm.etag, '100:250');
+  assert.equal(nativeNorm.title, 'Cycle 2 Wave E1');
+  assert.equal(nativeNorm.goal, 'Launch Fleet Native Plan Editor and OpenBell Shadow Runner.');
+  assert.equal(nativeNorm.goalTitle, 'Cycle 2 Wave E1');
+  assert.equal(nativeNorm.goalLine, 'Launch Fleet Native Plan Editor and OpenBell Shadow Runner.');
+  assert.equal(nativeNorm.gate, '');
+  assert.deepEqual(nativeNorm.tasks, nativeRaw.tasks);
+  assert.deepEqual(nativeNorm.threads, nativeRaw.threads);
+  assert.deepEqual(nativeNorm.workstreams, []);
+  assert.deepEqual(nativeNorm.milestones, []);
+  assert.deepEqual(nativeNorm.risks, []);
+
+  // Goal object with title only falls back cleanly to goalTitle
+  const titleOnly = normalizePlan({ goal: { title: 'Title Only Goal' }, tasks: {}, threads: [] }, '200:40');
+  assert.equal(titleOnly.goal, 'Title Only Goal');
+  assert.equal(titleOnly.title, 'Title Only Goal');
+
+  // Fleet schema
+  const fleetNorm = normalizePlan(
+    {
+      title: 'Fleet Release',
+      goal: 'Ship v1.20',
+      gate: 'npm test',
+      repo: '/repo/fleet',
+      workstreams: [{ id: 'ws-1', title: 'BE', owner: 'worker', status: 'in_progress', note: 'active' }],
+      milestones: [{ title: 'Alpha', status: 'verified' }],
+      risks: ['Legacy risk', { title: 'Race condition', severity: 'high' }],
+    },
+    '300:180',
+  );
+  assert.equal(fleetNorm.schema, 'fleet');
+  assert.equal(fleetNorm.workstreams[0].status, 'running');
+  assert.equal(fleetNorm.milestones[0].status, 'done');
+  assert.deepEqual(fleetNorm.risks, [{ title: 'Legacy risk' }, { title: 'Race condition', severity: 'high' }]);
+
+  // Hybrid schema when native + fleet fields coexist
+  const hybridNorm = normalizePlan({ ...nativeRaw, gate: 'npm test', workstreams: [{ id: 'ws-1', title: 'BE', owner: 'e1-fleet-be', status: 'done' }] }, '400:300');
+  assert.equal(hybridNorm.schema, 'hybrid');
+  assert.equal(typeof hybridNorm.goal, 'string');
+  assert.equal(hybridNorm.workstreams.length, 1);
+});
+
+test('buildSwarmSnapshot exposes normalized native plan.json and narrator view.json, and writeSwarmPlan performs atomic CAS', () => {
+  const dir = makeScratchDir('native-plan-');
+  try {
+    const coordId = 'dddddddd-dddd-dddd-dddd-dddddddddddd';
+    const narratorId = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee';
+    const swarmPath = join(dir, 'brain', coordId, '.system_generated', 'swarm');
+    const narratorViewDir = join(dir, 'brain', narratorId, 'swarm_view');
+    mkdirSync(swarmPath, { recursive: true });
+    mkdirSync(narratorViewDir, { recursive: true });
+
+    writeFileSync(
+      join(swarmPath, 'members.json'),
+      JSON.stringify({
+        title: 'Native Swarm',
+        members: {
+          coordinator: { conversation_id: coordId, role: 'coordinator', last_read_seq: 1 },
+          narrator: { conversation_id: narratorId, role: 'narrator', last_read_seq: 1 },
+        },
+      }),
+    );
+    writeFileSync(join(swarmPath, 'board.jsonl'), JSON.stringify({ seq: 1, agent: 'coordinator', text: 'Go' }) + '\n');
+
+    writeFileSync(
+      join(narratorViewDir, 'view.json'),
+      JSON.stringify({
+        headline: 'Wave E1 underway',
+        phase: 'build',
+        running_summary: 'Zone A & B active',
+        now: { coordinator: 'Coordinating batch 1' },
+        attention: [{ id: 'att-1', severity: 'info', title: 'No blockers' }],
+        feedback_ack: 'ack-42',
+      }),
+    );
+
+    // Absent plan.json yields null plan and listSwarms hasPlan=false
+    const snap0 = buildSwarmSnapshot(dir, coordId);
+    assert.equal(snap0.plan, null);
+    assert.equal(snap0.view.source, 'narrator');
+    assert.equal(snap0.view.json.headline, 'Wave E1 underway');
+    assert.equal(snap0.view.json.phase, 'build');
+    assert.equal(snap0.view.json.running_summary, 'Zone A & B active');
+    assert.equal(snap0.view.json.now.coordinator, 'Coordinating batch 1');
+    assert.equal(snap0.view.json.attention.length, 1);
+    assert.equal(snap0.view.json.feedback_ack, 'ack-42');
+    assert.equal(listSwarms([dir])[0].hasPlan, false);
+
+    // Write native plan.json externally and verify snapshot normalization
+    const nativeOnDisk = {
+      goal: { title: 'Native Title', line: 'Native Line' },
+      tasks: { worker1: 'Implement feature' },
+      threads: [{ id: 't-1', title: 'Thread 1', goal: 'Deliver', tasks: ['worker1'] }],
+      customNativeMeta: { wave: 2 },
+    };
+    writeFileSync(join(swarmPath, 'plan.json'), JSON.stringify(nativeOnDisk));
+    const snap1 = buildSwarmSnapshot(dir, coordId);
+    assert.equal(snap1.plan.schema, 'native');
+    assert.equal(snap1.plan.goal, 'Native Line');
+    assert.equal(snap1.plan.goalTitle, 'Native Title');
+    assert.equal(snap1.plan.goalLine, 'Native Line');
+    assert.ok(snap1.plan.etag.includes(':'));
+    assert.equal(listSwarms([dir])[0].hasPlan, true);
+
+    // CAS mismatch returns 409 with latest normalized plan
+    const conflict = writeSwarmPlan(dir, coordId, {
+      ifMatch: 'stale:0',
+      mode: 'patch',
+      patch: { gate: 'npm test' },
+    });
+    assert.equal(conflict.ok, false);
+    assert.equal(conflict.status, 409);
+    assert.equal(conflict.plan.etag, snap1.plan.etag);
+
+    // Patch native plan with Fleet gate/workstreams while preserving native fields on disk
+    const patched = writeSwarmPlan(dir, coordId, {
+      ifMatch: snap1.plan.etag,
+      mode: 'patch',
+      patch: {
+        goalLine: 'Updated Native Line',
+        gate: 'npm test',
+        workstreams: [{ id: 'ws-1', title: 'Backend', owner: 'worker1', status: 'done' }],
+      },
+    });
+    assert.equal(patched.ok, true);
+    assert.equal(patched.plan.schema, 'hybrid');
+    assert.equal(patched.plan.goal, 'Updated Native Line');
+    assert.equal(patched.plan.goalTitle, 'Native Title');
+    assert.notEqual(patched.etag, snap1.plan.etag);
+
+    const diskAfterPatch = JSON.parse(readFileSync(join(swarmPath, 'plan.json'), 'utf-8'));
+    assert.deepEqual(diskAfterPatch.goal, { title: 'Native Title', line: 'Updated Native Line' });
+    assert.deepEqual(diskAfterPatch.tasks, { worker1: 'Implement feature' });
+    assert.equal(diskAfterPatch.threads.length, 1);
+    assert.deepEqual(diskAfterPatch.customNativeMeta, { wave: 2 });
+    assert.equal(diskAfterPatch.gate, 'npm test');
+
+    // Mode replace on native/hybrid preserves unknown native fields & goal.{title,line}
+    const replaced = writeSwarmPlan(dir, coordId, {
+      ifMatch: patched.etag,
+      mode: 'replace',
+      patch: {
+        goal: 'Replaced Line',
+        workstreams: [{ id: 'ws-1', title: 'Backend', owner: 'worker1', status: 'verified' }],
+      },
+    });
+    assert.equal(replaced.ok, true);
+    const diskAfterReplace = JSON.parse(readFileSync(join(swarmPath, 'plan.json'), 'utf-8'));
+    assert.deepEqual(diskAfterReplace.goal, { title: 'Native Title', line: 'Replaced Line' });
+    assert.deepEqual(diskAfterReplace.customNativeMeta, { wave: 2 });
+    assert.equal(diskAfterReplace.gate, undefined);
+    assert.equal(diskAfterReplace.workstreams[0].status, 'verified');
+
+    // Control-char and symlink escape rejections
+    const badCtrl = writeSwarmPlan(dir, coordId, {
+      ifMatch: replaced.etag,
+      mode: 'patch',
+      patch: { gate: 'npm\x00test' },
+    });
+    assert.equal(badCtrl.ok, false);
+    assert.equal(badCtrl.status, 400);
+
+    const outsidePlan = join(dir, 'outside-plan.json');
+    writeFileSync(outsidePlan, '{}');
+    rmSync(join(swarmPath, 'plan.json'));
+    symlinkSync(outsidePlan, join(swarmPath, 'plan.json'));
+    const symlinkRes = writeSwarmPlan(dir, coordId, {
+      ifMatch: '',
+      mode: 'patch',
+      patch: { gate: 'npm test' },
+    });
+    assert.equal(symlinkRes.ok, false);
+    assert.equal(symlinkRes.status, 403);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

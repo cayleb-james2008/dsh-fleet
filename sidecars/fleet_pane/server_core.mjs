@@ -238,11 +238,15 @@ export function createFleetHandlers({
     buildSwarmSnapshot,
     computeSwarmFingerprint,
     findAppDataDirs,
+    findCoordinatorConvId,
     getSwarmMetaKeys,
     listSwarms,
+    oneLine,
     resolveAllowedFrame,
     resolveConversationSwarm,
     unseenBy,
+    validatePlanPatch,
+    writeSwarmPlan,
   } = store;
   const assets = sharedAssets || loadDistAssets(distDir);
   let cachedDirs = { at: 0, dirs: null };
@@ -589,6 +593,96 @@ export function createFleetHandlers({
     return { status: 200, json: { ok: true, result } };
   }
 
+  function invalidateSwarmPayloadCache(swarmId) {
+    for (const [k, entry] of swarmPayloadCache.entries()) {
+      if (entry?.swarm === swarmId) swarmPayloadCache.delete(k);
+    }
+    swarmsListCache = { at: 0, key: '', sig: '', swarms: [], packed: null };
+  }
+
+  async function postPlan(body = {}) {
+    if (!body || typeof body !== 'object' || Array.isArray(body) || body.confirm !== true) {
+      return { status: 400, json: { error: 'Confirmation required (confirm: true)' } };
+    }
+    const conv = typeof body.conversationId === 'string' ? body.conversationId.trim() : '';
+    if (!conv || !ID_RE.test(conv)) {
+      return { status: 400, json: { error: 'Valid conversationId required' } };
+    }
+    if (body.ifMatch !== undefined && typeof body.ifMatch !== 'string') {
+      return { status: 400, json: { error: 'ifMatch must be a string' } };
+    }
+    const ifMatch = typeof body.ifMatch === 'string' ? body.ifMatch.trim() : '';
+    if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(ifMatch)) {
+      return { status: 400, json: { error: 'Control characters are not permitted in ifMatch' } };
+    }
+    const mode = body.mode === undefined ? 'patch' : body.mode;
+    if (mode !== 'patch' && mode !== 'replace') {
+      return { status: 400, json: { error: 'mode must be "patch" or "replace"' } };
+    }
+    if (body.notifyCoordinator !== undefined && typeof body.notifyCoordinator !== 'boolean') {
+      return { status: 400, json: { error: 'notifyCoordinator must be a boolean' } };
+    }
+    if (validatePlanPatch) {
+      const valid = validatePlanPatch(body.patch);
+      if (!valid.ok) return { status: valid.status || 400, json: { error: valid.error } };
+    }
+
+    const appDataDirs = getAppDirs();
+    const res = resolveConversationSwarm(appDataDirs, conv);
+    if (!res.swarm || !res.appData) {
+      return { status: 404, json: { error: 'Swarm not found' } };
+    }
+
+    const written = writeSwarmPlan(res.appData, res.swarm, {
+      ifMatch,
+      mode,
+      patch: body.patch,
+    });
+    if (!written.ok) {
+      if (written.status === 409) {
+        invalidateSwarmPayloadCache(res.swarm);
+        return {
+          status: 409,
+          json: {
+            error: written.error || 'plan changed on disk',
+            plan: written.plan || null,
+          },
+        };
+      }
+      return { status: written.status || 400, json: { error: written.error || 'Failed to write plan' } };
+    }
+
+    invalidateSwarmPayloadCache(res.swarm);
+
+    let notified = false;
+    if (body.notifyCoordinator === true && sendMessageFn) {
+      const coordId = findCoordinatorConvId ? findCoordinatorConvId(res.appData, res.swarm) : res.swarm;
+      if (coordId) {
+        try {
+          const summaryRaw = written.plan?.title || written.plan?.goal || 'plan.json';
+          const summary = oneLine ? oneLine(summaryRaw, 180) : String(summaryRaw).slice(0, 180);
+          await sendMessageFn(
+            coordId,
+            `[fleet-plan-updated] Plan updated (${written.plan?.schema || 'fleet'}, etag ${written.etag}): ${summary}`,
+          );
+          notified = true;
+        } catch {
+          notified = false;
+        }
+      }
+    }
+
+    return {
+      status: 200,
+      json: {
+        ok: true,
+        plan: written.plan,
+        etag: written.etag,
+        notified,
+      },
+    };
+  }
+
   function resolveStreamTarget(query = {}) {
     const appDataDirs = getAppDirs();
     const requestedConv = typeof query.conversationId === 'string' ? query.conversationId.trim() : '';
@@ -621,6 +715,7 @@ export function createFleetHandlers({
     getWorktreeDiff,
     getFrame,
     postNudge,
+    postPlan,
     resolveStreamTarget,
   };
 }
@@ -947,7 +1042,7 @@ export async function createStandaloneRouter({
       });
     }
 
-    if (req.method === 'POST' && pathname === '/api/nudge') {
+    function handleJsonPost(req, res, fn) {
       if (!isLoopbackOrigin(req.headers.origin)) {
         res.writeHead(403, { 'Content-Type': 'application/json', Connection: 'close', ...SECURITY_HEADERS });
         res.end(JSON.stringify({ error: 'forbidden origin' }));
@@ -960,6 +1055,7 @@ export async function createStandaloneRouter({
         res.end(JSON.stringify({ error: 'payload too large' }));
         return;
       }
+      wakeFromIdle();
       let bytes = 0;
       const chunks = [];
       let aborted = false;
@@ -986,11 +1082,21 @@ export async function createStandaloneRouter({
             return sendPacked(req, res, 400, packJsonPayload({ error: 'invalid JSON body' }));
           }
         }
-        const h = handlers || (await ensureHandlers());
-        const out = await h.postNudge(parsed);
-        sendPacked(req, res, out.status, packJsonPayload(out.json));
+        try {
+          const h = handlers || (await ensureHandlers());
+          const out = await fn(h, parsed);
+          sendPacked(req, res, out.status, packJsonPayload(out.json));
+        } catch (err) {
+          sendPacked(req, res, 500, packJsonPayload({ error: String(err?.message || err) }));
+        }
       });
-      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/nudge') {
+      return handleJsonPost(req, res, (h, body) => h.postNudge(body));
+    }
+    if (req.method === 'POST' && pathname === '/api/plan') {
+      return handleJsonPost(req, res, (h, body) => h.postPlan(body));
     }
 
     res.writeHead(404, { 'Content-Type': 'text/plain', ...SECURITY_HEADERS });
@@ -1092,6 +1198,22 @@ export async function runSidecarApp({ appDataDir = '' } = {}) {
   }, 'GET');
   app.api('/api/nudge', async (data) => {
     const out = await handlers.postNudge(data);
+    return new Response(JSON.stringify(out.json), { status: out.status, contentType: 'application/json', headers: SECURITY_HEADERS });
+  }, 'POST');
+  app.api('/api/plan', async (data) => {
+    let payload = data;
+    if (typeof data === 'string') {
+      try {
+        payload = JSON.parse(data);
+      } catch {
+        return new Response(JSON.stringify({ error: 'invalid JSON body' }), {
+          status: 400,
+          contentType: 'application/json',
+          headers: SECURITY_HEADERS,
+        });
+      }
+    }
+    const out = await handlers.postPlan(payload);
     return new Response(JSON.stringify(out.json), { status: out.status, contentType: 'application/json', headers: SECURITY_HEADERS });
   }, 'POST');
 

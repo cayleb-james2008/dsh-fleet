@@ -433,3 +433,177 @@ test('Zero-client idle sleep pauses background SSE polling on disconnect and wak
     rmSync(fx.dir, { recursive: true, force: true });
   }
 });
+
+test('POST /api/plan supports create/patch/replace via member or coordinator ID, CAS 409, Origin-403, 413, 400, and notifyCoordinator', async () => {
+  const fx = setupFixtureAppData();
+  const nudged = [];
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+    sendMessageFn: async (conv, msg) => {
+      nudged.push({ conv, msg });
+      return { ok: true };
+    },
+  });
+
+  try {
+    const postPlan = (body, headers = {}) =>
+      fetch(`${srv.url}/api/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify(body),
+      });
+
+    // 1. Origin-403 CSRF check
+    const badOrigin = await postPlan(
+      { confirm: true, conversationId: fx.coord, ifMatch: '', mode: 'patch', patch: { title: 'X' } },
+      { Origin: 'https://evil.example' },
+    );
+    assert.equal(badOrigin.status, 403);
+
+    // 2. Host-403 DNS rebinding check
+    const badHost = await new Promise((resolve, reject) => {
+      const sock = net.connect(srv.port, '127.0.0.1', () => {
+        sock.write(`POST /api/plan HTTP/1.1\r\nHost: evil.attacker.example\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}`);
+      });
+      const chunks = [];
+      sock.on('data', (c) => chunks.push(c));
+      sock.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+      sock.on('error', reject);
+    });
+    assert.ok(badHost.startsWith('HTTP/1.1 403'));
+
+    // 3. 413 payload > 64 KB cap (both Content-Length and streaming body)
+    const oversized = await postPlan({
+      confirm: true,
+      conversationId: fx.coord,
+      ifMatch: '',
+      mode: 'patch',
+      patch: { goal: 'a'.repeat(70 * 1024) },
+    });
+    assert.equal(oversized.status, 413);
+
+    // 4. 400 validation errors: missing confirm, bad mode, bad status, control chars
+    assert.equal((await postPlan({ conversationId: fx.coord, ifMatch: '', patch: { title: 'No confirm' } })).status, 400);
+    assert.equal((await postPlan({ confirm: true, conversationId: fx.coord, mode: 'drop', patch: { title: 'Bad mode' } })).status, 400);
+    assert.equal(
+      (
+        await postPlan({
+          confirm: true,
+          conversationId: fx.coord,
+          patch: { workstreams: [{ id: 'ws-1', title: 'Bad', owner: 'worker', status: 'bogus' }] },
+        })
+      ).status,
+      400,
+    );
+    assert.equal(
+      (
+        await postPlan({
+          confirm: true,
+          conversationId: fx.coord,
+          patch: { goal: 'Bad\x07bell' },
+        })
+      ).status,
+      400,
+    );
+
+    // 5. 404 unknown swarm
+    const missingSwarm = await postPlan({
+      confirm: true,
+      conversationId: '99999999-9999-4999-8999-999999999999',
+      ifMatch: '',
+      mode: 'patch',
+      patch: { title: 'Missing' },
+    });
+    assert.equal(missingSwarm.status, 404);
+
+    // 6. Create native-compatible plan when absent (ifMatch: "")
+    const createdRes = await postPlan({
+      confirm: true,
+      conversationId: fx.coord,
+      ifMatch: '',
+      mode: 'patch',
+      notifyCoordinator: false,
+      patch: {
+        goalTitle: 'HTTP Plan Title',
+        goalLine: 'HTTP Plan Line',
+        tasks: { worker: 'Build endpoint' },
+        threads: [{ id: 't-1', title: 'Main Thread', goal: 'Ship', tasks: ['worker'] }],
+      },
+    });
+    assert.equal(createdRes.status, 200);
+    const created = await createdRes.json();
+    assert.equal(created.ok, true);
+    assert.equal(created.notified, false);
+    assert.equal(created.plan.schema, 'native');
+    assert.equal(created.plan.goal, 'HTTP Plan Line');
+    assert.equal(created.etag, created.plan.etag);
+
+    // Immediate GET /api/swarm sees new plan without stale cache
+    const snapAfterCreate = await (await fetch(`${srv.url}/api/swarm?conversationId=${fx.coord}`)).json();
+    assert.equal(snapAfterCreate.plan?.goal, 'HTTP Plan Line');
+    assert.equal(snapAfterCreate.plan?.etag, created.etag);
+
+    // 7. Patch via worker conversationId with notifyCoordinator: true
+    const patchedRes = await postPlan({
+      confirm: true,
+      conversationId: fx.worker,
+      ifMatch: created.etag,
+      mode: 'patch',
+      notifyCoordinator: true,
+      patch: {
+        gate: 'npm test',
+        workstreams: [{ id: 'ws-1', title: 'Plan API', owner: 'worker', status: 'done' }],
+        milestones: [{ title: 'M1', status: 'done' }],
+        risks: [{ title: 'None', severity: 'low' }],
+      },
+    });
+    assert.equal(patchedRes.status, 200);
+    const patched = await patchedRes.json();
+    assert.equal(patched.ok, true);
+    assert.equal(patched.notified, true);
+    assert.equal(patched.plan.schema, 'hybrid');
+    assert.equal(patched.plan.goalTitle, 'HTTP Plan Title');
+    assert.equal(patched.plan.tasks.worker, 'Build endpoint');
+    assert.equal(nudged.length, 1);
+    assert.equal(nudged[0].conv, fx.coord);
+    assert.ok(nudged[0].msg.startsWith('[fleet-plan-updated]'));
+
+    // 8. Stale ifMatch produces 409 Conflict with latest normalized plan
+    const conflictRes = await postPlan({
+      confirm: true,
+      conversationId: fx.coord,
+      ifMatch: created.etag,
+      mode: 'patch',
+      patch: { gate: 'stale' },
+    });
+    assert.equal(conflictRes.status, 409);
+    const conflict = await conflictRes.json();
+    assert.equal(conflict.error, 'plan changed on disk');
+    assert.equal(conflict.plan.etag, patched.etag);
+
+    // 9. Mode replace with latest etag updates Fleet fields cleanly
+    const replaceRes = await postPlan({
+      confirm: true,
+      conversationId: fx.coord,
+      ifMatch: patched.etag,
+      mode: 'replace',
+      patch: {
+        goalLine: 'Final Plan Line',
+        workstreams: [{ id: 'ws-1', title: 'Plan API', owner: 'worker', status: 'verified' }],
+      },
+    });
+    assert.equal(replaceRes.status, 200);
+    const replaced = await replaceRes.json();
+    assert.equal(replaced.plan.goal, 'Final Plan Line');
+    assert.equal(replaced.plan.gate, '');
+    assert.deepEqual(replaced.plan.milestones, []);
+    assert.equal(replaced.plan.workstreams[0].status, 'verified');
+    assert.equal(replaced.plan.tasks.worker, 'Build endpoint');
+  } finally {
+    await srv.close();
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
