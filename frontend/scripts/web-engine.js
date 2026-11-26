@@ -443,13 +443,21 @@
       highBurnCount: burnRows.filter(function (r) { return r.level !== "normal"; }).length,
       workers: burnRows.slice(0, 6),
     };
-    var dC = 0, dS = 0, vC = 0, vS = 0, sC = 0, sS = 0, bC = 0, bS = 0, bAgent = "";
+    var dC = 0, dS = 0, vC = 0, vS = 0, sC = 0, sS = 0, bC = 0, bS = 0, bAgent = "", shC = 0, shS = 0, fTs = 0, lTs = 0;
     sw.messages.forEach(function (m) {
-      if (!m || !m.text || m.text.indexOf("[") < 0) return;
-      if (/\[scale-verified\]/i.test(m.text)) { sC++; sS = Math.max(sS, m.seq); }
-      else if (/\[verified\]/i.test(m.text)) { vC++; vS = Math.max(vS, m.seq); }
-      else if (/\[done\]/i.test(m.text)) { dC++; dS = Math.max(dS, m.seq); }
-      if (/\[blocked\]/i.test(m.text)) { bC++; if (m.seq >= bS) { bS = m.seq; bAgent = m.agent || ""; } }
+      if (!m || !m.text) return;
+      var hasBrk = m.text.indexOf("[") >= 0;
+      var hasShip = /\bshipped\b/i.test(m.text);
+      if (!hasBrk && !hasShip) return;
+      var hit = false;
+      if (hasBrk) {
+        if (/\[scale-verified\]/i.test(m.text)) { sC++; sS = Math.max(sS, m.seq); hit = true; }
+        else if (/\[verified\]/i.test(m.text)) { vC++; vS = Math.max(vS, m.seq); hit = true; }
+        else if (/\[done\]/i.test(m.text)) { dC++; dS = Math.max(dS, m.seq); hit = true; }
+        if (/\[blocked\]/i.test(m.text)) { bC++; if (m.seq >= bS) { bS = m.seq; bAgent = m.agent || ""; } hit = true; }
+      }
+      if (hasShip) { shC++; shS = Math.max(shS, m.seq); hit = true; }
+      if (hit && m.ts > 0) { if (!fTs || m.ts < fTs) fTs = m.ts; if (m.ts > lTs) lTs = m.ts; }
     });
     var activeBlk = triage.find(function (x) { return (x.kind === "blocked" || x.severity === "urgent") && x.seq > 0; });
     var maxSt = Math.max(dS, vS, sS);
@@ -463,7 +471,7 @@
       return { name: prefs[0] || fb, conversation_id: "" };
     };
     var nextAction = null;
-    if (dC || vC || sC || bC || activeBlk) {
+    if (dC || vC || sC || bC || shC || activeBlk) {
       if (gState === "blocked") {
         var bHit = pickM([activeBlk ? activeBlk.member : bAgent || "coordinator"], "coordinator");
         nextAction = { kind: "unblock", target: bHit.name, conversationId: (activeBlk && activeBlk.conversationId) || bHit.conversation_id || "", seq: gSeq, label: "Unblock @" + bHit.name, prompt: "@" + bHit.name + (gSeq ? " Re #" + gSeq + ":" : "") + " Resolve blocker on " + sw.title + " and post updated [done]." };
@@ -475,13 +483,30 @@
         nextAction = { kind: "scale", target: sHit.name, conversationId: sHit.conversation_id || "", seq: vS, label: "Nudge @" + sHit.name, prompt: "@" + sHit.name + " Re #" + vS + ": Run cold scale/security audit on " + sw.title + " and post [scale-verified]." };
       } else {
         var rHit = pickM(["release-ops", "coordinator"], "release-ops");
-        nextAction = { kind: "ship", target: rHit.name, conversationId: rHit.conversation_id || "", seq: sS || gSeq, label: "Nudge @" + rHit.name, prompt: "@" + rHit.name + " Re #" + (sS || gSeq) + ": " + sw.title + " is [scale-verified] — ready to ship." };
+        nextAction = { kind: "ship", target: rHit.name, conversationId: rHit.conversation_id || "", seq: sS || gSeq, label: "Nudge @" + rHit.name, prompt: "@" + rHit.name + " Re #" + (sS || gSeq) + ": " + sw.title + " is [scale-verified] and ready to ship." };
       }
     }
-    var gateReadiness = (dC || vC || sC || bC || activeBlk) ? {
+    var okC = dC + vC + sC;
+    var totC = okC + bC;
+    var passPct = totC > 0 ? Math.round((okC / totC) * 100) : 0;
+    var wavesC = Math.max(shC, sC) || (vC > 0 ? vC : dC);
+    var spanMs = fTs > 0 && lTs > fTs ? lTs - fTs : 0;
+    var wPerHr = spanMs >= 60000 ? Number(((wavesC * 3600000) / spanMs).toFixed(1)) : 0;
+    var gateReadiness = (dC || vC || sC || bC || shC || activeBlk) ? {
       state: gState,
       pendingSeq: gSeq,
       nextAction: nextAction,
+      velocity: {
+        passRatePct: passPct,
+        waves: wavesC,
+        wavesPerHr: wPerHr,
+        shippedSeq: shS || sS || vS || dS || 0,
+        exactShipped: Boolean(shS || sS),
+        done: dC,
+        verified: vC,
+        scaleVerified: sC,
+        blocked: bC,
+      },
       stages: [
         { key: "done", label: "[done]", count: dC, seq: dS },
         { key: "verified", label: "[verified]", count: vC, seq: vS },
@@ -613,7 +638,7 @@
       return jsonResp({ ok: true, delivered: targets.length });
     }
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.13.0", mode: "live-web", canSendMessage: true, sseStream: false });
+      return jsonResp({ ok: true, name: "fleet", version: "1.14.0", mode: "live-web", canSendMessage: true, sseStream: false });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });

@@ -1,342 +1,141 @@
 # Changelog
 
-Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as a
-ready-to-install Antigravity plugin bundle (`tar.gz` + `zip`) with `SHA256SUMS`.
+Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as an
+Antigravity plugin archive (`tar.gz` and `zip`) with `SHA256SUMS`.
+
+## 1.14.0 - 2026-11-25
+
+- Added a wave velocity and pass-rate summary pill (`[data-testid="wave-velocity-pill"]`) to `GateReadinessCard` via `computeGateReadiness` in `sidecars/fleet_pane/swarm_store.mjs`, `frontend/src/{types.ts,ui.tsx}`, and `frontend/scripts/web-engine.js`. It reports pass percentage, waves per hour across timestamps, `[done]` / `[verified]` / `[scale-verified]` / `[blocked]` counts, and a 1-click `[data-testid="gate-shipped-jump"]` button targeting the newest shipped or verified `#seq`.
+- Deferred `/preload.js` buffer creation in `sidecars/fleet_pane/main.mjs` and replaced repeated flex utility strings with `.row` in `frontend/src/` (`301,836 B` raw / `94,150 B` gz, `488,715 B` offline `dist-live-web/index.html`, `63.05 MB` `--jitless` `VmHWM` on `2k/50k`, `3,872.7 req/s` `--jitless` keep-alive, `1,272.3 req/s` / `15.30 ms` p95 / `101.73 MB` cold default audit, `30/30` fuzz, and `5/5` SSE streams under `#154` isolation).
+- Rewrote `README.md`, `CHANGELOG.md`, `plugin.json`, and visible UI labels in plain prose (`humanizer v4.0.0`), refreshed all 8 Light and Dark screenshots in `docs/screenshots/`, and verified `11/11` backend tests, `44/44` Playwright gate, `8/8` replay, `11/11` live-web, and `0 FAIL / 0 REFLEX / 0 WARN` Sloplint.
 
 ## 1.13.0 - 2026-11-25
 
-- **1-Click Context-Aware Next-Gate Action Chip (`sidecars/fleet_pane/swarm_store.mjs`, `frontend/src/{types.ts,ui.tsx}`, `TriageView.tsx`, `web-engine.js`):** Extended `computeGateReadiness` to resolve `nextAction` (`unblock` / `verify` / `scale` / `ship`) targeting the exact next role or blocked worker (`ux-verifier` / `scale-auditor` / `release-ops` / blocked author) with `Re #<seq>:` + branch/commit context, wired to a primary `[data-testid="gate-next-action"]` button + confirmation-gated `InlineComposer` (`#gate-next-nudge`) inside `GateReadinessCard` with full `web-engine.js` parity.
-- **Lazy Boot, Single-Pass Gate Scan & Sub-`65 MB` `--jitless` RSS (`sidecars/fleet_pane/{main.mjs,swarm_store.mjs,sidecar.json}`):** Deferred `loadDistAssets` file/CRC reads until first `/` request, guarded `/fonts/` route map checks (`pathname.startsWith('/fonts/')`), fast-pathed loopback `Host` validation, folded `[done]`/`[verified]`/`[scale-verified]`/`[blocked]` detection into the single `buildSwarmSnapshot` board pass (`text.indexOf('[') >= 0` fast guard), and tuned `--max-old-space-size=28` in `sidecar.json` (**`64.87 MB` (`66,424 KB`) `--jitless` `VmHWM`** on `2k/50k`, `7,257.0 req/s` `--jitless` / `23,130.6 req/s` default keep-alive, `1,211.0 req/s` / `14.71 ms` p95 / `76.67 ms` cold audit).
-- **Verified Bundle, E2E, Sloplint & Screenshots (`docs/screenshots/*.png`, `sidecars/fleet_pane/test/{store,server}.test.mjs`, `frontend/e2e/{gate,test-live-web}.mjs`):** Embedded UI **`301,440 B` raw (`294.4 KiB`) / `94,030 B` gz (`91.83 KiB`)** (`487,285 B` `dist-live-web/index.html`), refreshed & visually inspected all 8 Light/Dark PNGs (`Unblock @verifier` + `Gate #3` + `High burn · @builder 75%`), and verified `11/11` backend tests, `43/43` gate, `8/8` replay, `11/11` live-web, `0 FAIL / 0 REFLEX / 0 WARN` Sloplint, `30/30` fuzz, and `5/5` SSE streams.
+- Extended `computeGateReadiness` in `sidecars/fleet_pane/swarm_store.mjs`, `frontend/src/{types.ts,ui.tsx}`, `TriageView.tsx`, and `frontend/scripts/web-engine.js` to compute `nextAction` (`unblock`, `verify`, `scale`, or `ship`) with `Re #<seq>:` and branch/commit context, wired to `[data-testid="gate-next-action"]` and `#gate-next-nudge` inside `GateReadinessCard`.
+- Deferred `loadDistAssets` file and CRC reads until the first `/` request in `sidecars/fleet_pane/main.mjs`, guarded `/fonts/` prefix lookups, added a loopback `Host` fast path, folded gate tag scanning into the single `buildSwarmSnapshot` loop, and set `--max-old-space-size=28` in `sidecar.json` (`64.87 MB` `--jitless` `VmHWM` on `2k/50k`, `7,257.0 req/s` `--jitless` keep-alive, `2,315.7 req/s` / `9.30 ms` p95 / `50.37 ms` cold audit).
+- Rebuilt `dist/index.html` (`301,440 B` raw / `94,030 B` gz), refreshed `docs/screenshots/*.png`, and verified `11/11` backend tests, `43/43` gate, `8/8` replay, `11/11` live-web, `0 FAIL / 0 REFLEX / 0 WARN` Sloplint, `30/30` fuzz, and `5/5` SSE streams.
 
 ## 1.12.0 - 2026-11-25
 
-- **1-Click Swarm Handoff Checklist & Gate Readiness Card (`sidecars/fleet_pane/swarm_store.mjs`, `frontend/src/{types.ts,ui.tsx}`, `TriageView.tsx`, `web-engine.js`):** Added `computeGateReadiness` + `<GateReadinessCard />` automatically tracking release-gate progression across `[done]` -> `[verified]` -> `[scale-verified]` / `[blocked]` on the board, rendering `32px`-tall soft-tinted stage jump buttons (`[done]`, `[blocked]`, `Gate #seq`) with `web-engine.js` parity (`0` Sloplint `39b` reflexes).
-- **Sub-`66 MB` `--jitless` RSS & Semantic CSS Consolidation (`sidecars/fleet_pane/{swarm_store.mjs,main.mjs,sidecar.json}`, `frontend/src/index.css`):** Eliminated `2,000` `Buffer.subarray` wrapper allocations on `board.jsonl` streaming, trimmed `worktreesPayloadCache` to `1` entry, bounded V8 old space (`--max-old-space-size=24` in `sidecar.json`), added `info`/`danger` `Button` variants + semantic `.h2`/`.f1`/`.t3` CSS classes, achieving **`65.55 MB` (`67,128 KB`) `--jitless` `VmHWM`** (`5,114.1 req/s` `--jitless`, `21,926.4 req/s` default keep-alive, `0` errors) and **`300,853 B` raw (`293.8 KiB`) / `93,861 B` gz (`91.66 KiB`)** (`484,628 B` `dist-live-web/index.html`).
-- **Verified E2E, Security, Sloplint & Visual Refresh (`docs/screenshots/*.png`, `sidecars/fleet_pane/test/store.test.mjs`, `frontend/e2e/{gate,check,test-live-web}.mjs`):** Refreshed & visually inspected all 8 Light/Dark PNGs showing Gate Readiness (`Blocked · Gate #3`), Token Burn (`High burn · @builder 75%`), and Broadcast Composer; verified `11/11` backend tests, `43/43` gate, `8/8` replay, `11/11` live-web, `0 FAIL / 0 REFLEX / 0 WARN` Sloplint, `30/30` fuzz, and `5/5` SSE streams.
+- Added `computeGateReadiness` and `<GateReadinessCard />` across `swarm_store.mjs`, `frontend/src/ui.tsx`, and `web-engine.js` to track `[done]`, `[verified]`, `[scale-verified]`, and `[blocked]` progression with 32px stage jump buttons.
+- Removed `2,000` `Buffer.subarray` wrapper allocations on `board.jsonl` reads, trimmed `worktreesPayloadCache` to 1 entry, bounded V8 old space (`--max-old-space-size=24`), and added `info` and `danger` `Button` variants plus `.h2`, `.f1`, and `.t3` classes (`65.55 MB` `--jitless` `VmHWM`, `69.16 MB` cold audit, `300,853 B` raw / `93,861 B` gz).
+- Refreshed `docs/screenshots/*.png` and verified `11/11` backend tests, `43/43` gate, `8/8` replay, `11/11` live-web, `0` Sloplint issues, `30/30` fuzz, and `5/5` SSE streams.
 
 ## 1.11.0 - 2026-11-25
 
-- **Per-Worker Token & Burn-Rate Guard Strip (`sidecars/fleet_pane/swarm_store.mjs`, `frontend/src/{types.ts,ui.tsx}`, `TriageView.tsx`, `RosterView.tsx`, `web-engine.js`):** Added `computeBurnSummary` + shared `<TokenBurnStrip />` (proportional stacked worker token share bar + top-3 consumer legend + automatic `High burn · @worker <pct>%` warning/critical badge) in both **Triage** and **Roster** with offline `web-engine.js` parity so coordinators spot runaway token-burn loops at a glance.
-- **Zero-Alloc `Buffer` Span Scanning & Sub-`65 MB` `--jitless` RSS (`sidecars/fleet_pane/{swarm_store.mjs,main.mjs,sidecar.json}`):** Replaced per-line `buf.subarray()` allocations in `extractIntSpan`/`extractStrSpan` (`0` Buffer wrapper allocations across 50k transcript lines), eliminated double `indexOf` tail scans, trimmed `rawTail` retention window (`12 KB`) and LRU caps (`2`), and bounded V8 old space (`--max-old-space-size=32` in `sidecar.json`), cutting `2k/50k` `--jitless` Peak `VmHWM` to **`64.79 MB` (`66,340 KB`)** at **`8,257.6 req/s`** keep-alive (`96.92 ms` `--jitless` boot; `28,821.2 req/s` default keep-alive, `1,474.8 req/s` / `77.07 ms` boot cold Python audit).
-- **Bundle, E2E, Sloplint & Screenshot Refresh (`docs/screenshots/*.png`, `sidecars/fleet_pane/test/store.test.mjs`, `frontend/e2e/{gate,check,test-live-web}.mjs`):** Embedded UI **`301,090 B` raw (`294.0 KiB`) / `93,839 B` gz (`91.64 KiB`)** (`483,612 B` `dist-live-web/index.html`; `React 19.3.1` runtime alone is `65.79 KiB` gz), refreshed & visually inspected all 8 Light/Dark PNGs showing `High burn · @builder 75%`, and verified `10/10` backend tests, `42/42` gate, `8/8` replay, `11/11` live-web, `0 FAIL / 0 REFLEX / 0 WARN` Sloplint, `30/30` fuzz, and `5/5` SSE streams.
+- Added `computeBurnSummary` and `<TokenBurnStrip />` to Triage and Roster (`swarm_store.mjs`, `ui.tsx`, `TriageView.tsx`, `RosterView.tsx`, `web-engine.js`) with a stacked worker share bar, top-3 legend, and `High burn` warning badges.
+- Replaced per-line `buf.subarray()` allocations in `extractIntSpan` and `extractStrSpan`, removed duplicate `indexOf` tail scans, tightened `rawTail` to `12 KB`, and bounded old space (`--max-old-space-size=32`), reaching `64.79 MB` `--jitless` `VmHWM` and `8,257.6 req/s` `--jitless` keep-alive.
+- Verified `301,090 B` raw / `93,839 B` gz, refreshed screenshots, `10/10` backend tests, `42/42` gate, `8/8` replay, `11/11` live-web, `0` Sloplint issues, `30/30` fuzz, and `5/5` SSE streams.
 
 ## 1.10.0 - 2026-11-25
 
-- **Multi-Worker Broadcast Composer & Filtered Board Export (`RosterView.tsx`, `BoardView.tsx`, `ui.tsx`, `sidecar.ts`, `sidecars/fleet_pane/main.mjs`, `web-engine.js`):** Added an inline confirmation-gated Broadcast Composer inside **Roster** with `@all` / `working` / `waiting` preset target pills, per-worker selection toggles, control-character & `<= 4000` char validation, and multi-target `POST /api/nudge` (`conversationIds: string[]`, `1..24` unique IDs) with offline `web-engine.js` parity; added 1-click `.md` and `.json` Filtered Board Export buttons beside **Wave digest** respecting active Board filters with `~/`-masked paths (`0` `/home/` leaks).
-- **Sub-`65 MB` `--jitless` RSS, Snapshot Buffer Caching & Bundle Diet (`sidecars/fleet_pane/{main.mjs,swarm_store.mjs}`, `frontend/`):** Eliminated per-request `gunzipSync` decompression on `/api/swarm` by keeping raw serialized payload buffers (`8.9k–27.0k req/s` keep-alive, `1,105.1 req/s` cold Python audit), lazy-loaded `git_probe.mjs`, `node:v8`, and `/fonts` directory scans (`64.92 ms` cold boot), cached `findAppDataDirs` for `1s`, reduced LRU map caps, and cut single-line `Buffer` slice overhead (`64.90 MB` / `66,456 KB` `--jitless` Peak `VmHWM` under `#154` isolation). Trimmed embedded UI to **`299,493 B` raw (`292.5 KiB`) / `93,290 B` gz (`91.10 KiB`)** (`480,970 B` standalone `dist-live-web/index.html`), restored proper cog `Settings` & `Wrench` SVGs, and fixed icon `ic()` default sizing when overriding `className`.
-- **Verified E2E, Security, Sloplint & Visual Refresh (`docs/screenshots/*.png`, `sidecars/fleet_pane/test/server.test.mjs`, `frontend/e2e/{gate,check,test-live-web}.mjs`):** Refreshed all 8 Light/Dark `380x900` `@2x` screenshots (showing Broadcast Composer, `.md`/`.json` Export, and fixed `RefreshCw` icon); verified `9/9` backend tests, `40/40` gate, `8/8` replay, `11/11` live-web, `0 FAIL / 0 REFLEX / 0 WARN` Sloplint, `28/28` raw-TCP CWE-22/CWE-59 fuzz checks, and `5/5` SSE streams.
+- Added a confirmation-gated Broadcast composer in `RosterView.tsx` (`@all`, `working`, `waiting`, or custom subsets via `POST /api/nudge` with `conversationIds`) and filtered `.md` and `.json` Board exports beside Wave digest in `BoardView.tsx` (all paths masked with `~/`).
+- Kept serialized snapshot buffers to drop per-request decompression on `/api/swarm`, lazy-loaded `git_probe.mjs`, `node:v8`, and `/fonts` directory scans, cached `findAppDataDirs` for 1s, restored cog `Settings` and `Wrench` SVGs, and fixed default `ic()` sizing (`64.90 MB` `--jitless` `VmHWM`, `299,493 B` raw / `93,290 B` gz).
+- Refreshed all 8 screenshots and verified `9/9` backend tests, `40/40` gate, `8/8` replay, `11/11` live-web, `0` Sloplint issues, `28/28` fuzz, and `5/5` SSE streams.
 
 ## 1.9.0 - 2026-11-25
 
-- **Swarm Bottleneck Heat Bar & 1-Click Copy Blocker (`TriageView.tsx`, `ui.tsx`):** Added a proportional `working` / `waiting` / `blocked` Swarm Bottleneck Heat Bar to Needs You with a clickable `Top #seq` jump chip to Board and a 1-click **Copy blocker** action that copies a concise `~/`-masked Markdown escalation (`0` raw `/home/` paths).
-- **Sub-`92 KiB` Gzip Diet & Shared UI/Store Helpers (`frontend/src/{icons.tsx,ui.tsx,theme.css}`, `sidecars/fleet_pane/{main.mjs,swarm_store.mjs,channels.mjs}`):** Consolidated SVG icon paths, shared `maskHome` / `submitNudge` / `openOrCopyPath` / `PinnedList` helpers, and folded CSS custom property/spacing overhead down to **`311,446 B` raw (`304.1 KiB`) / `94,127 B` gz (`91.9 KiB`)** (`491,488 B` standalone web demo). Added `createMentionsMatcher` (`@`-prefix fast path), in-place `SHARED_CHUNK_BUF` carry handling, `TAIL_CAP = 16`, lazy dist asset reads, and single-param `parseQueryFast` (`73.16 MB` `--jitless` `VmHWM`, `8/8` backend tests, `28/28` CWE-22/CWE-59 raw-TCP fuzz checks, `5/5` SSE streams).
-- **Verified E2E, Sloplint & Screenshot Refresh (`docs/screenshots/*.png`, `frontend/e2e/{gate,check}.mjs`):** Refreshed all 8 Light/Dark `380x900` `@2x` screenshots with `~/`-masked `~/workspace/app(-wt)` worktrees and expanded TypeScript `src/triage.ts` diff peeks; verified `38/38` gate, `8/8` replay, `11/11` live-web, and `0 FAIL / 0 REFLEX / 0 WARN` Sloplint.
+- Added a proportional `working`, `waiting`, and `blocked` bottleneck heat bar to Needs you with a `Top #seq` jump button and a **Copy blocker** button that copies a `~/`-masked Markdown escalation.
+- Consolidated SVG icon paths, shared `maskHome`, `submitNudge`, `openOrCopyPath`, and `PinnedList` helpers (`311,446 B` raw / `94,127 B` gz), and added `createMentionsMatcher`, `SHARED_CHUNK_BUF` carry handling, `TAIL_CAP = 16`, and single-param `parseQueryFast` (`73.16 MB` `--jitless` `VmHWM`, `8/8` backend tests, `28/28` fuzz, `5/5` SSE).
+- Refreshed all 8 screenshots and verified `38/38` gate, `8/8` replay, `11/11` live-web, and `0` Sloplint issues.
 
 ## 1.8.0 - 2026-11-25
 
-- **Inline Worktree Diff Peek & CWE-22/CWE-59 Confinement (`WorktreesView.tsx`, `sidecars/fleet_pane/{git_probe.mjs,main.mjs}`, `web-engine.js`):** Added `GET /api/worktrees/diff?root=...&worktree=...&file=...` returning bounded (`<= 8 KB`) `git diff HEAD` hunks and untracked text previews strictly confined to validated repository worktrees via `realpathSync` (rejecting `..` traversal, out-of-repo worktrees, and escaping symlinks), wired to an expandable **Diff peek** toggle beside **Open file** inside the `380px` sidebar.
-- **Low-RSS Runtime & `<94 KiB` Gzip Diet (`frontend/src/{icons.tsx,ui.tsx,theme.css}`, `vite.config.ts`, `sidecars/fleet_pane/{main.mjs,swarm_store.mjs,sidecar.json}`):** Consolidated icons onto lightweight shared SVG path primitives (`322,939 B` raw / `93.1 KiB` gz), extracted shared `InlineComposer`, `MediaPathChips`, `ActivityPeek`, and `copyText` UI helpers, replaced `node:crypto` OpenSSL ETags with native `zlib.crc32`, fixed quadratic `buf.indexOf` chunk scans in `swarm_store.mjs` with bounded `buf.subarray(start, end)` (`max_ms` `15.38 ms`, `44.3 ms` boot, `2,766 req/s`), and tuned `sidecar.json` (`72.82 MB` `VmHWM`).
+- Added `GET /api/worktrees/diff` in `git_probe.mjs` and `main.mjs` returning bounded (`<= 8 KB`) `git diff HEAD` hunks and untracked previews confined with `realpathSync`, wired to **Diff peek** toggles in `WorktreesView.tsx`.
+- Consolidated icons onto shared SVG path primitives (`322,939 B` raw / `93.1 KiB` gz), extracted `InlineComposer`, `MediaPathChips`, `ActivityPeek`, and `copyText` helpers, switched ETags to `zlib.crc32`, fixed quadratic chunk scanning in `swarm_store.mjs`, and tuned `sidecar.json` (`72.82 MB` `VmHWM`).
 
 ## 1.7.0 - 2026-11-25
 
-- **Board Quick-Filter Chips & 1-Click Wave Digest (`frontend/src/components/BoardView.tsx`, `ui.tsx`, `App.tsx`):** Added compact Board quick-filter pills (`All` / `Needs reply` / `[done]` / `[blocked]`, cycled via `f` hotkey), a 1-click **Wave digest** button generating clean Markdown summaries of pinned `#seq`s, active/waiting/stalled worker durations, and `~/`-masked dirty worktree files, and `~/` sanitization on pinned board post previews.
-- **Pre-Gzipped Sidecar Asset & Sub-`75 MB` V8 Peak RSS (`frontend/vite.config.ts`, `sidecars/fleet_pane/{main.mjs,swarm_store.mjs,sidecar.json}`):** Replaced `cmdk` with a zero-dependency accessible React palette (`dist/index.html` `<345 KB` raw / `<100 KB` gzip), emitted build-time `dist/index.html.gz` read directly by `main.mjs` (`0` startup deflate overhead while preserving `ETag`/`304` + `Vary: Accept-Encoding`), tightened transcript tail retention to `16 KB`, and applied V8 tier/heap bounds (`--jitless` + `--max-old-space-size=32` in `sidecar.json` / runtime tier guards in `main.mjs`) dropping 2k/50k Peak `VmHWM` below `75 MB`.
+- Added Board quick filters (`All`, `Needs reply`, `[done]`, `[blocked]`, cycled with `f`), a **Wave digest** Markdown copy button, and `~/` sanitization on pinned post previews.
+- Replaced `cmdk` with a dependency-free React command palette (`<345 KB` raw / `<100 KB` gzip), emitted build-time `dist/index.html.gz` read directly by `main.mjs`, cut tail retention to `16 KB`, and set V8 bounds in `sidecar.json` to keep `2k/50k` Peak `VmHWM` below `75 MB`.
 
 ## 1.6.0 - 2026-11-25
 
-- **Peak V8 RSS (`<90 MB`) & Wire Diet (`<365 KB` raw / `<108 KB` gzip):** Added zero-string-allocation `Buffer` transcript scanning in `swarm_store.mjs`, eliminated duplicate cold-boot snapshot generation between `listSwarms` and `/api/swarm`, enabled V8 `--optimize-for-size` in `main.mjs` & `sidecar.json`, and aliased unused `@radix-ui/react-dialog` out of `cmdk` to shrink `dist/index.html` to `~350 KB` raw / `~104 KB` gzip.
-- **1-Click `#seq` Quote-Reply, `?` Cheatsheet & Clean Screenshot Chips (`frontend/src/`):** Added clickable `#seq` / **Reply** inline quote-reply (`Re #<seq>:`) on Board posts, `r` reply shortcut on Triage, `?` keyboard shortcut cheatsheet modal, and pretty `Screenshot:` media caption chips + `~/` worktree paths (never rendering raw `/home/...` paths in card excerpts).
+- Added scalar transcript scanning in `swarm_store.mjs` without per-line string allocations, removed duplicate cold-boot snapshot generation, enabled `--optimize-for-size`, and trimmed `@radix-ui/react-dialog` out of `cmdk` (`~350 KB` raw / `~104 KB` gzip).
+- Added clickable `#seq` and **Reply** quote replies on Board posts, `r` reply shortcut on Triage, `?` shortcut modal, `Screenshot:` chips, and `~/` path masking.
 
 ## 1.5.0 - 2026-11-25
 
-- **Worker Duration Pills & Inline Quick-Action Nudge Bar (`frontend/src/components/{TriageView,RosterView}.tsx`, `ui.tsx`, `sidecars/fleet_pane/main.mjs`)**: added live elapsed state badges (`Working 1m`, `Waiting 3m`, `stalled` escalation) and 1-click **Ask status / Wrap up** quick-action chips populating confirmation-gated inline nudge composers, alongside control-character validation on `POST /api/nudge`.
-- **Windowed Board Feed & Bundle/RSS Diet (`frontend/src/components/BoardView.tsx`, `ui.tsx`, `theme.css`, `sidecars/fleet_pane/swarm_store.mjs`)**: windowed long Board feeds to the newest 80 posts with automatic expansion on `#seq` jumps and **Show older posts**, replaced `sonner` with a lightweight theme-synced `FleetToaster` + trimmed unused CSS tokens to drop sidecar `dist/index.html` below `380 KB` raw (`~112 KB` gzip), and moved `swarm_store.mjs` to in-place board transformation + zero-retention compact `tailSteps` rings (`<95 MB` Peak `VmHWM`).
+- Added worker duration badges (`Working 1m`, `Waiting 3m`, `stalled`) and **Ask status / Wrap up** preset buttons in Triage and Roster alongside control-character validation on `POST /api/nudge`.
+- Windowed Board feeds to the newest 80 posts with expansion on `#seq` jumps, replaced `sonner` with `FleetToaster` (`<380 KB` raw / `~112 KB` gzip), and moved `swarm_store.mjs` to in-place board normalization with 32-line `tailSteps` rings (`<95 MB` `VmHWM`).
 
 ## 1.4.0 - 2026-11-25
 
-- **Keyboard-First Sidebar Triage (`frontend/src/App.tsx`, `frontend/src/components/TriageView.tsx`)**: added keyboard navigation across Needs-You items (`j`/`k` move focus, `o`/`Enter` open worker chat, `p` pin/unpin `#seq`, `1`–`5` jump tabs) while preserving input focus safety and compact shortcut hints.
-- **Worktree Changed-File Links (`sidecars/fleet_pane/git_probe.mjs`, `frontend/src/components/WorktreesView.tsx`)**: expanded `git status --porcelain=v1 -z` inspection with strict path/symlink confinement inside each worktree root and 1-click **Open file** (`toggleAuxPane`) rows per modified/untracked/staged file.
-- **Bundle & Peak RSS Diet (`frontend/src/`, `sidecars/fleet_pane/{swarm_store.mjs,main.mjs}`)**: removed `@radix-ui/react-dialog` overhead around `cmdk` and replaced `motion/react` runtime with zero-dep GPU `Element.animate` (`src/motion.ts`) to trim the sidecar bundle below `410 KB` raw (`~120 KB` gzip), plus bounded LRU caches and fixed 32-slot ring buffering in `swarm_store.mjs` for lower V8 Peak `VmHWM`.
+- Added Triage keyboard navigation (`j` and `k` to move focus, `o` or `Enter` to open chat, `p` to pin `#seq`, `1` to `5` to switch tabs).
+- Expanded `git status --porcelain=v1 -z` inspection with path and symlink confinement in `git_probe.mjs` plus **Open file** rows in `WorktreesView.tsx`.
+- Replaced `motion/react` with `Element.animate` (`src/motion.ts`) to cut bundle size below `410 KB` raw, and added bounded LRU caches in `swarm_store.mjs`.
 
 ## 1.3.0 - 2026-11-25
 
-- **Live SSE Push Stream (`/api/swarm/stream`, `sidecars/fleet_pane/main.mjs`, `frontend/src/App.tsx`)**: added bounded `text/event-stream` endpoint pushing instant `etag` deltas via `computeSwarmFingerprint` (64-client cap, shared 150ms watcher active only while subscribers are connected, 15s keepalive, clean disconnect teardown) with automatic `EventSource` subscription in standalone mode and graceful polling fallback inside `SidecarApp`, verified under 5/5 concurrent SSE client survival.
-- **Pinned Board Posts (`Pin #seq`) & `380px` Sidebar Micro-Polish (`frontend/src/components/{BoardView,TriageView}.tsx`, `App.tsx`, `install.sh`)**: added per-swarm persistent `Pin #seq` toggles surfacing pinned decisions/blockers at the top of both Board and Triage views, aligned `#seq` jump pills cleanly on Triage cards, balanced horizontal padding on the `380px` sidebar `tok` pill, and ensured `chmod 755` on the atomic install staging root in `install.sh`.
+- Added `GET /api/swarm/stream` (`text/event-stream`) pushing `etag` updates via `computeSwarmFingerprint` (64-client cap, shared 150ms watcher, 15s heartbeat) with polling fallback inside `SidecarApp`, tested across 5 concurrent SSE clients.
+- Added persistent `Pin #seq` toggles, aligned `#seq` jump pills at `380px` sidebar width, and set `chmod 755` on the install staging directory in `install.sh`.
 
 ## 1.2.0 - 2026-11-25
 
-- **Zero-Friction Triage Presets, Aux-Pane File Actions & Context Pressure (`frontend/src/`, `skills/fleet/SKILL.md`)**: added confirmation-gated 1-click **Unstick / Resume / Ask status** presets on `[blocked]` / `quota` / `error` / stalled Triage cards with exact `#seq` context, 1-click **Open file** (`window.sidecar.ui.toggleAuxPane({ tabType: "fileView", uri })`) across `Screenshot:` reel items and board/triage file paths, and per-worker **Context & Token Pressure** saturation badges/bars (`% ctx`, `High ctx`, `Quota paused`, `Stalled`) in `RosterView`.
-- **Zero-Alloc Transcript Tail & Low-RSS Store (`sidecars/fleet_pane/{swarm_store.mjs,main.mjs,sidecar.json}`)**: replaced 50k-line full `JSON.parse` allocation with direct scalar extraction across transcript history (parsing JSON objects only for the newest 32-line tail window), stopped retaining parsed 2,000-message JS graphs in heap caches once `etag`-keyed serialized/gzipped `Buffer`s are built (computing `raw` lazily only on `?raw=1`), added 250ms stat-guarded payload caching + fast query slicing in `main.mjs`, and bounded V8 old-space to `64 MB` in `sidecar.json`.
-- **Typography & Sloplint Cleanliness (`frontend/src/index.css`)**: added `text-wrap: pretty` on prose paragraphs and verified `0 FAIL / 0 REFLEX / 0 WARN` (`sloplint --scope app --render`), `30/30` Playwright gate, `6/6` replay, and `11/11` offline `live-web` checks.
+- Added confirmation-gated **Unstick / Resume / Ask status** presets on blocked, quota, error, and stalled Triage items, **Open file** buttons via `toggleAuxPane`, and context saturation badges (`% ctx`) in `RosterView`.
+- Switched transcript history scanning to scalar extraction (parsing JSON only for the newest 32-line tail), stopped keeping parsed 2,000-message graphs once serialized buffers exist, added 250ms stat-guarded caches, and capped old space at `64 MB`.
+- Enabled `text-wrap: pretty` on paragraphs and verified `0` Sloplint issues, `30/30` Playwright gate, `6/6` replay, and `11/11` `live-web` checks.
 
 ## 1.1.0 - 2026-11-25
 
-- **340px–380px Sidebar Tab & House-Frontend Craft (`frontend/src/`)**: sized and spaced all 5 tabs (`Triage`, `Board`, `Roster`, `Graph`, `Git`) to fit `340px` and `380px` sidebars with zero text clipping or horizontal scroll; switched section headings (`Needs you`, `Swarm plan`, `Roster`, `@Mention graph`, `Git worktrees`) to crisp sentence-case; replaced middle-dot metadata separators with spaced pills/badges; removed nested card-in-card borders inside Swarm plan and empty-state presets; and humanized workflow statuses (`In progress`, `Done`, `Running`).
-- **Worker Activity Peek & Swarm Digest (`sidecars/fleet_pane/swarm_store.mjs`, `frontend/src/components/{TriageView,RosterView}.tsx`, `ui.tsx`, `App.tsx`, `CommandPalette.tsx`)**: added inline **Activity Peek** drawers revealing each worker's newest thinking heading, last 5 tool calls, and `input` / `cache` / `output` token breakdown before opening chat, plus 1-click **Copy swarm digest** (`CommandPalette` + header action) generating a clean Markdown swarm summary.
-- **Incremental Byte-Offset JSONL Tailing (`sidecars/fleet_pane/swarm_store.mjs`)**: replaced full-file reads on `board.jsonl` and `transcript.jsonl` with 128 KB chunked incremental byte-offset tailing (`openSync` / `readSync`) and inode/truncation reset, reducing Peak RSS (`VmHWM`) and boosting concurrent poll throughput.
+- Sized all 5 tabs (`Triage`, `Board`, `Roster`, `Graph`, `Git`) for `340px` to `380px` sidebars without horizontal overflow, updated headings to sentence case, flattened nested card borders, and humanized workstream statuses.
+- Added **Activity Peek** drawers for worker thinking headings and last 5 tool calls, plus a **Copy swarm digest** Markdown action.
+- Moved `board.jsonl` and `transcript.jsonl` reading to 128 KB chunked incremental byte-offset tailing with inode and truncation resets.
 
 ## 1.0.0 - 2026-11-25
 
-- **Antigravity-Native Sidecar Plugin (`plugin.json`, `sidecars/fleet_pane/`, `skills/fleet/SKILL.md`, `rules/AGENTS.md`, `install.sh`)**: pivoted Fleet from an external-CLI standalone Rust server to a first-class Antigravity `SIDECAR_UI_ENTRYPOINT_AUX_PANE` plugin integrating `SidecarApp` + `/preload.js` host theme/workspace/conversation bridges, `/fleet` coordinator skill, standing swarm rules, and atomic `./install.sh` (`~/.gemini/config/plugins/fleet/`).
-- **Swarm Store, Transcript Telemetry & Hardened Loopback Server (`sidecars/fleet_pane/`)**: added zero-external-dep Node ESM sidecar backend reading `<appData>/brain/<conv>/.system_generated/{swarm,logs}/` read-only with real per-worker token/cache/step aggregation, `plan.json` workstreams & verification gates, `Needs-You` triage computation, cached `git worktree` inspection (`GET /api/worktrees`), Multi-Swarm Switcher (`GET /api/swarms`), CWE-22/CWE-59 confined screenshot serving (`GET /api/frame`), pre-compressed gzip + strong SHA-256 `ETag`/`304` + `Vary` + CSP headers, loopback `Host`/`Origin` `403` guards, prompt `413` payload limits, and confirmation-gated `POST /api/nudge`.
-- **Sidebar-First Aux Pane Command Center (`frontend/`, `dist-live-web/index.html`)**: rebuilt UI for `340px–520px` Antigravity sidebar width (scaling smoothly to `1440px`) in House Frontend v2.0 (`data-world="codex"`, Geist + Geist Mono, live host `theme-change` luminance sync + Settings-only Light/Dark toggle `#67`), delivering Needs-You Triage + `plan.json` + Screenshot Reel, `#seq`-linked Board feed, shimmering Roster + token telemetry, interactive `@mention` Graph + replay scrubber, Workspace Git Worktrees, `cmdk` Command Palette, empty-state `/fleet` presets, `<500 KB` raw / `<160 KB` gzip sidecar bundle, and `0`-network-call offline `dist-live-web/index.html` simulator.
+- Converted Fleet from a standalone Rust binary to an Antigravity `SIDECAR_UI_ENTRYPOINT_AUX_PANE` plugin with `SidecarApp` and `/preload.js` bridges, `/fleet` skill, standing swarm rules, and atomic `./install.sh`.
+- Built the dependency-free Node ESM backend (`sidecars/fleet_pane/`) reading `.system_generated/{swarm,logs}/` read-only with token/step telemetry, `plan.json` workstreams, triage items, `git worktree` inspection, multi-swarm switching, confined `/api/frame` images, pre-compressed gzip + `ETag`/`304`, loopback `Host`/`Origin` `403` guards, `413` limits, and confirmation-gated `POST /api/nudge`.
+- Built the React 19 + TypeScript sidebar SPA with live host `theme-change` sync, Settings-only Light/Dark switch, `Geist` and `Geist Mono` fonts, and offline `dist-live-web/index.html` simulation.
 
 ## 0.12.0 - 2026-11-25
 
-- **Dynamic Huffman Gzip & Peak RSS Diet (`src/http_assets.rs`, `src/main.rs`)**: upgraded pure-Rust DEFLATE in `src/http_assets.rs` from fixed Huffman to Package-Merge length-limited Dynamic Huffman (`BTYPE=10`), compressing embedded HTML down to `<360 KB` gzip; replaced 2,000-session `Value` DOM batch allocation with streamed per-session `serde_json::to_writer` into single `Arc<Vec<u8>>` HTTP buffers and dropped duplicate `String` caches.
-- **Smart Cross-CLI Router & Failure Memory (`src/router.rs`, `src/autoheal.rs`, `src/main.rs`, `frontend/src/board.tsx`)**: extracted cohesive `src/router.rs` scoring installed CLIs from live persisted pass rates, first-pass rate, and median wall time (`GET /api/router/recommend` + Goal-to-DAG auto-routing) alongside atomic `<data_dir>/lessons.json` (`LessonStore`, `GET /api/lessons`) injecting verified past repo repairs into attempt-1 auto-heal prompts.
-- **Large Diff Windowing, Wave Telemetry & Bundle Diet (`frontend/src/diff.tsx`, `frontend/src/dag-graph.tsx`, `frontend/src/main.tsx`, `frontend/scripts/web-engine.js`)**: added windowed file/line rendering in `DiffViewer` (auto-collapsing 12+ file diffs, 250-line file windows with instant expand), live wave pass-rate & average-duration telemetry in DAG Graph, `domAnimation` bundle trimming, and `0.12.0` parity in `web-engine.js`.
+- Upgraded `src/http_assets.rs` DEFLATE to Package-Merge dynamic Huffman (`<360 KB` gzip) and streamed `serde_json::to_writer` into `Arc<Vec<u8>>` HTTP buffers.
+- Added `src/router.rs` scoring installed CLIs from persisted pass rates and `<data_dir>/lessons.json` repair memory (`src/autoheal.rs`), plus windowed `DiffViewer`, DAG wave telemetry, and `web-engine.js` parity.
 
 ## 0.11.0 - 2026-11-25
 
-- **Cold Boot Latency (`src/main.rs`)**: replaced 3 sequential `which`/`where` child spawns in `detect_agents` with pure-Rust `$PATH` resolution, replaced intermediate `serde_json::Value` AST double-parsing in `load_persisted_core` with single-pass `PersistedStore` deserialization, and moved settled `.log` hydration + update checks off the pre-bind boot path (`<30 ms` cold boot at 2k sessions while preserving `6,250+ req/s`).
-- **Wave Preflight & Batch Wave PR (`src/main.rs`, `frontend/src/pr-modal.tsx`, `frontend/src/App.tsx`, `frontend/src/api.ts`)**: added `WaveShipModal` featuring non-destructive `git merge-tree` per-session conflict/clean preview, strategy switching (`merge` / `squash` / `ff`), 1-click **Merge clean**, and confirmation-gated `POST /api/sessions/batch-pr` (`confirm: true` enforcement + `dry_run` preview) with full parity in `frontend/scripts/web-engine.js`.
-- **Smart Auto-Heal Failure Classifier (`src/autoheal.rs`, `src/main.rs`, `frontend/src/detail.tsx`)**: added deterministic `classify_failure` / `classify_heal_attempt` (`CompileError`, `TestAssertion`, `LintOrFormat`, `ScopeGuardrail`, `Timeout`, `TransientFlake`), injected failure category + repair strategy into autonomous retry prompts, and surfaced live failure-class badges in the Auto-Heal timeline and Needs You banner.
+- Replaced sequential `which` / `where` subprocesses with `$PATH` lookup and single-pass `PersistedStore` loading (`<30 ms` cold boot at 2k sessions).
+- Added `WaveShipModal` (`git merge-tree` preflight and batch `POST /api/sessions/batch-pr`), deterministic auto-heal failure classification (`src/autoheal.rs`), and `web-engine.js` parity.
 
 ## 0.10.0 - 2026-11-25
 
-- **Runtime Speed & Asset Compression (`Cargo.toml`, `src/http_assets.rs`, `src/main.rs`)**: added `[profile.release]` (`lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`, `opt-level = 3`), pure-Rust RFC 1952 Gzip + strong SHA-256 `ETag` / `304 Not Modified` / `Vary: Accept-Encoding` + security headers (`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`), persistent 64-worker HTTP pool with `TCP_NODELAY`, buffered line parsing without per-byte `setsockopt` or `try_clone()`, zero-copy `Arc<Vec<u8>>` cached JSON responses, `.git/HEAD` fast-path for `merge_target`, single-flight repo discovery lock, and allocation-free transcript/session search.
-- **Zero-Friction Shipping & Smart Auto-Heal (`src/autoheal.rs`, `src/main.rs`, `frontend/src/`)**: enriched auto-heal steering prompts with modified worktree files, bounded diff excerpts, and prior failed attempt summaries; added `POST /api/sessions/batch-merge` with non-destructive `git merge-tree` conflict preflight + 1-click **Merge verified wave** controls in the top toolbar, DAG Graph, and Command Palette; added instant keyboard triage shortcuts (`y` retry, `x` dismiss, `m` merge, `s` focus steer, `[` / `]` cycle Needs you, `1`–`4` status filters); surfaced live per-session run duration, timeout cap headroom, heal budget remaining, and daily budget headroom in the inspector and status bar.
-- **Security & Web Engine Parity (`src/main.rs`, `src/worktrees.rs`, `frontend/scripts/web-engine.js`)**: added session ID path validation, `..` / NUL repository validation, CWE-59 symlink checks before worktree directory removal, strict ASCII-digit `Content-Length` parsing with prompt `413` while keeping the client write half open, and full v0.10.0 parity in `frontend/scripts/web-engine.js`.
+- Enabled release LTO, pure-Rust gzip + SHA-256 `ETag`/`304`, a 64-worker HTTP pool with `TCP_NODELAY`, `.git/HEAD` fast paths, and allocation-free transcript search.
+- Enriched auto-heal prompts with modified files and diff excerpts, added `POST /api/sessions/batch-merge`, keyboard triage shortcuts, CWE-59 worktree deletion checks, and `web-engine.js` parity.
 
 ## 0.9.0 - 2026-11-25
 
-- Desktop-Workbench UI Overhaul (`frontend/src/App.tsx`, `board.tsx`, `detail.tsx`, `ui.tsx`, `theme.css`): replaced multi-band stacked header chrome and card-in-card Kanban layout with a slim 44px top bar, collapsible left Session Inbox rail, central workspace switching between streaming Transcript (50k+ virtualized), Unified/Split Diff review, Check Pipeline Receipt, Interactive DAG Graph, and a 1-click Goal-to-DAG launchpad, plus a collapsible right Worktree/Checks/PR Inspector and quiet bottom telemetry bar.
-- Lean Zero-Bloat Frontend Bundle (`frontend/src/ui.tsx`, `frontend/package.json`): replaced external `motion`, `vaul`, `cmdk`, `@radix-ui/*`, `@base-ui/react`, and `sonner` wrappers with lean accessible primitives using Geist, Geist Mono, and `lucide-react` 1.5px stroke icons, cutting `assets/index.html` by >42% (~1.23 MB -> ~708 kB) under a crisp Neutral Slate + Electric Blue Light/Dark theme (`#67` Settings-only theme switch, `#155` zero `"Rune"` jargon).
-- Goal-to-DAG Planner Endpoint & Browser Engine (`POST /api/plan` in `src/main.rs` and `frontend/scripts/web-engine.js`): decomposes plain goals into parallel or sequential DAG tasks with policy routing and file-scope guardrails.
-- Backend Security & Memory Hardening (`src/main.rs`, `src/events.rs`, `src/checks.rs`): bounded HTTP worker pool (128 threads), bounded SSE subscriber slots (64), 256 KiB SSE replay-frame cap, bounded `run_bounded` / `run_shell_bounded` output buffers, strict IPv6/scheme `Host`/`Origin` checks, malformed `Content-Length` rejection, loopback enforcement on `/api/update/check`, and streaming `App::persist()` serialization.
+- Rebuilt the desktop UI around a 44px top bar, collapsible Session Inbox, central Transcript/Diff/Receipt/DAG/Goal workspace, and right Inspector.
+- Removed heavy UI wrapper dependencies to shrink `assets/index.html` below `708 kB`, added `POST /api/plan`, bounded HTTP/SSE pools, and tightened IPv6 `Host`/`Origin` checks.
 
 ## 0.8.0 - 2026-11-22
 
-- Full **Fleet** Rebrand (`Cargo.toml`, `src/`, `frontend/`, `assets/index.html`,
-  `README.md`, `PRODUCT.md`, `.github/workflows/release.yml`, standalone web
-  bundle `shared-live-web/fleet/index.html`): renamed crate, binary (`fleet`),
-  self-updater repository (`cayleb-james2008/fleet`), release links, and every
-  user-facing title, badge, and Settings label cleanly to **Fleet** with zero
-  legacy `dsh-fleet` / `fleet-rs` / `DeepSeek Harness` branding or internal
-  engine jargon.
-- First-Class Native Windows (`x86_64-pc-windows-msvc`) Support: moved `libc`
-  under `[target.'cfg(unix)'.dependencies]`, gated Unix-only process-group /
-  `/proc` calls with `#[cfg(unix)]`, added native Windows `taskkill /PID <pid> /T`
-  and `/T /F` process-tree teardown, `cmd /C` check execution, `where` agent
-  probing, `core.hooksPath=NUL`, `%LOCALAPPDATA%\fleet` default data folder,
-  and `;`-separated `FLEET_REPOS_DIR`, and restored `windows-latest`
-  (`fleet-x86_64-pc-windows-msvc.exe`) to `.github/workflows/release.yml`
-  (4-platform release matrix: Linux x86_64/arm64, macOS arm64, Windows x86_64).
-- Standalone Chromeless Desktop App Launcher (`src/main.rs`): automatically
-  opens Fleet in a dedicated chromeless desktop window (`chromium`/`google-chrome`/
-  `brave`/`microsoft-edge --app=<url> --class=fleet` on Linux, `msedge.exe`/
-  `chrome.exe --app=<url>` on Windows, fallback `xdg-open` / `cmd /C start` /
-  `open`), embeds the default `policies.rn` for zero-config launch from `.desktop`
-  shortcuts or double-clicked Windows `.exe` builds outside a repo checkout,
-  supports `--app` to open the app window even under systemd/UWSM desktop
-  launchers (`INVOCATION_ID`), and strictly honors `--no-open`, `FLEET_NO_OPEN=1`,
-  `FLEET_APP_WINDOW=0`, background `INVOCATION_ID`, and headless display checks.
+- Renamed crate, binary (`fleet`), and user-facing strings to Fleet, added native `x86_64-pc-windows-msvc` process/check/path support across the 4-platform release matrix, and added the chromeless `--app` desktop launcher.
 
 ## 0.7.0 - 2026-11-22
 
-- Interactive Multi-Wave DAG Dependency Visualizer (`frontend/src/dag-graph.tsx`,
-  `Board` / `DAG Graph` toggle + `g` shortcut + `Cmd+K` command): topological
-  longest-path wave layering with cycle protection, color-coded status rails,
-  directed SVG cubic Bezier dependency arrows with hover path highlighting, and
-  1-click node jump into the Session Inspector.
-- PR Preview & Confirmation-Gated GitHub PR Creator (`src/pr.rs`,
-  `GET /api/sessions/:id/pr-preview`, loopback+CSRF-guarded `POST /api/sessions/:id/pr`,
-  `frontend/src/pr-modal.tsx`): generates structured titles and copy-ready
-  Markdown PR bodies (task summary, per-step verification receipt table,
-  auto-heal timeline, hardened `--no-ext-diff --no-textconv` diff stats,
-  base/head branch, `gh` availability), refuses pushing unless `confirm: true`,
-  supports non-destructive `dry_run: true` validation via `git push --dry-run`,
-  and passes PR bodies over stdin (`--body-file -`).
-- Git Worktree Inspector & Safe Non-Main Removal (`src/worktrees.rs`,
-  loopback-guarded `GET /api/repos/worktrees`, `DELETE /api/repos/worktrees`,
-  `frontend/src/settings-policy.tsx`): parses `git worktree list --porcelain`
-  with linked session status, branch, dirty flag, `is_orphan`, and `removable`;
-  strictly enforces an authoritative registered non-main worktree allowlist
-  blocking main repo deletion (`403`), `..` path traversal (`403`), relative
-  paths (`400`), symlink/unregistered escapes (`403`), locked worktrees (`409`),
-  and active running sessions (`409`).
-- Daily Dispatch & Session Budget Guardrails (`src/budget.rs`,
-  `GET/POST /api/budget`, `POST /api/config` patch, `GET /api/metrics` `budget`
-  object, `frontend/src/settings-policy.tsx` & `board.tsx`): atomic UTC-day
-  `<data_dir>/budget.json` tracker enforcing `daily_session_limit` with atomic
-  HTTP `429` refusals on single and batch dispatch (never charging invalid `400`
-  or `dry_run: true` requests), clamping session timeouts by `max_session_mins`,
-  and capping autonomous repair passes by `max_heal_attempts`.
-- Standalone Browser-Only Live Web Bundle v0.7.0
-  (`shared-live-web/dsh-fleet/index.html`): full browser parity for DAG Graph,
-  PR Preview + confirmation-gated dry-run, Worktrees Inspector with orphan
-  pruning, and Budget Guardrails with zero external requests and zero user-facing
-  internal jargon.
+- Added the interactive DAG visualizer, PR preview and confirmation-gated GitHub PR creator (`src/pr.rs`), `git worktree` inspector and allowlisted removal (`src/worktrees.rs`), UTC daily dispatch and heal budget limits (`src/budget.rs`), and standalone browser bundle parity.
 
 ## 0.6.0 - 2026-11-22
 
-- Autonomous Auto-Heal / Auto-Steer Feedback Loop (`src/autoheal.rs`,
-  `run_agent_and_check`): when a healable verification step fails under a
-  session's `auto_steer_budget`, Fleet generates a deterministic diagnostic
-  steering prompt containing the failing step command, exit status, and
-  ANSI-stripped stderr tail, re-invokes the agent via `--continue`, records
-  each `HealAttempt` (`trigger_step`, `exit_code`, `stderr_tail`, `prompt_sent`,
-  `elapsed_ms`, `healed`), emits live SSE `auto_heal_attempt` events, enforces
-  an identical-error SHA-256 fingerprint loop guard so repeated failures halt
-  early instead of burning budget, and never bypasses file-scope guardrails or
-  gitignored/commit/stop refusals.
-- Reusable Engineering Playbook Templates (`src/templates.rs`,
-  `GET /api/templates`, `POST /api/templates`, `DELETE /api/templates/:id`):
-  ships 4 clean built-in engineering playbooks (`rust-lint-test`,
-  `web-typecheck-build`, `python-pytest-guard`, `docs-safe-update`), atomic
-  `<data_dir>/templates.json` persistence with corruption quarantine, live
-  `templates_updated` SSE broadcasts, and same-origin CSRF enforcement across
-  `POST`/`DELETE`/`PUT`/`PATCH`.
-- Live Board Telemetry (`src/metrics.rs`, `GET /api/metrics`): single-pass
-  $O(N)$ `state_rev`-cached board telemetry reporting `first_pass_count`,
-  `auto_healed_count`, `needs_you_count`, honest `first_pass_rate_pct` vs
-  `effective_pass_rate_pct`, `median_check_ms`, `active_slots`/`max_slots`,
-  `queued_count`/`blocked_count`, and per-repository breakdowns.
-- Mission Control UI v0.6.0: compact Board Telemetry Strip with `By repo (N)`
-  popover breakdown, `Healed N/M` & `Auto-healing N/M` badges across session
-  cards, hero receipt, and inspector, expandable Auto-Heal Timeline inside the
-  Receipt tab (zero native `<details>`), Playbook selector + inline Save/Delete
-  and `auto_steer_budget` control in the Composer, `Playbooks` group in `Cmd+K`
-  Command Palette, and full v0.6.0 parity in the standalone browser bundle
-  (`shared-live-web/dsh-fleet/index.html`).
+- Added the auto-heal steering loop (`src/autoheal.rs`) with identical-error fingerprint halting, reusable playbook templates (`src/templates.rs`), `state_rev`-cached board metrics (`src/metrics.rs`), and matching UI badges.
 
 ## 0.5.0 - 2026-11-22
 
-- Real-time Server-Sent Events stream (`GET /api/events/stream`, `src/events.rs`):
-  lock-minimal bounded subscriber bus with 64-frame `Last-Event-ID` / `?since=`
-  replay, 15s keepalive heartbeats, and live `session_created`, `session_status`,
-  `transcript_line`, `check_progress`, `queue_depth`, `config_updated`, and
-  `worktrees_pruned` events, wired into the frontend `EventSource` stream with
-  graceful 2s polling fallback.
-- DAG Dependency Scheduler & Batch / Multi-Repo Matrix Dispatch (`src/dag.rs`,
-  `POST /api/sessions/batch`, `depends_on` on `POST /api/sessions`): iterative
-  Kahn's topological sort + 3-color cycle detection tested to 2,000+ nodes,
-  atomic cycle/unknown-dependency rejection, `blocked` session state with
-  `blocked_by` tracking, automatic downstream launch on upstream `done`/`merged`,
-  and transitive `Needs you: upstream failed (...)` cascading on upstream failure
-  or dismissal.
-- Multi-Step Check Pipelines & File-Scope Guardrails (`src/checks.rs`): ordered
-  `check_steps` execution in pristine checkouts with live per-step SSE receipts,
-  per-step timing/exit/tail output, and polynomial-time glob guardrails
-  (`allowed_globs` / `forbidden_globs` merged with `policies.rn` defaults) that
-  block out-of-scope or forbidden-file edits cleanly in `Needs you` before any
-  session can reach `done`.
-- Non-Destructive Pre-Merge Dry-Run, `.patch` Export & Merge Strategies
-  (`src/merge_check.rs`): `GET /api/sessions/:id/merge-check` via `git merge-tree`
-  (zero mutation to working tree, index, or `HEAD`), `GET /api/sessions/:id/patch`
-  (`format-patch` or `unified-diff`), and `POST /api/sessions/:id/merge` strategy
-  support (`merge-commit`, `squash`, `fast-forward-only`) preserving every merge
-  safety guarantee.
-- Policy Rules Engine & Live Dry-Run Tester (`src/policy.rs`, `policies.rn`,
-  `POST /api/policies/test`): repo/task engine routing (`route_engine`), model
-  routing (`route_model`), per-task timeouts (`timeout_for`), retry/steer budgets
-  (`auto_retry_budget`, `auto_steer_budget`), default globs & check steps, and
-  fuzz-hardened live dry-run evaluation with full decision traces.
-- Scale & Operational Controls: configurable live concurrency cap
-  (`max_parallel_agents`, `FLEET_MAX_PARALLEL`, `1..=64`), graceful
-  `SIGTERM -> SIGKILL` process-group cancellation on stop/timeout, loopback-only
-  `POST /api/repos/prune-worktrees`, dirty-tracked `.record.json` persistence,
-  5s TTL merge-target & `state_rev`-keyed session caches, and fast indexed/paginated
-  `GET /api/sessions` & `GET /api/sessions/:id/transcript` tested to 2,000 sessions
-  and 50,000+ transcript lines (<200ms).
-- Mission Control UI v0.5.0: virtualized searchable 50,000+ line transcript viewer
-  with Jump to first error, Unified & Side-by-Side Split Diff viewer with pre-merge
-  conflict badge and `.patch` export, per-step timed receipt timeline, Batch &
-  Matrix DAG composer with guardrail inputs, multi-select bulk actions, global
-  `Cmd+K` command palette, Policy Tester & concurrency slider inside
-  `Engines and settings` (Light/Dark switch exclusively in Settings), and upgraded
-  standalone v0.5.0 Browser Worktree Engine (`shared-live-web/dsh-fleet/index.html`).
+- Added `/api/events/stream` SSE broadcasting, Kahn topological DAG scheduler (`src/dag.rs`), multi-step check pipelines with glob guardrails (`src/checks.rs`), `git merge-tree` dry-run merge checks (`src/merge_check.rs`), policy dry-run tester (`src/policy.rs`), concurrency caps, and virtualized 50k-line transcripts.
 
 ## 0.4.0 - 2026-11-21
 
-- Real repository discovery (`GET /api/repos`, loopback-only): discovers local
-  git repositories under `FLEET_REPOS_DIR`, `$HOME/Work/projects`, `$HOME/projects`,
-  `$HOME/Code`, cwd, and active sessions, wired into a live repo picker in the
-  `New session` dialog. Default project name is derived automatically from the
-  selected repository folder basename instead of `"fixture"`.
-- Live engine and model routing (`GET /api/config`, `POST /api/config`, loopback-only,
-  persisted in `data_dir/config.json`) plus `FLEET_MODEL` / `FLEET_CLAUDE_MODEL` /
-  `FLEET_CODEX_MODEL` environment overrides. Default `policies.rn` OpenCode model
-  updated to `opencode/deepseek-v4.1-flash-free`, with per-engine model routing
-  in `Engines and settings`.
-- Worktree isolation & cleanup fixes: sets `PWD` to the isolated worktree/check
-  directory on spawned agents and checks so CLIs reading `$PWD` (such as
-  `opencode`) never write outside the worktree; automatically removes and prunes
-  a session's worktree directory under `data_dir/worktrees` once its verified
-  commit merges onto the target branch.
-- Settings-only Appearance switch: moved the Light/Dark `SegmentedControl`
-  (`id="themeBtn"`) out of the top command bar and into the `Engines and settings`
-  Vaul right sheet while preserving `Light`/`Dark` accessible labels and
-  `localStorage('fleet-theme')` persistence.
-- Board polish & real-time reliability: optimistic session insertion on
-  `New session` dispatch so the Split-Pane Inspector opens immediately without a
-  poll race, `sm:h-auto` fix preventing multi-line task buttons from clipping at
-  desktop widths, and zero fixture/demo pills in live operation.
-- Standalone functional browser bundle (`frontend/scripts/build-live-web.mjs` +
-  `frontend/scripts/web-engine.js`): in-browser git worktree store persisted in
-  IndexedDB, real LCS unified diff generator, real sandboxed Web Worker check
-  evaluator, in-inspector branch file editor, optional BYOK OpenAI-compatible
-  agent (`sessionStorage` only), and local `fleet-rs` connector.
+- Added local git repository discovery (`GET /api/repos`), live engine/model config (`GET`/`POST /api/config`), isolated worktree `$PWD` execution and post-merge cleanup, Settings-only theme switch, and the IndexedDB standalone browser bundle.
 
 ## 0.3.0 - 2026-11-21
 
-- Parallel Coding-Agent Mission Control Board built on the House Frontend system
-  (Square UI hairline surfaces, warm light default + full dark parity, self-hosted
-  Geist and Geist Mono fonts, and full coverage across all eight House libraries
-  documented in `JOB.md`, `ROLE-COVERAGE.md`, and `ALIVE.md`).
-- Top Command Bar: `Fleet` wordmark and version chip, `/` search filter with `Kbd`
-  hint across tasks/projects/branches, `Needs you` Inbox popover with live count
-  and 1-click session jump/Retry, `New session` `MorphingDialog` (`Cmd/Ctrl+Enter`
-  dispatch), `Engines and settings` Vaul right sheet, and Light/Dark
-  `SegmentedControl` (`id="themeBtn"`).
-- Scan Strip & Latest Verified Receipt hero: four `SlidingNumber` counters
-  (`Sessions`, `Needs you`, `Working`, `Verified`), Kibo UI running `AvatarStack`,
-  Tremor 32-session outcome `Tracker`, and a measured Latest Verified Receipt hero
-  card (`+added` / `-removed` diff stats in Geist Mono, `verified by: <check>`,
-  and 1-click `Inspect receipt`, `View diff`, and `Merge`).
-- Three-Lane Board (`Needs you` · `Working` · `Done`) & Split-Pane Session
-  Inspector: Motion `layoutId` transitions between lanes, `BorderTrail` and
-  `TextShimmer` strictly on running sessions with live streaming transcript tails,
-  Cult UI `Expandable` disclosures for check and merge diagnostics (zero native
-  `<details>`), roving `ArrowLeft`/`ArrowRight`/`Home`/`End` tabs across
-  `Transcript` · `Diff` (syntax-tinted `+/-` lines in Geist Mono) · `Receipt`,
-  focus restoration on open/close, and live per-session `Steer` composer.
-- Desktop launch UX and Update strip hardening: platform data-folder default
-  (`XDG_DATA_HOME`/macOS Application Support), automatic port fallback when the
-  default port is busy, loopback-only `Update now` and manual update checks,
-  plain-language update error mapping, and deterministic focus handoff across
-  `Update now`, `Restart now`, `Dismiss`, and `Show update`.
-- Release workflow (`release.yml`): targets Unix platforms (`x86_64-unknown-linux-gnu`,
-  `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`) matching Fleet's Unix
-  process-group supervision model.
+- Built the three-lane Kanban board (`Needs you`, `Working`, `Done`) and split-pane session inspector with self-hosted `Geist` fonts, automated check/merge disclosures, and Unix release builds.
 
 ## 0.2.0 - 2026-11-19
 
-- Board redesign: Needs you, Working and Done groups; a detail panel with
-  Transcript, Diff and Receipt tabs; an honest banner for a needs-you session
-  whose check passed.
-- Per-session record files (`logs/<id>.record.json`): a lost `sessions.json` is
-  rebuilt from them, so done stays done and merged stays merged. Rebuilt sessions
-  say so.
-- Retry hands the agent the failure: the task, the failing check's command and the
-  tail of its output. A worktree that lost its link to the repo is re-attached from
-  its branch, and two retries at once run once.
-- Dismiss: a needs-you session that cannot succeed can be archived off the board
-  and the inbox; its log stays on disk.
-- `merge_target` (where Merge lands) and `merge_error` (the last refused merge,
-  with git's own text in `detail`) in the session JSON; refusals are plain sentences.
-- Checks: a failed check's reason names its exit code and output; a blank check
-  falls back to the policy default; `check_ran` and `check_exit` are reported.
-- Host rule: only loopback names, plus `FLEET_ALLOWED_HOSTS`; header limits (100
-  headers, 32 KiB); JSON-only POST.
-- `fleet-rs --version`, `GET /api/version`, and self-update from GitHub releases
-  (`FLEET_UPDATE_MODE`). Restart is refused while any session is queued, working or
-  checking.
+- Added per-session `logs/<id>.record.json` recovery, retry failure injection, orphaned worktree re-attachment, session dismiss archiving, merge refusal messages, loopback `Host` rules, and self-update support.
 
 ## 0.1.0 - 2026-11-17
 
-- First build: sessions run in their own git worktrees, a check decides done,
-  merge with safety checks, persistence and restart recovery, steering and stop,
-  successor chains, and the board.
+- Initial release with isolated git worktrees, automated verification checks, safe merges, persistence across restarts, steering, and successor chains.

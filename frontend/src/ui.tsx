@@ -118,10 +118,10 @@ export function formatFilteredBoardExport(
   const q = filter.query.trim();
   const tags = [filter.quickFilter, filter.agentFilter !== "all" && `@${filter.agentFilter}`, q && `"${q}"`].filter(Boolean).join(", ");
   return [
-    `# ${title} — Board (${tags})`,
+    `# ${title} (${tags})`,
     `- Swarm: ${snap.id} | Showing: ${messages.length} | Head: #${snap.head || 0}`,
     "",
-    ...messages.map((m) => `- **#${m.seq}**${m.time ? ` \`${m.time}\`` : ""} **@${m.agent}**: ${cleanDigestLine(m.text, 400)}`),
+    ...messages.map((m) => `- #${m.seq}${m.time ? ` \`${m.time}\`` : ""} @${m.agent}: ${cleanDigestLine(m.text, 400)}`),
   ].join("\n");
 }
 
@@ -223,7 +223,7 @@ export function formatSwarmDigest(
     return `- @${m.name}: ${m.status}${ts ? ` ${fmtElapsed(ts)}` : ""} (${m.steps} steps, ${fmtTokens(m.usage.totalTokens)} tok)`;
   }));
   sec("Workstreams", (snap.plan?.workstreams || []).map((ws) => `- [${humanizeStatus(ws.status)}] ${ws.title}${ws.owner ? ` (@${ws.owner})` : ""}`));
-  sec("Needs you", (snap.triage || []).map((it) => `- **${it.title}**: ${maskHome(it.detail)}`));
+  sec("Needs you", (snap.triage || []).map((it) => `- ${it.title}: ${maskHome(it.detail)}`));
   sec("Deliverables", (snap.messages || []).filter((m) => !m.control && /\[(done|verified|blocked)\]/i.test(m.text)).slice(-5).map((m) => `- #${m.seq} @${m.agent}: ${cleanDigestLine(m.text)}`));
   sec("Worktrees", (worktrees?.worktrees || []).filter((w) => !w.clean && w.files?.length).map((wt) => `- \`${wt.branch}\` (${maskHome(wt.path)}): ${wt.files!.slice(0, 8).map((f) => `${f.state} ${f.path}`).join(", ")}`));
   return lines.join("\n");
@@ -543,7 +543,7 @@ export function InlineComposer({
 }) {
   return (
     <div className={cn("pt-2 border-t border-hairline space-y-2", className)}>
-      <div className="flex flex-wrap items-center justify-between gap-2">
+      <div className="row flex-wrap gap-2">
         <label htmlFor={id} className="text-[12px] font-medium text-ink-2">{label}</label>
         {headerRight}
       </div>
@@ -612,7 +612,7 @@ export function ActivityPeek({ member, mode = "roster" }: { member: SwarmMember;
       {roster ? (
         <p className="font-semibold text-ink">Recent worker activity</p>
       ) : (
-        <div className="flex flex-wrap items-center justify-between gap-2 text-ink-2 num">
+        <div className="row flex-wrap gap-2 text-ink-2 num">
           <span className="font-medium text-ink">{member.steps} steps</span>
           <span>
             {fmtTokens(member.usage.totalTokens)} tok ({fmtTokens(member.usage.inputTokens)}/{fmtTokens(member.usage.cacheReadTokens)}/{fmtTokens(member.usage.outputTokens)})
@@ -740,6 +740,7 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
   const tone = gate.state === "blocked" ? "danger" : gate.state === "ready" ? "success" : "info";
   const label = gate.state === "blocked" ? "Blocked" : gate.state === "ready" ? "Ready" : "Verifying";
   const next = gate.nextAction;
+  const v = gate.velocity;
   const live = Boolean(next && canLiveNudge(snap) && next.conversationId);
 
   return (
@@ -768,6 +769,24 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
           )}
         </div>
       </div>
+      {v && (
+        <div className="row flex-wrap t2" data-testid="wave-velocity-pill">
+          <div className="wrap gap-1">
+            <Badge tone={v.blocked > 0 ? "warning" : "success"} className="num">
+              {v.passRatePct}% pass{v.wavesPerHr > 0 ? ` · ${v.wavesPerHr}/hr` : ""}
+            </Badge>
+            <span className="num text-ink-2">
+              {v.done}d · {v.verified}v · {v.scaleVerified}s · {v.blocked}b
+            </span>
+          </div>
+          {v.shippedSeq > 0 && (
+            <Button data-testid="gate-shipped-jump" onClick={() => onJump(v.shippedSeq)} className="bg-board num">
+              {v.exactShipped ? "Shipped" : "Latest"} #{v.shippedSeq}
+              <ArrowUpRight />
+            </Button>
+          )}
+        </div>
+      )}
       <div className="wrap gap-1">
         {gate.stages.map((st) =>
           st.seq > 0 ? (

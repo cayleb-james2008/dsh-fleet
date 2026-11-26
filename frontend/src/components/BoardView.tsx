@@ -253,7 +253,7 @@ export function BoardView({
         </div>
 
         {/* Quick-filter strip + 1-click Wave Digest */}
-        <div className="flex flex-wrap items-center justify-between gap-1">
+        <div className="row flex-wrap gap-1">
           <div className="wrap gap-1" role="group" aria-label="Board quick filters">
             {(
               [

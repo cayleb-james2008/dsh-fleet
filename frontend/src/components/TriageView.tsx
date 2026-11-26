@@ -140,7 +140,7 @@ export function TriageView({
     <div className="space-y-4">
       {/* Needs-You Triage Inbox */}
       <section aria-labelledby="triage-heading" className="space-y-2">
-        <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="row flex-wrap gap-2">
           <h2 id="triage-heading" className="h2">
             Needs you ({triage.length})
           </h2>

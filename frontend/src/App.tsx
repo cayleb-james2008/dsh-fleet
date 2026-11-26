@@ -46,9 +46,9 @@ import {
 } from "./ui";
 
 const SWARM_PRESETS = [
-  ["feature-verifier", "Feature + Verifier", "Worktree + verifier", "/fleet Build on worktree, test, @verifier [done]."],
-  ["audit-harden", "Audit & Harden", "Tests & security", "/fleet Audit tests, security, UI craft."],
-  ["multi-lane", "Multi-Lane Ship", "Parallel lanes", "/fleet Shard worktrees with monitor + plan.json."],
+  ["feature-verifier", "Feature and verifier", "Isolated worktree + verifier check", "/fleet Build on worktree, test, @verifier [done]."],
+  ["audit-harden", "Audit and harden", "Run tests and security checks", "/fleet Audit tests, security, UI craft."],
+  ["multi-lane", "Parallel lanes", "Shard worktrees with a monitor", "/fleet Shard worktrees with monitor + plan.json."],
 ].map(([id, title, summary, prompt]) => ({ id, title, summary, prompt }));
 
 const TABS: Array<{ id: TabId; label: string; Icon: typeof Inbox }> = [
@@ -447,8 +447,8 @@ export function App() {
         ) : !hasSwarm ? (
           <div className="space-y-4">
             <div className="space-y-2">
-              <h2 className="text-[16px] font-semibold text-ink">Launch an Antigravity swarm</h2>
-              <p className="text-[14px] text-ink-2">Launch a preset or open a recent swarm below.</p>
+              <h2 className="text-[16px] font-semibold text-ink">Start a swarm</h2>
+              <p className="text-[14px] text-ink-2">Pick a preset or open a recent swarm.</p>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
                 {SWARM_PRESETS.map((p) => (
                   <Card key={p.id} className="p-3 flex flex-col justify-between gap-2">
@@ -573,9 +573,9 @@ export function App() {
           <div className="rounded-card bg-board p-3 text-[12px] text-ink-2 space-y-1">
             <div className="f1 font-medium text-ink">
               <CommandIcon />
-              <span>Fleet Antigravity Plugin v1.13.0</span>
+              <span>Fleet Antigravity Plugin v1.14.0</span>
             </div>
-            <p>Loopback swarm &amp; worktree monitor. Zero telemetry.</p>
+            <p>Reads local swarm files over loopback with no telemetry.</p>
           </div>
         </div>
       </Modal>

@@ -56,10 +56,11 @@ await check("loads simulated Antigravity swarm, Token Burn, and Gate Readiness N
   const burn = await page.locator('#panel-triage [data-testid="token-burn-strip"]').textContent();
   const card = page.locator('#panel-triage [data-testid="gate-readiness-card"]');
   const gateTxt = await card.textContent();
+  const velTxt = await card.locator('[data-testid="wave-velocity-pill"]').textContent();
   await card.locator('[data-testid="gate-next-action"]').click();
   const prefilled = await card.locator("#gate-next-nudge").inputValue();
   await card.locator('button:has-text("Cancel")').click();
-  return txt.includes("Needs you") && txt.includes("builder asked a question") && burn.includes("Token burn") && /\d+%/.test(burn) && gateTxt.includes("Gate readiness") && prefilled.includes("Re #");
+  return txt.includes("Needs you") && txt.includes("builder asked a question") && burn.includes("Token burn") && /\d+%/.test(burn) && gateTxt.includes("Gate readiness") && /\d+% pass/.test(velTxt || "") && prefilled.includes("Re #");
 });
 
 await check("plan.json goal & humanized workstreams visible", async () => {

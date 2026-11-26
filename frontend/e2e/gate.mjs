@@ -181,6 +181,19 @@ await runChecks("gate", async (check) => {
     return jumped;
   });
 
+  await check("triage Wave Velocity pill shows pass rate, counts, and jumps to shipped #seq", async () => {
+    const pill = page.locator('#panel-triage [data-testid="wave-velocity-pill"]');
+    if ((await pill.count()) !== 1) return false;
+    const txt = await pill.textContent();
+    if (!txt || !/\d+% pass/.test(txt) || !txt.includes("1d · 0v · 0s · 0b")) return false;
+    await pill.locator('[data-testid="gate-shipped-jump"]').click();
+    await page.waitForSelector("#panel-board");
+    const jumped = (await page.locator('#tab-board[aria-selected="true"]').count()) === 1;
+    await page.locator("#tab-triage").click();
+    await page.waitForSelector("#panel-triage");
+    return jumped;
+  });
+
   // 7-9: #seq jump from Triage -> Board tab + Board filters
   await page.locator('#panel-triage button:has-text("#4")').first().click();
   await page.waitForSelector("#panel-board");

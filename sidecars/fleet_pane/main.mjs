@@ -251,7 +251,7 @@ export function createFleetHandlers({
       healthPacked = pack({
         ok: true,
         name: 'fleet',
-        version: '1.13.0',
+        version: '1.14.0',
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
         sseStream: !isSidecar,
@@ -610,7 +610,8 @@ export async function startStandaloneServer({
     sendMessageFn,
   });
 
-  const preloadBuf = Buffer.from(STANDALONE_PRELOAD_JS);
+  let preloadBuf = null;
+  let preloadHdrs = null;
   const MAX_SSE_CLIENTS = 64;
   const SSE_POLL_MS = 150;
   const SSE_PING_MS = 15000;
@@ -676,12 +677,18 @@ export async function startStandaloneServer({
     sseTimer.unref();
   }
 
-  const preloadHeaders = {
-    'Content-Type': 'application/javascript; charset=utf-8',
-    'Cache-Control': 'no-cache',
-    'Content-Length': preloadBuf.length,
-    ...SECURITY_HEADERS,
-  };
+  function getPreload() {
+    if (!preloadBuf) {
+      preloadBuf = Buffer.from(STANDALONE_PRELOAD_JS);
+      preloadHdrs = {
+        'Content-Type': 'application/javascript; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Content-Length': preloadBuf.length,
+        ...SECURITY_HEADERS,
+      };
+    }
+    return { buf: preloadBuf, headers: preloadHdrs };
+  }
 
   function sendPacked(req, res, status, packed) {
     if (status === 200 && req.headers['if-none-match'] === packed.etag) {
@@ -756,8 +763,9 @@ export async function startStandaloneServer({
     }
 
     if (req.method === 'GET' && pathname === '/preload.js') {
-      res.writeHead(200, preloadHeaders);
-      res.end(preloadBuf);
+      const p = getPreload();
+      res.writeHead(200, p.headers);
+      res.end(p.buf);
       return;
     }
 

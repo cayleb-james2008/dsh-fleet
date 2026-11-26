@@ -60,11 +60,11 @@ export function CommandPalette({
   const items = useMemo<PaletteItem[]>(() => {
     const list: PaletteItem[] = [
       ...([
-        ["v-triage", "Needs-you Triage", () => onSelectTab("triage")],
-        ["v-board", "Swarm Board", () => onSelectTab("board")],
-        ["v-roster", "Worker Roster", () => onSelectTab("roster")],
-        ["v-graph", "@Mention Graph", () => onSelectTab("graph")],
-        ["v-worktrees", "Git Worktrees", () => onSelectTab("worktrees")],
+        ["v-triage", "Needs you", () => onSelectTab("triage")],
+        ["v-board", "Board", () => onSelectTab("board")],
+        ["v-roster", "Roster", () => onSelectTab("roster")],
+        ["v-graph", "Mention graph", () => onSelectTab("graph")],
+        ["v-worktrees", "Git worktrees", () => onSelectTab("worktrees")],
         ...(snap?.swarm ? [["a-digest", "Wave digest", onCopyDigest] as const] : []),
         ["a-settings", "Settings", onOpenSettings],
         ["a-keys", "Keyboard shortcuts", onOpenShortcuts, "?"],
