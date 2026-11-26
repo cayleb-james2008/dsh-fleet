@@ -11,18 +11,30 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const MAX_ROOTS = 16;
 const MAX_WORKTREES_PER_ROOT = 24;
 const MAX_CHANGED_FILES = 24;
+const MAX_BRANCH_FILES = 200;
+const MAX_RECENT_COMMITS = 5;
 const GIT_TIMEOUT_MS = 2500;
 const DEFAULT_TTL_MS = 3000;
+const VALID_ACTIONS = new Set(['dry_run_merge', 'ff_merge', 'rebase', 'remove_worktree']);
+const BRANCH_NAME_RE = /^[A-Za-z0-9._/-]{1,128}$/;
 
-function execGit(cwd, args) {
+function execGit(cwd, args, timeoutMs = GIT_TIMEOUT_MS) {
   return new Promise((resolve) => {
     execFile(
       'git',
       ['-C', cwd, ...args],
-      { encoding: 'utf-8', timeout: GIT_TIMEOUT_MS, maxBuffer: 2 * 1024 * 1024 },
-      (err, stdout) => {
-        if (err) return resolve({ ok: false, stdout: '', error: err.message });
-        resolve({ ok: true, stdout: stdout || '' });
+      { encoding: 'utf-8', timeout: timeoutMs, maxBuffer: 2 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) {
+          return resolve({
+            ok: false,
+            code: typeof err.code === 'number' ? err.code : 1,
+            stdout: stdout || '',
+            stderr: stderr || '',
+            error: err.message,
+          });
+        }
+        resolve({ ok: true, code: 0, stdout: stdout || '', stderr: stderr || '' });
       },
     );
   });
@@ -159,6 +171,24 @@ async function detectBaseBranch(rootPath) {
   return '';
 }
 
+function parseMergeTreeOutput(res) {
+  const parts = String(res.stdout || '').split('\0').filter(Boolean);
+  const treeSha = parts[0] || '';
+  if (res.ok && /^[0-9a-f]{40,64}$/i.test(treeSha)) {
+    return { ok: true, clean: true, treeSha, conflictFiles: [] };
+  }
+  if (res.code === 1 && /^[0-9a-f]{40,64}$/i.test(treeSha)) {
+    return { ok: true, clean: false, treeSha, conflictFiles: [...new Set(parts.slice(1))] };
+  }
+  return {
+    ok: false,
+    clean: false,
+    treeSha: '',
+    conflictFiles: [],
+    error: (res.stderr || res.error || 'merge-tree failed').trim(),
+  };
+}
+
 async function inspectWorktree(rootPath, wt, index, baseBranch = '') {
   let wtReal = wt.path;
   let exists = true;
@@ -173,6 +203,9 @@ async function inspectWorktree(rootPath, wt, index, baseBranch = '') {
   let untrackedFiles = 0;
   let stagedFiles = 0;
   const files = [];
+  const workingPathSet = new Set();
+  const branchFiles = [];
+  const commits = [];
   let totalChanged = 0;
   let lastCommitSha = wt.head ? wt.head.slice(0, 8) : '';
   let lastCommitSubject = '';
@@ -181,13 +214,15 @@ async function inspectWorktree(rootPath, wt, index, baseBranch = '') {
   let behind = 0;
   const branch = wt.branch || (wt.detached ? 'detached' : 'unknown');
   const isMain = index === 0 || wtReal === rootPath;
-  const checkDiv = Boolean(exists && !wt.bare && !isMain && baseBranch && branch !== baseBranch && !wt.detached);
+  const checkBranchRel = Boolean(exists && !wt.bare && !isMain && baseBranch && (wt.detached || branch !== baseBranch));
 
   if (exists && !wt.bare) {
-    const [statusRes, logRes, divRes] = await Promise.all([
+    const [statusRes, logRes, divRes, branchFilesRes, commitsRes] = await Promise.all([
       execGit(wtReal, ['status', '--porcelain=v1', '-z']),
       execGit(wtReal, ['log', '-n', '1', '--format=%h%x09%s%x09%ct']),
-      checkDiv ? execGit(wtReal, ['rev-list', '--left-right', '--count', `${baseBranch}...HEAD`]) : Promise.resolve({ ok: false, stdout: '' }),
+      checkBranchRel ? execGit(wtReal, ['rev-list', '--left-right', '--count', `${baseBranch}...HEAD`]) : Promise.resolve({ ok: false, stdout: '' }),
+      checkBranchRel ? execGit(wtReal, ['diff', '--name-only', '-z', `${baseBranch}...HEAD`]) : Promise.resolve({ ok: false, stdout: '' }),
+      checkBranchRel ? execGit(wtReal, ['log', '-n', String(MAX_RECENT_COMMITS), '--format=%h%x09%s%x09%aI', `${baseBranch}..HEAD`]) : Promise.resolve({ ok: false, stdout: '' }),
     ]);
     if (statusRes.ok && statusRes.stdout) {
       const tokens = statusRes.stdout.split('\0');
@@ -204,6 +239,7 @@ async function inspectWorktree(rootPath, wt, index, baseBranch = '') {
           if (y !== ' ') dirtyFiles++;
         }
         totalChanged++;
+        workingPathSet.add(relPath);
         if (files.length < MAX_CHANGED_FILES) {
           const state = x === '?' && y === '?' ? '??' : x !== ' ' ? x : y;
           const uri = state === 'D' ? '' : safeWorktreeFileUri(wtReal, relPath);
@@ -222,9 +258,46 @@ async function inspectWorktree(rootPath, wt, index, baseBranch = '') {
       behind = Number(parts[0]) || 0;
       ahead = Number(parts[1]) || 0;
     }
+    if (branchFilesRes.ok && branchFilesRes.stdout) {
+      for (const p of branchFilesRes.stdout.split('\0')) {
+        if (!p) continue;
+        if (branchFiles.length < MAX_BRANCH_FILES) branchFiles.push(p);
+      }
+    }
+    if (commitsRes.ok && commitsRes.stdout.trim()) {
+      for (const line of commitsRes.stdout.trim().split('\n')) {
+        if (!line) continue;
+        const [sha = '', subject = '', authorTime = ''] = line.split('\t');
+        if (sha) {
+          commits.push({
+            sha: sha.trim(),
+            subject: subject.slice(0, 120),
+            authorTime: authorTime.trim(),
+          });
+        }
+      }
+    }
   }
 
   const clean = dirtyFiles === 0 && untrackedFiles === 0 && stagedFiles === 0;
+  let mergeability = 'clean';
+  let conflictFiles = [];
+
+  if (isMain || (baseBranch && branch === baseBranch)) {
+    mergeability = 'main';
+  } else if (wt.detached) {
+    mergeability = 'detached';
+  } else if (!clean) {
+    mergeability = 'dirty';
+  } else if (exists && !wt.bare && baseBranch && ahead > 0) {
+    const mtRaw = await execGit(wtReal, ['merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', baseBranch, 'HEAD']);
+    const mt = parseMergeTreeOutput(mtRaw);
+    if (mt.ok && !mt.clean) {
+      mergeability = 'conflict';
+      conflictFiles = mt.conflictFiles;
+    }
+  }
+
   const landStatus = isMain || branch === baseBranch
     ? 'main'
     : !clean
@@ -236,36 +309,94 @@ async function inspectWorktree(rootPath, wt, index, baseBranch = '') {
           : 'merged';
 
   return {
-    id: `${rootPath}::${wtReal}`,
-    root: rootPath,
-    name: basename(wtReal) || wtReal,
-    path: wtReal,
-    uri: exists ? pathToFileURL(wtReal).href : '',
-    isMain,
-    exists,
-    bare: wt.bare,
-    detached: wt.detached,
-    locked: wt.locked,
-    prunable: wt.prunable,
-    branch,
-    head: wt.head.slice(0, 8),
-    clean,
-    baseBranch: baseBranch || 'main',
-    ahead,
-    behind,
-    landStatus,
-    dirtyFiles,
-    untrackedFiles,
-    stagedFiles,
-    files,
-    filesTruncated: totalChanged > MAX_CHANGED_FILES,
-    lastCommitSha,
-    lastCommitSubject,
-    lastCommitAt,
+    record: {
+      id: `${rootPath}::${wtReal}`,
+      root: rootPath,
+      name: basename(wtReal) || wtReal,
+      path: wtReal,
+      uri: exists ? pathToFileURL(wtReal).href : '',
+      isMain,
+      exists,
+      bare: wt.bare,
+      detached: wt.detached,
+      locked: wt.locked,
+      prunable: wt.prunable,
+      branch,
+      head: wt.head.slice(0, 8),
+      clean,
+      baseBranch: baseBranch || 'main',
+      ahead,
+      behind,
+      landStatus,
+      mergeability,
+      conflictFiles,
+      dirtyFiles,
+      untrackedFiles,
+      stagedFiles,
+      files,
+      filesTruncated: totalChanged > MAX_CHANGED_FILES,
+      branchFiles,
+      commits,
+      lastCommitSha,
+      lastCommitSubject,
+      lastCommitAt,
+    },
+    workingPathSet,
   };
 }
 
+function buildRootCollisions(worktrees, workingPathsByWt) {
+  const byFile = new Map();
+  for (const wt of worktrees) {
+    if (wt.isMain || (wt.baseBranch && wt.branch === wt.baseBranch)) continue;
+    const workingSet = workingPathsByWt.get(wt.path) || new Set();
+    const branchSet = new Set(wt.branchFiles || []);
+    const touched = new Set([...workingSet, ...branchSet]);
+    for (const file of touched) {
+      let entries = byFile.get(file);
+      if (!entries) {
+        entries = [];
+        byFile.set(file, entries);
+      }
+      entries.push({
+        path: wt.path,
+        branch: wt.branch,
+        hasWorking: workingSet.has(file),
+        hasBranch: branchSet.has(file),
+      });
+    }
+  }
+  const collisions = [];
+  for (const [file, entries] of byFile.entries()) {
+    if (entries.length < 2) continue;
+    let anyWorking = false;
+    let anyBranch = false;
+    for (const e of entries) {
+      if (e.hasWorking) anyWorking = true;
+      if (e.hasBranch) anyBranch = true;
+    }
+    const kind = anyWorking && anyBranch ? 'mixed' : anyBranch ? 'branch' : 'working';
+    collisions.push({
+      file,
+      worktrees: entries.map((e) => e.path),
+      branches: entries.map((e) => e.branch),
+      kind,
+    });
+  }
+  collisions.sort((a, b) => a.file.localeCompare(b.file));
+  return collisions;
+}
+
 const probeCache = new Map(); // rootPath -> { at, promise }
+
+/** Invalidate cached worktree probe results for a repo root (or all roots when omitted). */
+export function invalidateWorktreeCache(rootPath = '') {
+  if (!rootPath) {
+    probeCache.clear();
+    return;
+  }
+  probeCache.delete(rootPath);
+}
 
 async function probeSingleRoot(root, ttlMs) {
   const now = Date.now();
@@ -280,17 +411,26 @@ async function probeSingleRoot(root, ttlMs) {
         uri: root.uri,
         isGit: false,
         worktrees: [],
+        collisions: [],
         error: 'not a git repository',
       };
     }
     const baseBranch = await detectBaseBranch(root.path);
     const parsed = parsePorcelainWorktrees(res.stdout).slice(0, MAX_WORKTREES_PER_ROOT);
-    const worktrees = await Promise.all(parsed.map((wt, idx) => inspectWorktree(root.path, wt, idx, baseBranch)));
+    const inspected = await Promise.all(parsed.map((wt, idx) => inspectWorktree(root.path, wt, idx, baseBranch)));
+    const worktrees = [];
+    const workingPathsByWt = new Map();
+    for (const item of inspected) {
+      worktrees.push(item.record);
+      workingPathsByWt.set(item.record.path, item.workingPathSet);
+    }
+    const collisions = buildRootCollisions(worktrees, workingPathsByWt);
     return {
       root: root.path,
       uri: root.uri,
       isGit: true,
       worktrees,
+      collisions,
       error: '',
     };
   })();
@@ -305,8 +445,10 @@ export async function probeWorktrees(rawRoots, { ttlMs = DEFAULT_TTL_MS } = {}) 
   const { roots, rejected } = parseRootsInput(rawRoots);
   const results = await Promise.all(roots.map((r) => probeSingleRoot(r, ttlMs)));
   const worktrees = [];
+  const collisions = [];
   for (const r of results) {
     worktrees.push(...r.worktrees);
+    collisions.push(...r.collisions);
   }
   return {
     roots: results.map((r) => ({
@@ -317,17 +459,93 @@ export async function probeWorktrees(rawRoots, { ttlMs = DEFAULT_TTL_MS } = {}) 
       error: r.error,
     })),
     worktrees,
+    collisions,
     rejected,
     cachedTtlMs: ttlMs,
   };
 }
 
-/** Validate worktree/file path confinement and return bounded (<=8 KB) git diff text. */
-export async function probeWorktreeDiff({ root = '', worktree = '', file = '', maxBytes = 8192 } = {}) {
-  const normRoot = normalizeWorkspaceRoot(root);
-  const normWt = normalizeWorkspaceRoot(worktree);
-  if (!normRoot || !normWt) {
+async function resolveConfinedWorktree({ root = '', worktree = '', path = '' } = {}) {
+  const rawWt = worktree || path;
+  const normWt = normalizeWorkspaceRoot(rawWt);
+  const hasRoot = typeof root === 'string' && root.trim().length > 0;
+  const normRoot = hasRoot ? normalizeWorkspaceRoot(root) : null;
+  if ((hasRoot && !normRoot) || !normWt) {
     return { ok: false, status: 400, error: 'invalid workspace root or worktree' };
+  }
+
+  const probeDir = normRoot ? normRoot.path : normWt.path;
+  const wtList = await execGit(probeDir, ['worktree', 'list', '--porcelain']);
+  if (!wtList.ok) {
+    return { ok: false, status: 404, error: 'not a git repository' };
+  }
+  const allowedWts = parsePorcelainWorktrees(wtList.stdout);
+  if (allowedWts.length === 0) {
+    return { ok: false, status: 404, error: 'not a git repository' };
+  }
+
+  let matchedWt = null;
+  let matchedIdx = -1;
+  for (let i = 0; i < allowedWts.length; i++) {
+    try {
+      if (realpathSync(allowedWts[i].path) === normWt.path) {
+        matchedWt = allowedWts[i];
+        matchedIdx = i;
+        break;
+      }
+    } catch {}
+  }
+  if (!matchedWt) {
+    return { ok: false, status: 404, error: 'worktree not in repository' };
+  }
+
+  let rootPath = normRoot ? normRoot.path : '';
+  if (!rootPath) {
+    try {
+      rootPath = realpathSync(allowedWts[0].path);
+    } catch {
+      rootPath = allowedWts[0].path;
+    }
+  }
+  const isMain = matchedIdx === 0 || normWt.path === rootPath;
+  return { ok: true, rootPath, wtPath: normWt.path, wtEntry: matchedWt, isMain };
+}
+
+function checkAncestorInWorktree(wtReal, wtPrefix, abs) {
+  let cur = dirname(abs);
+  while (cur && cur.length >= wtReal.length) {
+    try {
+      lstatSync(cur);
+      const realCur = realpathSync(cur);
+      if (realCur !== wtReal && !realCur.startsWith(wtPrefix)) {
+        return { ok: false, error: 'parent escapes worktree root' };
+      }
+      return { ok: true };
+    } catch (err) {
+      if (!err || err.code !== 'ENOENT') {
+        return { ok: false, error: 'path escapes worktree root' };
+      }
+      if (cur === wtReal) break;
+      const next = dirname(cur);
+      if (next === cur) break;
+      cur = next;
+    }
+  }
+  return { ok: false, error: 'file parent missing' };
+}
+
+/** Validate worktree/file path confinement and return bounded (<=16 KB) git diff text. */
+export async function probeWorktreeDiff({
+  root = '',
+  worktree = '',
+  path = '',
+  file = '',
+  mode = 'working',
+  maxBytes = 8192,
+} = {}) {
+  const diffMode = mode === undefined || mode === '' ? 'working' : mode;
+  if (diffMode !== 'working' && diffMode !== 'branch') {
+    return { ok: false, status: 400, error: 'invalid diff mode' };
   }
 
   const relPath = typeof file === 'string' ? file.trim() : '';
@@ -338,26 +556,14 @@ export async function probeWorktreeDiff({ root = '', worktree = '', file = '', m
     return { ok: false, status: 400, error: 'invalid path segment' };
   }
 
-  const wtList = await execGit(normRoot.path, ['worktree', 'list', '--porcelain']);
-  if (!wtList.ok) {
-    return { ok: false, status: 404, error: 'not a git repository' };
-  }
-  const allowedWts = parsePorcelainWorktrees(wtList.stdout);
-  let matchesRepoWt = false;
-  for (const w of allowedWts) {
-    try {
-      if (realpathSync(w.path) === normWt.path) {
-        matchesRepoWt = true;
-        break;
-      }
-    } catch {}
-  }
-  if (!matchesRepoWt) {
-    return { ok: false, status: 404, error: 'worktree not in repository' };
+  const confined = await resolveConfinedWorktree({ root, worktree, path });
+  if (!confined.ok) {
+    return { ok: false, status: confined.status, error: confined.error };
   }
 
-  const wtPrefix = normWt.path.endsWith(sep) ? normWt.path : `${normWt.path}${sep}`;
-  const abs = resolve(normWt.path, relPath);
+  const wtReal = confined.wtPath;
+  const wtPrefix = wtReal.endsWith(sep) ? wtReal : `${wtReal}${sep}`;
+  const abs = resolve(wtReal, relPath);
   if (!abs.startsWith(wtPrefix)) {
     return { ok: false, status: 404, error: 'path escapes worktree root' };
   }
@@ -373,50 +579,61 @@ export async function probeWorktreeDiff({ root = '', worktree = '', file = '', m
     }
   } catch (err) {
     if (err && err.code === 'ENOENT') {
-      try {
-        const realParent = realpathSync(dirname(abs));
-        if (realParent !== normWt.path && !realParent.startsWith(wtPrefix)) {
-          return { ok: false, status: 404, error: 'parent escapes worktree root' };
-        }
-      } catch {
-        return { ok: false, status: 404, error: 'file parent missing' };
+      const anc = checkAncestorInWorktree(wtReal, wtPrefix, abs);
+      if (!anc.ok) {
+        return { ok: false, status: 404, error: anc.error };
       }
     } else {
       return { ok: false, status: 404, error: 'path escapes worktree root' };
     }
   }
 
-  const cap = Math.min(8192, Math.max(512, Number(maxBytes) || 8192));
-  let diffRes = await execGit(normWt.path, ['diff', 'HEAD', '--no-ext-diff', '--', relPath]);
-  let text = diffRes.ok ? diffRes.stdout : '';
-  if (!text) {
-    const cachedRes = await execGit(normWt.path, ['diff', '--cached', '--no-ext-diff', '--', relPath]);
-    const workRes = await execGit(normWt.path, ['diff', '--no-ext-diff', '--', relPath]);
-    text = [cachedRes.ok ? cachedRes.stdout : '', workRes.ok ? workRes.stdout : ''].filter(Boolean).join('\n');
-  }
-
+  const cap = Math.min(16384, Math.max(512, Number(maxBytes) || 8192));
+  let text = '';
   let untracked = false;
-  if (!text && existsOnDisk && realTarget) {
-    const stRes = await execGit(normWt.path, ['status', '--porcelain=v1', '-z', '--', relPath]);
-    if (stRes.ok && stRes.stdout.startsWith('?? ')) {
-      untracked = true;
-      try {
-        const st = statSync(realTarget);
-        if (st.isFile()) {
-          const fd = openSync(realTarget, 'r');
-          const buf = Buffer.allocUnsafe(Math.min(cap, st.size));
-          const n = readSync(fd, buf, 0, buf.length, 0);
-          closeSync(fd);
-          const slice = buf.subarray(0, n);
-          if (slice.includes(0)) {
-            text = `+++ ${relPath}\n[binary untracked file omitted]`;
-          } else {
-            const rawText = slice.toString('utf8');
-            const bodyLines = rawText.split('\n').map((l) => `+${l}`).join('\n');
-            text = `+++ ${relPath} (untracked)\n${bodyLines}${st.size > cap ? '\n... (truncated)' : ''}`;
+
+  if (diffMode === 'branch') {
+    const baseBranch = await detectBaseBranch(confined.rootPath);
+    if (!baseBranch) {
+      return { ok: false, status: 400, error: 'base branch not found' };
+    }
+    const mbRes = await execGit(wtReal, ['merge-base', baseBranch, 'HEAD']);
+    if (mbRes.ok && mbRes.stdout.trim()) {
+      const mergeBase = mbRes.stdout.trim();
+      const branchDiff = await execGit(wtReal, ['diff', '--no-ext-diff', `${mergeBase}..HEAD`, '--', relPath]);
+      text = branchDiff.ok ? branchDiff.stdout : '';
+    }
+  } else {
+    const diffRes = await execGit(wtReal, ['diff', 'HEAD', '--no-ext-diff', '--', relPath]);
+    text = diffRes.ok ? diffRes.stdout : '';
+    if (!text) {
+      const cachedRes = await execGit(wtReal, ['diff', '--cached', '--no-ext-diff', '--', relPath]);
+      const workRes = await execGit(wtReal, ['diff', '--no-ext-diff', '--', relPath]);
+      text = [cachedRes.ok ? cachedRes.stdout : '', workRes.ok ? workRes.stdout : ''].filter(Boolean).join('\n');
+    }
+
+    if (!text && existsOnDisk && realTarget) {
+      const stRes = await execGit(wtReal, ['status', '--porcelain=v1', '-z', '--', relPath]);
+      if (stRes.ok && stRes.stdout.startsWith('?? ')) {
+        untracked = true;
+        try {
+          const st = statSync(realTarget);
+          if (st.isFile()) {
+            const fd = openSync(realTarget, 'r');
+            const buf = Buffer.allocUnsafe(Math.min(cap, st.size));
+            const n = readSync(fd, buf, 0, buf.length, 0);
+            closeSync(fd);
+            const slice = buf.subarray(0, n);
+            if (slice.includes(0)) {
+              text = `+++ ${relPath}\n[binary untracked file omitted]`;
+            } else {
+              const rawText = slice.toString('utf8');
+              const bodyLines = rawText.split('\n').map((l) => `+${l}`).join('\n');
+              text = `+++ ${relPath} (untracked)\n${bodyLines}${st.size > cap ? '\n... (truncated)' : ''}`;
+            }
           }
-        }
-      } catch {}
+        } catch {}
+      }
     }
   }
 
@@ -440,12 +657,238 @@ export async function probeWorktreeDiff({ root = '', worktree = '', file = '', m
   return {
     ok: true,
     status: 200,
-    worktree: normWt.path,
+    worktree: wtReal,
     file: relPath,
+    mode: diffMode,
     diff: text,
     truncated,
     untracked,
     added,
     removed,
+  };
+}
+
+function isSafeBranchName(name) {
+  if (typeof name !== 'string') return false;
+  const s = name.trim();
+  if (!s || !BRANCH_NAME_RE.test(s)) return false;
+  if (s.startsWith('-') || s.startsWith('/') || s.endsWith('/') || s.endsWith('.') || s.endsWith('.lock')) return false;
+  if (s.includes('..') || s.includes('//') || s.includes('@{')) return false;
+  return true;
+}
+
+async function isWorktreeClean(wtPath) {
+  const res = await execGit(wtPath, ['status', '--porcelain=v1', '-z']);
+  return res.ok && res.stdout.length === 0;
+}
+
+/** Execute a confined, shell-free git worktree action (`dry_run_merge`, `ff_merge`, `rebase`, `remove_worktree`). */
+export async function executeWorktreeAction({
+  action = '',
+  root = '',
+  path = '',
+  worktree = '',
+  targetBranch = '',
+  deleteBranch = false,
+} = {}) {
+  if (!VALID_ACTIONS.has(action)) {
+    return {
+      ok: false,
+      httpStatus: 400,
+      payload: { ok: false, action: String(action || ''), status: 'invalid', message: 'Unsupported worktree action' },
+    };
+  }
+
+  const confined = await resolveConfinedWorktree({ root, worktree, path });
+  if (!confined.ok) {
+    return {
+      ok: false,
+      httpStatus: confined.status,
+      payload: { ok: false, action, status: 'invalid', message: confined.error },
+    };
+  }
+
+  const { rootPath, wtPath, wtEntry, isMain } = confined;
+  const wtBranch = wtEntry.branch || '';
+
+  let target = '';
+  if (typeof targetBranch === 'string' && targetBranch.trim()) {
+    const candidate = targetBranch.trim();
+    if (!isSafeBranchName(candidate)) {
+      return {
+        ok: false,
+        httpStatus: 400,
+        payload: { ok: false, action, status: 'invalid', message: 'Invalid targetBranch name' },
+      };
+    }
+    const refCheck = await execGit(rootPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${candidate}`]);
+    if (!refCheck.ok || !refCheck.stdout.trim()) {
+      return {
+        ok: false,
+        httpStatus: 404,
+        payload: { ok: false, action, status: 'not_found', message: `Target branch '${candidate}' not found` },
+      };
+    }
+    target = candidate;
+  } else {
+    target = await detectBaseBranch(rootPath);
+    if (!target) {
+      return {
+        ok: false,
+        httpStatus: 400,
+        payload: { ok: false, action, status: 'no_base', message: 'Base branch (main/master) not found' },
+      };
+    }
+  }
+
+  const fail = (httpStatus, status, message, extra = {}) => ({
+    ok: false,
+    httpStatus,
+    payload: { ok: false, action, status, message, ...extra },
+  });
+
+  if (action === 'dry_run_merge') {
+    if (isMain || wtBranch === target) {
+      return fail(400, 'invalid', `Cannot dry-run merge ${target} into itself`);
+    }
+    const wtRef = wtBranch || wtEntry.head;
+    if (!wtRef) {
+      return fail(400, 'invalid', 'Worktree has no HEAD commit');
+    }
+    const mtRaw = await execGit(rootPath, ['merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', target, wtRef]);
+    const mt = parseMergeTreeOutput(mtRaw);
+    if (!mt.ok) {
+      return fail(409, 'error', mt.error);
+    }
+    const status = mt.clean ? 'clean' : 'conflict';
+    const message = mt.clean
+      ? `Clean merge into ${target}`
+      : `${mt.conflictFiles.length} conflict(s) merging into ${target}`;
+    return {
+      ok: true,
+      httpStatus: 200,
+      payload: {
+        ok: true,
+        action,
+        status,
+        clean: mt.clean,
+        conflicts: mt.conflictFiles,
+        conflictFiles: mt.conflictFiles,
+        treeSha: mt.treeSha,
+        result: { clean: mt.clean, treeSha: mt.treeSha, conflicts: mt.conflictFiles },
+        message,
+      },
+    };
+  }
+
+  if (action === 'ff_merge') {
+    if (isMain || wtBranch === target) {
+      return fail(400, 'invalid', `Cannot fast-forward merge ${target} into itself`);
+    }
+    if (wtEntry.detached || !wtBranch) {
+      return fail(400, 'detached', 'Cannot fast-forward merge a detached worktree');
+    }
+    if (!(await isWorktreeClean(wtPath))) {
+      return fail(409, 'dirty', 'Worktree has uncommitted changes');
+    }
+    if (!(await isWorktreeClean(rootPath))) {
+      return fail(409, 'dirty', 'Primary repository has uncommitted changes');
+    }
+    const rootBranchRes = await execGit(rootPath, ['symbolic-ref', '--short', 'HEAD']);
+    const rootBranch = rootBranchRes.ok ? rootBranchRes.stdout.trim() : '';
+    if (rootBranch !== target) {
+      return fail(409, 'wrong_branch', `Primary repository is on '${rootBranch || 'detached'}', expected '${target}'`);
+    }
+    const mergeRes = await execGit(rootPath, ['merge', '--ff-only', wtBranch], 10000);
+    if (!mergeRes.ok) {
+      return fail(409, 'not_ff', (mergeRes.stderr || mergeRes.error || 'Branch cannot be fast-forward merged; rebase required').trim());
+    }
+    invalidateWorktreeCache(rootPath);
+    return {
+      ok: true,
+      httpStatus: 200,
+      payload: {
+        ok: true,
+        action,
+        status: 'merged',
+        result: { branch: wtBranch, target, stdout: mergeRes.stdout.trim() },
+        message: `Fast-forwarded ${target} to ${wtBranch}`,
+      },
+    };
+  }
+
+  if (action === 'rebase') {
+    if (isMain || wtBranch === target) {
+      return fail(400, 'invalid', `Cannot rebase ${target} worktree onto itself`);
+    }
+    if (wtEntry.detached || !wtBranch) {
+      return fail(400, 'detached', 'Cannot rebase a detached worktree');
+    }
+    if (!(await isWorktreeClean(wtPath))) {
+      return fail(409, 'dirty', 'Worktree has uncommitted changes; commit or stash before rebasing');
+    }
+    const rebaseRes = await execGit(wtPath, ['rebase', target], 10000);
+    if (rebaseRes.ok) {
+      invalidateWorktreeCache(rootPath);
+      return {
+        ok: true,
+        httpStatus: 200,
+        payload: {
+          ok: true,
+          action,
+          status: 'rebased',
+          result: { branch: wtBranch, target, stdout: rebaseRes.stdout.trim() },
+          message: `Rebased ${wtBranch} onto ${target}`,
+        },
+      };
+    }
+    const conflictRes = await execGit(wtPath, ['diff', '--name-only', '--diff-filter=U', '-z']);
+    const conflicts = conflictRes.ok && conflictRes.stdout
+      ? [...new Set(conflictRes.stdout.split('\0').filter(Boolean))]
+      : [];
+    await execGit(wtPath, ['rebase', '--abort'], 5000);
+    invalidateWorktreeCache(rootPath);
+    const message = conflicts.length
+      ? `Rebase aborted due to conflicts in ${conflicts.join(', ')}`
+      : (rebaseRes.stderr || rebaseRes.error || 'Rebase failed and was aborted').trim();
+    return fail(409, 'conflict', message, {
+      aborted: true,
+      conflicts,
+      conflictFiles: conflicts,
+      result: { aborted: true, conflicts },
+    });
+  }
+
+  // remove_worktree
+  if (isMain || wtBranch === target) {
+    return fail(400, 'invalid', 'Cannot remove primary or base-branch worktree');
+  }
+  if (!(await isWorktreeClean(wtPath))) {
+    return fail(409, 'dirty', 'Worktree has uncommitted changes');
+  }
+  const mergedCheck = await execGit(wtPath, ['merge-base', '--is-ancestor', 'HEAD', target]);
+  if (!mergedCheck.ok) {
+    return fail(409, 'unmerged', `Worktree has unmerged commits not in ${target}`);
+  }
+  const rmRes = await execGit(rootPath, ['worktree', 'remove', wtPath], 10000);
+  if (!rmRes.ok) {
+    return fail(409, 'error', (rmRes.stderr || rmRes.error || 'Failed to remove worktree').trim());
+  }
+  let branchDeleted = false;
+  if (deleteBranch === true && wtBranch) {
+    const brRes = await execGit(rootPath, ['branch', '-d', wtBranch]);
+    branchDeleted = brRes.ok;
+  }
+  invalidateWorktreeCache(rootPath);
+  return {
+    ok: true,
+    httpStatus: 200,
+    payload: {
+      ok: true,
+      action,
+      status: 'removed',
+      result: { path: wtPath, branch: wtBranch, branchDeleted },
+      message: `Removed clean merged worktree ${basename(wtPath)}`,
+    },
   };
 }

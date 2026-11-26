@@ -4,7 +4,12 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parsePorcelainWorktrees, probeWorktreeDiff, probeWorktrees } from '../git_probe.mjs';
+import {
+  executeWorktreeAction,
+  parsePorcelainWorktrees,
+  probeWorktreeDiff,
+  probeWorktrees,
+} from '../git_probe.mjs';
 import {
   buildSwarmSnapshot,
   computeBurnSummary,
@@ -643,5 +648,97 @@ test('buildSwarmSnapshot exposes normalized native plan.json and narrator view.j
     assert.equal(symlinkRes.status, 403);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('git_probe enriches branchFiles, commits, mergeability, collisions (working/branch/mixed), and detached worktrees', async () => {
+  const baseDir = makeScratchDir('gitprobe-e2-');
+  const repoDir = join(baseDir, 'repo');
+  const wtA = join(baseDir, 'wt-a');
+  const wtB = join(baseDir, 'wt-b');
+  const wtDet = join(baseDir, 'wt-det');
+  try {
+    execFileSync('git', ['init', '-b', 'main', repoDir], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoDir, 'config', 'user.email', 'test@example.com'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoDir, 'config', 'user.name', 'Test'], { stdio: 'ignore' });
+    writeFileSync(join(repoDir, 'shared.txt'), 'line 1\n');
+    writeFileSync(join(repoDir, 'work.txt'), 'work base\n');
+    writeFileSync(join(repoDir, 'mix.txt'), 'mix base\n');
+    execFileSync('git', ['-C', repoDir, 'add', '.'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoDir, 'commit', '-m', 'Initial'], { stdio: 'ignore' });
+
+    execFileSync('git', ['-C', repoDir, 'worktree', 'add', '-b', 'feat/a', wtA], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoDir, 'worktree', 'add', '-b', 'feat/b', wtB], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoDir, 'worktree', 'add', '--detach', wtDet, 'HEAD'], { stdio: 'ignore' });
+
+    // Committed changes on feat/a: shared.txt + mix.txt (7 commits -> capped at 5)
+    for (let i = 1; i <= 6; i++) {
+      writeFileSync(join(wtA, 'shared.txt'), `feat-a v${i}\n`);
+      execFileSync('git', ['-C', wtA, 'commit', '-am', `feat-a commit ${i}`], { stdio: 'ignore' });
+    }
+    writeFileSync(join(wtA, 'mix.txt'), 'feat-a mix\n');
+    execFileSync('git', ['-C', wtA, 'commit', '-am', 'feat-a mix commit'], { stdio: 'ignore' });
+
+    // Advance main on shared.txt so feat/a has a merge-tree conflict while feat/b is clean
+    writeFileSync(join(repoDir, 'shared.txt'), 'main diverged\n');
+    execFileSync('git', ['-C', repoDir, 'commit', '-am', 'Main diverged shared'], { stdio: 'ignore' });
+
+    // Committed change on feat/b: shared.txt (branch collision with feat/a)
+    writeFileSync(join(wtB, 'shared.txt'), 'feat-b branch\n');
+    execFileSync('git', ['-C', wtB, 'commit', '-am', 'feat-b commit'], { stdio: 'ignore' });
+
+    // Working dirty changes: work.txt in both wtA & wtB (working collision); mix.txt dirty in wtB (mixed collision with wtA's branchFile)
+    writeFileSync(join(wtA, 'work.txt'), 'wtA dirty\n');
+    writeFileSync(join(wtB, 'work.txt'), 'wtB dirty\n');
+    writeFileSync(join(wtB, 'mix.txt'), 'wtB dirty mix\n');
+
+    const dirtyProbe = await probeWorktrees([repoDir], { ttlMs: 0 });
+    const mainWt = dirtyProbe.worktrees.find((w) => w.isMain);
+    const detWt = dirtyProbe.worktrees.find((w) => w.detached);
+    const aWt = dirtyProbe.worktrees.find((w) => w.branch === 'feat/a');
+    const bWt = dirtyProbe.worktrees.find((w) => w.branch === 'feat/b');
+
+    assert.equal(mainWt?.mergeability, 'main');
+    assert.equal(detWt?.mergeability, 'detached');
+    assert.equal(aWt?.mergeability, 'dirty');
+    assert.equal(bWt?.mergeability, 'dirty');
+    assert.equal(aWt?.commits.length, 5);
+    assert.equal(aWt?.commits[0].subject, 'feat-a mix commit');
+    assert.ok(aWt?.commits[0].sha && typeof aWt?.commits[0].authorTime === 'string' && aWt.commits[0].authorTime.length > 0);
+    assert.deepEqual(aWt?.branchFiles.sort(), ['mix.txt', 'shared.txt']);
+
+    const byFile = Object.fromEntries(dirtyProbe.collisions.map((c) => [c.file, c]));
+    assert.equal(byFile['shared.txt']?.kind, 'branch');
+    assert.equal(byFile['shared.txt']?.worktrees.length, 2);
+    assert.equal(byFile['work.txt']?.kind, 'working');
+    assert.equal(byFile['mix.txt']?.kind, 'mixed');
+
+    // Clean wtA and check mergeability === 'conflict' + conflictFiles
+    execFileSync('git', ['-C', wtA, 'checkout', '--', 'work.txt'], { stdio: 'ignore' });
+    const cleanAProbe = await probeWorktrees([repoDir], { ttlMs: 0 });
+    const aClean = cleanAProbe.worktrees.find((w) => w.branch === 'feat/a');
+    assert.equal(aClean?.mergeability, 'conflict');
+    assert.deepEqual(aClean?.conflictFiles, ['shared.txt']);
+
+    // mode=branch vs mode=working diff via path-only confinement
+    const branchDiff = await probeWorktreeDiff({ path: wtA, file: 'shared.txt', mode: 'branch' });
+    assert.equal(branchDiff.ok, true);
+    assert.equal(branchDiff.mode, 'branch');
+    assert.ok(branchDiff.diff.includes('+feat-a v6'));
+
+    const workingDiff = await probeWorktreeDiff({ path: wtA, file: 'shared.txt', mode: 'working' });
+    assert.equal(workingDiff.ok, true);
+    assert.equal(workingDiff.diff, '');
+
+    // Reject path traversal & direct unit action checks
+    const badMode = await probeWorktreeDiff({ path: wtA, file: 'shared.txt', mode: 'bogus' });
+    assert.equal(badMode.ok, false);
+    assert.equal(badMode.status, 400);
+
+    const rmMain = await executeWorktreeAction({ action: 'remove_worktree', path: repoDir });
+    assert.equal(rmMain.ok, false);
+    assert.equal(rmMain.httpStatus, 400);
+  } finally {
+    rmSync(baseDir, { recursive: true, force: true });
   }
 });

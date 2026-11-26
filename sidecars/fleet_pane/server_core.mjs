@@ -31,6 +31,7 @@ const __dirname = import.meta.dirname || dirname(new URL(import.meta.url).pathna
 const SIDE_ID_RE = /^[a-z0-9._-]{3,128}$/i;
 const BIND_HOST = '127.0.0.1';
 const MAX_BODY_BYTES = 64 * 1024;
+const MAX_WORKTREE_ACTION_BYTES = 16 * 1024;
 
 const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
@@ -505,10 +506,50 @@ export function createFleetHandlers({
     const res = await probeWorktreeDiff({
       root: typeof query.root === 'string' ? query.root : '',
       worktree: typeof query.worktree === 'string' ? query.worktree : '',
+      path: typeof query.path === 'string' ? query.path : '',
       file: typeof query.file === 'string' ? query.file : '',
+      mode: typeof query.mode === 'string' ? query.mode : 'working',
       maxBytes: Number(query.maxBytes) || 8192,
     });
     return { status: res.status || (res.ok ? 200 : 400), packed: pack(res) };
+  }
+
+  async function postWorktreeAction(body = {}) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return { status: 400, json: { ok: false, error: 'JSON object body required' } };
+    }
+    if (body.confirm === false) {
+      return { status: 400, json: { ok: false, error: 'Confirmation required' } };
+    }
+    const action = typeof body.action === 'string' ? body.action.trim() : '';
+    if (!action) {
+      return { status: 400, json: { ok: false, error: 'action is required' } };
+    }
+    const rawPath = typeof body.path === 'string' ? body.path : typeof body.worktree === 'string' ? body.worktree : '';
+    if (!rawPath.trim()) {
+      return { status: 400, json: { ok: false, action, error: 'worktree path is required' } };
+    }
+    if (body.root !== undefined && typeof body.root !== 'string') {
+      return { status: 400, json: { ok: false, action, error: 'root must be a string' } };
+    }
+    if (body.targetBranch !== undefined && typeof body.targetBranch !== 'string') {
+      return { status: 400, json: { ok: false, action, error: 'targetBranch must be a string' } };
+    }
+    if (body.deleteBranch !== undefined && typeof body.deleteBranch !== 'boolean') {
+      return { status: 400, json: { ok: false, action, error: 'deleteBranch must be a boolean' } };
+    }
+
+    const { executeWorktreeAction } = await getGitProbe();
+    const res = await executeWorktreeAction({
+      action,
+      root: typeof body.root === 'string' ? body.root : '',
+      path: typeof body.path === 'string' ? body.path : '',
+      worktree: typeof body.worktree === 'string' ? body.worktree : '',
+      targetBranch: typeof body.targetBranch === 'string' ? body.targetBranch : '',
+      deleteBranch: body.deleteBranch === true,
+    });
+    worktreesPayloadCache.clear();
+    return { status: res.httpStatus, json: res.payload };
   }
 
   function getFrame(query = {}) {
@@ -716,6 +757,7 @@ export function createFleetHandlers({
     getFrame,
     postNudge,
     postPlan,
+    postWorktreeAction,
     resolveStreamTarget,
   };
 }
@@ -1042,14 +1084,14 @@ export async function createStandaloneRouter({
       });
     }
 
-    function handleJsonPost(req, res, fn) {
+    function handleJsonPost(req, res, fn, maxBytes = MAX_BODY_BYTES) {
       if (!isLoopbackOrigin(req.headers.origin)) {
         res.writeHead(403, { 'Content-Type': 'application/json', Connection: 'close', ...SECURITY_HEADERS });
         res.end(JSON.stringify({ error: 'forbidden origin' }));
         return;
       }
       const cl = Number(req.headers['content-length']);
-      if (Number.isFinite(cl) && cl > MAX_BODY_BYTES) {
+      if (Number.isFinite(cl) && cl > maxBytes) {
         req.pause();
         res.writeHead(413, { 'Content-Type': 'application/json', Connection: 'close', ...SECURITY_HEADERS });
         res.end(JSON.stringify({ error: 'payload too large' }));
@@ -1062,7 +1104,7 @@ export async function createStandaloneRouter({
       req.on('data', (chunk) => {
         if (aborted) return;
         bytes += chunk.length;
-        if (bytes > MAX_BODY_BYTES) {
+        if (bytes > maxBytes) {
           aborted = true;
           req.pause();
           res.writeHead(413, { 'Content-Type': 'application/json', Connection: 'close', ...SECURITY_HEADERS });
@@ -1097,6 +1139,9 @@ export async function createStandaloneRouter({
     }
     if (req.method === 'POST' && pathname === '/api/plan') {
       return handleJsonPost(req, res, (h, body) => h.postPlan(body));
+    }
+    if (req.method === 'POST' && pathname === '/api/worktrees/action') {
+      return handleJsonPost(req, res, (h, body) => h.postWorktreeAction(body), MAX_WORKTREE_ACTION_BYTES);
     }
 
     res.writeHead(404, { 'Content-Type': 'text/plain', ...SECURITY_HEADERS });
@@ -1214,6 +1259,39 @@ export async function runSidecarApp({ appDataDir = '' } = {}) {
       }
     }
     const out = await handlers.postPlan(payload);
+    return new Response(JSON.stringify(out.json), { status: out.status, contentType: 'application/json', headers: SECURITY_HEADERS });
+  }, 'POST');
+  app.api('/api/worktrees/action', async (data) => {
+    let payload = data;
+    if (typeof data === 'string') {
+      if (Buffer.byteLength(data, 'utf8') > MAX_WORKTREE_ACTION_BYTES) {
+        return new Response(JSON.stringify({ error: 'payload too large' }), {
+          status: 413,
+          contentType: 'application/json',
+          headers: SECURITY_HEADERS,
+        });
+      }
+      try {
+        payload = JSON.parse(data);
+      } catch {
+        return new Response(JSON.stringify({ error: 'invalid JSON body' }), {
+          status: 400,
+          contentType: 'application/json',
+          headers: SECURITY_HEADERS,
+        });
+      }
+    } else if (data && typeof data === 'object') {
+      try {
+        if (Buffer.byteLength(JSON.stringify(data), 'utf8') > MAX_WORKTREE_ACTION_BYTES) {
+          return new Response(JSON.stringify({ error: 'payload too large' }), {
+            status: 413,
+            contentType: 'application/json',
+            headers: SECURITY_HEADERS,
+          });
+        }
+      } catch {}
+    }
+    const out = await handlers.postWorktreeAction(payload);
     return new Response(JSON.stringify(out.json), { status: out.status, contentType: 'application/json', headers: SECURITY_HEADERS });
   }, 'POST');
 

@@ -607,3 +607,213 @@ test('POST /api/plan supports create/patch/replace via member or coordinator ID,
     rmSync(fx.dir, { recursive: true, force: true });
   }
 });
+
+test('GET /api/worktrees, /api/worktrees/diff (working|branch), and POST /api/worktrees/action enforce security and execute git lifecycle cleanly', async () => {
+  const fx = setupFixtureAppData();
+  const baseDir = makeScratchDir('http-wt-');
+  const repoDir = join(baseDir, 'repo');
+  const wtClean = join(baseDir, 'wt-clean');
+  const wtConflict = join(baseDir, 'wt-conflict');
+
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+  });
+
+  try {
+    execFileSync('git', ['init', '-b', 'main', repoDir], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoDir, 'config', 'user.email', 'test@example.com'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoDir, 'config', 'user.name', 'Test'], { stdio: 'ignore' });
+    mkdirSync(join(repoDir, 'src'), { recursive: true });
+    writeFileSync(join(repoDir, 'shared.txt'), 'base shared\n');
+    writeFileSync(join(repoDir, 'src', 'app.txt'), 'base app\n');
+    execFileSync('git', ['-C', repoDir, 'add', '.'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoDir, 'commit', '-m', 'Initial'], { stdio: 'ignore' });
+
+    execFileSync('git', ['-C', repoDir, 'worktree', 'add', '-b', 'feat/clean', wtClean], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoDir, 'worktree', 'add', '-b', 'feat/conflict', wtConflict], { stdio: 'ignore' });
+
+    // Committed change on feat/clean (does not touch shared.txt)
+    writeFileSync(join(wtClean, 'src', 'clean-only.txt'), 'clean branch change\n');
+    execFileSync('git', ['-C', wtClean, 'add', '.'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', wtClean, 'commit', '-m', 'Add clean file'], { stdio: 'ignore' });
+    // Dirty working edit on src/app.txt in wtClean (mixed collision with committed edit in wtConflict)
+    writeFileSync(join(wtClean, 'src', 'app.txt'), 'dirty working edit\n');
+
+    // Committed changes on feat/conflict touching both shared.txt and src/app.txt
+    writeFileSync(join(wtConflict, 'shared.txt'), 'conflict branch change\n');
+    writeFileSync(join(wtConflict, 'src', 'app.txt'), 'conflict app branch change\n');
+    execFileSync('git', ['-C', wtConflict, 'commit', '-am', 'Conflict branch edits'], { stdio: 'ignore' });
+
+    // Advance main on shared.txt so feat/conflict conflicts with main while feat/clean is clean (behind 1)
+    writeFileSync(join(repoDir, 'shared.txt'), 'main advanced shared\n');
+    execFileSync('git', ['-C', repoDir, 'commit', '-am', 'Advance main shared'], { stdio: 'ignore' });
+
+    // 1. GET /api/worktrees enriched schema + mixed collision
+    const wtRes = await fetch(`${srv.url}/api/worktrees?roots=${encodeURIComponent(repoDir)}`);
+    assert.equal(wtRes.status, 200);
+    const wtBody = await wtRes.json();
+    assert.ok(Array.isArray(wtBody.collisions));
+    const appCollision = wtBody.collisions.find((c) => c.file === 'src/app.txt');
+    assert.ok(appCollision);
+    assert.equal(appCollision.kind, 'mixed');
+    assert.equal(appCollision.worktrees.length, 2);
+
+    const cleanInfo = wtBody.worktrees.find((w) => w.branch === 'feat/clean');
+    const conflictInfo = wtBody.worktrees.find((w) => w.branch === 'feat/conflict');
+    assert.equal(cleanInfo?.mergeability, 'dirty');
+    assert.deepEqual(cleanInfo?.branchFiles, ['src/clean-only.txt']);
+    assert.equal(cleanInfo?.commits.length, 1);
+    assert.equal(conflictInfo?.mergeability, 'conflict');
+    assert.deepEqual(conflictInfo?.conflictFiles, ['shared.txt']);
+
+    // 2. GET /api/worktrees/diff?path=...&file=...&mode=working|branch + security guards
+    const dBranch = await fetch(
+      `${srv.url}/api/worktrees/diff?path=${encodeURIComponent(wtClean)}&file=${encodeURIComponent('src/clean-only.txt')}&mode=branch`,
+    );
+    assert.equal(dBranch.status, 200);
+    const dBranchJson = await dBranch.json();
+    assert.equal(dBranchJson.mode, 'branch');
+    assert.ok(dBranchJson.diff.includes('+clean branch change'));
+
+    const dWorking = await fetch(
+      `${srv.url}/api/worktrees/diff?path=${encodeURIComponent(wtClean)}&file=${encodeURIComponent('src/app.txt')}&mode=working`,
+    );
+    assert.equal(dWorking.status, 200);
+    const dWorkingJson = await dWorking.json();
+    assert.equal(dWorkingJson.mode, 'working');
+    assert.ok(dWorkingJson.diff.includes('+dirty working edit'));
+
+    // Reject subdir path (must be canonical worktree root), traversal, and symlink escape
+    const dSubdir = await fetch(
+      `${srv.url}/api/worktrees/diff?path=${encodeURIComponent(join(wtClean, 'src'))}&file=app.txt&mode=working`,
+    );
+    assert.equal(dSubdir.status, 404);
+
+    const dTrav = await fetch(
+      `${srv.url}/api/worktrees/diff?path=${encodeURIComponent(wtClean)}&file=${encodeURIComponent('../repo/shared.txt')}&mode=branch`,
+    );
+    assert.equal(dTrav.status, 400);
+
+    symlinkSync('/etc/hosts', join(wtClean, 'evil-link'));
+    const dSym = await fetch(
+      `${srv.url}/api/worktrees/diff?path=${encodeURIComponent(wtClean)}&file=evil-link&mode=working`,
+    );
+    assert.equal(dSym.status, 404);
+    rmSync(join(wtClean, 'evil-link'));
+
+    // 3. POST /api/worktrees/action security guards: Host-403, Origin-403, 413 (>16 KiB), confinement
+    const postAction = (body, headers = {}) =>
+      fetch(`${srv.url}/api/worktrees/action`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify(body),
+      });
+
+    const badOrigin = await postAction(
+      { action: 'dry_run_merge', path: wtConflict },
+      { Origin: 'https://evil.example' },
+    );
+    assert.equal(badOrigin.status, 403);
+
+    const badHost = await new Promise((resolve, reject) => {
+      const sock = net.connect(srv.port, '127.0.0.1', () => {
+        sock.write(`POST /api/worktrees/action HTTP/1.1\r\nHost: evil.attacker.example\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}`);
+      });
+      const chunks = [];
+      sock.on('data', (c) => chunks.push(c));
+      sock.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+      sock.on('error', reject);
+    });
+    assert.ok(badHost.startsWith('HTTP/1.1 403'));
+
+    const oversized16k = await postAction({
+      action: 'dry_run_merge',
+      path: wtConflict,
+      targetBranch: 'a'.repeat(17 * 1024),
+    });
+    assert.equal(oversized16k.status, 413);
+
+    const badPath = await postAction({ action: 'dry_run_merge', path: join(wtClean, 'src') });
+    assert.equal(badPath.status, 404);
+
+    const rmMain = await postAction({ action: 'remove_worktree', path: repoDir });
+    assert.equal(rmMain.status, 400);
+
+    // 4. dry_run_merge: conflict vs clean
+    const dryConflictRes = await postAction({ action: 'dry_run_merge', path: wtConflict });
+    assert.equal(dryConflictRes.status, 200);
+    const dryConflict = await dryConflictRes.json();
+    assert.equal(dryConflict.ok, true);
+    assert.equal(dryConflict.status, 'conflict');
+    assert.equal(dryConflict.clean, false);
+    assert.deepEqual(dryConflict.conflicts, ['shared.txt']);
+
+    const dryCleanRes = await postAction({ action: 'dry_run_merge', path: wtClean });
+    assert.equal(dryCleanRes.status, 200);
+    const dryClean = await dryCleanRes.json();
+    assert.equal(dryClean.ok, true);
+    assert.equal(dryClean.status, 'clean');
+    assert.equal(dryClean.clean, true);
+    assert.deepEqual(dryClean.conflicts, []);
+
+    // 5. rebase auto-aborts on conflict & preserves clean state
+    const rebaseConflictRes = await postAction({ action: 'rebase', path: wtConflict });
+    assert.equal(rebaseConflictRes.status, 409);
+    const rebaseConflict = await rebaseConflictRes.json();
+    assert.equal(rebaseConflict.ok, false);
+    assert.equal(rebaseConflict.aborted, true);
+    assert.deepEqual(rebaseConflict.conflicts, ['shared.txt']);
+    assert.equal(existsSync(join(repoDir, '.git', 'worktrees', 'wt-conflict', 'rebase-merge')), false);
+    assert.equal(execFileSync('git', ['-C', wtConflict, 'status', '--porcelain'], { encoding: 'utf8' }), '');
+
+    // 6. Dirty worktree blocks ff_merge, rebase, and remove_worktree; unmerged clean blocks remove_worktree
+    assert.equal((await postAction({ action: 'ff_merge', path: wtClean })).status, 409);
+    assert.equal((await postAction({ action: 'rebase', path: wtClean })).status, 409);
+    assert.equal((await postAction({ action: 'remove_worktree', path: wtClean })).status, 409);
+
+    // Clean wtClean -> diverged ff_merge still refused (409), unmerged remove still refused (409)
+    execFileSync('git', ['-C', wtClean, 'checkout', '--', 'src/app.txt'], { stdio: 'ignore' });
+    assert.equal((await postAction({ action: 'ff_merge', path: wtClean })).status, 409);
+    assert.equal((await postAction({ action: 'remove_worktree', path: wtClean })).status, 409);
+
+    // 7. Rebase wtClean cleanly onto main -> ff_merge succeeds -> remove_worktree succeeds
+    const rebaseCleanRes = await postAction({ action: 'rebase', path: wtClean });
+    assert.equal(rebaseCleanRes.status, 200);
+    const rebaseClean = await rebaseCleanRes.json();
+    assert.equal(rebaseClean.ok, true);
+    assert.equal(rebaseClean.status, 'rebased');
+
+    const ffRes = await postAction({ action: 'ff_merge', path: wtClean });
+    assert.equal(ffRes.status, 200);
+    const ffJson = await ffRes.json();
+    assert.equal(ffJson.ok, true);
+    assert.equal(ffJson.status, 'merged');
+    assert.equal(existsSync(join(repoDir, 'src', 'clean-only.txt')), true);
+
+    // Cache invalidated: GET /api/worktrees sees feat/clean merged (ahead === 0)
+    const afterMergeWt = await (await fetch(`${srv.url}/api/worktrees?roots=${encodeURIComponent(repoDir)}`)).json();
+    const mergedClean = afterMergeWt.worktrees.find((w) => w.branch === 'feat/clean');
+    assert.equal(mergedClean?.ahead, 0);
+    assert.equal(mergedClean?.landStatus, 'merged');
+
+    // remove_worktree succeeds now that wtClean is clean & merged
+    const rmCleanRes = await postAction({ action: 'remove_worktree', path: wtClean, deleteBranch: true });
+    assert.equal(rmCleanRes.status, 200);
+    const rmClean = await rmCleanRes.json();
+    assert.equal(rmClean.ok, true);
+    assert.equal(rmClean.status, 'removed');
+    assert.equal(rmClean.result.branchDeleted, true);
+    assert.equal(existsSync(wtClean), false);
+
+    // Unmerged wtConflict is still refused removal
+    const rmUnmergedRes = await postAction({ action: 'remove_worktree', path: wtConflict });
+    assert.equal(rmUnmergedRes.status, 409);
+  } finally {
+    await srv.close();
+    rmSync(baseDir, { recursive: true, force: true });
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
