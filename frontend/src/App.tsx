@@ -21,11 +21,13 @@ import { TriageView } from "./components/TriageView";
 import { WorktreesView } from "./components/WorktreesView";
 import {
   applyTheme,
+  fetchSwarmDelta,
   fetchSwarmSnapshot,
   fetchSwarms,
   fetchWorktrees,
   inferThemeFromCssColor,
   isEmbeddedHost,
+  mergeSwarmDelta,
   openWorkerConversation,
   readStoredTheme,
   startSwarmPreset,
@@ -80,6 +82,9 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const etagRef = useRef<string>("");
+  const snapRef = useRef<SwarmSnapshot | null>(null);
+  snapRef.current = snap;
+  const lastSwarmsFetchRef = useRef<number>(0);
 
   const [workspaceUris, setWorkspaceUris] = useState<string[]>([]);
   const [manualRoots, setManualRoots] = useState<string[]>([]);
@@ -95,6 +100,7 @@ export function App() {
   const [boardComposeNonce, setBoardComposeNonce] = useState(0);
   const [rosterSpawnNonce, setRosterSpawnNonce] = useState(0);
   const [sseConnected, setSseConnected] = useState(false);
+  const [deltaLive, setDeltaLive] = useState(false);
   const [sseStatus, setSseStatus] = useState<"idle" | "live" | "reconnecting">("idle");
   const [sseNonce, setSseNonce] = useState(0);
   const [lastSyncAt, setLastSyncAt] = useState(0);
@@ -148,6 +154,20 @@ export function App() {
     };
   }, []);
 
+  const membersSigOf = (s: SwarmSnapshot | null) =>
+    (s?.members || []).map((m) => `${m.name}:${m.status}:${m.killed ? 1 : 0}`).join(",");
+
+  const maybeRefreshSwarmsList = useCallback((force = false) => {
+    const now = Date.now();
+    if (!force && now - lastSwarmsFetchRef.current < 30000) return;
+    lastSwarmsFetchRef.current = now;
+    void fetchSwarms()
+      .then((listData) => {
+        if (listData?.swarms) setSwarms(listData.swarms);
+      })
+      .catch(() => {});
+  }, []);
+
   const refreshSwarm = useCallback(
     async (force = false) => {
       try {
@@ -156,9 +176,13 @@ export function App() {
           fetchSwarmSnapshot(selectedSwarmId, force ? "" : etagRef.current),
           fetchSwarms().catch(() => null),
         ]);
-        if (listData?.swarms) setSwarms(listData.swarms);
+        if (listData?.swarms) {
+          setSwarms(listData.swarms);
+          lastSwarmsFetchRef.current = Date.now();
+        }
         if (data && !data.unchanged) {
           etagRef.current = data.etag || "";
+          snapRef.current = data;
           setSnap(data);
         }
         setLastSyncAt(Date.now());
@@ -172,20 +196,51 @@ export function App() {
     [selectedSwarmId],
   );
 
+  const syncSwarmDelta = useCallback(
+    async (convId: string, signal?: AbortSignal) => {
+      const curSnap = snapRef.current;
+      if (!curSnap || !convId || (curSnap.swarm !== convId && curSnap.conversationId !== convId)) {
+        await refreshSwarm(false);
+        return;
+      }
+      const prevHead = curSnap.head ?? 0;
+      const prevMembersSig = membersSigOf(curSnap);
+      const prevEtag = etagRef.current || curSnap.etag || "";
+      const delta = await fetchSwarmDelta(convId, {
+        since: prevHead > 0 ? prevHead : 0,
+        etag: prevEtag,
+        waitMs: 0,
+        signal,
+      });
+      if (signal?.aborted) return;
+      setLastSyncAt(Date.now());
+      setError("");
+      const isNoop =
+        delta.unchanged ||
+        (Boolean(delta.etag) &&
+          delta.etag === prevEtag &&
+          delta.mode !== "full" &&
+          !(delta.messagesDelta && delta.messagesDelta.length > 0));
+      if (isNoop) {
+        maybeRefreshSwarmsList(false);
+        return;
+      }
+      const merged = mergeSwarmDelta(curSnap, delta);
+      if (merged) {
+        etagRef.current = merged.etag || "";
+        snapRef.current = merged;
+        setSnap(merged);
+        const listChanged = (merged.head ?? 0) !== prevHead || membersSigOf(merged) !== prevMembersSig;
+        maybeRefreshSwarmsList(listChanged);
+      }
+    },
+    [maybeRefreshSwarmsList, refreshSwarm],
+  );
+
   useEffect(() => {
     etagRef.current = "";
     refreshSwarm(true);
   }, [refreshSwarm]);
-
-  useEffect(() => {
-    const ms = Number(pollMs);
-    if (!ms) return;
-    const effectiveMs = sseConnected ? Math.max(ms, 15000) : ms;
-    const id = setInterval(() => {
-      if (!document.hidden) refreshSwarm(false);
-    }, effectiveMs);
-    return () => clearInterval(id);
-  }, [pollMs, sseConnected, refreshSwarm]);
 
   useEffect(() => {
     if (!snap?.swarm) return;
@@ -195,17 +250,173 @@ export function App() {
     return () => clearInterval(id);
   }, [snap?.swarm]);
 
-  // Live SSE push stream when running on standalone HTTP server (graceful poll fallback inside SidecarApp).
   const refreshRef = useRef(refreshSwarm);
   refreshRef.current = refreshSwarm;
+  const syncDeltaRef = useRef(syncSwarmDelta);
+  syncDeltaRef.current = syncSwarmDelta;
   const canSse = Boolean(snap?.capabilities?.sseStream);
+  const canDelta = Boolean(snap?.capabilities?.deltaStream);
   const activeConvId = selectedSwarmId || snap?.swarm || "";
+  const deltaTargetId =
+    !canSse &&
+    canDelta &&
+    !loading &&
+    snap?.swarm &&
+    (!selectedSwarmId || snap.swarm === selectedSwarmId || snap.conversationId === selectedSwarmId)
+      ? activeConvId
+      : "";
+
+  // Continuous abort-safe GET /api/swarm/delta?waitMs=20000 long-poll loop when !canSse (SidecarApp & live-web).
+  useEffect(() => {
+    const ms = Number(pollMs);
+    if (canSse || !canDelta || !ms || !deltaTargetId) {
+      setDeltaLive(false);
+      return;
+    }
+
+    let cancelled = false;
+    let controller: AbortController | null = null;
+    let sleepTimer: ReturnType<typeof setTimeout> | null = null;
+    let sleepResolve: (() => void) | null = null;
+
+    const sleepAbortable = (delayMs: number) =>
+      new Promise<void>((resolve) => {
+        if (cancelled) {
+          resolve();
+          return;
+        }
+        sleepResolve = () => {
+          if (sleepTimer) {
+            clearTimeout(sleepTimer);
+            sleepTimer = null;
+          }
+          sleepResolve = null;
+          resolve();
+        };
+        sleepTimer = setTimeout(() => {
+          sleepTimer = null;
+          sleepResolve = null;
+          resolve();
+        }, delayMs);
+      });
+
+    const onVisibility = () => {
+      if (!document.hidden) sleepResolve?.();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+
+    const runLoop = async () => {
+      setDeltaLive(true);
+      while (!cancelled) {
+        if (document.hidden) {
+          await sleepAbortable(Math.max(ms, 2000));
+          continue;
+        }
+        const curSnap = snapRef.current;
+        const since = curSnap && typeof curSnap.head === "number" && curSnap.head > 0 ? curSnap.head : 0;
+        const reqEtag = etagRef.current || curSnap?.etag || "";
+        controller = new AbortController();
+        const startedAt = Date.now();
+        try {
+          const delta = await fetchSwarmDelta(deltaTargetId, {
+            since,
+            etag: reqEtag,
+            waitMs: 20000,
+            signal: controller.signal,
+          });
+          if (cancelled || controller.signal.aborted) break;
+
+          const elapsed = Date.now() - startedAt;
+          setDeltaLive(true);
+          setLastSyncAt(Date.now());
+          setError("");
+
+          const isNoop =
+            delta.unchanged ||
+            (Boolean(delta.etag) &&
+              delta.etag === reqEtag &&
+              delta.mode !== "full" &&
+              !(delta.messagesDelta && delta.messagesDelta.length > 0));
+          if (isNoop) {
+            maybeRefreshSwarmsList(false);
+            if (elapsed < 250) {
+              await sleepAbortable(ms);
+            }
+            continue;
+          }
+
+          const latestSnap = snapRef.current;
+          const prevHead = latestSnap?.head ?? 0;
+          const prevMembersSig = membersSigOf(latestSnap);
+          if (delta.etag && delta.etag === etagRef.current && latestSnap) {
+            maybeRefreshSwarmsList(false);
+            if (elapsed < 250) {
+              await sleepAbortable(ms);
+            }
+            continue;
+          }
+          const merged = mergeSwarmDelta(latestSnap, delta);
+          if (merged) {
+            etagRef.current = merged.etag || "";
+            snapRef.current = merged;
+            setSnap(merged);
+            const listChanged = (merged.head ?? 0) !== prevHead || membersSigOf(merged) !== prevMembersSig;
+            maybeRefreshSwarmsList(listChanged);
+          }
+        } catch (err) {
+          if (cancelled || (err instanceof DOMException && err.name === "AbortError")) break;
+          const msg = err instanceof Error ? err.message : "";
+          if (msg.includes("(404)")) {
+            await refreshRef.current(false);
+            await sleepAbortable(ms);
+          } else {
+            setDeltaLive(false);
+            setError(msg || "Failed to load swarm delta");
+            await sleepAbortable(Math.min(Math.max(ms, 1000), 5000));
+          }
+        } finally {
+          controller = null;
+        }
+      }
+    };
+
+    void runLoop();
+
+    return () => {
+      cancelled = true;
+      setDeltaLive(false);
+      document.removeEventListener("visibilitychange", onVisibility);
+      controller?.abort();
+      sleepResolve?.();
+    };
+  }, [canSse, canDelta, pollMs, deltaTargetId, sseNonce, maybeRefreshSwarmsList]);
+
+  // Safety-net polling for SSE mode (uses /api/swarm/delta when snapshot exists) or empty workspace discovery.
+  useEffect(() => {
+    const ms = Number(pollMs);
+    if (!ms) return;
+    if (!canSse && canDelta && deltaTargetId) return;
+    const effectiveMs = sseConnected ? Math.max(ms, 15000) : ms;
+    const id = setInterval(() => {
+      if (document.hidden) return;
+      if (canSse && canDelta && activeConvId && snapRef.current) {
+        void syncDeltaRef.current(activeConvId).catch(() => refreshRef.current(false));
+      } else {
+        void refreshRef.current(false);
+      }
+    }, effectiveMs);
+    return () => clearInterval(id);
+  }, [pollMs, canSse, canDelta, sseConnected, deltaTargetId, activeConvId]);
+
+  // Live SSE push stream when running on standalone HTTP server (delta long-poll inside SidecarApp).
   useEffect(() => {
     if (!canSse || pollMs === "0" || !activeConvId || typeof EventSource === "undefined") {
       setSseConnected(false);
       setSseStatus("idle");
       return;
     }
+    const sseController = new AbortController();
+    let pingSyncPending = false;
     const q = `?conversationId=${encodeURIComponent(activeConvId)}`;
     const es = new EventSource(`/api/swarm/stream${q}`);
     es.onopen = () => {
@@ -220,27 +431,51 @@ export function App() {
       try {
         const d = JSON.parse((ev as MessageEvent).data || "{}");
         if (d?.etag && d.etag !== etagRef.current) {
-          refreshRef.current(false);
+          if (canDelta) {
+            void syncDeltaRef.current(activeConvId, sseController.signal).catch((err) => {
+              if (sseController.signal.aborted) return;
+              if (err instanceof Error && err.message.includes("(404)")) {
+                return refreshRef.current(false);
+              }
+              return refreshRef.current(false);
+            });
+          } else {
+            void refreshRef.current(false);
+          }
         }
       } catch {
-        refreshRef.current(false);
+        void refreshRef.current(false);
       }
     });
     es.addEventListener("ping", () => {
       setSseConnected(true);
       setSseStatus("live");
       setLastSyncAt(Date.now());
+      if (canDelta && !document.hidden && snapRef.current && !pingSyncPending) {
+        pingSyncPending = true;
+        void syncDeltaRef.current(activeConvId, sseController.signal)
+          .catch((err) => {
+            if (sseController.signal.aborted) return;
+            if (err instanceof Error && err.message.includes("(404)")) {
+              return refreshRef.current(false);
+            }
+          })
+          .finally(() => {
+            pingSyncPending = false;
+          });
+      }
     });
     es.onerror = () => {
       setSseConnected(false);
       setSseStatus("reconnecting");
     };
     return () => {
+      sseController.abort();
       setSseConnected(false);
       setSseStatus("idle");
       es.close();
     };
-  }, [canSse, pollMs, activeConvId, sseNonce]);
+  }, [canSse, canDelta, pollMs, activeConvId, sseNonce]);
 
   const allRoots = [...new Set([...workspaceUris, ...manualRoots])];
   const allRootsKey = allRoots.join("\0");
@@ -342,6 +577,7 @@ export function App() {
 
   const handleSelectSwarm = (id: string) => {
     etagRef.current = "";
+    setLoading(true);
     setSelectedSwarmId(id);
     setHighlightSeq(null);
     setBoardAgentFilter("all");
@@ -497,7 +733,7 @@ export function App() {
                 {activeCount} working · {waitingCount} waiting <span className="text-ink-3">#{snap?.head || 0}</span>
               </div>
               <div className="f1">
-                {sseConnected && <Badge tone="success">Live</Badge>}
+                {(sseConnected || deltaLive) && <Badge tone="success">Live</Badge>}
                 {snap?.member && <Badge>you: {snap.member}</Badge>}
                 <span className="inline-flex items-center rounded-chip bg-board px-2 py-1 num font-medium text-ink-2">{fmtTokens(snap?.usage?.totalTokens)} tok</span>
               </div>
@@ -741,7 +977,7 @@ export function App() {
                   onClick={handleLaunchCustom}
                 >
                   {window.sidecar?.agent?.startConversation ? <Rocket /> : <ClipboardCopy />}
-                  {launching ? "Starting..." : window.sidecar?.agent?.startConversation ? "Launch swarm" : "Copy prompt"}
+                  {launching ? "Starting…" : window.sidecar?.agent?.startConversation ? "Launch swarm" : "Copy prompt"}
                 </Button>
               </div>
             </div>

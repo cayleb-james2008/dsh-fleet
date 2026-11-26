@@ -2007,6 +2007,410 @@ await runChecks("gate", async (check) => {
     );
   });
 
+  await check("SidecarApp !canSse delta long-poll merges incremental delta, deduplicates seq, and skips redundant /api/swarms", async () => {
+    const dPage = await ctx.newPage();
+    await dPage.setViewportSize({ width: 340, height: 900 });
+    const dErrs = [];
+    const deltaCalls = [];
+    let swarmHits = 0;
+    let swarmsHits = 0;
+    let deltaStep = 0;
+    let releaseLastDelta = null;
+
+    dPage.on("pageerror", (e) => dErrs.push(e.message));
+    dPage.on("console", (msg) => {
+      if (msg.type() === "error") dErrs.push(msg.text());
+    });
+
+    const baseMembers = [
+      {
+        name: "coordinator",
+        conversation_id: "delta-coord-1",
+        model: "gemini-3-pro",
+        role: "coordinator",
+        wake_mode: "mentions",
+        wait_since: 2,
+        last_read_seq: 2,
+        unread: 0,
+        killed: false,
+        status: "waiting",
+        steps: 4,
+        activity: "",
+        activityKind: "",
+        replied: false,
+        replyAsk: "",
+        narrator: false,
+        roleWorker: false,
+        failure: null,
+        transcriptMtime: Date.now(),
+        startedAt: new Date().toISOString(),
+        lastStepAt: new Date().toISOString(),
+        usage: { inputTokens: 800, cacheReadTokens: 0, outputTokens: 100, totalTokens: 900 },
+        posts: 1,
+        lastPostSeq: 1,
+        lastPostTime: "12:00:00",
+        lastPostTs: Date.now(),
+      },
+      {
+        name: "builder",
+        conversation_id: "delta-builder-2",
+        model: "gemini-3-pro",
+        role: "worker",
+        wake_mode: "mentions",
+        wait_since: 1,
+        last_read_seq: 2,
+        unread: 0,
+        killed: false,
+        status: "working",
+        steps: 6,
+        activity: "Building delta channel",
+        activityKind: "tool",
+        replied: false,
+        replyAsk: "",
+        narrator: false,
+        roleWorker: false,
+        failure: null,
+        transcriptMtime: Date.now(),
+        startedAt: new Date().toISOString(),
+        lastStepAt: new Date().toISOString(),
+        usage: { inputTokens: 1000, cacheReadTokens: 0, outputTokens: 200, totalTokens: 1200 },
+        posts: 1,
+        lastPostSeq: 2,
+        lastPostTime: "12:01:00",
+        lastPostTs: Date.now(),
+      },
+    ];
+
+    await dPage.route("**/api/swarms*", async (route) => {
+      swarmsHits += 1;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          swarms: [
+            {
+              id: "delta-coord-1",
+              title: "Delta Sidecar Gate",
+              appData: "gate",
+              head: deltaStep >= 2 ? 3 : 2,
+              memberCount: 2,
+              activeCount: deltaStep >= 2 ? 0 : 1,
+              waitingCount: deltaStep >= 2 ? 2 : 1,
+              killedCount: 0,
+              triageCount: 0,
+              totalTokens: 2100,
+              hasPlan: false,
+              lastActivityTs: Date.now(),
+            },
+          ],
+          defaultConversationId: "delta-coord-1",
+        }),
+      });
+    });
+
+    await dPage.route(/\/api\/swarm(\?.*)?$/, async (route) => {
+      swarmHits += 1;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversationId: "delta-coord-1",
+          swarm: "delta-coord-1",
+          member: "coordinator",
+          etag: "delta-v1",
+          id: "delta-coord-1",
+          title: "Delta Sidecar Gate",
+          head: 2,
+          members: baseMembers,
+          messages: [
+            { seq: 1, agent: "coordinator", text: "@builder Start delta task", time: "12:00:00", ts: Date.now() - 5000, mentions: ["builder"], all: false },
+            { seq: 2, agent: "builder", text: "@coordinator Working on #1", time: "12:01:00", ts: Date.now() - 2000, mentions: ["coordinator"], all: false },
+          ],
+          replyRefs: { 1: [2] },
+          edges: [{ from: "coordinator", to: "builder", count: 1, direct: 1, viaAll: 0 }],
+          triage: [],
+          usage: { inputTokens: 1800, cacheReadTokens: 0, outputTokens: 300, totalTokens: 2100 },
+          capabilities: { canSendMessage: true, isSidecar: true, sseStream: false, deltaStream: true },
+        }),
+      });
+    });
+
+    await dPage.route(/\/api\/swarm\/delta(\?.*)?$/, async (route) => {
+      const reqUrl = new URL(route.request().url());
+      deltaStep += 1;
+      deltaCalls.push({
+        step: deltaStep,
+        since: reqUrl.searchParams.get("since"),
+        etag: reqUrl.searchParams.get("etag"),
+        waitMs: reqUrl.searchParams.get("waitMs"),
+      });
+
+      if (deltaStep === 1) {
+        await new Promise((r) => setTimeout(r, 270));
+        await route
+          .fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({ ok: true, unchanged: true, etag: "delta-v1", head: 2 }),
+          })
+          .catch(() => {});
+        return;
+      }
+
+      if (deltaStep === 2) {
+        const updatedMembers = [
+          baseMembers[0],
+          { ...baseMembers[1], status: "waiting", activity: "", posts: 2, lastPostSeq: 3, lastPostTime: "12:02:00" },
+        ];
+        await route
+          .fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({
+              ok: true,
+              mode: "delta",
+              unchanged: false,
+              conversationId: "delta-coord-1",
+              swarm: "delta-coord-1",
+              etag: "delta-v2",
+              since: 2,
+              head: 3,
+              messagesDelta: [
+                { seq: 2, agent: "builder", text: "@coordinator Working on #1", time: "12:01:00", ts: Date.now() - 2000, mentions: ["coordinator"], all: false },
+                { seq: 3, agent: "builder", text: "@coordinator [done] Re #2: Delta update landed", time: "12:02:00", ts: Date.now(), mentions: ["coordinator"], all: false },
+              ],
+              replyRefsDelta: { 2: [3] },
+              edgesDelta: [{ from: "builder", to: "coordinator", count: 1, direct: 1, viaAll: 0 }],
+              members: updatedMembers,
+              triage: [],
+              usage: { inputTokens: 2000, cacheReadTokens: 0, outputTokens: 400, totalTokens: 2400 },
+            }),
+          })
+          .catch(() => {});
+        return;
+      }
+
+      await new Promise((r) => {
+        releaseLastDelta = r;
+        setTimeout(r, 5000);
+      });
+      await route
+        .fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ ok: true, unchanged: true, etag: "delta-v2", head: 3 }),
+        })
+        .catch(() => {});
+    });
+
+    await dPage.goto(BASE, { waitUntil: "domcontentloaded" });
+    await dPage.locator("#tab-board").click();
+    await dPage.waitForFunction(() => (document.querySelector("#panel-board")?.textContent || "").includes("Delta update landed"));
+
+    const seq2Count = await dPage.locator('#panel-board [data-seq="2"]').count();
+    const replyRefTxt = await dPage.locator('[data-testid="board-reply-refs-2"]').textContent();
+    const ov340 = await dPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    // Pause updates via Settings to verify abort-safe shutdown of parked delta request
+    await dPage.locator('button[aria-label="Open settings"]').click();
+    await dPage.locator('div[role="dialog"] button[role="radio"]:has-text("Paused")').click();
+    await dPage.locator('button[aria-label="Close dialog"]').click();
+    await dPage.waitForSelector('[data-testid="sse-resync-banner"]');
+
+    releaseLastDelta?.();
+    await dPage.close();
+
+    return (
+      swarmHits === 1 &&
+      swarmsHits === 2 &&
+      deltaCalls.length >= 2 &&
+      deltaCalls[0].since === "2" &&
+      deltaCalls[0].etag === "delta-v1" &&
+      deltaCalls[0].waitMs === "20000" &&
+      deltaCalls[1].since === "2" &&
+      seq2Count === 1 &&
+      Boolean(replyRefTxt?.includes("#3")) &&
+      ov340 <= 0 &&
+      dErrs.length === 0
+    );
+  });
+
+  await check("SSE ping consumes /api/swarm/delta (including mode full fallback) without re-fetching /api/swarm", async () => {
+    const sPage = await ctx.newPage();
+    const sErrs = [];
+    let swarmHits = 0;
+    const deltaCalls = [];
+
+    sPage.on("pageerror", (e) => sErrs.push(e.message));
+    sPage.on("console", (msg) => {
+      if (msg.type() === "error") sErrs.push(msg.text());
+    });
+
+    await sPage.route("**/api/swarms*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          swarms: [
+            {
+              id: "sse-delta-1",
+              title: "SSE Ping Delta Gate",
+              appData: "gate",
+              head: 1,
+              memberCount: 1,
+              activeCount: 0,
+              waitingCount: 1,
+              killedCount: 0,
+              triageCount: 0,
+              totalTokens: 500,
+              hasPlan: false,
+              lastActivityTs: Date.now(),
+            },
+          ],
+          defaultConversationId: "sse-delta-1",
+        }),
+      });
+    });
+
+    await sPage.route(/\/api\/swarm(\?.*)?$/, async (route) => {
+      swarmHits += 1;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversationId: "sse-delta-1",
+          swarm: "sse-delta-1",
+          member: "coordinator",
+          etag: "s-v1",
+          id: "sse-delta-1",
+          title: "SSE Ping Delta Gate",
+          head: 1,
+          members: [
+            {
+              name: "coordinator",
+              conversation_id: "sse-delta-1",
+              model: "gemini-3-pro",
+              role: "coordinator",
+              wake_mode: "mentions",
+              wait_since: 1,
+              last_read_seq: 1,
+              unread: 0,
+              killed: false,
+              status: "waiting",
+              steps: 1,
+              activity: "",
+              activityKind: "",
+              replied: false,
+              replyAsk: "",
+              narrator: false,
+              roleWorker: false,
+              failure: null,
+              transcriptMtime: Date.now(),
+              startedAt: new Date().toISOString(),
+              lastStepAt: new Date().toISOString(),
+              usage: { inputTokens: 400, cacheReadTokens: 0, outputTokens: 100, totalTokens: 500 },
+              posts: 1,
+              lastPostSeq: 1,
+              lastPostTime: "12:00:00",
+              lastPostTs: Date.now(),
+            },
+          ],
+          messages: [{ seq: 1, agent: "coordinator", text: "@all Initial SSE post", time: "12:00:00", ts: Date.now(), mentions: [], all: true }],
+          replyRefs: {},
+          edges: [],
+          triage: [],
+          usage: { inputTokens: 400, cacheReadTokens: 0, outputTokens: 100, totalTokens: 500 },
+          capabilities: { canSendMessage: false, isSidecar: false, sseStream: true, deltaStream: true },
+        }),
+      });
+    });
+
+    await sPage.route(/\/api\/swarm\/stream(\?.*)?$/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache" },
+        body: 'event: swarm\ndata: {"conversationId":"sse-delta-1","swarm":"sse-delta-1","etag":"s-v1"}\n\nevent: ping\ndata: {"ts":1000}\n\n',
+      });
+    });
+
+    await sPage.route(/\/api\/swarm\/delta(\?.*)?$/, async (route) => {
+      const reqUrl = new URL(route.request().url());
+      deltaCalls.push({
+        since: reqUrl.searchParams.get("since"),
+        etag: reqUrl.searchParams.get("etag"),
+        waitMs: reqUrl.searchParams.get("waitMs"),
+      });
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ok: true,
+          mode: "full",
+          unchanged: false,
+          conversationId: "sse-delta-1",
+          swarm: "sse-delta-1",
+          member: "coordinator",
+          etag: "s-v2",
+          id: "sse-delta-1",
+          title: "SSE Ping Delta Gate",
+          head: 2,
+          members: [
+            {
+              name: "coordinator",
+              conversation_id: "sse-delta-1",
+              model: "gemini-3-pro",
+              role: "coordinator",
+              wake_mode: "mentions",
+              wait_since: 2,
+              last_read_seq: 2,
+              unread: 0,
+              killed: false,
+              status: "waiting",
+              steps: 2,
+              activity: "",
+              activityKind: "",
+              replied: false,
+              replyAsk: "",
+              narrator: false,
+              roleWorker: false,
+              failure: null,
+              transcriptMtime: Date.now(),
+              startedAt: new Date().toISOString(),
+              lastStepAt: new Date().toISOString(),
+              usage: { inputTokens: 500, cacheReadTokens: 0, outputTokens: 150, totalTokens: 650 },
+              posts: 2,
+              lastPostSeq: 2,
+              lastPostTime: "12:01:00",
+              lastPostTs: Date.now(),
+            },
+          ],
+          messages: [
+            { seq: 1, agent: "coordinator", text: "@all Initial SSE post", time: "12:00:00", ts: Date.now(), mentions: [], all: true },
+            { seq: 2, agent: "coordinator", text: "@all SSE ping delta full", time: "12:01:00", ts: Date.now(), mentions: [], all: true },
+          ],
+          replyRefs: {},
+          edges: [],
+          triage: [],
+          usage: { inputTokens: 500, cacheReadTokens: 0, outputTokens: 150, totalTokens: 650 },
+          capabilities: { canSendMessage: false, isSidecar: false, sseStream: true, deltaStream: true },
+        }),
+      });
+    });
+
+    await sPage.goto(BASE, { waitUntil: "domcontentloaded" });
+    await sPage.locator("#tab-board").click();
+    await sPage.waitForFunction(() => (document.querySelector("#panel-board")?.textContent || "").includes("SSE ping delta full"));
+    await sPage.close();
+
+    return (
+      swarmHits === 1 &&
+      deltaCalls.length >= 1 &&
+      deltaCalls[0].since === "1" &&
+      deltaCalls[0].waitMs === "0" &&
+      sErrs.length === 0
+    );
+  });
+
   await check("addArtifactComment bridge helper is wired without error", async () => {
     return await page.evaluate(() => {
       if (typeof window.sidecar?.ui?.addArtifactComment !== "function") return false;
