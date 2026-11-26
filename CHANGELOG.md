@@ -3,6 +3,14 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as an
 Antigravity plugin archive (`tar.gz` and `zip`) with `SHA256SUMS`.
 
+## 1.24.0 - 2026-11-26
+
+- Added an incremental `board.jsonl` byte-offset tail cache (`LRU=8`) and `buildSwarmDelta` in `sidecars/fleet_pane/swarm_store.mjs`, paired with `GET /api/swarm/delta` (`fs.watch` coalesced wakeup, `125ms` fallback poll, `<=64` waiters, and `capabilities.deltaStream: true`) in both `createStandaloneRouter` and `runSidecarApp` inside `sidecars/fleet_pane/server_core.mjs`.
+- Added sub-200ms delta sync (`fetchSwarmDelta` and `mergeSwarmDelta`) in `frontend/src/{types.ts,sidecar.ts,App.tsx}`, replacing 2s full-board polling with abort-safe `GET /api/swarm/delta?waitMs=20000` long-polling when `!canSse && canDelta`, routing SSE `ping` and `swarm` refreshes through `/api/swarm/delta`, and matching offline behavior in `frontend/scripts/web-engine.js`.
+- Fixed release packaging in `.github/workflows/release.yml` by copying `sidecars/fleet_pane/server_core.mjs` into `$stage/sidecars/fleet_pane/` and running a staged `--standalone --port 0` `/api/health` and `/api/swarms` smoke check before archiving.
+- Resolved `sloplint` checks across `frontend/src/{fonts.css,ui.tsx}` and `frontend/src/components/{TriageView,BoardView,WorktreesView}.tsx` to maintain zero fails and zero warnings on both source and built bundles.
+- Captured light and dark `docs/screenshots/delta-{light,dark}.png`, bumped all manifests and runtime endpoints to `1.24.0`, and verified post-final-edit: `31/31` backend unit tests, `63/63` gate, `8/8` replay, `23/23` `test-live-web.mjs`, `SLOP 0/0/0` (`frontend/src` and built `dist`), `373,794 B` raw (`365.0 KiB`) / `113,137 B` gz (`110.5 KiB`), `55.13 ms` boot, `110.22 MB` RSS, `1,387.7 req/s` (`15.49 ms` p95, `0/3,480` errors), `5/5` SSE, and `30/30` fuzz.
+
 ## 1.23.0 - 2026-11-26
 
 - Hardened the Node sidecar in `sidecars/fleet_pane/{swarm_store,channels,git_probe,server_core}.mjs`: added primitive type guards (`safeStr`, `safeSeq`) against non-primitive JSON payloads, bounded 2 MiB line buffering in `streamLinesIncremental`, last-good `view.json` fallback on transient parse errors, content-hash `plan.json` ETags for same-size CAS conflict detection, bounded LRU caches, CWE-59 symlink and escaping-root guards in `git_probe.mjs`, streaming bounded git diff execution, custom default branch fallbacks, and strict `/api/plan` and `/api/control` input validation (including coordinator kill protection, 404/409 target checks, and control-character rejection).

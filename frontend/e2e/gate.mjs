@@ -343,7 +343,7 @@ await runChecks("gate", async (check) => {
     const pill = page.locator('#panel-triage [data-testid="wave-velocity-pill"]');
     if ((await pill.count()) !== 1) return false;
     const txt = await pill.textContent();
-    if (!txt || !/\d+% pass/.test(txt) || !txt.includes("1d · 0v · 0s · 0b")) return false;
+    if (!txt || !/\d+% pass/.test(txt) || !/1d\s*0v\s*0s\s*0b/.test(txt)) return false;
     await pill.locator('[data-testid="gate-shipped-jump"]').click();
     await page.waitForSelector("#panel-board");
     const jumped = (await page.locator('#tab-board[aria-selected="true"]').count()) === 1;

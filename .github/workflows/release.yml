@@ -61,6 +61,7 @@ jobs:
         run: |
           ./install.sh --dest "${{ runner.temp }}/fleet-plugin-smoke"
           test -f "${{ runner.temp }}/fleet-plugin-smoke/plugin.json"
+          test -f "${{ runner.temp }}/fleet-plugin-smoke/sidecars/fleet_pane/server_core.mjs"
           test -f "${{ runner.temp }}/fleet-plugin-smoke/sidecars/fleet_pane/dist/index.html"
       - name: Package plugin archives
         run: |
@@ -71,10 +72,50 @@ jobs:
           cp -R assets skills rules "$stage/"
           mkdir -p "$stage/sidecars/fleet_pane"
           cp sidecars/fleet_pane/package.json sidecars/fleet_pane/sidecar.json \
-             sidecars/fleet_pane/main.mjs sidecars/fleet_pane/channels.mjs \
-             sidecars/fleet_pane/git_probe.mjs sidecars/fleet_pane/swarm_store.mjs \
-             "$stage/sidecars/fleet_pane/"
+             sidecars/fleet_pane/main.mjs sidecars/fleet_pane/server_core.mjs \
+             sidecars/fleet_pane/channels.mjs sidecars/fleet_pane/git_probe.mjs \
+             sidecars/fleet_pane/swarm_store.mjs "$stage/sidecars/fleet_pane/"
           cp -R sidecars/fleet_pane/dist "$stage/sidecars/fleet_pane/"
+          test -f "$stage/sidecars/fleet_pane/server_core.mjs"
+          node -e '
+            const { spawn } = require("node:child_process");
+            const path = require("node:path");
+            const entry = path.resolve(process.argv[1]);
+            const child = spawn(process.execPath, [entry, "--standalone", "--port", "0"], { stdio: ["ignore", "pipe", "pipe"] });
+            let buf = "", errBuf = "";
+            const timer = setTimeout(() => { child.kill("SIGKILL"); console.error("smoke timeout", errBuf); process.exit(1); }, 10000);
+            child.stderr.on("data", (d) => { errBuf += d; });
+            child.stdout.on("data", async (d) => {
+              buf += d;
+              const m = buf.match(/http:\/\/127\.0\.0\.1:(\d+)/);
+              if (!m) return;
+              try {
+                const base = `http://127.0.0.1:${m[1]}`;
+                const h = await fetch(`${base}/api/health`);
+                const hj = await h.json();
+                const s = await fetch(`${base}/api/swarms`);
+                const sj = await s.json();
+                if (!h.ok || !hj.ok || !s.ok || !Array.isArray(sj.swarms)) {
+                  throw new Error(`bad smoke response: ${h.status} ${s.status}`);
+                }
+                clearTimeout(timer);
+                child.kill("SIGTERM");
+                process.exit(0);
+              } catch (e) {
+                clearTimeout(timer);
+                child.kill("SIGKILL");
+                console.error(e, errBuf);
+                process.exit(1);
+              }
+            });
+            child.on("exit", (code) => {
+              if (code !== null && code !== 0) {
+                clearTimeout(timer);
+                console.error("smoke exited", code, errBuf);
+                process.exit(code);
+              }
+            });
+          ' "$stage/sidecars/fleet_pane/main.mjs"
           tar -czf "dist/${stage}.tar.gz" "$stage"
           zip -rq "dist/${stage}.zip" "$stage"
           (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)

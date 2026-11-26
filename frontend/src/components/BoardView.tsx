@@ -570,7 +570,7 @@ export function BoardView({
                   onChange={(e) => setChannelOpMember(e.target.value)}
                   className="h-8 rounded-chip border border-hairline-s bg-surface px-2 text-[12px] text-ink"
                 >
-                  <option value="">Select worker...</option>
+                  <option value="">Select worker…</option>
                   {members.filter((m) => !m.killed).map((m) => (
                     <option key={m.name} value={m.name}>@{m.name}</option>
                   ))}
@@ -587,7 +587,7 @@ export function BoardView({
                 disabled={!channelOpReady || channelOpSending}
                 onClick={handleChannelOpSubmit}
               >
-                {channelOpSending ? "Applying..." : `Confirm ${channelOpAction}`}
+                {channelOpSending ? "Applying…" : `Confirm ${channelOpAction}`}
               </Button>
             </div>
           </Card>
@@ -888,7 +888,7 @@ export function BoardView({
               className="flex-1 justify-start text-ink-2"
             >
               <Plus className="h-3.5 w-3.5" />
-              <span>Post to #{composerChannel}...</span>
+              <span>Post to #{composerChannel}…</span>
             </Button>
           </div>
         ) : (

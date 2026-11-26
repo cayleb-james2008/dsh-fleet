@@ -1203,12 +1203,23 @@ test('buildSwarmDelta handles full, unchanged, append-only incremental delta, to
     assert.deepEqual(delta3.edgesDelta, []);
     assert.equal(delta3.usage.totalTokens, 1200);
 
+    // 5b. Repeated edge (builder -> verifier again) emits incremental edgesDelta (count: 1, not cumulative 2)
+    appendFileSync(
+      boardPath,
+      JSON.stringify({ seq: 4, agent: 'builder', text: '@verifier follow-up', time: '2026-11-26 10:03:00' }) + '\n',
+    );
+    const delta4 = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 3, prevEtag: delta3.etag });
+    assert.equal(delta4.ok, true);
+    assert.equal(delta4.mode, 'delta');
+    assert.equal(delta4.head, 4);
+    assert.deepEqual(delta4.edgesDelta, [{ from: 'builder', to: 'verifier', count: 1, direct: 1, viaAll: 0 }]);
+
     // 6. Truncation -> mode: "full" fallback
     writeFileSync(
       boardPath,
       JSON.stringify({ seq: 1, agent: 'coordinator', text: '@builder Fresh truncated board', time: '2026-11-26 10:05:00' }) + '\n',
     );
-    const truncFull = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 3, prevEtag: delta3.etag });
+    const truncFull = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 4, prevEtag: delta4.etag });
     assert.equal(truncFull.ok, true);
     assert.equal(truncFull.mode, 'full');
     assert.equal(truncFull.head, 1);

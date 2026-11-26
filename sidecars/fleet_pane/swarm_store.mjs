@@ -2704,47 +2704,60 @@ export function buildSwarmDelta({ appData, conversationId, since = 0, prevEtag =
 
   const messagesDelta = acc.recentMsgs.filter((m) => m.seq > sinceNum);
   const replyRefsDelta = {};
+  const deltaEdgesMap = new Map();
   if (messagesDelta.length > 0) {
-    if (canUseCachedTail) {
-      for (const targetSeq of batchResult.touchedReplyTargets) {
-        const children = acc.replyRefsMap.get(targetSeq);
-        if (children) replyRefsDelta[targetSeq] = children.slice().sort((a, b) => a - b);
+    const seen = new Set();
+    for (const m of messagesDelta) {
+      if (m.control || m.seq <= 0) continue;
+      const explicitReply = Number(m.replyToSeq ?? m.reply_to) || 0;
+      if (explicitReply > 0 && acc.replyRefsMap.has(explicitReply)) {
+        replyRefsDelta[explicitReply] = acc.replyRefsMap.get(explicitReply).slice().sort((a, b) => a - b);
       }
-    } else {
-      for (const m of messagesDelta) {
-        if (m.control || m.seq <= 0) continue;
-        const explicitReply = Number(m.replyToSeq ?? m.reply_to) || 0;
-        if (explicitReply > 0 && acc.replyRefsMap.has(explicitReply)) {
-          replyRefsDelta[explicitReply] = acc.replyRefsMap.get(explicitReply).slice().sort((a, b) => a - b);
+      if (m.text.indexOf('#') >= 0) {
+        REF_SEQ_RE.lastIndex = 0;
+        let match;
+        while ((match = REF_SEQ_RE.exec(m.text)) !== null) {
+          const t = Number(match[1]);
+          if (acc.replyRefsMap.has(t)) replyRefsDelta[t] = acc.replyRefsMap.get(t).slice().sort((a, b) => a - b);
         }
-        if (m.text.indexOf('#') >= 0) {
-          REF_SEQ_RE.lastIndex = 0;
-          let match;
-          while ((match = REF_SEQ_RE.exec(m.text)) !== null) {
-            const t = Number(match[1]);
-            if (acc.replyRefsMap.has(t)) replyRefsDelta[t] = acc.replyRefsMap.get(t).slice().sort((a, b) => a - b);
+      }
+      const mentions = m.mentions || [];
+      const viaChannel = m.via_channel || [];
+      if (!isRoleWorker(m.agent, roster.members[m.agent]) && (m.all || mentions.length || viaChannel.length)) {
+        seen.clear();
+        const bumpDeltaEdge = (to, isDirect) => {
+          const key = `${m.agent}\0${to}`;
+          let e = deltaEdgesMap.get(key);
+          if (!e) {
+            e = { from: m.agent, to, count: 0, direct: 0, viaAll: 0 };
+            deltaEdgesMap.set(key, e);
+          }
+          e.count++;
+          if (isDirect) e.direct++;
+          else e.viaAll++;
+        };
+        if (m.all) {
+          for (const to of names) {
+            if (to === m.agent || isRoleWorker(to, roster.members[to]) || seen.has(to)) continue;
+            seen.add(to);
+            bumpDeltaEdge(to, mentions.includes(to) || viaChannel.includes(to));
+          }
+        } else {
+          for (const to of mentions) {
+            if (to === m.agent || isRoleWorker(to, roster.members[to]) || seen.has(to)) continue;
+            seen.add(to);
+            bumpDeltaEdge(to, true);
+          }
+          for (const to of viaChannel) {
+            if (to === m.agent || isRoleWorker(to, roster.members[to]) || seen.has(to)) continue;
+            seen.add(to);
+            bumpDeltaEdge(to, true);
           }
         }
       }
     }
   }
-
-  let edgesDelta = [];
-  if (messagesDelta.length > 0) {
-    if (canUseCachedTail) {
-      edgesDelta = [...batchResult.touchedEdgeKeys].map((k) => ({ ...acc.edges.get(k) }));
-    } else {
-      const touched = new Set();
-      for (const m of messagesDelta) {
-        if (m.control || isRoleWorker(m.agent, roster.members[m.agent])) continue;
-        const targets = m.all
-          ? names.filter((to) => to !== m.agent && !isRoleWorker(to, roster.members[to]))
-          : [...(m.mentions || []), ...(m.via_channel || [])].filter((to) => to !== m.agent && !isRoleWorker(to, roster.members[to]));
-        for (const to of targets) touched.add(`${m.agent}\0${to}`);
-      }
-      edgesDelta = [...touched].map((k) => acc.edges.get(k)).filter(Boolean).map((e) => ({ ...e }));
-    }
-  }
+  const edgesDelta = [...deltaEdgesMap.values()];
 
   trimRecentMsgs(acc);
   lruSet(boardTailCache, dir, { meta: streamMeta, rosterSig, acc }, BOARD_TAIL_CACHE_LIMIT);
@@ -2765,7 +2778,7 @@ export function buildSwarmDelta({ appData, conversationId, since = 0, prevEtag =
     replyRefsDelta,
     edgesDelta,
     members: telemetry.members,
-    channels: telemetry.channels,
+    ...(telemetry.channels.length ? { channels: telemetry.channels } : {}),
     plan: telemetry.plan,
     view: telemetry.view,
     triage: telemetry.triage,

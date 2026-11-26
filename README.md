@@ -82,7 +82,7 @@ Triage supports keyboard navigation (`j` and `k` to move, `o` or `Enter` to open
 
 In Board, Fleet reads `board.jsonl` with channel filter tabs (`snap.channels`), an empty-channel fallback with quick reset controls, a Channel Manager drawer (`create`, `archive`, `subscribe`, `unsubscribe`), quick filters (`All`, `Needs reply`, `[done]`, `[blocked]`, cycled with `f`), pinned posts, `#seq` quote replies, clickable `replyRefs` backlink chips (with filter recovery when jumping to hidden posts), a sticky confirmation-gated Board/Channel Composer (`channel` and `replyToSeq`), Markdown wave digests, and `.md` or `.json` board exports stripped of local `/home/` paths. In Roster, each worker card pairs duration badges, token breakdowns, context saturation, and an mtime-cached transcript tail `activityPeek` with worker recovery, filtered board jumps, a Spawn Worker drawer, a 1-click Switch Model drawer on quota or error cards, a confirmation-gated Kill Worker flow (surfacing `409` unmerged worktree `dirtyFiles` and `ahead` warnings before Force kill), and a broadcast composer for `@all`, `working`, `waiting`, or custom worker subsets. Board posts, channel operations, worker spawning, model switching, worker killing, and gate verdicts dispatch through `POST /api/control` as `[fleet-operator:<op>]` directives to the swarm coordinator with synchronous double-submit guards and missing-coordinator warnings. In Graph, a replayable `@mention` graph traces message flow across the swarm. In Git, Fleet probes workspace worktrees with `git status --porcelain=v1 -z` and `git merge-tree --write-tree`, flags overlapping `collisions` across active worktrees, shows recent commits and `Working Changes` vs `Branch Diff` hunks (`GET /api/worktrees/diff?mode=working|branch`), and runs confirmation-gated `Dry-Run Merge`, `FF Merge`, `Rebase` (with automatic `--abort` on conflict), and clean `Remove` actions (`POST /api/worktrees/action`) with inline recovery hints.
 
-Live updates stream over `GET /api/swarm/stream` (`text/event-stream`) with ping heartbeats in standalone mode and fall back to polling inside Antigravity's `SidecarApp` gateway. On startup, `main.mjs` binds the HTTP listener and answers `/api/health` immediately before lazily loading `server_core.mjs` (`swarm_store.mjs`, `git_probe.mjs`, and gzip caches) and `--jitless` V8 tuning flags after socket bind. When zero SSE clients are connected, `server_core.mjs` enters `idleSleep` and clears background polling timers until the next request or stream connection, serves cached `/api/worktrees` responses synchronously on cache hit, and reads only the trailing 8 KB of each `transcript.jsonl` into a shared buffer for `activityPeek` while tailing full history incrementally in 32 KB chunks without retaining parsed board graphs in memory.
+Live updates stream over `GET /api/swarm/stream` (`text/event-stream`) with ping heartbeats in standalone mode and pull incremental updates through `GET /api/swarm/delta` (`fs.watch` coalesced wakeup with a `125ms` fallback and `waitMs=20000` long-polling inside Antigravity's `SidecarApp` gateway, plus byte-offset `board.jsonl` tail caching in `swarm_store.mjs`). On startup, `main.mjs` binds the HTTP listener and answers `/api/health` immediately before lazily loading `server_core.mjs` (`swarm_store.mjs`, `git_probe.mjs`, and gzip caches) and `--jitless` V8 tuning flags after socket bind. When zero SSE clients are connected, `server_core.mjs` enters `idleSleep` and clears background polling timers until the next request or stream connection, serves cached `/api/worktrees` responses synchronously on cache hit, and reads only the trailing 8 KB of each `transcript.jsonl` into a shared buffer for `activityPeek` while tailing full history incrementally in 32 KB chunks without retaining parsed board graphs in memory.
 
 ---
 
@@ -91,7 +91,7 @@ Live updates stream over `GET /api/swarm/stream` (`text/event-stream`) with ping
 ```mermaid
 flowchart LR
     Host["Antigravity Host<br/>(Aux Side Pane + /preload.js)"] <-->|"SidecarApp RPC + theme-change<br/>toggleConversation / toggleAuxPane"| Backend["Fleet Sidecar Bootstrap<br/>(sidecars/fleet_pane/main.mjs)"]
-    UI["Embedded Sidebar SPA<br/>(359.1 KiB raw / 108.6 KiB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>Zero-Client Idle Sleep + 304 JSON"| Backend
+    UI["Embedded Sidebar SPA<br/>(365.0 KiB raw / 110.5 KiB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>+ /api/swarm/delta + 304 JSON"| Backend
     Backend -->|"Lazy Route + Store Load"| Core["server_core.mjs + swarm_store.mjs"]
     Core -->|"Collision, Merge-Tree & Worktree Actions"| Git["git_probe.mjs"]
     Core -.->|"Read-Only 8 KB Tail + Scan"| Brain["~/.gemini/antigravity/brain/&lt;conv&gt;<br/>.system_generated/{swarm,logs}"]
@@ -104,14 +104,14 @@ flowchart LR
 
 Measured under `#154` CPU isolation (`taskset -c 24-31`, 16 concurrent polling clients) on a 2,000-board-post and 50,000-transcript-line stress fixture:
 
-| Metric | v1.21.0 | v1.22.0 | **v1.23.0** |
+| Metric | v1.22.0 | v1.23.0 | **v1.24.0** |
 | --- | --- | --- | --- |
-| Embedded sidecar UI (`/`) | `336,001 B` raw (`328.1 KiB`) / `103,435 B` gz (`101.0 KiB`) | `357,566 B` raw (`349.2 KiB`) / `108,730 B` gz (`106.2 KiB`) | **`367,693 B` raw (`359.1 KiB`) / `111,231 B` gz (`108.6 KiB`)** |
-| Cold boot & RSS (`16w` audit) | `91.09 ms` / `100.22 MB` (`ETag 304`) | `50.03 ms` / `113.51 MB` (`ETag 304`) | **`52.47 ms` / `122.0 MB` (`ETag 304`)** |
-| Cold audit HTTP (`16w` close) | `828.5 req/s` / `22.29 ms` p95 (`0/2,080` errors) | `2,350.6 req/s` / `11.24 ms` p95 (`0/5,897` errors) | **`2,189.3 req/s` / `9.77 ms` p95 (`0/5,487` errors)** |
+| Embedded sidecar UI (`/`) | `357,566 B` raw (`349.2 KiB`) / `108,730 B` gz (`106.2 KiB`) | `367,693 B` raw (`359.1 KiB`) / `111,231 B` gz (`108.6 KiB`) | **`373,794 B` raw (`365.0 KiB`) / `113,137 B` gz (`110.5 KiB`)** |
+| Cold boot & RSS (`16w` audit) | `50.03 ms` / `113.51 MB` (`ETag 304`) | `52.47 ms` / `122.0 MB` (`ETag 304`) | **`55.13 ms` / `110.22 MB` (`ETag 304`)** |
+| Cold audit HTTP (`16w` close) | `2,350.6 req/s` / `11.24 ms` p95 (`0/5,897` errors) | `2,189.3 req/s` / `9.77 ms` p95 (`0/5,487` errors) | **`1,387.7 req/s` / `15.49 ms` p95 (`0/3,480` errors)** |
 | Simultaneous SSE (`x5` streams) | `5/5` (`0` drops) | `5/5` (`0` drops) | **`5/5` (`0` drops)** |
-| Raw-TCP fuzz & backend tests | `30/30` fuzz + `18/18` unit | `30/30` fuzz + `22/22` unit | **`30/30` fuzz + `29/29` unit** |
-| E2E gate, replay, and Sloplint | `52/52` + `8/8` + `18/18` live-web + `0 FAIL / 0 WARN` | `57/57` + `8/8` + `21/21` live-web + `0 FAIL / 0 WARN` | **`61/61` + `8/8` + `22/22` live-web + `0 FAIL / 0 WARN`** |
+| Raw-TCP fuzz & backend tests | `30/30` fuzz + `22/22` unit | `30/30` fuzz + `29/29` unit | **`30/30` fuzz + `31/31` unit** |
+| E2E gate, replay, and Sloplint | `57/57` + `8/8` + `21/21` live-web + `0 FAIL / 0 WARN` | `61/61` + `8/8` + `22/22` live-web + `0 FAIL / 0 WARN` | **`63/63` + `8/8` + `23/23` live-web + `0 FAIL / 0 WARN`** |
 
 ---
 

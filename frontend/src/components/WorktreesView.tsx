@@ -680,7 +680,7 @@ export function WorktreesView({
                               {diffOpen && (
                                 <div className="rounded-chip border border-hairline bg-canvas p-2 space-y-1">
                                   {diffBusy ? (
-                                    <p className="text-[12px] text-ink-2">Loading...</p>
+                                    <p className="text-[12px] text-ink-2">Loading…</p>
                                   ) : diffEntry ? (
                                     <>
                                       <div className="row flex-wrap gap-1 text-[12px] text-ink-2">

@@ -1439,7 +1439,7 @@
       return jsonResp({ ok: true, delivered: targets.length });
     }
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.23.0", mode: "live-web", canSendMessage: true, sseStream: false, deltaStream: true, idleSleep: false, sseClients: 0 });
+      return jsonResp({ ok: true, name: "fleet", version: "1.24.0", mode: "live-web", canSendMessage: true, sseStream: false, deltaStream: true, idleSleep: false, sseClients: 0 });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });

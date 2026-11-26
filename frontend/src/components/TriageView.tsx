@@ -1181,13 +1181,13 @@ export function TriageView({
             <h2 id="reel-heading" className="h2">Verified captures ({frames.length})</h2>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            {frames.map((frame) => (
+            {frames.map((frame, idx) => (
               <Card key={frame.path} className="overflow-hidden">
                 <div className="bg-board border-b border-hairline aspect-video flex items-center justify-center overflow-hidden">
                   <img
                     src={`/api/frame?conversationId=${encodeURIComponent(snap.swarm || snap.conversationId || "")}&path=${encodeURIComponent(frame.path)}`}
                     alt={frame.caption || `Screenshot from #${frame.seq}`}
-                    loading="lazy"
+                    fetchPriority={idx === 0 ? "high" : undefined}
                     className="w-full h-full object-cover"
                   />
                 </div>

@@ -1195,13 +1195,16 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
       </div>
       {v && (
         <div className="row flex-wrap t2" data-testid="wave-velocity-pill">
-          <div className="wrap gap-1">
+          <div className="wrap gap-1.5">
             <Badge tone={v.blocked > 0 ? "warning" : "success"} className="num">
               {v.passRatePct}% pass{v.wavesPerHr > 0 ? ` · ${v.wavesPerHr}/hr` : ""}
             </Badge>
-            <span className="num text-ink-2">
-              {v.done}d · {v.verified}v · {v.scaleVerified}s · {v.blocked}b
-            </span>
+            <div className="num text-ink-2 inline-flex items-center divide-x divide-hairline">
+              <span className="pr-1.5">{v.done}d</span>
+              <span className="px-1.5">{v.verified}v</span>
+              <span className="px-1.5">{v.scaleVerified}s</span>
+              <span className="pl-1.5">{v.blocked}b</span>
+            </div>
           </div>
           {v.shippedSeq > 0 && (
             <Button data-testid="gate-shipped-jump" onClick={() => onJump(v.shippedSeq)} className="bg-board num">
