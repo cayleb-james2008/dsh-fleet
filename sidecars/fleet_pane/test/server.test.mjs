@@ -1368,6 +1368,15 @@ test('GET /api/swarm/delta supports full, incremental append, fs.watch wakeup (<
 
     const snap0 = await (await fetch(`${srv.url}/api/swarm?conversationId=${fx.coord}`)).json();
     assert.equal(snap0.capabilities?.deltaStream, true);
+    assert.equal(typeof snap0.contextLimit, 'number');
+    assert.equal(typeof snap0.contextPct, 'number');
+    assert.equal(typeof snap0.cost?.totalUsd, 'number');
+    assert.equal(typeof snap0.cost?.cacheHitPct, 'number');
+    assert.equal(typeof snap0.cost?.cacheSavingsUsd, 'number');
+    assert.equal(typeof snap0.cost?.pricingKnown, 'boolean');
+    assert.ok(snap0.byModel && typeof snap0.byModel === 'object');
+    assert.equal(typeof snap0.burnSummary?.costUsd, 'number');
+    assert.equal(typeof snap0.burnSummary?.pricingKnown, 'boolean');
 
     // 2. Validation errors (400 / 404)
     const badQueries = [
@@ -1457,6 +1466,11 @@ test('GET /api/swarm/delta supports full, incremental append, fs.watch wakeup (<
     assert.equal(delta2.mode, 'delta');
     assert.equal(delta2.messagesDelta.length, 0);
     assert.equal(delta2.usage.totalTokens, 420);
+    assert.equal(typeof delta2.contextLimit, 'number');
+    assert.equal(typeof delta2.contextPct, 'number');
+    assert.equal(typeof delta2.cost?.totalUsd, 'number');
+    assert.ok(delta2.byModel && typeof delta2.byModel === 'object');
+    assert.equal(typeof delta2.burnSummary?.costUsd, 'number');
     assert.ok(trWakeLatency < 300, `Expected <300ms wakeup on transcript append, got ${trWakeLatency}ms`);
     assert.deepEqual(srv.getDeltaStats(), { activeWaiters: 0, activeSwarmWatchers: 0, activeFsWatchers: 0 });
 
