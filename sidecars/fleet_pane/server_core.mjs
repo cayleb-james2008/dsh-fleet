@@ -9,7 +9,7 @@
  *    pre-serialized/pre-gzipped cached JSON snapshots, security headers,
  *    Host loopback-403 check, prompt 413 payload enforcement, and `/preload.js`.
  */
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, watch } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
 
@@ -236,6 +236,7 @@ export function createFleetHandlers({
 } = {}) {
   const {
     ID_RE = SIDE_ID_RE,
+    buildSwarmDelta,
     buildSwarmSnapshot,
     computeSwarmFingerprint,
     findAppDataDirs,
@@ -265,9 +266,24 @@ export function createFleetHandlers({
   let healthPacked = null;
   let healthKey = '';
 
+  const SWARM_PAYLOAD_CACHE_LIMIT = 8;
   const swarmPayloadCache = new Map(); // cacheKey -> { etag, packed }
+  const setSwarmPayloadCache = (cacheKey, entry) => {
+    if (swarmPayloadCache.has(cacheKey)) swarmPayloadCache.delete(cacheKey);
+    else if (swarmPayloadCache.size >= SWARM_PAYLOAD_CACHE_LIMIT) {
+      swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
+    }
+    swarmPayloadCache.set(cacheKey, entry);
+  };
   const worktreesPayloadCache = new Map(); // rootsKey -> { at, packed }
   let swarmsListCache = { at: 0, key: '', sig: '', swarms: [], packed: null };
+
+  const MAX_DELTA_WAITERS = 64;
+  const DELTA_MAX_WAIT_MS = 25000;
+  const DELTA_WATCH_COALESCE_MS = 15;
+  const DELTA_FALLBACK_POLL_MS = 125;
+  const deltaWaiters = new Set();
+  const swarmWatchers = new Map(); // `${appData}\0${swarmId}` -> { appData, swarmId, watchers, waiters, debounceTimer, fallbackTimer }
 
   function getHealthPacked(sleepState = null) {
     const appDataDirs = getAppDirs();
@@ -283,6 +299,13 @@ export function createFleetHandlers({
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
         sseStream: !isSidecar,
+        deltaStream: true,
+        capabilities: {
+          canSendMessage: Boolean(sendMessageFn),
+          isSidecar,
+          sseStream: !isSidecar,
+          deltaStream: true,
+        },
         idleSleep,
         sseClients: sseCount,
         appDataDirs,
@@ -318,14 +341,12 @@ export function createFleetHandlers({
           ...snap,
           ...unseenBy(snap, member),
           etag: fullEtag,
-          capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, sseStream: !isSidecar },
+          capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, sseStream: !isSidecar, deltaStream: true },
         },
         fastEtag(fullEtag),
       );
       const unchangedPacked = pack({ conversationId: id, swarm: id, member, unchanged: true, etag: fullEtag });
-      if (swarmPayloadCache.has(cacheKey)) swarmPayloadCache.delete(cacheKey);
-      else if (swarmPayloadCache.size >= 1) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
-      swarmPayloadCache.set(cacheKey, {
+      setSwarmPayloadCache(cacheKey, {
         checkedAt: now,
         appData,
         swarm: id,
@@ -375,7 +396,7 @@ export function createFleetHandlers({
         swarm: null,
         member: null,
         resolvedFrom,
-        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar },
+        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, deltaStream: true },
         swarms: getSwarmsEntry().swarms,
       });
     }
@@ -409,7 +430,7 @@ export function createFleetHandlers({
         swarm: null,
         member: null,
         resolvedFrom,
-        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar },
+        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, deltaStream: true },
         swarms: getSwarmsEntry().swarms,
       });
     }
@@ -430,7 +451,7 @@ export function createFleetHandlers({
         swarm: null,
         member: null,
         resolvedFrom,
-        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar },
+        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, deltaStream: true },
         swarms: getSwarmsEntry().swarms,
       });
     }
@@ -459,15 +480,13 @@ export function createFleetHandlers({
         ...snap,
         ...unseenBy(snap, res.member),
         etag,
-        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, sseStream: !isSidecar },
+        capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, sseStream: !isSidecar, deltaStream: true },
       },
       fastEtag(etag),
     );
     if (!includeRaw) {
       const unchangedPacked = pack({ conversationId: conv, swarm: res.swarm, member: res.member, unchanged: true, etag });
-      if (swarmPayloadCache.has(cacheKey)) swarmPayloadCache.delete(cacheKey);
-      else if (swarmPayloadCache.size >= 1) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
-      swarmPayloadCache.set(cacheKey, {
+      setSwarmPayloadCache(cacheKey, {
         checkedAt: now,
         appData: res.appData,
         swarm: res.swarm,
@@ -480,6 +499,293 @@ export function createFleetHandlers({
       });
     }
     return packed;
+  }
+
+  function parseDeltaQuery(query = {}) {
+    let requestedConv = '';
+    if (query.conversationId !== undefined) {
+      if (typeof query.conversationId !== 'string') return { ok: false, status: 400, error: 'Invalid conversationId' };
+      requestedConv = query.conversationId.trim();
+      if (!requestedConv || !ID_RE.test(requestedConv)) {
+        return { ok: false, status: 400, error: 'Invalid conversationId' };
+      }
+    }
+
+    let since = 0;
+    if (query.since !== undefined && query.since !== '') {
+      const s = String(query.since).trim();
+      if (!/^\d+$/.test(s)) return { ok: false, status: 400, error: 'since must be a non-negative integer' };
+      since = Number(s);
+      if (!Number.isSafeInteger(since) || since < 0) {
+        return { ok: false, status: 400, error: 'since must be a non-negative integer' };
+      }
+    }
+
+    let waitMs = 0;
+    if (query.waitMs !== undefined && query.waitMs !== '') {
+      const s = String(query.waitMs).trim();
+      const w = Number(s);
+      if (!Number.isFinite(w) || !Number.isInteger(w) || w < 0 || w > DELTA_MAX_WAIT_MS) {
+        return { ok: false, status: 400, error: `waitMs must be an integer between 0 and ${DELTA_MAX_WAIT_MS}` };
+      }
+      waitMs = w;
+    }
+
+    let etag = '';
+    if (query.etag !== undefined) {
+      if (typeof query.etag !== 'string' || query.etag.length > 16384 || /[\x00-\x1f\x7f]/.test(query.etag)) {
+        return { ok: false, status: 400, error: 'Invalid etag' };
+      }
+      etag = query.etag;
+    }
+
+    return { ok: true, requestedConv, since, waitMs, etag };
+  }
+
+  function collectWatchPaths(appData, swarmId) {
+    const swDir = join(appData, 'brain', swarmId, '.system_generated', 'swarm');
+    const paths = [];
+    if (existsSync(swDir)) paths.push(swDir);
+    for (const f of ['board.jsonl', 'members.json', 'plan.json', 'view.json']) {
+      const p = join(swDir, f);
+      if (existsSync(p)) paths.push(p);
+    }
+    const roster = getSwarmRoster ? getSwarmRoster(appData, swarmId) : null;
+    if (roster?.members && typeof roster.members === 'object') {
+      for (const m of Object.values(roster.members)) {
+        if (!m || typeof m !== 'object' || m.killed) continue;
+        const cid = typeof m.conversation_id === 'string' ? m.conversation_id.trim() : '';
+        if (!cid || !ID_RE.test(cid)) continue;
+        const logsDir = join(appData, 'brain', cid, '.system_generated', 'logs');
+        const trPath = join(logsDir, 'transcript.jsonl');
+        if (existsSync(trPath)) paths.push(trPath);
+        else if (existsSync(logsDir)) paths.push(logsDir);
+        const viewDir = join(appData, 'brain', cid, 'swarm_view');
+        if (existsSync(viewDir)) paths.push(viewDir);
+      }
+    }
+    return paths;
+  }
+
+  function notifySwarmWatcher(entry, force = false) {
+    if (!entry || entry.waiters.size === 0) return;
+    const fp = computeSwarmFingerprint(entry.appData, entry.swarmId);
+    for (const waiter of [...entry.waiters]) {
+      if (force || !fp) {
+        waiter.wake();
+        continue;
+      }
+      const candEtag = `${entry.swarmId}|${waiter.member || ''}|${fp.etag}`;
+      if (candEtag !== waiter.etag) waiter.wake();
+    }
+  }
+
+  function acquireSwarmWatcher(appData, swarmId, waiter) {
+    const key = `${appData}\0${swarmId}`;
+    let entry = swarmWatchers.get(key);
+    if (!entry) {
+      entry = {
+        key,
+        appData,
+        swarmId,
+        watchers: [],
+        waiters: new Set(),
+        debounceTimer: null,
+        fallbackTimer: null,
+      };
+      const scheduleNotify = () => {
+        if (entry.debounceTimer) return;
+        entry.debounceTimer = setTimeout(() => {
+          entry.debounceTimer = null;
+          notifySwarmWatcher(entry);
+        }, DELTA_WATCH_COALESCE_MS);
+        entry.debounceTimer.unref?.();
+      };
+      for (const p of collectWatchPaths(appData, swarmId)) {
+        try {
+          const w = watch(p, { persistent: false }, scheduleNotify);
+          w.on('error', () => {});
+          entry.watchers.push(w);
+        } catch {}
+      }
+      entry.fallbackTimer = setInterval(() => {
+        notifySwarmWatcher(entry);
+      }, DELTA_FALLBACK_POLL_MS);
+      entry.fallbackTimer.unref?.();
+      swarmWatchers.set(key, entry);
+    }
+    entry.waiters.add(waiter);
+    return entry;
+  }
+
+  function releaseSwarmWatcher(key, waiter) {
+    const entry = swarmWatchers.get(key);
+    if (!entry) return;
+    entry.waiters.delete(waiter);
+    if (entry.waiters.size === 0) {
+      if (entry.debounceTimer) {
+        clearTimeout(entry.debounceTimer);
+        entry.debounceTimer = null;
+      }
+      if (entry.fallbackTimer) {
+        clearInterval(entry.fallbackTimer);
+        entry.fallbackTimer = null;
+      }
+      for (const w of entry.watchers) {
+        try {
+          w.close();
+        } catch {}
+      }
+      entry.watchers.length = 0;
+      swarmWatchers.delete(key);
+    }
+  }
+
+  function notifySwarmWatchersForSwarm(swarmId) {
+    for (const entry of swarmWatchers.values()) {
+      if (entry.swarmId === swarmId) notifySwarmWatcher(entry, true);
+    }
+  }
+
+  function closeDeltaWaiters() {
+    for (const waiter of [...deltaWaiters]) {
+      waiter.abort();
+    }
+    for (const key of [...swarmWatchers.keys()]) {
+      const entry = swarmWatchers.get(key);
+      if (!entry) continue;
+      for (const waiter of [...entry.waiters]) waiter.abort();
+    }
+  }
+
+  function getDeltaStats() {
+    let activeFsWatchers = 0;
+    for (const entry of swarmWatchers.values()) activeFsWatchers += entry.watchers.length;
+    return {
+      activeWaiters: deltaWaiters.size,
+      activeSwarmWatchers: swarmWatchers.size,
+      activeFsWatchers,
+    };
+  }
+
+  function formatDeltaResponse(conv, res, delta) {
+    if (!delta) {
+      return { status: 404, packed: pack({ ok: false, error: 'Swarm not found' }) };
+    }
+    const fullEtag = `${res.swarm}|${res.member || ''}|${delta.etag}`;
+    if (delta.unchanged) {
+      return {
+        status: 200,
+        packed: pack({
+          ok: true,
+          unchanged: true,
+          conversationId: conv,
+          swarm: res.swarm,
+          member: res.member,
+          etag: fullEtag,
+          head: delta.head,
+        }),
+      };
+    }
+    const base = {
+      ...delta,
+      conversationId: conv,
+      swarm: res.swarm,
+      member: res.member,
+      etag: fullEtag,
+      capabilities: { canSendMessage: Boolean(sendMessageFn), isSidecar, sseStream: !isSidecar, deltaStream: true },
+    };
+    if (delta.mode === 'full') {
+      Object.assign(base, unseenBy(delta, res.member));
+    }
+    return { status: 200, packed: pack(base, fastEtag(fullEtag)) };
+  }
+
+  async function getSwarmDelta(query = {}, { signal = null } = {}) {
+    const parsed = parseDeltaQuery(query);
+    if (!parsed.ok) {
+      return { status: parsed.status, packed: pack({ ok: false, error: parsed.error }) };
+    }
+    const appDataDirs = getAppDirs();
+    let conv = parsed.requestedConv || defaultConversationId;
+    if (!conv) {
+      const swarmsData = getSwarmsEntry().swarms;
+      if (swarmsData.length) conv = swarmsData[0].id;
+    }
+    if (!conv || !ID_RE.test(conv)) {
+      return { status: 404, packed: pack({ ok: false, error: 'Swarm not found' }) };
+    }
+
+    const res = resolveConversationSwarm(appDataDirs, conv);
+    if (!res.swarm || !res.appData) {
+      return { status: 404, packed: pack({ ok: false, error: 'Swarm not found' }) };
+    }
+
+    const evaluateNow = () => {
+      const delta = buildSwarmDelta({
+        appData: res.appData,
+        conversationId: conv,
+        since: parsed.since,
+        prevEtag: parsed.etag,
+      });
+      return formatDeltaResponse(conv, res, delta);
+    };
+
+    const initialDelta = buildSwarmDelta({
+      appData: res.appData,
+      conversationId: conv,
+      since: parsed.since,
+      prevEtag: parsed.etag,
+    });
+    if (!initialDelta) {
+      return { status: 404, packed: pack({ ok: false, error: 'Swarm not found' }) };
+    }
+    if (!initialDelta.unchanged || parsed.waitMs <= 0) {
+      return formatDeltaResponse(conv, res, initialDelta);
+    }
+
+    if (signal?.aborted) {
+      return { status: 499, packed: pack({ ok: false, aborted: true }) };
+    }
+    if (deltaWaiters.size >= MAX_DELTA_WAITERS) {
+      return { status: 503, packed: pack({ ok: false, error: 'too many delta waiters' }) };
+    }
+
+    const initialFullEtag = `${res.swarm}|${res.member || ''}|${initialDelta.etag}`;
+    const watcherKey = `${res.appData}\0${res.swarm}`;
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let deadlineTimer = null;
+      const waiter = {
+        member: res.member || '',
+        etag: initialFullEtag,
+        wake: () => finish(evaluateNow),
+        abort: () => finish(() => ({ status: 499, packed: pack({ ok: false, aborted: true }) })),
+      };
+      const onAbort = () => waiter.abort();
+      const cleanup = () => {
+        if (deadlineTimer) {
+          clearTimeout(deadlineTimer);
+          deadlineTimer = null;
+        }
+        if (signal) signal.removeEventListener('abort', onAbort);
+        deltaWaiters.delete(waiter);
+        releaseSwarmWatcher(watcherKey, waiter);
+      };
+      const finish = (buildOut) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(buildOut());
+      };
+
+      deltaWaiters.add(waiter);
+      acquireSwarmWatcher(res.appData, res.swarm, waiter);
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+      deadlineTimer = setTimeout(() => finish(evaluateNow), parsed.waitMs);
+      deadlineTimer.unref?.();
+    });
   }
 
     function getWorktreesPackedSync(query = {}) {
@@ -649,6 +955,7 @@ export function createFleetHandlers({
       if (entry?.swarm === swarmId) swarmPayloadCache.delete(k);
     }
     swarmsListCache = { at: 0, key: '', sig: '', swarms: [], packed: null };
+    notifySwarmWatchersForSwarm(swarmId);
   }
 
   async function postPlan(body = {}) {
@@ -1006,6 +1313,9 @@ export function createFleetHandlers({
     getHealthPacked,
     getSwarmsPacked,
     getSwarmPacked,
+    getSwarmDelta,
+    getDeltaStats,
+    closeDeltaWaiters,
     getWorktreesPackedSync,
     getWorktreesPacked,
     getWorktreeDiff,
@@ -1059,6 +1369,13 @@ export async function createStandaloneRouter({
       mode: 'standalone',
       canSendMessage: Boolean(sendMessageFn),
       sseStream: true,
+      deltaStream: true,
+      capabilities: {
+        canSendMessage: Boolean(sendMessageFn),
+        isSidecar: false,
+        sseStream: true,
+        deltaStream: true,
+      },
       idleSleep,
       sseClients: sseClients.size,
       appDataDirs: bootDirs,
@@ -1269,6 +1586,33 @@ export async function createStandaloneRouter({
       const q = parseQueryFast(search);
       return withHandlers((h) => sendPacked(req, res, 200, h.getSwarmPacked(q)));
     }
+    if (req.method === 'GET' && pathname === '/api/swarm/delta') {
+      const q = parseQueryFast(search);
+      const ac = new AbortController();
+      const onClose = () => {
+        if (!res.writableEnded) ac.abort();
+      };
+      res.on('close', onClose);
+      res.on('error', onClose);
+      return withHandlers((h) =>
+        Promise.resolve(h.getSwarmDelta(q, { signal: ac.signal })).then(
+          (out) => {
+            res.off('close', onClose);
+            res.off('error', onClose);
+            if (!res.writableEnded && !res.destroyed) {
+              sendPacked(req, res, out.status, out.packed);
+            }
+          },
+          (err) => {
+            res.off('close', onClose);
+            res.off('error', onClose);
+            if (!res.writableEnded && !res.destroyed) {
+              sendPacked(req, res, 500, packJsonPayload({ ok: false, error: String(err?.message || err) }));
+            }
+          },
+        ),
+      );
+    }
     if (req.method === 'GET' && pathname === '/api/swarm/stream') {
       if (sseClients.size >= MAX_SSE_CLIENTS) {
         res.writeHead(503, { 'Content-Type': 'application/json', Connection: 'close', ...SECURITY_HEADERS });
@@ -1411,7 +1755,9 @@ export async function createStandaloneRouter({
     handleRequest,
     ensureHandlers,
     getSleepState: () => ({ idleSleep, sseClients: sseClients.size, timerActive: Boolean(sseTimer) }),
+    getDeltaStats: () => (handlers ? handlers.getDeltaStats() : { activeWaiters: 0, activeSwarmWatchers: 0, activeFsWatchers: 0 }),
     closeClients: () => {
+      handlers?.closeDeltaWaiters?.();
       for (const client of sseClients) {
         try {
           client.res.end();
@@ -1446,6 +1792,7 @@ export async function startStandaloneServer({
     port: addr.port,
     url: `http://${host}:${addr.port}`,
     getSleepState: router.getSleepState,
+    getDeltaStats: router.getDeltaStats,
     close: () => {
       router.closeClients();
       return new Promise((resolve) => server.close(() => resolve()));
@@ -1491,6 +1838,10 @@ export async function runSidecarApp({ appDataDir = '' } = {}) {
   app.api('/api/health', () => new Response(handlers.getHealthPacked().raw, { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
   app.api('/api/swarms', () => new Response(handlers.getSwarmsPacked().raw, { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
   app.api('/api/swarm', (data) => new Response(handlers.getSwarmPacked(data).raw, { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
+  app.api('/api/swarm/delta', async (data) => {
+    const out = await handlers.getSwarmDelta(data);
+    return new Response(out.packed.raw, { status: out.status, contentType: 'application/json', headers: SECURITY_HEADERS });
+  }, 'GET');
   app.api('/api/worktrees', async (data) => new Response((await handlers.getWorktreesPacked(data)).raw, { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
   app.api('/api/worktrees/diff', async (data) => {
     const out = await handlers.getWorktreeDiff(data);

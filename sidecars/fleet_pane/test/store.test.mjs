@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -12,10 +12,12 @@ import {
   probeWorktrees,
 } from '../git_probe.mjs';
 import {
+  buildSwarmDelta,
   buildSwarmSnapshot,
   computeBurnSummary,
   computeGateReadiness,
   findCoordinatorConvId,
+  getBoardTailStats,
   listSwarms,
   normalizePlan,
   readTranscriptActivityTail,
@@ -1093,5 +1095,141 @@ test('git_probe handles missing baseBranch, custom default branch, huge diffs, s
     assert.equal(noBaseAction.payload.status, 'no_base');
   } finally {
     rmSync(baseDir, { recursive: true, force: true });
+  }
+});
+
+test('buildSwarmDelta handles full, unchanged, append-only incremental delta, torn line completion, and truncation/rotation fallback', () => {
+  const dir = makeScratchDir('delta-store-');
+  try {
+    const coordId = '4444dddd-4444-4444-8444-444444444444';
+    const workerId = '5555eeee-5555-4555-8555-555555555555';
+    const verifierId = '6666ffff-6666-4666-8666-666666666666';
+    const swDir = join(dir, 'brain', coordId, '.system_generated', 'swarm');
+    const workerLogDir = join(dir, 'brain', workerId, '.system_generated', 'logs');
+    mkdirSync(swDir, { recursive: true });
+    mkdirSync(workerLogDir, { recursive: true });
+
+    writeFileSync(
+      join(swDir, 'members.json'),
+      JSON.stringify({
+        title: 'Delta Store Swarm',
+        members: {
+          coordinator: { conversation_id: coordId, role: 'coordinator', last_read_seq: 1 },
+          builder: { conversation_id: workerId, role: 'worker', model: 'gemini-3-pro', last_read_seq: 1 },
+          verifier: { conversation_id: verifierId, role: 'worker', last_read_seq: 0 },
+        },
+      }),
+    );
+
+    const boardPath = join(swDir, 'board.jsonl');
+    writeFileSync(
+      boardPath,
+      JSON.stringify({ seq: 1, agent: 'coordinator', text: '@builder Start delta task', time: '2026-11-26 10:00:00' }) + '\n',
+    );
+    writeFileSync(
+      join(workerLogDir, 'transcript.jsonl'),
+      JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', input_tokens: 400, output_tokens: 50 }) + '\n',
+    );
+
+    // 1. since === 0 -> mode: "full"
+    const full0 = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 0 });
+    assert.equal(full0.ok, true);
+    assert.equal(full0.mode, 'full');
+    assert.equal(full0.unchanged, false);
+    assert.equal(full0.head, 1);
+    assert.equal(full0.messages.length, 1);
+    const tail0 = getBoardTailStats(dir, coordId);
+    assert.ok(tail0 && tail0.size > 0);
+    assert.equal(tail0.head, 1);
+
+    // 2. Matching etag -> unchanged: true
+    const same = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 1, prevEtag: full0.etag });
+    assert.deepEqual(
+      { ok: same.ok, unchanged: same.unchanged, etag: same.etag, head: same.head },
+      { ok: true, unchanged: true, etag: full0.etag, head: 1 },
+    );
+
+    // 3. Append-only growth + torn trailing line
+    const line2 = JSON.stringify({
+      seq: 2,
+      agent: 'builder',
+      text: '@verifier [done] Re #1: implemented delta store',
+      time: '2026-11-26 10:01:00',
+    });
+    const torn3 = '{"seq":3,"agent":"verifier","text":"@coordinator [verified]';
+    appendFileSync(boardPath, line2 + '\n' + torn3);
+
+    const delta1 = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 1, prevEtag: full0.etag });
+    assert.equal(delta1.ok, true);
+    assert.equal(delta1.mode, 'delta');
+    assert.equal(delta1.unchanged, false);
+    assert.equal(delta1.since, 1);
+    assert.equal(delta1.head, 2);
+    assert.equal(delta1.messagesDelta.length, 1);
+    assert.equal(delta1.messagesDelta[0].seq, 2);
+    assert.deepEqual(delta1.replyRefsDelta, { 1: [2] });
+    assert.equal(delta1.edgesDelta.length, 1);
+    assert.deepEqual(delta1.edgesDelta[0], { from: 'builder', to: 'verifier', count: 1, direct: 1, viaAll: 0 });
+    assert.equal(delta1.triage.some((t) => t.kind === 'verify' && t.seq === 2), true);
+    assert.equal(delta1.gateReadiness?.state, 'verifying');
+    const tail1 = getBoardTailStats(dir, coordId);
+    assert.equal(tail1.ino, tail0.ino);
+    assert.ok(tail1.size > tail0.size);
+
+    // 4. Complete torn line 3 -> incremental tail resumes from carryBuf without re-reading earlier bytes
+    appendFileSync(boardPath, ' Re #2: all checks pass","time":"2026-11-26 10:02:00"}\n');
+    const delta2 = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 2, prevEtag: delta1.etag });
+    assert.equal(delta2.ok, true);
+    assert.equal(delta2.mode, 'delta');
+    assert.equal(delta2.head, 3);
+    assert.equal(delta2.messagesDelta.length, 1);
+    assert.equal(delta2.messagesDelta[0].seq, 3);
+    assert.deepEqual(delta2.replyRefsDelta, { 2: [3] });
+    assert.equal(delta2.triage.some((t) => t.kind === 'verify'), false);
+    const tail2 = getBoardTailStats(dir, coordId);
+    assert.equal(tail2.ino, tail1.ino);
+    assert.ok(tail2.size > tail1.size);
+
+    // 5. Transcript-only append -> mode: "delta" with empty messagesDelta and updated usage
+    appendFileSync(
+      join(workerLogDir, 'transcript.jsonl'),
+      JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', input_tokens: 600, output_tokens: 150 }) + '\n',
+    );
+    const delta3 = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 3, prevEtag: delta2.etag });
+    assert.equal(delta3.ok, true);
+    assert.equal(delta3.mode, 'delta');
+    assert.equal(delta3.messagesDelta.length, 0);
+    assert.deepEqual(delta3.replyRefsDelta, {});
+    assert.deepEqual(delta3.edgesDelta, []);
+    assert.equal(delta3.usage.totalTokens, 1200);
+
+    // 6. Truncation -> mode: "full" fallback
+    writeFileSync(
+      boardPath,
+      JSON.stringify({ seq: 1, agent: 'coordinator', text: '@builder Fresh truncated board', time: '2026-11-26 10:05:00' }) + '\n',
+    );
+    const truncFull = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 3, prevEtag: delta3.etag });
+    assert.equal(truncFull.ok, true);
+    assert.equal(truncFull.mode, 'full');
+    assert.equal(truncFull.head, 1);
+    assert.equal(truncFull.messages.length, 1);
+
+    // 7. File rotation (different inode) -> mode: "full" fallback
+    const rotatedTmp = join(swDir, 'board.jsonl.new');
+    writeFileSync(
+      rotatedTmp,
+      [
+        JSON.stringify({ seq: 1, agent: 'coordinator', text: '@builder rotated 1' }),
+        JSON.stringify({ seq: 2, agent: 'builder', text: '@coordinator rotated 2' }),
+      ].join('\n') + '\n',
+    );
+    renameSync(rotatedTmp, boardPath);
+    const rotFull = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 1, prevEtag: truncFull.etag });
+    assert.equal(rotFull.ok, true);
+    assert.equal(rotFull.mode, 'full');
+    assert.equal(rotFull.head, 2);
+    assert.equal(rotFull.messages.length, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
