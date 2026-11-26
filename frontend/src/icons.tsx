@@ -50,7 +50,6 @@ export const SkipForward = ic("M19 5 9 12l10 7zM5 19V5", " rotate-180");
 export const Cpu = ic("M6 6h12v12H6zM10 10h4v4h-4zM9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4");
 export const ExternalLink = ic("M15 3h6v6M10 14 21 3M18 13v6H4V5h7");
 export const ArrowUpRight = ExternalLink;
-export const Sparkles = CheckCircle2;
 export const Trash2 = ic("M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6");
 export const Users = ic("M16 21v-2a4 4 0 0 0-8 0v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z");
 export const Wrench = ic("M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z");

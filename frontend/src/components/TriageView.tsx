@@ -85,11 +85,26 @@ const MILESTONE_STATUS_CYCLE: PlanMilestoneStatus[] = ["pending", "in_progress",
 
 function NarratorViewSection({ snap }: { snap: SwarmSnapshot }) {
   const vj = snap.view?.json;
-  if (!vj || typeof vj !== "object") return null;
+  if (snap.view?.exists && snap.view?.jsonError && (!vj || typeof vj !== "object")) {
+    return (
+      <section aria-labelledby="narrator-heading" className="space-y-2">
+        <div className="f1">
+          <Radio className="text-warn" />
+          <h2 id="narrator-heading" className="h2">Narrator view</h2>
+        </div>
+        <Card className="p-3 border-warn bg-warn-soft text-[12px] text-ink" role="alert" data-testid="narrator-view-error">
+          <p className="font-medium text-warn">Unable to parse narrator view.json</p>
+          <p className="text-ink-2 break-words">{maskHome(snap.view.jsonError)}</p>
+        </Card>
+      </section>
+    );
+  }
+  if (!vj || typeof vj !== "object" || Array.isArray(vj)) return null;
 
   const headline = maskHome(safePlanText(vj.headline)).trim();
   const phase = safePlanText(vj.phase).trim();
   const summary = maskHome(safePlanText(vj.running_summary)).trim();
+  const ack = maskHome(safePlanText(vj.feedback_ack)).trim();
 
   const nowEntries =
     vj.now && typeof vj.now === "object" && !Array.isArray(vj.now)
@@ -102,18 +117,21 @@ function NarratorViewSection({ snap }: { snap: SwarmSnapshot }) {
     ? vj.attention
         .map((item) => {
           if (typeof item === "string") return { text: maskHome(item).trim(), member: "" };
-          if (item && typeof item === "object") {
+          if (item && typeof item === "object" && !Array.isArray(item)) {
             const obj = item as { member?: unknown; title?: unknown; detail?: unknown; text?: unknown };
             const member = safePlanText(obj.member).trim();
-            const text = maskHome(safePlanText(obj.title) || safePlanText(obj.text) || safePlanText(obj.detail)).trim();
+            const text = maskHome(
+              safePlanText(obj.title) || safePlanText(obj.text) || safePlanText(obj.detail) || safePlanText(obj),
+            ).trim();
             return text ? { text, member } : null;
           }
-          return null;
+          const scalar = maskHome(safePlanText(item)).trim();
+          return scalar ? { text: scalar, member: "" } : null;
         })
         .filter((x): x is { text: string; member: string } => Boolean(x && x.text))
     : [];
 
-  if (!headline && !phase && !summary && nowEntries.length === 0 && attentionItems.length === 0) {
+  if (!headline && !phase && !summary && !ack && nowEntries.length === 0 && attentionItems.length === 0) {
     return null;
   }
 
@@ -129,6 +147,7 @@ function NarratorViewSection({ snap }: { snap: SwarmSnapshot }) {
       <Card className="p-3 space-y-2" data-testid="narrator-view-card">
         {headline && <p className="text-[13px] font-medium text-ink break-words">{headline}</p>}
         {summary && <p className="text-[12px] text-ink-2 break-words leading-snug">{summary}</p>}
+        {ack && <p className="text-[12px] text-ink-3 break-words">Ack: {ack}</p>}
         {attentionItems.length > 0 && (
           <ul className="space-y-1" aria-label="Narrator attention items">
             {attentionItems.map((it, idx) => (
@@ -198,14 +217,24 @@ function SwarmPlanSection({
   const [saving, setSaving] = useState(false);
   const [planError, setPlanError] = useState("");
   const [conflictPlan, setConflictPlan] = useState<NormalizedPlan | null>(null);
+  const openedPlanRef = useRef<NormalizedPlan | null>(null);
+  const saveLockRef = useRef(false);
 
   useEffect(() => {
     setEditing(false);
     setConflictPlan(null);
     setPlanError("");
+    openedPlanRef.current = null;
   }, [swarmId]);
 
+  useEffect(() => {
+    if (conflictPlan && !conflictPlan.etag && plan?.etag && plan.etag !== baseEtag) {
+      setConflictPlan({ ...conflictPlan, etag: plan.etag });
+    }
+  }, [conflictPlan, plan?.etag, baseEtag]);
+
   const hydrateDraft = (source: NormalizedPlan | null) => {
+    openedPlanRef.current = source;
     setBaseEtag(source?.etag || "");
     setDraftGoalTitle(source?.goalTitle || "");
     setDraftGoal(source?.goalLine || source?.goal || "");
@@ -216,6 +245,50 @@ function SwarmPlanSection({
     setNotifyCoordinator(false);
     setPlanError("");
     setConflictPlan(null);
+  };
+
+  const mergePlanWithLatest = (latest: NormalizedPlan) => {
+    const orig = openedPlanRef.current;
+    const origGoalTitle = orig?.goalTitle || "";
+    const origGoal = orig?.goalLine || orig?.goal || "";
+    const origGate = orig?.gate || "";
+
+    const nextGoalTitle = latest.goalTitle || "";
+    const nextGoal = latest.goalLine || latest.goal || "";
+    const nextGate = latest.gate || "";
+
+    if (draftGoalTitle === origGoalTitle && nextGoalTitle !== origGoalTitle) setDraftGoalTitle(nextGoalTitle);
+    if (draftGoal === origGoal && nextGoal !== origGoal) setDraftGoal(nextGoal);
+    if (draftGate === origGate && nextGate !== origGate) setDraftGate(nextGate);
+
+    const origWsIds = new Set((orig?.workstreams || []).map((w) => w.id));
+    setDraftWorkstreams((cur) => {
+      const curIds = new Set(cur.map((w) => w.id));
+      const addedOnDisk = latest.workstreams.filter((w) => !origWsIds.has(w.id) && !curIds.has(w.id));
+      return [...cur, ...addedOnDisk.map((w) => ({ ...w }))];
+    });
+
+    const origTaskOwners = new Set(Object.keys(orig?.tasks || {}));
+    setDraftTasks((cur) => {
+      const curOwners = new Set(cur.map((t) => t.owner.trim()));
+      const addedTasks = Object.entries(latest.tasks || {})
+        .filter(([owner]) => !origTaskOwners.has(owner) && !curOwners.has(owner))
+        .map(([owner, desc]) => ({ owner, desc }));
+      return [...cur, ...addedTasks];
+    });
+
+    const origMsTitles = new Set((orig?.milestones || []).map((m) => m.title));
+    setDraftMilestones((cur) => {
+      const curTitles = new Set(cur.map((m) => m.title.trim()));
+      const addedMs = latest.milestones.filter((m) => !origMsTitles.has(m.title) && !curTitles.has(m.title));
+      return [...cur, ...addedMs.map((m) => ({ ...m }))];
+    });
+
+    openedPlanRef.current = latest;
+    setBaseEtag(latest.etag || plan?.etag || "");
+    setConflictPlan(null);
+    setPlanError("");
+    toast.success("Merged latest disk plan with your edits");
   };
 
   const openEditor = () => {
@@ -231,7 +304,7 @@ function SwarmPlanSection({
     draftTasks.some((t) => hasControlChars(t.owner) || hasControlChars(t.desc));
 
   const handleSave = async () => {
-    if (!swarmId) return;
+    if (saveLockRef.current || !swarmId) return;
     if (hasInvalidChars) {
       setPlanError("Control characters are not allowed.");
       toast.error("Control characters not permitted");
@@ -268,6 +341,7 @@ function SwarmPlanSection({
       return;
     }
 
+    saveLockRef.current = true;
     setSaving(true);
     setPlanError("");
     try {
@@ -303,6 +377,7 @@ function SwarmPlanSection({
         setPlanError(err instanceof Error ? err.message : "Failed to save plan");
       }
     } finally {
+      saveLockRef.current = false;
       setSaving(false);
     }
   };
@@ -333,16 +408,33 @@ function SwarmPlanSection({
       {editing ? (
         <Card className="p-3 space-y-3" data-testid="plan-editor">
           {conflictPlan !== null && (
-            <div className="rounded-chip border border-danger bg-bad-soft p-2 space-y-2 text-[12px]" data-testid="plan-conflict-banner">
-              <p className="font-medium text-danger">Plan changed on disk since you opened it.</p>
-              <Button
-                variant="outline"
-                data-testid="plan-conflict-reload"
-                onClick={() => hydrateDraft(conflictPlan)}
-              >
-                <RefreshCw />
-                Reload latest plan
-              </Button>
+            <div role="alert" className="rounded-chip border border-danger bg-bad-soft p-2.5 space-y-2 text-[12px]" data-testid="plan-conflict-banner">
+              <div className="space-y-0.5">
+                <p className="font-medium text-danger">Plan changed on disk since you opened it (409 Conflict).</p>
+                {(conflictPlan.goalLine || conflictPlan.goal) && (
+                  <p className="text-ink-2 break-words">
+                    Latest disk goal: {maskHome(conflictPlan.goalLine || conflictPlan.goal)}
+                  </p>
+                )}
+              </div>
+              <div className="wrap gap-1.5">
+                <Button
+                  variant="primary"
+                  data-testid="plan-conflict-merge"
+                  onClick={() => mergePlanWithLatest(conflictPlan)}
+                >
+                  <RefreshCw />
+                  Reload & merge
+                </Button>
+                <Button
+                  variant="outline"
+                  data-testid="plan-conflict-reload"
+                  onClick={() => hydrateDraft(conflictPlan)}
+                >
+                  <RefreshCw />
+                  Reload latest plan
+                </Button>
+              </div>
             </div>
           )}
 
@@ -630,8 +722,8 @@ function SwarmPlanSection({
                   </div>
                   {th.tasks.length > 0 && (
                     <div className="wrap gap-1">
-                      {th.tasks.map((tk) => (
-                        <Badge key={tk} tone="neutral">@{tk}</Badge>
+                      {th.tasks.map((tk, tIdx) => (
+                        <Badge key={`${tk}-${tIdx}`} tone="neutral">@{tk}</Badge>
                       ))}
                     </div>
                   )}
@@ -737,6 +829,7 @@ export function TriageView({
   const [nudgeDraft, setNudgeDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [peekId, setPeekId] = useState<string | null>(null);
+  const nudgeLockRef = useRef(false);
   const nowMs = useNowMs();
   const cardRefs = useRef<Array<HTMLDivElement | null>>([]);
 
@@ -786,13 +879,18 @@ export function TriageView({
     setNudgeDraft(customPrompt ?? item.suggestedPrompt);
   };
 
-  const handleConfirmNudge = () => {
-    if (!nudgeTarget) return;
-    return submitNudge(nudgeTarget.conversationId, nudgeDraft, `Sent nudge to ${nudgeTarget.member}`, setSending, () => {
-      setNudgeTarget(null);
-      setNudgeDraft("");
-      onRefresh();
-    });
+  const handleConfirmNudge = async () => {
+    if (nudgeLockRef.current || !nudgeTarget) return;
+    nudgeLockRef.current = true;
+    try {
+      await submitNudge(nudgeTarget.conversationId, nudgeDraft, `Sent nudge to ${nudgeTarget.member}`, setSending, () => {
+        setNudgeTarget(null);
+        setNudgeDraft("");
+        onRefresh();
+      });
+    } finally {
+      nudgeLockRef.current = false;
+    }
   };
 
   const handleCopy = (text: string, label = "Copied") => {
@@ -952,13 +1050,13 @@ export function TriageView({
             {triage.map((item, idx) => {
               const isSelected = idx === selectedIdx;
               const isPinned = item.seq > 0 && pinnedSet.has(item.seq);
-              const sev = SEVERITY_BADGE[item.severity];
+              const sev = SEVERITY_BADGE[item.severity] || SEVERITY_BADGE.attention;
               const editingThis = nudgeTarget?.id === item.id;
               const worker: SwarmMember | undefined = memberByName.get(item.member);
               const peeking = peekId === item.id;
               const tools = worker?.recentTools || [];
               const presets = unstickPresetFor(item);
-              const { cleanText: cleanDetail, shots: detailShots } = parseScreenshotLines(item.detail);
+              const { cleanText: cleanDetail, shots: detailShots } = parseScreenshotLines(safePlanText(item.detail));
               const paths = extractLocalFilePaths(cleanDetail);
               const { elapsed, isStalled: memberStalled } = memberMeta(worker, nowMs);
               const isStalled = item.kind === "stuck" || memberStalled;

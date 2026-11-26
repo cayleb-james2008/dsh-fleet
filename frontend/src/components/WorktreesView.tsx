@@ -1,4 +1,4 @@
-import { useState } from "../hooks";
+import { useRef, useState } from "../hooks";
 import {
   AlertTriangle,
   ChevronDown,
@@ -9,6 +9,7 @@ import {
   FolderGit2,
   GitBranch,
   RefreshCw,
+  X,
 } from "../icons";
 import { fetchWorktreeDiff, openFileInAuxPane, runWorktreeAction } from "../sidecar";
 import type {
@@ -101,14 +102,33 @@ function normalizeChangedFiles(entries: WorktreeInfo["branchFiles"] | WorktreeIn
   return out;
 }
 
-function collisionTargetsLabel(c: WorktreeCollision): string {
+function collisionTargets(c: WorktreeCollision): string[] {
   if (Array.isArray(c.branches) && c.branches.length > 0) {
-    return c.branches.join(", ");
+    return c.branches.map((b) => String(b || "").trim()).filter(Boolean);
   }
   return (c.worktrees || [])
     .map((w) => (typeof w === "string" ? maskHome(w) : w.branch || maskHome(w.path || w.id || "")))
-    .filter(Boolean)
-    .join(", ");
+    .map((s) => String(s || "").trim())
+    .filter(Boolean);
+}
+
+function actionRecoveryHint(res: WorktreeActionPayload): string {
+  if (res.ok) return "";
+  if (res.aborted) return "Working tree restored cleanly after abort. Resolve conflicts before retrying.";
+  switch (res.status) {
+    case "not_ff":
+      return "Branch has diverged from base. Run Rebase first or resolve manually.";
+    case "dirty":
+      return "Commit or stash uncommitted changes in this worktree before retrying.";
+    case "wrong_branch":
+      return "Switch the primary worktree back to the base branch before FF merge.";
+    case "unmerged":
+      return "Worktree has unmerged commits or uncommitted edits.";
+    case "conflict":
+      return "Resolve the listed conflicting file(s) before retrying.";
+    default:
+      return "";
+  }
 }
 
 function ownerForWorktree(wt: WorktreeInfo, members?: SwarmMember[]): SwarmMember | undefined {
@@ -133,6 +153,7 @@ export function WorktreesView({
   workspaceUris,
   payload,
   loading,
+  error,
   manualRoots,
   members,
   onAddManualRoot,
@@ -141,6 +162,7 @@ export function WorktreesView({
   workspaceUris: string[];
   payload: WorktreesPayload | null;
   loading: boolean;
+  error?: string;
   manualRoots: string[];
   members?: SwarmMember[];
   onAddManualRoot: (root: string) => void;
@@ -154,9 +176,11 @@ export function WorktreesView({
   const [confirmAction, setConfirmAction] = useState<{ wtPath: string; action: WorktreeActionName } | null>(null);
   const [busyActionKey, setBusyActionKey] = useState<string | null>(null);
   const [actionResultByWt, setActionResultByWt] = useState<Record<string, WorktreeActionPayload>>({});
+  const actionLockRef = useRef(false);
 
   const worktrees = payload?.worktrees || [];
   const collisions = payload?.collisions || [];
+  const rootErrors = (payload?.roots || []).filter((r) => Boolean(r.error));
   const allRoots = [...new Set([...workspaceUris, ...manualRoots])];
 
   const getDiffMode = (wtPath: string): WorktreeDiffMode => diffModeByWt[wtPath] || "working";
@@ -187,7 +211,9 @@ export function WorktreesView({
   };
 
   const executeWorktreeAction = async (wt: WorktreeInfo, action: WorktreeActionName) => {
+    if (actionLockRef.current) return;
     const key = `${wt.path}::${action}`;
+    actionLockRef.current = true;
     setBusyActionKey(key);
     setConfirmAction(null);
     try {
@@ -209,6 +235,7 @@ export function WorktreesView({
       }));
       toast.error(maskHome(message));
     } finally {
+      actionLockRef.current = false;
       setBusyActionKey((cur) => (cur === key ? null : cur));
     }
   };
@@ -255,12 +282,23 @@ export function WorktreesView({
         </form>
       )}
 
+      {(error || rootErrors.length > 0) && (
+        <Card role="alert" data-testid="worktrees-error-banner" className="border-danger bg-bad-soft p-2.5 space-y-1 text-[12px] text-danger">
+          {error && <p className="font-medium break-words">{maskHome(error)}</p>}
+          {rootErrors.map((r) => (
+            <p key={r.path} className="break-words">
+              {maskHome(r.path)}: {maskHome(r.error)}
+            </p>
+          ))}
+        </Card>
+      )}
+
       {collisions.length > 0 && (
         <Card
           data-testid="worktree-collisions-banner"
           className="border-warn bg-warn-soft p-3 space-y-2"
         >
-          <div className="row flex-wrap">
+          <div className="row flex-wrap gap-1.5">
             <div className="f1 min-w-0">
               <AlertTriangle className="h-4 w-4 text-warn shrink-0" />
               <span className="h2">File collisions ({collisions.length})</span>
@@ -270,19 +308,26 @@ export function WorktreesView({
           <ul aria-label="Worktree file collisions" className="divide-y divide-hairline rounded-chip border border-hairline bg-surface px-2 py-1">
             {collisions.map((c) => {
               const kind = c.kind || "mixed";
-              const targets = collisionTargetsLabel(c);
+              const targets = collisionTargets(c);
               return (
                 <li
                   key={c.file}
                   data-testid={`wt-collision-${c.file}`}
-                  className="py-1.5 space-y-0.5 min-w-0"
+                  className="py-1.5 space-y-1 min-w-0"
                 >
-                  <div className="row flex-wrap gap-1.5">
-                    <span className="text-[12px] font-medium text-ink mono break-all">{c.file}</span>
-                    <Badge tone={COLLISION_TONE[kind] || "warning"}>{kind}</Badge>
+                  <div className="flex items-start justify-between gap-1.5 flex-wrap min-w-0">
+                    <span className="text-[12px] font-medium text-ink mono break-all min-w-0 flex-1">{c.file}</span>
+                    <Badge tone={COLLISION_TONE[kind] || "warning"} className="shrink-0">{kind}</Badge>
                   </div>
-                  {targets && (
-                    <p className="t3 break-all">Touched by: {targets}</p>
+                  {targets.length > 0 && (
+                    <div className="wrap gap-1 min-w-0" data-testid={`wt-collision-targets-${c.file}`}>
+                      <span className="t3 shrink-0">Touched by:</span>
+                      {targets.map((target, idx) => (
+                        <Badge key={`${target}-${idx}`} tone="neutral" className="max-w-full truncate">
+                          {target}
+                        </Badge>
+                      ))}
+                    </div>
                   )}
                 </li>
               );
@@ -330,7 +375,7 @@ export function WorktreesView({
                       <GitBranch className="h-3.5 w-3.5 text-info shrink-0" />
                       <span className="h2 break-all">{wt.branch}</span>
                       {wt.isMain && <Badge tone="neutral">main</Badge>}
-                      {owner && <Badge tone="violet">@{owner.name}</Badge>}
+                      {owner && <Badge tone="violet" className="max-w-full truncate">@{owner.name}</Badge>}
                       <Badge tone={wt.clean ? "success" : "warning"}>
                         {wt.clean ? "clean" : `${dirtyCount} changed`}
                       </Badge>
@@ -350,7 +395,7 @@ export function WorktreesView({
                         </Badge>
                       )}
                       {!wt.isMain && (ahead > 0 || behind > 0) && (
-                        <Badge tone={behind > 0 ? "warning" : "info"} className="num">
+                        <Badge tone={behind > 0 ? "warning" : "info"} className="num max-w-full truncate">
                           +{ahead} / -{behind} vs {wt.baseBranch || "main"}
                         </Badge>
                       )}
@@ -444,31 +489,59 @@ export function WorktreesView({
                       </div>
                     )}
 
-                    {actionRes && (
-                      <div
-                        data-testid={`wt-action-result-${wt.branch}`}
-                        className={cn(
-                          "rounded-chip border px-2 py-1.5 space-y-1 text-[12px]",
-                          actionRes.ok ? "border-ok bg-ok-soft text-ink" : "border-danger bg-bad-soft text-danger",
-                        )}
-                      >
-                        <div className="row flex-wrap gap-1.5">
-                          <span className="font-medium break-words">{maskHome(actionRes.message || actionRes.status || "Action complete")}</span>
-                          {actionRes.status && <Badge tone={actionRes.ok ? "success" : "danger"}>{actionRes.status}</Badge>}
+                    {actionRes && (() => {
+                      const hint = actionRecoveryHint(actionRes);
+                      return (
+                        <div
+                          role={actionRes.ok ? "status" : "alert"}
+                          data-testid={`wt-action-result-${wt.branch}`}
+                          className={cn(
+                            "rounded-chip border px-2 py-1.5 space-y-1 text-[12px]",
+                            actionRes.ok ? "border-ok bg-ok-soft text-ink" : "border-danger bg-bad-soft text-danger",
+                          )}
+                        >
+                          <div className="flex items-start justify-between gap-1.5">
+                            <div className="flex items-start gap-1.5 min-w-0 flex-1">
+                              {!actionRes.ok && <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5 text-danger" />}
+                              <span className="font-medium break-words min-w-0">
+                                {maskHome(actionRes.message || actionRes.status || "Action complete")}
+                              </span>
+                            </div>
+                            <div className="f1 shrink-0">
+                              {actionRes.aborted && <Badge tone="warning">aborted</Badge>}
+                              {actionRes.status && <Badge tone={actionRes.ok ? "success" : "danger"}>{actionRes.status}</Badge>}
+                              <button
+                                type="button"
+                                aria-label={`Dismiss ${wt.branch} action result`}
+                                data-testid={`wt-action-dismiss-${wt.branch}`}
+                                onClick={() =>
+                                  setActionResultByWt((prev) => {
+                                    const next = { ...prev };
+                                    delete next[wt.path];
+                                    return next;
+                                  })
+                                }
+                                className="rounded p-0.5 text-ink-3 hover:text-ink cursor-pointer"
+                              >
+                                <X className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                          {hint && <p className="text-ink-2 break-words">{hint}</p>}
+                          {actionConflicts.length > 0 && (
+                            <ul
+                              data-testid={`wt-action-conflicts-${wt.branch}`}
+                              aria-label={`Conflicting files in ${wt.branch}`}
+                              className="list-disc pl-4 mono text-[12px] text-ink space-y-0.5"
+                            >
+                              {actionConflicts.map((cf) => (
+                                <li key={cf} className="break-all">{cf}</li>
+                              ))}
+                            </ul>
+                          )}
                         </div>
-                        {actionConflicts.length > 0 && (
-                          <ul
-                            data-testid={`wt-action-conflicts-${wt.branch}`}
-                            aria-label={`Conflicting files in ${wt.branch}`}
-                            className="list-disc pl-4 mono text-[12px] text-ink space-y-0.5"
-                          >
-                            {actionConflicts.map((cf) => (
-                              <li key={cf} className="break-all">{cf}</li>
-                            ))}
-                          </ul>
-                        )}
-                      </div>
-                    )}
+                      );
+                    })()}
                   </div>
                 )}
 

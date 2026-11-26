@@ -56,6 +56,7 @@ export function RosterView({
   const [spawnWorkspace, setSpawnWorkspace] = useState<SwarmWorkspaceMode>("share");
   const [spawnChannel, setSpawnChannel] = useState("");
   const [spawning, setSpawning] = useState(false);
+  const [spawnError, setSpawnError] = useState("");
   const spawnNameRef = useRef<HTMLInputElement>(null);
 
   // Switch Model drawer state
@@ -63,12 +64,19 @@ export function RosterView({
   const [switchModelVal, setSwitchModelVal] = useState("");
   const [switchReason, setSwitchReason] = useState("");
   const [switching, setSwitching] = useState(false);
+  const [switchError, setSwitchError] = useState("");
 
   // Confirmation-gated Kill Worker state (+ 409 unmerged worktree warning)
   const [killMember, setKillMember] = useState<string | null>(null);
   const [killReason, setKillReason] = useState("");
   const [killing, setKilling] = useState(false);
+  const [killError, setKillError] = useState("");
   const [kill409, setKill409] = useState<{ member: string; dirtyFiles: number; ahead: number; message: string } | null>(null);
+
+  const spawnLockRef = useRef(false);
+  const switchLockRef = useRef(false);
+  const killLockRef = useRef(false);
+  const nudgeLockRef = useRef(false);
 
   const nowMs = useNowMs();
 
@@ -78,6 +86,7 @@ export function RosterView({
   const canNudge = canLiveNudge(snap);
   const swarmConvId = snap.swarm || snap.conversationId || "";
   const activeChannels = (snap.channels || []).filter((c) => !c.archived);
+  const hasCoordinator = members.some((m) => !m.killed && m.role === "coordinator" && Boolean(m.conversation_id));
 
   useEffect(() => {
     if (!spawnNonce) return;
@@ -100,13 +109,15 @@ export function RosterView({
     !spawnBadChars;
 
   const handleSpawnSubmit = async () => {
-    if (!spawnReady) return;
+    if (spawnLockRef.current || !spawnReady) return;
     if (!canNudge) {
       await copyText(`Spawn @${cleanSpawnName} (${spawnWorkspace}): ${spawnBrief.trim()}`, `Copied spawn brief for @${cleanSpawnName}`);
       setSpawnOpen(false);
       return;
     }
+    spawnLockRef.current = true;
     setSpawning(true);
+    setSpawnError("");
     try {
       await sendSwarmControl({
         op: "spawn_worker",
@@ -123,13 +134,17 @@ export function RosterView({
       setSpawnOpen(false);
       onRefresh();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Spawn worker failed");
+      const msg = err instanceof Error ? err.message : "Spawn worker failed";
+      setSpawnError(msg);
+      toast.error(msg);
     } finally {
+      spawnLockRef.current = false;
       setSpawning(false);
     }
   };
 
   const openSwitchModel = (m: SwarmMember) => {
+    setSwitchError("");
     if (switchMember === m.name) {
       setSwitchMember(null);
       return;
@@ -147,8 +162,10 @@ export function RosterView({
 
   const handleSwitchModelSubmit = async (memberName: string) => {
     const model = switchModelVal.trim();
-    if (!swarmConvId || !model || hasControlChars(model) || hasControlChars(switchReason)) return;
+    if (switchLockRef.current || !swarmConvId || !model || hasControlChars(model) || hasControlChars(switchReason)) return;
+    switchLockRef.current = true;
     setSwitching(true);
+    setSwitchError("");
     try {
       await sendSwarmControl({
         op: "switch_model",
@@ -162,13 +179,17 @@ export function RosterView({
       setSwitchReason("");
       onRefresh();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Switch model failed");
+      const msg = err instanceof Error ? err.message : "Switch model failed";
+      setSwitchError(msg);
+      toast.error(msg);
     } finally {
+      switchLockRef.current = false;
       setSwitching(false);
     }
   };
 
   const openKillConfirm = (m: SwarmMember) => {
+    setKillError("");
     if (killMember === m.name) {
       setKillMember(null);
       setKill409(null);
@@ -180,8 +201,10 @@ export function RosterView({
   };
 
   const handleKillSubmit = async (memberName: string, forceUnmerged = false) => {
-    if (!swarmConvId || hasControlChars(killReason)) return;
+    if (killLockRef.current || !swarmConvId || hasControlChars(killReason)) return;
+    killLockRef.current = true;
     setKilling(true);
+    setKillError("");
     try {
       await sendSwarmControl({
         op: "kill_worker",
@@ -204,9 +227,12 @@ export function RosterView({
           message: err.message,
         });
       } else {
-        toast.error(err instanceof Error ? err.message : "Kill worker failed");
+        const msg = err instanceof Error ? err.message : "Kill worker failed";
+        setKillError(msg);
+        toast.error(msg);
       }
     } finally {
+      killLockRef.current = false;
       setKilling(false);
     }
   };
@@ -234,18 +260,23 @@ export function RosterView({
 
   const badBroadcast = hasControlChars(broadcastText) || broadcastText.trim().length > 4000;
 
-  const handleBroadcastSubmit = () => {
-    if (badBroadcast || broadcastConvs.length === 0) return;
+  const handleBroadcastSubmit = async () => {
+    if (nudgeLockRef.current || badBroadcast || broadcastConvs.length === 0) return;
     if (!canNudge) {
       void copyText(broadcastText.trim(), "Broadcast copied");
       setBroadcastOpen(false);
       return;
     }
-    return submitNudge(broadcastConvs, broadcastText, `Broadcast sent (${broadcastConvs.length})`, setSending, () => {
-      setBroadcastOpen(false);
-      setBroadcastText("@all ");
-      onRefresh();
-    });
+    nudgeLockRef.current = true;
+    try {
+      await submitNudge(broadcastConvs, broadcastText, `Broadcast sent (${broadcastConvs.length})`, setSending, () => {
+        setBroadcastOpen(false);
+        setBroadcastText("@all ");
+        onRefresh();
+      });
+    } finally {
+      nudgeLockRef.current = false;
+    }
   };
 
   const sorted = useMemo(() => {
@@ -260,12 +291,19 @@ export function RosterView({
       );
   }, [members, showKilled]);
 
-  const sendNudge = (member: SwarmMember) =>
-    submitNudge(member.conversation_id, nudgeText, `Message sent to ${member.name}`, setSending, () => {
-      setNudgeMember(null);
-      setNudgeText("");
-      onRefresh();
-    });
+  const sendNudge = async (member: SwarmMember) => {
+    if (nudgeLockRef.current) return;
+    nudgeLockRef.current = true;
+    try {
+      await submitNudge(member.conversation_id, nudgeText, `Message sent to ${member.name}`, setSending, () => {
+        setNudgeMember(null);
+        setNudgeText("");
+        onRefresh();
+      });
+    } finally {
+      nudgeLockRef.current = false;
+    }
+  };
 
   return (
     <div className="space-y-3">
@@ -317,6 +355,16 @@ export function RosterView({
               <X />
             </Button>
           </div>
+          {canNudge && members.length > 0 && !hasCoordinator && (
+            <p role="alert" className="rounded-chip border border-warn bg-warn-soft px-2 py-1 text-[12px] text-warn" data-testid="roster-missing-coordinator">
+              No active coordinator in roster. Spawn directives may fail.
+            </p>
+          )}
+          {spawnError && (
+            <p role="alert" className="rounded-chip border border-danger bg-bad-soft px-2 py-1 text-[12px] text-danger" data-testid="spawn-worker-error">
+              {spawnError}
+            </p>
+          )}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
             <div className="space-y-1">
               <label htmlFor="spawn-worker-name" className="text-[12px] font-medium text-ink-2">Worker name</label>
@@ -605,6 +653,16 @@ export function RosterView({
                         <X />
                       </Button>
                     </div>
+                    {canNudge && members.length > 0 && !hasCoordinator && (
+                      <p role="alert" className="rounded-chip border border-warn bg-warn-soft px-2 py-1 text-[12px] text-warn" data-testid="roster-missing-coordinator">
+                        No active coordinator in roster. Switch directives may fail.
+                      </p>
+                    )}
+                    {switchError && (
+                      <p role="alert" className="rounded-chip border border-danger bg-bad-soft px-2 py-1 text-[12px] text-danger" data-testid="switch-model-error">
+                        {switchError}
+                      </p>
+                    )}
                     <div className="wrap gap-1">
                       {MODEL_SUGGESTIONS.map((mdl) => (
                         <Pill
@@ -653,6 +711,16 @@ export function RosterView({
                     <p className="text-[12px] text-ink">
                       Permanently stop @{m.name} and clean up its workspace.
                     </p>
+                    {canNudge && members.length > 0 && !hasCoordinator && (
+                      <p role="alert" className="rounded-chip border border-warn bg-warn-soft px-2 py-1 text-[12px] text-warn" data-testid="roster-missing-coordinator">
+                        No active coordinator in roster. Kill directives may fail.
+                      </p>
+                    )}
+                    {killError && (
+                      <p role="alert" className="rounded-chip border border-danger bg-bad-soft px-2 py-1 text-[12px] text-danger" data-testid="kill-worker-error">
+                        {killError}
+                      </p>
+                    )}
                     <Input
                       aria-label={`Kill reason for ${m.name}`}
                       data-testid={`kill-worker-reason-${m.name}`}
