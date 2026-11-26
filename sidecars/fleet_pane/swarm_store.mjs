@@ -187,7 +187,7 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine, { rawSpan =
           if (end > start) {
             const rem = Math.max(0, s.size - offset + (totalLen - nl - 1));
             if (rawSpan) onLine(activeBuf, start, end, null, rem);
-            else onLine(activeBuf.subarray(start, end).toString('utf8'));
+            else onLine(activeBuf.toString('utf8', start, end));
           }
           pos = nl + 1;
         }
@@ -1065,6 +1065,43 @@ export function getSwarmMetaKeys(appData, id) {
   };
 }
 
+/** Compute release-gate handoff progression across [done] -> [verified] -> [scale-verified] / [blocked]. */
+export function computeGateReadiness(messages, triage = []) {
+  let doneC = 0, doneSeq = 0;
+  let verC = 0, verSeq = 0;
+  let scaleC = 0, scaleSeq = 0;
+  let blkC = 0, blkSeq = 0;
+  for (const m of messages || []) {
+    if (!m || m.control || !m.text) continue;
+    const seq = Number(m.seq) || 0;
+    const t = m.text;
+    if (/\[scale-verified\]/i.test(t)) { scaleC++; scaleSeq = Math.max(scaleSeq, seq); }
+    else if (/\[verified\]/i.test(t)) { verC++; verSeq = Math.max(verSeq, seq); }
+    else if (/\[done\]/i.test(t)) { doneC++; doneSeq = Math.max(doneSeq, seq); }
+    if (/\[blocked\]/i.test(t)) { blkC++; blkSeq = Math.max(blkSeq, seq); }
+  }
+  const activeBlk = (triage || []).find((x) => (x.kind === 'blocked' || x.severity === 'urgent') && x.seq > 0);
+  if (!doneC && !verC && !scaleC && !blkC && !activeBlk) return null;
+  const pendingSeq = activeBlk ? activeBlk.seq
+    : doneSeq > verSeq ? doneSeq
+    : verSeq > scaleSeq ? verSeq
+    : blkSeq > Math.max(doneSeq, verSeq, scaleSeq) ? blkSeq
+    : scaleSeq || verSeq || doneSeq || 0;
+  const state = activeBlk || blkSeq > Math.max(doneSeq, verSeq, scaleSeq) ? 'blocked'
+    : scaleC > 0 && doneSeq <= verSeq && verSeq <= scaleSeq ? 'ready'
+    : 'verifying';
+  return {
+    state,
+    pendingSeq,
+    stages: [
+      { key: 'done', label: '[done]', count: doneC, seq: doneSeq },
+      { key: 'verified', label: '[verified]', count: verC, seq: verSeq },
+      { key: 'scale', label: '[scale-verified]', count: scaleC, seq: scaleSeq },
+      { key: 'blocked', label: '[blocked]', count: blkC, seq: blkSeq },
+    ],
+  };
+}
+
 /** Compute per-worker token share and high-burn warning state for coordinator guardrails. */
 export function computeBurnSummary(members, totalTokens = 0) {
   const total = Number(totalTokens) || 0;
@@ -1283,6 +1320,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
   const triage = buildTriageItems({ members, messages, sysAttention });
   const totalTokens = totalInputTokens + totalCacheReadTokens + totalOutputTokens;
   const burnSummary = computeBurnSummary(members, totalTokens);
+  const gateReadiness = computeGateReadiness(messages, triage);
 
   const activeCount = members.filter((m) => !m.killed && m.status === 'working').length;
   const waitingCount = members.filter((m) => !m.killed && m.status === 'waiting').length;
@@ -1329,6 +1367,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     systemAttention: sysAttention,
     triage,
     burnSummary,
+    gateReadiness,
     usage: {
       inputTokens: totalInputTokens,
       cacheReadTokens: totalCacheReadTokens,

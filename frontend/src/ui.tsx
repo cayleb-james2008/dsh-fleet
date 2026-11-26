@@ -13,7 +13,7 @@ import type {
 } from "react";
 import { ArrowUpRight, ClipboardCopy, FileCode2, Image as ImageIcon, Pin, PinOff, Send, X } from "./icons";
 import { openFileInAuxPane, parseScreenshotLines, sendConfirmedNudge } from "./sidecar";
-import type { BoardMessage, BurnSummary, SwarmMember, SwarmSnapshot, TriageItem, WorktreesPayload } from "./types";
+import type { BoardMessage, SwarmMember, SwarmSnapshot, TriageItem, WorktreesPayload } from "./types";
 
 export const canLiveNudge = (snap: SwarmSnapshot): boolean =>
   Boolean(snap.capabilities?.canSendMessage || window.sidecar?.agent?.sendMessage);
@@ -260,7 +260,7 @@ export function fmtClockTime(ts: number | null | undefined, fallback = ""): stri
     : d.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
-export type ButtonVariant = "primary" | "secondary" | "outline" | "ghost";
+export type ButtonVariant = "primary" | "secondary" | "outline" | "ghost" | "info" | "danger";
 export type ButtonSize = "sm" | "icon";
 
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
@@ -273,6 +273,8 @@ const BUTTON_VARIANTS: Record<ButtonVariant, string> = {
   secondary: "bg-track text-ink border-hairline-s hover:bg-board active:bg-hairline",
   outline: "bg-surface text-ink border-[var(--edge)] hover:bg-board active:bg-track",
   ghost: "bg-transparent text-ink-2 hover:bg-track hover:text-ink active:bg-hairline",
+  info: "bg-blue-soft text-info border-hairline-s hover:opacity-90",
+  danger: "bg-bad-soft text-danger border-hairline-s hover:opacity-90",
 };
 
 const BUTTON_SIZES: Record<ButtonSize, string> = {
@@ -452,7 +454,7 @@ export function Modal({
         className="w-full max-w-[440px] max-h-[85vh] overflow-y-auto rounded-card border border-hairline bg-surface p-4 shadow-[var(--elev-lift)]"
       >
         <div className="row pb-3 border-b border-hairline">
-          <h2 id="fleet-modal-title" className="text-[14px] font-semibold text-ink">
+          <h2 id="fleet-modal-title" className="h2">
             {title}
           </h2>
           <Button variant="ghost" size="icon" aria-label="Close dialog" onClick={onClose}>
@@ -547,7 +549,7 @@ export function InlineComposer({
       </div>
       <Textarea id={id} rows={2} maxLength={4000} value={value} onChange={(e) => onChange(e.target.value)} />
       <div className="row">
-        <span className="text-[12px] text-ink-3 num">{showCounter ? `${value.length}/4000` : ""}</span>
+        <span className="t3 num">{showCounter ? `${value.length}/4000` : ""}</span>
         <div className="flex items-center gap-2">
           <Button variant="ghost" onClick={onCancel}>Cancel</Button>
           <Button variant="primary" data-testid="composer-submit" disabled={disabled || !value.trim()} onClick={onSubmit}>
@@ -662,7 +664,7 @@ export function PinnedList({
               <span className="font-semibold num">#{pm.seq}</span> <span className="font-medium">{pm.agent}:</span>{" "}
               <span className="text-ink-2">{preview}</span>
             </button>
-            <div className="flex items-center gap-1 shrink-0">
+            <div className="f1 shrink-0">
               {!compact && (
                 <Button variant="ghost" className="num" onClick={() => onJump(pm.seq)}>
                   #{pm.seq}
@@ -691,27 +693,10 @@ export function SegBar({ segments, label }: { segments: Array<{ key: string; pct
 const BURN_COLS = ["bg-blue", "bg-[var(--violet)]", "bg-warn", "bg-danger", "bg-[var(--edge)]"];
 
 export function TokenBurnStrip({ snap }: { snap: SwarmSnapshot }) {
-  const members = snap.members || [];
-  const total = snap.burnSummary?.totalTokens ?? snap.usage?.totalTokens ?? 0;
-  const rows: BurnSummary["workers"] = snap.burnSummary?.workers?.length
-    ? snap.burnSummary.workers
-    : members
-        .filter((m) => !m.roleWorker && m.usage.totalTokens > 0)
-        .map((m) => {
-          const tok = m.usage.totalTokens;
-          const sharePct = total > 0 ? Math.round((tok / total) * 100) : 0;
-          const level: "normal" | "warn" | "critical" = tok >= 400_000 || (total >= 20_000 && sharePct >= 65 && members.length >= 2)
-            ? "critical"
-            : tok >= 150_000 || (total >= 10_000 && sharePct >= 45 && members.length >= 2)
-              ? "warn"
-              : "normal";
-          return { name: m.name, totalTokens: tok, sharePct, level, killed: m.killed };
-        })
-        .sort((a, b) => b.totalTokens - a.totalTokens || a.name.localeCompare(b.name))
-        .slice(0, 6);
-  if (total <= 0 || rows.length === 0) return null;
-  const top = snap.burnSummary?.topWorker || rows[0];
-  const shown = rows.slice(0, 4);
+  const b = snap.burnSummary;
+  if (!b || b.totalTokens <= 0 || !b.workers.length) return null;
+  const top = b.topWorker || b.workers[0];
+  const shown = b.workers.slice(0, 4);
   const restPct = Math.max(0, 100 - shown.reduce((s, r) => s + r.sharePct, 0));
   const segs = [
     ...shown.map((w, i) => ({ key: w.name, pct: w.sharePct, cls: BURN_COLS[i % 4], title: `@${w.name}: ${fmtTokens(w.totalTokens)} (${w.sharePct}%)` })),
@@ -723,7 +708,7 @@ export function TokenBurnStrip({ snap }: { snap: SwarmSnapshot }) {
       <div className="row flex-wrap t2">
         <div className="wrap gap-1">
           <span className="font-semibold text-ink">Token burn</span>
-          <span className="num">{fmtTokens(total)} tok</span>
+          <span className="num">{fmtTokens(b.totalTokens)} tok</span>
         </div>
         {top.level !== "normal" ? (
           <Badge tone={top.level === "critical" ? "danger" : "warning"} data-testid="high-burn-badge">
@@ -735,12 +720,54 @@ export function TokenBurnStrip({ snap }: { snap: SwarmSnapshot }) {
       </div>
       <SegBar segments={segs} label={`Token share led by ${top.name} (${top.sharePct}%)`} />
       <div className="wrap gap-2 t2 num">
-        {rows.slice(0, 3).map((w, i) => (
+        {b.workers.slice(0, 3).map((w, i) => (
           <span key={w.name} className="inline-flex items-center gap-1">
             <span className={cn("h-2 w-2 rounded-full", BURN_COLS[i % 4])} aria-hidden="true" />
             <span className="text-ink font-medium">{w.name}</span> {fmtTokens(w.totalTokens)} ({w.sharePct}%)
           </span>
         ))}
+      </div>
+    </Card>
+  );
+}
+
+export function GateReadinessCard({ snap, onJump }: { snap: SwarmSnapshot; onJump: (seq: number) => void }) {
+  const gate = snap.gateReadiness;
+  if (!gate) return null;
+  const tone = gate.state === "blocked" ? "danger" : gate.state === "ready" ? "success" : "info";
+  const label = gate.state === "blocked" ? "Blocked" : gate.state === "ready" ? "Ready" : "Verifying";
+
+  return (
+    <Card className="p-2 space-y-1" data-testid="gate-readiness-card">
+      <div className="row flex-wrap t2">
+        <div className="wrap gap-1">
+          <span className="font-semibold text-ink">Gate readiness</span>
+          <Badge tone={tone}>{label}</Badge>
+        </div>
+        {gate.pendingSeq > 0 && (
+          <Button data-testid="gate-pending-jump" onClick={() => onJump(gate.pendingSeq)} className="bg-board num">
+            Gate #{gate.pendingSeq}
+            <ArrowUpRight className="h-3 w-3" />
+          </Button>
+        )}
+      </div>
+      <div className="wrap gap-1">
+        {gate.stages.map((st) =>
+          st.seq > 0 ? (
+            <Button
+              key={st.key}
+              variant={st.key === "blocked" ? "danger" : "info"}
+              onClick={() => onJump(st.seq)}
+              className="num"
+            >
+              {st.label} {st.count} · #{st.seq}
+            </Button>
+          ) : (
+            <Badge key={st.key} tone="neutral" className="opacity-55">
+              {st.label} 0
+            </Badge>
+          ),
+        )}
       </div>
     </Card>
   );

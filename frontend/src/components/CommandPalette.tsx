@@ -171,7 +171,7 @@ export function CommandPalette({
                   )}
                 >
                   <span className="truncate">{item.label}</span>
-                  {item.meta && <span className="text-[12px] text-ink-3 num shrink-0">{item.meta}</span>}
+                  {item.meta && <span className="t3 num shrink-0">{item.meta}</span>}
                 </button>
               </div>
             ))

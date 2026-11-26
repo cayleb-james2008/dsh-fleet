@@ -51,10 +51,11 @@ async function check(label, fn) {
 await page.goto(BASE, { waitUntil: "networkidle" });
 await page.waitForSelector('h1:has-text("Fleet v1.0 Antigravity Sidecar")');
 
-await check("loads simulated Antigravity swarm and Token Burn Guard Strip in 380px sidebar", async () => {
+await check("loads simulated Antigravity swarm, Token Burn, and Gate Readiness in 380px sidebar", async () => {
   const txt = await page.locator("#panel-triage").textContent();
   const burn = await page.locator('#panel-triage [data-testid="token-burn-strip"]').textContent();
-  return txt.includes("Needs you") && txt.includes("builder asked a question") && burn.includes("Token burn") && /\d+%/.test(burn);
+  const gateTxt = await page.locator('#panel-triage [data-testid="gate-readiness-card"]').textContent();
+  return txt.includes("Needs you") && txt.includes("builder asked a question") && burn.includes("Token burn") && /\d+%/.test(burn) && gateTxt.includes("Gate readiness") && gateTxt.includes("[done]");
 });
 
 await check("plan.json goal & humanized workstreams visible", async () => {

@@ -22,7 +22,7 @@ import {
   parseScreenshotLines,
 } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot, TriageItem } from "../types";
-import { ActivityPeek, Badge, Button, Card, InlineComposer, MediaPathChips, Pill, PinnedList, SegBar, StatusDot, TokenBurnStrip, canLiveNudge, cn, copyText, fmtTimeAgo, fmtTokens, formatBlockerContext, humanizeStatus, memberMeta, openOrCopyPath, submitNudge, useNowMs } from "../ui";
+import { ActivityPeek, Badge, Button, Card, GateReadinessCard, InlineComposer, MediaPathChips, Pill, PinnedList, SegBar, StatusDot, TokenBurnStrip, canLiveNudge, cn, copyText, fmtTimeAgo, fmtTokens, formatBlockerContext, humanizeStatus, memberMeta, openOrCopyPath, submitNudge, useNowMs } from "../ui";
 
 const SEVERITY_BADGE: Record<TriageItem["severity"], { tone: "danger" | "warning" | "info"; label: string; Icon: typeof AlertTriangle }> = {
   urgent: { tone: "danger", label: "Urgent", Icon: ShieldAlert },
@@ -141,7 +141,7 @@ export function TriageView({
       {/* Needs-You Triage Inbox */}
       <section aria-labelledby="triage-heading" className="space-y-2">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <h2 id="triage-heading" className="text-[14px] font-semibold text-ink">
+          <h2 id="triage-heading" className="h2">
             Needs you ({triage.length})
           </h2>
           {triage.length === 0 ? (
@@ -150,7 +150,7 @@ export function TriageView({
               All clear
             </Badge>
           ) : (
-            <div className="hidden sm:flex items-center gap-2 text-[12px] text-ink-3 mono">
+            <div className="hidden sm:flex items-center gap-2 t3 mono">
               {["j/k move", "o chat", "p pin", "r reply", "? help"].map((k) => <span key={k}>{k}</span>)}
             </div>
           )}
@@ -182,6 +182,8 @@ export function TriageView({
         )}
 
         <TokenBurnStrip snap={snap} />
+
+        <GateReadinessCard snap={snap} onJump={onJumpToBoardSeq} />
 
         {triage.length === 0 ? (
           <Card className="p-3 bg-board">
@@ -266,7 +268,7 @@ export function TriageView({
                       </Button>
                     )}
                     {item.seq > 0 && (
-                      <div className="flex items-center gap-1 ml-auto">
+                      <div className="f1 ml-auto">
                         <Button variant="ghost" aria-pressed={isPinned} aria-label={isPinned ? `Unpin #${item.seq}` : `Pin #${item.seq}`} onClick={() => onTogglePin(item.seq)} className="px-2">
                           {isPinned ? <PinOff /> : <Pin />}
                         </Button>
@@ -313,9 +315,9 @@ export function TriageView({
       {/* Pinned Board Posts */}
       {pinnedMsgs.length > 0 && (
         <section aria-labelledby="pinned-triage-heading" className="space-y-2">
-          <div className="flex items-center gap-1">
+          <div className="f1">
             <Pin className="text-info" />
-            <h2 id="pinned-triage-heading" className="text-[14px] font-semibold text-ink">Pinned posts ({pinnedMsgs.length})</h2>
+            <h2 id="pinned-triage-heading" className="h2">Pinned posts ({pinnedMsgs.length})</h2>
           </div>
           <Card className="p-2"><PinnedList messages={pinnedMsgs} onJump={onJumpToBoardSeq} onUnpin={onTogglePin} /></Card>
         </section>
@@ -324,9 +326,9 @@ export function TriageView({
       {/* Coordinator Plan & Workstreams */}
       {plan && (
         <section aria-labelledby="plan-heading" className="space-y-2">
-          <div className="flex items-center gap-1">
+          <div className="f1">
             <Layers className="text-ink-3" />
-            <h2 id="plan-heading" className="text-[14px] font-semibold text-ink">Swarm plan</h2>
+            <h2 id="plan-heading" className="h2">Swarm plan</h2>
           </div>
           <Card className="p-3 space-y-2">
             {plan.goal && <p className="text-[14px] font-medium text-ink break-words">{plan.goal}</p>}
@@ -342,7 +344,7 @@ export function TriageView({
                   <li key={ws.id || i} className="row py-2 first:pt-1 last:pb-0">
                     <div className="min-w-0">
                       <p className="text-[13px] font-medium text-ink truncate">{ws.title}</p>
-                      {ws.owner && <p className="text-[12px] text-ink-3">@{ws.owner}</p>}
+                      {ws.owner && <p className="t3">@{ws.owner}</p>}
                     </div>
                     <Badge tone={WORKSTREAM_TONE[String(ws.status || "pending").toLowerCase()] || "neutral"}>{humanizeStatus(ws.status)}</Badge>
                   </li>
@@ -369,9 +371,9 @@ export function TriageView({
       {/* Screenshot Reel */}
       {frames.length > 0 && (
         <section aria-labelledby="reel-heading" className="space-y-2">
-          <div className="flex items-center gap-1">
+          <div className="f1">
             <ImageIcon className="text-ink-3" />
-            <h2 id="reel-heading" className="text-[14px] font-semibold text-ink">Verified captures ({frames.length})</h2>
+            <h2 id="reel-heading" className="h2">Verified captures ({frames.length})</h2>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
             {frames.map((frame) => (
@@ -386,7 +388,7 @@ export function TriageView({
                 </div>
                 <div className="row px-2 py-2">
                   <span className="text-[12px] text-ink-2 truncate">{frame.caption || frame.path.split("/").pop()}</span>
-                  <div className="flex items-center gap-1 shrink-0">
+                  <div className="f1 shrink-0">
                     <Button aria-label={`Open ${frame.caption || "capture"} file`} onClick={() => openOrCopyPath(frame.path, frame.path)}>
                       <ExternalLink />
                       Open file

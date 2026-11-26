@@ -351,7 +351,7 @@ export function App() {
                       aria-label="Active swarm"
                       value={snap?.swarm || selectedSwarmId || ""}
                       onChange={(e) => handleSelectSwarm(e.target.value)}
-                      className="h-7 max-w-[165px] min-[380px]:max-w-[190px] sm:max-w-[320px] truncate rounded-chip border border-[var(--edge)] bg-board px-2 text-[14px] font-semibold text-ink cursor-pointer"
+                      className="h-7 max-w-[165px] min-[380px]:max-w-[190px] sm:max-w-[320px] truncate rounded-chip border border-[var(--edge)] bg-board px-2 h2 cursor-pointer"
                     >
                       {swarms.map((sw) => (
                         <option key={sw.id} value={sw.id}>{sw.title || sw.id} ({sw.activeCount}/{sw.memberCount})</option>
@@ -359,12 +359,12 @@ export function App() {
                     </select>
                   </>
                 ) : (
-                  <h1 className="text-[14px] font-semibold text-ink truncate">{snap?.title || "Fleet"}</h1>
+                  <h1 className="h2 truncate">{snap?.title || "Fleet"}</h1>
                 )}
               </div>
             </div>
 
-            <div className="flex items-center gap-1 shrink-0">
+            <div className="f1 shrink-0">
               {([
                 ...(hasSwarm ? [["Copy swarm digest", ClipboardCopy, handleCopyDigest, false] as const] : []),
                 ["Open command palette", Search, () => setPaletteOpen(true), false] as const,
@@ -384,7 +384,7 @@ export function App() {
                 <StatusDot state={activeCount > 0 ? "working" : waitingCount > 0 ? "waiting" : "killed"} />
                 {activeCount} working · {waitingCount} waiting <span className="text-ink-3">#{snap?.head || 0}</span>
               </div>
-              <div className="flex items-center gap-1">
+              <div className="f1">
                 {sseConnected && <Badge tone="success">Live</Badge>}
                 {snap?.member && <Badge>you: {snap.member}</Badge>}
                 <span className="inline-flex items-center rounded-chip bg-board px-2 py-1 num font-medium text-ink-2">{fmtTokens(snap?.usage?.totalTokens)} tok</span>
@@ -453,7 +453,7 @@ export function App() {
                 {SWARM_PRESETS.map((p) => (
                   <Card key={p.id} className="p-3 flex flex-col justify-between gap-2">
                     <div>
-                      <p className="text-[14px] font-semibold text-ink">{p.title}</p>
+                      <p className="h2">{p.title}</p>
                       <p className="text-[13px] text-ink-2">{p.summary}</p>
                     </div>
                     <Button variant="primary" onClick={() => handleLaunchPreset(p)}>
@@ -466,12 +466,12 @@ export function App() {
 
             {swarms.length > 0 && (
               <section aria-labelledby="recent-swarms-heading" className="space-y-2">
-                <h2 id="recent-swarms-heading" className="text-[14px] font-semibold text-ink">Recent swarms ({swarms.length})</h2>
+                <h2 id="recent-swarms-heading" className="h2">Recent swarms ({swarms.length})</h2>
                 <div className="space-y-2">
                   {swarms.map((sw) => (
                     <Card key={sw.id} className="p-3 row">
                       <div className="min-w-0">
-                        <p className="text-[14px] font-semibold text-ink truncate">{sw.title || sw.id}</p>
+                        <p className="h2 truncate">{sw.title || sw.id}</p>
                         <div className="wrap gap-2 text-[12px] text-ink-2 num">
                           <span>{sw.activeCount} active</span><span>{sw.memberCount} members</span><span>#{sw.head}</span><span>{fmtTokens(sw.totalTokens)} tok</span>
                         </div>
@@ -571,9 +571,9 @@ export function App() {
             />
           </div>
           <div className="rounded-card bg-board p-3 text-[12px] text-ink-2 space-y-1">
-            <div className="flex items-center gap-1 font-medium text-ink">
+            <div className="f1 font-medium text-ink">
               <CommandIcon />
-              <span>Fleet Antigravity Plugin v1.11.0</span>
+              <span>Fleet Antigravity Plugin v1.12.0</span>
             </div>
             <p>Loopback swarm &amp; worktree monitor. Zero telemetry.</p>
           </div>
