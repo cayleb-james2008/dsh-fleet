@@ -487,7 +487,7 @@ export async function sendSwarmControl(req: ControlRequest): Promise<ControlDisp
     const workerStatus = typeof data.status === "string" ? data.status : undefined;
     const msg =
       res.status === 409 && code === "worker_not_waiting"
-        ? `Worker is ${workerStatus || "working"} — wait for waiting state or enable override`
+        ? `Worker is ${workerStatus || "working"}. Wait for waiting state or enable override`
         : code || `Control action failed (${res.status})`;
     throw new SwarmControlError(msg, res.status, {
       code,

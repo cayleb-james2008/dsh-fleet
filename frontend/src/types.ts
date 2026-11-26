@@ -310,11 +310,11 @@ export interface OperatorCommand {
   target?: string;
   payload?: unknown;
   status: OperatorCommandStatus;
-  createdAt: number;
-  updatedAt: number;
+  createdAt: number | string;
+  updatedAt: number | string;
   coordinatorId?: string;
-  resolvedSeq?: number;
-  error?: string;
+  resolvedSeq?: number | null;
+  error?: string | null;
 }
 
 export interface CoordinatorDispatchState {
@@ -328,7 +328,7 @@ export interface ControlDispatchResponse {
   opId?: string;
   status?: OperatorCommandStatus | string;
   coordinatorId?: string;
-  coordinatorState?: CoordinatorDispatchState | null;
+  coordinatorState?: CoordinatorDispatchState | string | null;
   directivePreview?: string;
   deliveredAt?: string;
   delivered?: number;

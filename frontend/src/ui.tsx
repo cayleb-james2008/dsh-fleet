@@ -86,15 +86,23 @@ export const copyText = (text: string, okMsg = "Copied"): Promise<void> =>
 
 export const hasControlChars = (s: string): boolean => /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(s);
 
-export function isCoordinatorUnhealthy(state?: CoordinatorDispatchState | null): boolean {
+export function isCoordinatorUnhealthy(state?: CoordinatorDispatchState | string | null): boolean {
   if (!state) return false;
+  if (typeof state === "string") {
+    const st = state.trim().toLowerCase();
+    return Boolean(st && st !== "working" && st !== "waiting");
+  }
   if (state.failure) return true;
   const st = String(state.status || "").trim().toLowerCase();
   return Boolean(st && st !== "working" && st !== "waiting");
 }
 
-export function formatCoordinatorWarning(state?: CoordinatorDispatchState | null): string {
+export function formatCoordinatorWarning(state?: CoordinatorDispatchState | string | null): string {
   if (!state) return "";
+  if (typeof state === "string") {
+    const st = state.trim();
+    return st ? `coordinator ${st}` : "coordinator unavailable";
+  }
   if (state.failure) {
     const kind = state.failure.kind || "error";
     const txt = maskHome(state.failure.text || "").trim();
@@ -110,7 +118,7 @@ export function notifyDispatch(res: ControlDispatchResponse | undefined, fallbac
     ? `Dispatched ${opId} (awaiting coordinator)`
     : `Dispatched ${fallbackLabel} (awaiting coordinator)`;
   if (isCoordinatorUnhealthy(res?.coordinatorState)) {
-    toast.error(`${base} — warning: ${formatCoordinatorWarning(res?.coordinatorState)}`);
+    toast.error(`${base}: warning (${formatCoordinatorWarning(res?.coordinatorState)})`);
     return;
   }
   toast.message(base);
@@ -1334,6 +1342,15 @@ const OP_LABELS: Record<string, string> = {
   nudge: "Nudge",
 };
 
+function opTimeMs(v?: number | string | null): number {
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+  if (typeof v === "string" && v) {
+    const ms = Date.parse(v);
+    return Number.isFinite(ms) ? ms : 0;
+  }
+  return 0;
+}
+
 /** Compact operator command queue strip showing pending, verified, and failed dispatches. */
 export function OperatorOpsStrip({
   snap,
@@ -1358,7 +1375,7 @@ export function OperatorOpsStrip({
   const activeOps = allOps
     .filter((o) => o && o.opId && o.status !== "dismissed")
     .slice()
-    .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+    .sort((a, b) => (opTimeMs(b.updatedAt) || opTimeMs(b.createdAt)) - (opTimeMs(a.updatedAt) || opTimeMs(a.createdAt)));
 
   if (activeOps.length === 0) return null;
 
@@ -1483,7 +1500,7 @@ export function OperatorOpsStrip({
                   <span className="t3 mono truncate max-w-[110px]" title={op.opId}>{op.opId}</span>
                 </div>
 
-                {op.resolvedSeq && op.resolvedSeq > 0 && onJumpToBoardSeq ? (
+                {op.resolvedSeq != null && op.resolvedSeq > 0 && onJumpToBoardSeq ? (
                   <Button
                     variant="ghost"
                     data-testid={`op-seq-${op.opId}`}

@@ -3,7 +3,7 @@ name: fleet
 description: Coordinate an Antigravity-native multi-agent swarm with structured plan tracking, isolated worktrees, cold verification gates, and live telemetry in the Fleet sidecar pane. Trigger with /fleet or when splitting multi-lane coding, audit, or verification work across swarm workers.
 ---
 
-# Fleet — Antigravity Swarm Coordinator
+# Fleet: Antigravity Swarm Coordinator
 
 Use Antigravity's native `swarm`, `post_message`, `read_board`, and `swarm_wait` tools to execute multi-agent work with clear ownership, zero silent stalls, and cold verification.
 

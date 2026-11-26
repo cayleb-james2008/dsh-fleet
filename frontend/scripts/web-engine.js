@@ -1742,7 +1742,7 @@
       });
     }
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.27.0", mode: "live-web", canSendMessage: true, sseStream: false, deltaStream: true, transcriptInspector: true, idleSleep: false, sseClients: 0 });
+      return jsonResp({ ok: true, name: "fleet", version: "1.28.0", mode: "live-web", canSendMessage: true, sseStream: false, deltaStream: true, transcriptInspector: true, idleSleep: false, sseClients: 0 });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });
