@@ -241,10 +241,12 @@ export function createFleetHandlers({
     findAppDataDirs,
     findCoordinatorConvId,
     getSwarmMetaKeys,
+    getSwarmRoster,
     listSwarms,
     oneLine,
     resolveAllowedFrame,
     resolveConversationSwarm,
+    roleOf,
     unseenBy,
     validatePlanPatch,
     writeSwarmPlan,
@@ -697,7 +699,7 @@ export function createFleetHandlers({
 
     let notified = false;
     if (body.notifyCoordinator === true && sendMessageFn) {
-      const coordId = findCoordinatorConvId ? findCoordinatorConvId(res.appData, res.swarm) : res.swarm;
+      const coordId = (findCoordinatorConvId ? findCoordinatorConvId(res.appData, res.swarm) : null) || res.swarm;
       if (coordId) {
         try {
           const summaryRaw = written.plan?.title || written.plan?.goal || 'plan.json';
@@ -720,6 +722,233 @@ export function createFleetHandlers({
         plan: written.plan,
         etag: written.etag,
         notified,
+      },
+    };
+  }
+
+  const CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/;
+  const SINGLE_LINE_CTRL_RE = /[\x00-\x1f\x7f]/;
+  const WORKER_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/;
+  const CHANNEL_NAME_RE = /^[a-z][a-z0-9-]{0,23}$/;
+  const MEMBER_REF_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
+  const RESERVED_WORKERS = new Set(['all', 'coordinator']);
+  const RESERVED_CHANNELS = new Set(['main', 'all', 'here']);
+  const PROTECTED_ROLES = new Set(['coordinator', 'narrator', 'monitor']);
+  const PROTECTED_NAME_RE = /^(?:coordinator|narrator|monitor)(?:-\d+)?$/i;
+  const WORKSPACE_MODES = new Set(['inherit', 'share', 'branch']);
+  const CHANNEL_ACTIONS = new Set(['create', 'archive', 'subscribe', 'unsubscribe']);
+  const GATE_VERDICTS = new Set(['verified', 'blocked', 'ship']);
+  const CONTROL_OPS = new Set(['board_post', 'spawn_worker', 'switch_model', 'kill_worker', 'channel_op', 'gate_verdict']);
+
+  function checkControlString(val, field, { required = false, maxLen = 4000, singleLine = false } = {}) {
+    if (val === undefined || val === null) {
+      return required ? { ok: false, error: `${field} is required` } : { ok: true, value: '' };
+    }
+    if (typeof val !== 'string') {
+      return { ok: false, error: `${field} must be a string` };
+    }
+    if ((singleLine ? SINGLE_LINE_CTRL_RE : CTRL_RE).test(val)) {
+      return { ok: false, error: `Control characters are not permitted in ${field}` };
+    }
+    if (val.length > maxLen) {
+      return { ok: false, error: `${field} exceeds maximum length (${maxLen})` };
+    }
+    const trimmed = val.trim();
+    if (required && !trimmed) {
+      return { ok: false, error: `${field} is required` };
+    }
+    return { ok: true, value: trimmed };
+  }
+
+  async function postControl(body = {}) {
+    if (!body || typeof body !== 'object' || Array.isArray(body) || body.confirm !== true) {
+      return { status: 400, json: { error: 'Confirmation required (confirm: true)' } };
+    }
+    const convCheck = checkControlString(body.conversationId, 'conversationId', { required: true, maxLen: 128, singleLine: true });
+    if (!convCheck.ok || !ID_RE.test(convCheck.value)) {
+      return { status: 400, json: { error: 'Valid conversationId required' } };
+    }
+    const conv = convCheck.value;
+    const op = typeof body.op === 'string' ? body.op.trim() : '';
+    if (!CONTROL_OPS.has(op)) {
+      return { status: 400, json: { error: 'Unsupported control op' } };
+    }
+
+    const bad = (error) => ({ status: 400, json: { error } });
+    const inlineClean = (s, max = 160) => (oneLine ? oneLine(s, max) : String(s).replace(/\s+/g, ' ').trim().slice(0, max));
+
+    let directive = '';
+    let killTarget = '';
+    let forceUnmerged = false;
+
+    if (op === 'board_post') {
+      const textChk = checkControlString(body.text, 'text', { required: true, maxLen: 4000 });
+      if (!textChk.ok) return bad(textChk.error);
+      const chanChk = checkControlString(body.channel, 'channel', { required: false, maxLen: 64, singleLine: true });
+      if (!chanChk.ok) return bad(chanChk.error);
+      let channel = chanChk.value;
+      if (channel && channel !== 'main') {
+        if (!CHANNEL_NAME_RE.test(channel) || RESERVED_CHANNELS.has(channel)) {
+          return bad('Invalid channel name');
+        }
+      } else {
+        channel = 'main';
+      }
+      let replyToSeq = 0;
+      if (body.replyToSeq !== undefined && body.replyToSeq !== null) {
+        if (typeof body.replyToSeq !== 'number' || !Number.isInteger(body.replyToSeq) || body.replyToSeq <= 0) {
+          return bad('replyToSeq must be a positive integer');
+        }
+        replyToSeq = body.replyToSeq;
+      }
+      const header = `[fleet-operator:board_post] channel=#${channel}${replyToSeq ? ` replyTo=#${replyToSeq}` : ''}`;
+      const bodyLine = replyToSeq && !textChk.value.includes(`#${replyToSeq}`)
+        ? `Re #${replyToSeq}: ${textChk.value}`
+        : textChk.value;
+      directive = `${header}\nPost on the swarm board${channel !== 'main' ? ` in #${channel}` : ''}:\n${bodyLine}`;
+    } else if (op === 'spawn_worker') {
+      const nameChk = checkControlString(body.name, 'name', { required: true, maxLen: 64, singleLine: true });
+      if (!nameChk.ok) return bad(nameChk.error);
+      const name = nameChk.value;
+      if (!WORKER_NAME_RE.test(name) || RESERVED_WORKERS.has(name) || name.startsWith('coordinator-')) {
+        return bad('Invalid worker name');
+      }
+      const briefChk = checkControlString(body.brief, 'brief', { required: true, maxLen: 4000 });
+      if (!briefChk.ok) return bad(briefChk.error);
+      const workspaceMode = body.workspaceMode === undefined || body.workspaceMode === null ? 'inherit' : body.workspaceMode;
+      if (typeof workspaceMode !== 'string' || !WORKSPACE_MODES.has(workspaceMode)) {
+        return bad('workspaceMode must be inherit, share, or branch');
+      }
+      const chanChk = checkControlString(body.channel, 'channel', { required: false, maxLen: 64, singleLine: true });
+      if (!chanChk.ok) return bad(chanChk.error);
+      const channel = chanChk.value;
+      if (channel && (!CHANNEL_NAME_RE.test(channel) || RESERVED_CHANNELS.has(channel))) {
+        return bad('Invalid channel name');
+      }
+      const modelChk = checkControlString(body.model, 'model', { required: false, maxLen: 256, singleLine: true });
+      if (!modelChk.ok) return bad(modelChk.error);
+      const forkChk = checkControlString(body.forkFrom, 'forkFrom', { required: false, maxLen: 128, singleLine: true });
+      if (!forkChk.ok) return bad(forkChk.error);
+      if (forkChk.value && !MEMBER_REF_RE.test(forkChk.value) && !ID_RE.test(forkChk.value)) {
+        return bad('Invalid forkFrom member');
+      }
+      const header = `[fleet-operator:spawn_worker] name=${name} workspace=${workspaceMode}${channel ? ` channel=#${channel}` : ''}${modelChk.value ? ` model=${modelChk.value}` : ''}${forkChk.value ? ` forkFrom=${forkChk.value}` : ''}`;
+      directive = `${header}\nSpawn worker ${name} via swarm(action:"add", name:${JSON.stringify(name)}, workspace:${JSON.stringify(workspaceMode)}${modelChk.value ? `, model:${JSON.stringify(modelChk.value)}` : ''}${forkChk.value ? `, fork:${JSON.stringify(forkChk.value)}` : ''}) with brief:\n${briefChk.value}`;
+    } else if (op === 'switch_model') {
+      const memChk = checkControlString(body.member, 'member', { required: true, maxLen: 64, singleLine: true });
+      if (!memChk.ok || !MEMBER_REF_RE.test(memChk.value)) return bad(memChk.ok ? 'Invalid member name' : memChk.error);
+      const modelChk = checkControlString(body.model, 'model', { required: true, maxLen: 4000, singleLine: true });
+      if (!modelChk.ok) return bad(modelChk.error);
+      const reasonChk = checkControlString(body.reason, 'reason', { required: false, maxLen: 4000, singleLine: true });
+      if (!reasonChk.ok) return bad(reasonChk.error);
+      const header = `[fleet-operator:switch_model] member=${memChk.value} model=${modelChk.value}${reasonChk.value ? ` reason=${inlineClean(reasonChk.value, 160)}` : ''}`;
+      directive = `${header}\nSwitch @${memChk.value} to model ${modelChk.value} via swarm(action:"model", name:${JSON.stringify(memChk.value)}, model:${JSON.stringify(modelChk.value)})${reasonChk.value ? `. Reason: ${reasonChk.value}` : '.'}`;
+    } else if (op === 'kill_worker') {
+      const memChk = checkControlString(body.member, 'member', { required: true, maxLen: 64, singleLine: true });
+      if (!memChk.ok || !MEMBER_REF_RE.test(memChk.value)) return bad(memChk.ok ? 'Invalid member name' : memChk.error);
+      if (body.forceUnmerged !== undefined && typeof body.forceUnmerged !== 'boolean') {
+        return bad('forceUnmerged must be a boolean');
+      }
+      const reasonChk = checkControlString(body.reason, 'reason', { required: false, maxLen: 4000, singleLine: true });
+      if (!reasonChk.ok) return bad(reasonChk.error);
+      killTarget = memChk.value;
+      forceUnmerged = body.forceUnmerged === true;
+      const header = `[fleet-operator:kill_worker] member=${killTarget} forceUnmerged=${forceUnmerged}${reasonChk.value ? ` reason=${inlineClean(reasonChk.value, 160)}` : ''}`;
+      directive = `${header}\nKill worker @${killTarget} via swarm(action:"kill", name:${JSON.stringify(killTarget)})${forceUnmerged ? ' (operator confirmed forceUnmerged=true)' : ''}${reasonChk.value ? `. Reason: ${reasonChk.value}` : '.'}`;
+    } else if (op === 'channel_op') {
+      const action = typeof body.action === 'string' ? body.action.trim() : '';
+      if (!CHANNEL_ACTIONS.has(action)) {
+        return bad('action must be create, archive, subscribe, or unsubscribe');
+      }
+      const chanChk = checkControlString(body.channel, 'channel', { required: true, maxLen: 64, singleLine: true });
+      if (!chanChk.ok) return bad(chanChk.error);
+      const channel = chanChk.value;
+      if (!CHANNEL_NAME_RE.test(channel) || RESERVED_CHANNELS.has(channel)) {
+        return bad('Invalid channel name');
+      }
+      const topicChk = checkControlString(body.topic, 'topic', { required: false, maxLen: 4000, singleLine: true });
+      if (!topicChk.ok) return bad(topicChk.error);
+      const needsMember = action === 'subscribe' || action === 'unsubscribe';
+      const memChk = checkControlString(body.member, 'member', { required: needsMember, maxLen: 64, singleLine: true });
+      if (!memChk.ok) return bad(memChk.error);
+      if (memChk.value && !MEMBER_REF_RE.test(memChk.value)) {
+        return bad('Invalid member name');
+      }
+      const header = `[fleet-operator:channel_op] action=${action} channel=#${channel}${memChk.value ? ` member=${memChk.value}` : ''}${topicChk.value ? ` topic=${inlineClean(topicChk.value, 160)}` : ''}`;
+      directive = `${header}\nRun channel operation ${action} on #${channel}${memChk.value ? ` for @${memChk.value}` : ''}${topicChk.value ? ` with topic ${JSON.stringify(topicChk.value)}` : ''}.`;
+    } else if (op === 'gate_verdict') {
+      const verdict = typeof body.verdict === 'string' ? body.verdict.trim() : '';
+      if (!GATE_VERDICTS.has(verdict)) {
+        return bad('verdict must be verified, blocked, or ship');
+      }
+      if (typeof body.seq !== 'number' || !Number.isInteger(body.seq) || body.seq <= 0) {
+        return bad('seq must be a positive integer');
+      }
+      const targetChk = checkControlString(body.targetMember, 'targetMember', { required: false, maxLen: 64, singleLine: true });
+      if (!targetChk.ok) return bad(targetChk.error);
+      if (targetChk.value && !MEMBER_REF_RE.test(targetChk.value)) {
+        return bad('Invalid targetMember name');
+      }
+      const noteChk = checkControlString(body.note, 'note', { required: true, maxLen: 4000 });
+      if (!noteChk.ok) return bad(noteChk.error);
+      const header = `[fleet-operator:gate_verdict] verdict=${verdict} seq=#${body.seq}${targetChk.value ? ` targetMember=${targetChk.value}` : ''}`;
+      directive = `${header}\nOperator gate verdict [${verdict}] on #${body.seq}${targetChk.value ? ` for @${targetChk.value}` : ''}:\n${noteChk.value}`;
+    }
+
+    const appDataDirs = getAppDirs();
+    const res = resolveConversationSwarm(appDataDirs, conv);
+    if (!res.swarm || !res.appData) {
+      return { status: 404, json: { error: 'Swarm not found' } };
+    }
+    const roster = getSwarmRoster ? getSwarmRoster(res.appData, res.swarm) : null;
+    const coordinatorId = findCoordinatorConvId
+      ? findCoordinatorConvId(roster || res.appData, roster ? '' : res.swarm)
+      : null;
+    if (!coordinatorId) {
+      return { status: 404, json: { error: 'Coordinator conversation not found' } };
+    }
+
+    if (op === 'kill_worker') {
+      const memberObj = roster?.members?.[killTarget] || null;
+      const targetRole = roleOf ? roleOf(killTarget, memberObj) : (memberObj?.role || '');
+      const isProtected = PROTECTED_ROLES.has(targetRole) || PROTECTED_NAME_RE.test(killTarget);
+      const explicitProtected = body.explicit === true || body.allowProtected === true || body.forceProtected === true;
+      if (isProtected && !explicitProtected) {
+        return bad(`Refusing to kill protected role "${killTarget}" without explicit confirmation`);
+      }
+      if (memberObj?.workspace && memberObj.workspace_mode !== 'inherit' && !forceUnmerged) {
+        const { probeMemberWorktree } = await getGitProbe();
+        const probe = await probeMemberWorktree(memberObj.workspace);
+        if (probe.ok && (probe.dirtyFiles > 0 || probe.ahead > 0)) {
+          return {
+            status: 409,
+            json: {
+              error: 'unmerged worktree',
+              dirtyFiles: probe.dirtyFiles,
+              ahead: probe.ahead,
+            },
+          };
+        }
+      }
+    }
+
+    if (!sendMessageFn) {
+      return {
+        status: 501,
+        json: { error: 'Swarm control requires live Antigravity sidecar runtime' },
+      };
+    }
+
+    await sendMessageFn(coordinatorId, directive);
+    const deliveredAt = new Date().toISOString();
+    return {
+      status: 200,
+      json: {
+        ok: true,
+        op,
+        coordinatorId,
+        directivePreview: inlineClean(directive, 240),
+        deliveredAt,
       },
     };
   }
@@ -757,6 +986,7 @@ export function createFleetHandlers({
     getFrame,
     postNudge,
     postPlan,
+    postControl,
     postWorktreeAction,
     resolveStreamTarget,
   };
@@ -1140,6 +1370,9 @@ export async function createStandaloneRouter({
     if (req.method === 'POST' && pathname === '/api/plan') {
       return handleJsonPost(req, res, (h, body) => h.postPlan(body));
     }
+    if (req.method === 'POST' && pathname === '/api/control') {
+      return handleJsonPost(req, res, (h, body) => h.postControl(body));
+    }
     if (req.method === 'POST' && pathname === '/api/worktrees/action') {
       return handleJsonPost(req, res, (h, body) => h.postWorktreeAction(body), MAX_WORKTREE_ACTION_BYTES);
     }
@@ -1245,55 +1478,45 @@ export async function runSidecarApp({ appDataDir = '' } = {}) {
     const out = await handlers.postNudge(data);
     return new Response(JSON.stringify(out.json), { status: out.status, contentType: 'application/json', headers: SECURITY_HEADERS });
   }, 'POST');
-  app.api('/api/plan', async (data) => {
-    let payload = data;
-    if (typeof data === 'string') {
-      try {
-        payload = JSON.parse(data);
-      } catch {
-        return new Response(JSON.stringify({ error: 'invalid JSON body' }), {
-          status: 400,
-          contentType: 'application/json',
-          headers: SECURITY_HEADERS,
-        });
-      }
-    }
-    const out = await handlers.postPlan(payload);
-    return new Response(JSON.stringify(out.json), { status: out.status, contentType: 'application/json', headers: SECURITY_HEADERS });
-  }, 'POST');
-  app.api('/api/worktrees/action', async (data) => {
-    let payload = data;
-    if (typeof data === 'string') {
-      if (Buffer.byteLength(data, 'utf8') > MAX_WORKTREE_ACTION_BYTES) {
-        return new Response(JSON.stringify({ error: 'payload too large' }), {
-          status: 413,
-          contentType: 'application/json',
-          headers: SECURITY_HEADERS,
-        });
-      }
-      try {
-        payload = JSON.parse(data);
-      } catch {
-        return new Response(JSON.stringify({ error: 'invalid JSON body' }), {
-          status: 400,
-          contentType: 'application/json',
-          headers: SECURITY_HEADERS,
-        });
-      }
-    } else if (data && typeof data === 'object') {
-      try {
-        if (Buffer.byteLength(JSON.stringify(data), 'utf8') > MAX_WORKTREE_ACTION_BYTES) {
+  const registerJsonPost = (path, fn, maxBytes = MAX_BODY_BYTES) => {
+    app.api(path, async (data) => {
+      let payload = data;
+      if (typeof data === 'string') {
+        if (Buffer.byteLength(data, 'utf8') > maxBytes) {
           return new Response(JSON.stringify({ error: 'payload too large' }), {
             status: 413,
             contentType: 'application/json',
             headers: SECURITY_HEADERS,
           });
         }
-      } catch {}
-    }
-    const out = await handlers.postWorktreeAction(payload);
-    return new Response(JSON.stringify(out.json), { status: out.status, contentType: 'application/json', headers: SECURITY_HEADERS });
-  }, 'POST');
+        try {
+          payload = JSON.parse(data);
+        } catch {
+          return new Response(JSON.stringify({ error: 'invalid JSON body' }), {
+            status: 400,
+            contentType: 'application/json',
+            headers: SECURITY_HEADERS,
+          });
+        }
+      } else if (data && typeof data === 'object') {
+        try {
+          if (Buffer.byteLength(JSON.stringify(data), 'utf8') > maxBytes) {
+            return new Response(JSON.stringify({ error: 'payload too large' }), {
+              status: 413,
+              contentType: 'application/json',
+              headers: SECURITY_HEADERS,
+            });
+          }
+        } catch {}
+      }
+      const out = await fn(payload);
+      return new Response(JSON.stringify(out.json), { status: out.status, contentType: 'application/json', headers: SECURITY_HEADERS });
+    }, 'POST');
+  };
+
+  registerJsonPost('/api/plan', (payload) => handlers.postPlan(payload));
+  registerJsonPost('/api/control', (payload) => handlers.postControl(payload));
+  registerJsonPost('/api/worktrees/action', (payload) => handlers.postWorktreeAction(payload), MAX_WORKTREE_ACTION_BYTES);
 
   await app.run();
 }

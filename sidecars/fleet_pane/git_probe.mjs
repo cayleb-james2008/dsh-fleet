@@ -892,3 +892,49 @@ export async function executeWorktreeAction({
     },
   };
 }
+
+/** Inspect a member's workspace path (uncached) for dirty files and unmerged commits ahead of base branch. */
+export async function probeMemberWorktree(workspacePath) {
+  const confined = await resolveConfinedWorktree({ worktree: workspacePath });
+  if (!confined.ok) {
+    return { ok: false, error: confined.error };
+  }
+  const { rootPath, wtPath, wtEntry, isMain } = confined;
+  const branch = wtEntry.branch || (wtEntry.detached ? 'detached' : '');
+  const baseBranch = await detectBaseBranch(rootPath);
+  const checkAhead = Boolean(baseBranch && (!isMain || wtEntry.detached || (branch && branch !== baseBranch)));
+
+  const [statusRes, divRes] = await Promise.all([
+    execGit(wtPath, ['status', '--porcelain=v1', '-z']),
+    checkAhead ? execGit(wtPath, ['rev-list', '--left-right', '--count', `${baseBranch}...HEAD`]) : Promise.resolve({ ok: false, stdout: '' }),
+  ]);
+
+  let dirtyFiles = 0;
+  if (statusRes.ok && statusRes.stdout) {
+    const tokens = statusRes.stdout.split('\0');
+    for (let i = 0; i < tokens.length; ) {
+      const rec = tokens[i++];
+      if (!rec || rec.length < 4) continue;
+      const x = rec[0];
+      if (x === 'R' || x === 'C') i++;
+      dirtyFiles++;
+    }
+  }
+
+  let ahead = 0;
+  if (divRes.ok && divRes.stdout.trim()) {
+    const parts = divRes.stdout.trim().split(/\s+/);
+    ahead = Number(parts[1]) || 0;
+  }
+
+  return {
+    ok: true,
+    rootPath,
+    path: wtPath,
+    branch,
+    baseBranch: baseBranch || '',
+    isMain,
+    dirtyFiles,
+    ahead,
+  };
+}

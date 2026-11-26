@@ -1477,19 +1477,46 @@ export function writeSwarmPlan(appData, swarmId, { ifMatch = '', mode = 'patch',
   return { ok: true, plan: normalizePlan(next, newEtag), etag: newEtag };
 }
 
-/** Return the coordinator conversation_id for a swarm (falling back to swarmId). */
-export function findCoordinatorConvId(appData, swarmId) {
+/** Read and parse `members.json` for a swarm. */
+export function getSwarmRoster(appData, swarmId) {
   const mf = readSmallCached(join(swarmDir(appData, swarmId), 'members.json'), smallFileCache, 1024 * 1024);
   if (!mf.text) return null;
-  const roster = parseRoster(mf.text);
-  if (!roster?.members) return null;
+  return parseRoster(mf.text);
+}
+
+/** Return the coordinator conversation_id from a swarm dir, (appData, swarmId), or members roster. */
+export function findCoordinatorConvId(swarmDirOrMembers, swarmId = '') {
+  let roster = null;
+  if (typeof swarmDirOrMembers === 'string') {
+    if (swarmId) {
+      roster = getSwarmRoster(swarmDirOrMembers, swarmId);
+    } else {
+      const mf = readSmallCached(join(swarmDirOrMembers, 'members.json'), smallFileCache, 1024 * 1024);
+      if (!mf.text) return null;
+      roster = parseRoster(mf.text);
+    }
+  } else if (Array.isArray(swarmDirOrMembers)) {
+    for (const m of swarmDirOrMembers) {
+      if (!m || typeof m !== 'object' || m.killed) continue;
+      if ((m.role === 'coordinator' || m.name === 'coordinator') && typeof m.conversation_id === 'string' && ID_RE.test(m.conversation_id)) {
+        return m.conversation_id;
+      }
+    }
+    return null;
+  } else if (swarmDirOrMembers && typeof swarmDirOrMembers === 'object') {
+    roster =
+      swarmDirOrMembers.members && typeof swarmDirOrMembers.members === 'object'
+        ? swarmDirOrMembers
+        : { members: swarmDirOrMembers };
+  }
+  if (!roster?.members || typeof roster.members !== 'object') return null;
   for (const [name, m] of Object.entries(roster.members)) {
     if (!m || typeof m !== 'object' || m.killed) continue;
     if ((m.role === 'coordinator' || name === 'coordinator') && typeof m.conversation_id === 'string' && ID_RE.test(m.conversation_id)) {
       return m.conversation_id;
     }
   }
-  return ID_RE.test(swarmId) ? swarmId : null;
+  return null;
 }
 
 /** Validate that a target file lies strictly inside `<appData>/brain/` with no traversal. */
@@ -1914,6 +1941,22 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
 
   // Transform board messages in-place so peak heap does not hold 2x 2k-object graphs
   const seen = new Set();
+  const validSeqs = new Set();
+  for (let i = 0; i < msgs.length; i++) {
+    const s = Number(msgs[i].seq) || 0;
+    if (s > 0 && !controlOf(msgs[i])) validSeqs.add(s);
+  }
+  const replyRefsMap = new Map();
+  const refSeqRe = /(?:^|[^A-Za-z0-9_@#&])#(\d+)\b/g;
+  const addReplyRef = (targetSeq, childSeq) => {
+    if (targetSeq <= 0 || targetSeq === childSeq || !validSeqs.has(targetSeq)) return;
+    let children = replyRefsMap.get(targetSeq);
+    if (!children) {
+      children = [];
+      replyRefsMap.set(targetSeq, children);
+    }
+    if (!children.includes(childSeq)) children.push(childSeq);
+  };
   const gateAcc = { doneC: 0, doneSeq: 0, doneText: '', verC: 0, verSeq: 0, verText: '', scaleC: 0, scaleSeq: 0, scaleText: '', blkC: 0, blkSeq: 0, blkAgent: '', shipC: 0, shipSeq: 0, firstTs: 0, lastTs: 0 };
   for (let i = 0; i < msgs.length; i++) {
     const m = msgs[i];
@@ -1935,6 +1978,17 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
       m.all = false;
       m.control = control;
       continue;
+    }
+    if (seq > 0) {
+      const explicitReply = Number(m.replyToSeq ?? m.reply_to) || 0;
+      if (explicitReply > 0) addReplyRef(explicitReply, seq);
+      if (text.indexOf('#') >= 0) {
+        refSeqRe.lastIndex = 0;
+        let match;
+        while ((match = refSeqRe.exec(text)) !== null) {
+          addReplyRef(Number(match[1]), seq);
+        }
+      }
     }
     const hasBrk = text.indexOf('[') >= 0;
     const hasShip = text.indexOf('shipped') >= 0 || text.indexOf('Shipped') >= 0 || text.indexOf('SHIPPED') >= 0;
@@ -2127,6 +2181,12 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     },
   }, 8);
 
+  const replyRefs = {};
+  for (const [targetSeq, children] of replyRefsMap.entries()) {
+    children.sort((a, b) => a - b);
+    replyRefs[targetSeq] = children;
+  }
+
   const snap = {
     id,
     title,
@@ -2136,6 +2196,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     head,
     members,
     messages,
+    replyRefs,
     ...(channels.length ? { channels } : {}),
     edges: [...edges.values()],
     view: vf.view,

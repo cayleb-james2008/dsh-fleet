@@ -47,3 +47,14 @@ When the **Fleet** sidecar pane is enabled (`fleet/fleet_pane`), surface a singl
    - Never kill a `share`/`branch` worker before landing or merging its changes.
    - Kill finished helpers (`swarm{action: "kill", name}`) and update `plan.json` statuses before posting the final response to the user.
    - Use Fleet's **Peek**, confirmation-gated **Unstick / Nudge** presets, **Open file** (`toggleAuxPane` `fileView`), and **Copy swarm digest** controls inside the sidecar pane to triage workers rapidly without switching contexts.
+
+## Operator control directives
+
+When the operator triggers an action from the Fleet sidecar pane, the sidecar sends the coordinator a message whose first line starts with `[fleet-operator:<op>]`. Treat these directives as confirmed operator instructions and run them right away using your native swarm tools.
+
+- `[fleet-operator:board_post]`: Post the message body to the swarm board with `post_message`, keeping the requested channel or `#seq` citation when specified.
+- `[fleet-operator:spawn_worker]`: Spawn the named worker with `swarm` (`action: "add"`) using the requested `workspace` mode (`inherit`, `share`, or `branch`), optional `model`, and optional `fork`.
+- `[fleet-operator:switch_model]`: Switch the named waiting worker to the requested model with `swarm` (`action: "model"`), keeping its conversation history intact.
+- `[fleet-operator:kill_worker]`: Verify that the worker's `share` or `branch` workspace is merged or landed before calling `swarm` (`action: "kill"`), unless `forceUnmerged=true` is present in the header.
+- `[fleet-operator:channel_op]`: Apply the requested `create`, `archive`, `subscribe`, or `unsubscribe` channel operation for the named channel and member.
+- `[fleet-operator:gate_verdict]`: Post the operator's `[verified]`, `[blocked]`, or `ship` verdict to the board referencing the target `#seq` and member, then update `plan.json` if a workstream or milestone status changed.

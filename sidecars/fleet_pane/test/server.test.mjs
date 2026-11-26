@@ -817,3 +817,281 @@ test('GET /api/worktrees, /api/worktrees/diff (working|branch), and POST /api/wo
     rmSync(fx.dir, { recursive: true, force: true });
   }
 });
+
+test('POST /api/control executes all 6 ops, enforces 400/403/404/409/413/501 guards, and snapshot exposes replyRefs', async () => {
+  const fx = setupFixtureAppData();
+  const baseDir = makeScratchDir('http-ctrl-');
+  const repoDir = join(baseDir, 'repo');
+  const wtDirty = join(baseDir, 'wt-dirty');
+  const wtClean = join(baseDir, 'wt-clean');
+  const noCoordSwarm = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const noCoordWorker = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  const delivered = [];
+
+  execFileSync('git', ['init', '-b', 'main', repoDir], { stdio: 'ignore' });
+  execFileSync('git', ['-C', repoDir, 'config', 'user.email', 'test@example.com'], { stdio: 'ignore' });
+  execFileSync('git', ['-C', repoDir, 'config', 'user.name', 'Test'], { stdio: 'ignore' });
+  writeFileSync(join(repoDir, 'base.txt'), 'base\n');
+  execFileSync('git', ['-C', repoDir, 'add', '.'], { stdio: 'ignore' });
+  execFileSync('git', ['-C', repoDir, 'commit', '-m', 'Initial'], { stdio: 'ignore' });
+
+  execFileSync('git', ['-C', repoDir, 'worktree', 'add', '-b', 'feat/dirty-worker', wtDirty], { stdio: 'ignore' });
+  writeFileSync(join(wtDirty, 'committed.txt'), 'ahead\n');
+  execFileSync('git', ['-C', wtDirty, 'add', 'committed.txt'], { stdio: 'ignore' });
+  execFileSync('git', ['-C', wtDirty, 'commit', '-m', 'Worker commit'], { stdio: 'ignore' });
+  writeFileSync(join(wtDirty, 'dirty.txt'), 'uncommitted\n');
+
+  execFileSync('git', ['-C', repoDir, 'worktree', 'add', '-b', 'feat/clean-worker', wtClean], { stdio: 'ignore' });
+
+  const swDir = join(fx.appData, 'brain', fx.coord, '.system_generated', 'swarm');
+  const monitorConv = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  const cleanConv = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+  writeFileSync(
+    join(swDir, 'members.json'),
+    JSON.stringify({
+      title: 'Control Test Swarm',
+      members: {
+        coordinator: { conversation_id: fx.coord, role: 'coordinator' },
+        worker: { conversation_id: fx.worker, role: 'worker', workspace_mode: 'share', workspace: wtDirty },
+        'clean-worker': { conversation_id: cleanConv, role: 'worker', workspace_mode: 'share', workspace: wtClean },
+        monitor: { conversation_id: monitorConv, role: 'monitor' },
+      },
+    }),
+  );
+  writeFileSync(
+    join(swDir, 'board.jsonl'),
+    [
+      JSON.stringify({ seq: 1, agent: 'coordinator', text: '@worker Begin work' }),
+      JSON.stringify({ seq: 2, agent: 'worker', text: 'Re #1: Ready for review' }),
+    ].join('\n') + '\n',
+  );
+
+  // Second swarm with no coordinator member (tests 404 coordinator missing)
+  const noCoordDir = join(fx.appData, 'brain', noCoordSwarm, '.system_generated', 'swarm');
+  mkdirSync(noCoordDir, { recursive: true });
+  writeFileSync(
+    join(noCoordDir, 'members.json'),
+    JSON.stringify({
+      title: 'Orphan Swarm',
+      members: {
+        solo: { conversation_id: noCoordWorker, role: 'worker' },
+      },
+    }),
+  );
+  writeFileSync(join(noCoordDir, 'board.jsonl'), JSON.stringify({ seq: 1, agent: 'solo', text: 'Orphan post' }) + '\n');
+
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+    sendMessageFn: async (conv, msg) => {
+      delivered.push({ conv, msg });
+      return { ok: true };
+    },
+  });
+
+  const srvNoSend = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+    sendMessageFn: null,
+  });
+
+  try {
+    const postControl = (body, headers = {}, base = srv.url) =>
+      fetch(`${base}/api/control`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify(body),
+      });
+
+    // 1. Security guards: Origin-403, Host-403, 413 (> 64 KB)
+    assert.equal(
+      (
+        await postControl(
+          { confirm: true, conversationId: fx.coord, op: 'board_post', text: 'Hi' },
+          { Origin: 'https://evil.example' },
+        )
+      ).status,
+      403,
+    );
+
+    const badHost = await new Promise((resolve, reject) => {
+      const sock = net.connect(srv.port, '127.0.0.1', () => {
+        sock.write(`POST /api/control HTTP/1.1\r\nHost: evil.attacker.example\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}`);
+      });
+      const chunks = [];
+      sock.on('data', (c) => chunks.push(c));
+      sock.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+      sock.on('error', reject);
+    });
+    assert.ok(badHost.startsWith('HTTP/1.1 403'));
+
+    assert.equal(
+      (
+        await postControl({
+          confirm: true,
+          conversationId: fx.coord,
+          op: 'spawn_worker',
+          name: 'qa-bot',
+          brief: 'a'.repeat(70 * 1024),
+        })
+      ).status,
+      413,
+    );
+
+    // 2. 400 validation errors
+    assert.equal((await postControl({ conversationId: fx.coord, op: 'board_post', text: 'Missing confirm' })).status, 400);
+    assert.equal((await postControl({ confirm: true, conversationId: '../bad', op: 'board_post', text: 'Bad conv' })).status, 400);
+    assert.equal((await postControl({ confirm: true, conversationId: fx.coord, op: 'unknown_op' })).status, 400);
+    assert.equal((await postControl({ confirm: true, conversationId: fx.coord, op: 'board_post', text: 'x'.repeat(4001) })).status, 400);
+    assert.equal((await postControl({ confirm: true, conversationId: fx.coord, op: 'board_post', text: 'bad\x07ctrl' })).status, 400);
+    assert.equal((await postControl({ confirm: true, conversationId: fx.coord, op: 'spawn_worker', name: 'all', brief: 'x' })).status, 400);
+    assert.equal((await postControl({ confirm: true, conversationId: fx.coord, op: 'spawn_worker', name: 'coordinator', brief: 'x' })).status, 400);
+    assert.equal((await postControl({ confirm: true, conversationId: fx.coord, op: 'spawn_worker', name: 'BadName', brief: 'x' })).status, 400);
+    assert.equal((await postControl({ confirm: true, conversationId: fx.coord, op: 'channel_op', action: 'create', channel: 'main' })).status, 400);
+    assert.equal((await postControl({ confirm: true, conversationId: fx.coord, op: 'channel_op', action: 'create', channel: 'Bad_Chan' })).status, 400);
+    assert.equal((await postControl({ confirm: true, conversationId: fx.coord, op: 'channel_op', action: 'subscribe', channel: 'backend' })).status, 400);
+    assert.equal((await postControl({ confirm: true, conversationId: fx.coord, op: 'switch_model', member: 'worker', model: 'bad\nmodel' })).status, 400);
+    assert.equal((await postControl({ confirm: true, conversationId: fx.coord, op: 'gate_verdict', verdict: 'verified', seq: 0, note: 'Bad seq' })).status, 400);
+    assert.equal((await postControl({ confirm: true, conversationId: fx.coord, op: 'kill_worker', member: 'coordinator', forceUnmerged: true })).status, 400);
+    assert.equal((await postControl({ confirm: true, conversationId: fx.coord, op: 'kill_worker', member: 'monitor' })).status, 400);
+    assert.equal((await postControl({ confirm: true, conversationId: fx.coord, op: 'kill_worker', member: 'narrator' })).status, 400);
+
+    // 3. 404 missing swarm or missing coordinator
+    assert.equal(
+      (
+        await postControl({
+          confirm: true,
+          conversationId: '99999999-9999-4999-8999-999999999999',
+          op: 'board_post',
+          text: 'Missing swarm',
+        })
+      ).status,
+      404,
+    );
+    assert.equal(
+      (
+        await postControl({
+          confirm: true,
+          conversationId: noCoordWorker,
+          op: 'board_post',
+          text: 'No coordinator',
+        })
+      ).status,
+      404,
+    );
+
+    // 4. 409 unmerged worktree guard & forceUnmerged bypass
+    const unmergedRes = await postControl({
+      confirm: true,
+      conversationId: fx.coord,
+      op: 'kill_worker',
+      member: 'worker',
+      reason: 'Finished',
+    });
+    assert.equal(unmergedRes.status, 409);
+    const unmergedBody = await unmergedRes.json();
+    assert.equal(unmergedBody.error, 'unmerged worktree');
+    assert.equal(unmergedBody.dirtyFiles, 1);
+    assert.equal(unmergedBody.ahead, 1);
+    assert.equal(delivered.length, 0);
+
+    const forceKillRes = await postControl({
+      confirm: true,
+      conversationId: fx.coord,
+      op: 'kill_worker',
+      member: 'worker',
+      forceUnmerged: true,
+      reason: 'Abandoning scratch',
+    });
+    assert.equal(forceKillRes.status, 200);
+    const forceKillBody = await forceKillRes.json();
+    assert.equal(forceKillBody.ok, true);
+    assert.equal(forceKillBody.op, 'kill_worker');
+    assert.equal(forceKillBody.coordinatorId, fx.coord);
+    assert.ok(forceKillBody.directivePreview.startsWith('[fleet-operator:kill_worker]'));
+    assert.ok(forceKillBody.deliveredAt);
+
+    const cleanKillRes = await postControl({
+      confirm: true,
+      conversationId: fx.coord,
+      op: 'kill_worker',
+      member: 'clean-worker',
+    });
+    assert.equal(cleanKillRes.status, 200);
+
+    // 5. Remaining 5 ops (resolved via worker conversationId -> delivered to coordinatorId)
+    const ops = [
+      {
+        op: 'board_post',
+        payload: { confirm: true, conversationId: fx.worker, op: 'board_post', channel: 'backend', text: 'Run integration tests', replyToSeq: 2 },
+      },
+      {
+        op: 'spawn_worker',
+        payload: {
+          confirm: true,
+          conversationId: fx.coord,
+          op: 'spawn_worker',
+          name: 'qa-bot',
+          brief: 'Verify backend endpoints',
+          workspaceMode: 'share',
+          channel: 'backend',
+          model: 'gemini-3-pro',
+          forkFrom: 'coordinator',
+        },
+      },
+      {
+        op: 'switch_model',
+        payload: { confirm: true, conversationId: fx.coord, op: 'switch_model', member: 'worker', model: 'gemini-3-pro', reason: 'quota exhausted' },
+      },
+      {
+        op: 'channel_op',
+        payload: { confirm: true, conversationId: fx.coord, op: 'channel_op', action: 'create', channel: 'release-qa', topic: 'Wave E3 checks' },
+      },
+      {
+        op: 'gate_verdict',
+        payload: { confirm: true, conversationId: fx.coord, op: 'gate_verdict', verdict: 'verified', seq: 2, targetMember: 'worker', note: 'All 18 tests passed' },
+      },
+    ];
+
+    for (const item of ops) {
+      const res = await postControl(item.payload);
+      assert.equal(res.status, 200, `Expected 200 for ${item.op}`);
+      const json = await res.json();
+      assert.equal(json.ok, true);
+      assert.equal(json.op, item.op);
+      assert.equal(json.coordinatorId, fx.coord);
+      assert.ok(json.directivePreview.startsWith(`[fleet-operator:${item.op}]`));
+      assert.ok(typeof json.deliveredAt === 'string' && json.deliveredAt.length > 0);
+    }
+
+    assert.equal(delivered.length, 7);
+    for (const d of delivered) {
+      assert.equal(d.conv, fx.coord);
+      const firstLine = d.msg.split('\n')[0];
+      assert.ok(/^\[fleet-operator:[a-z_]+\]/.test(firstLine), `Invalid single-line header: ${firstLine}`);
+    }
+
+    // 6. GET /api/swarm snapshot exposes replyRefs
+    const snapRes = await fetch(`${srv.url}/api/swarm?conversationId=${fx.coord}`);
+    assert.equal(snapRes.status, 200);
+    const snapJson = await snapRes.json();
+    assert.deepEqual(snapJson.replyRefs, { 1: [2] });
+
+    // 7. 501 when !sendMessageFn
+    const noSendRes = await postControl(
+      { confirm: true, conversationId: fx.coord, op: 'board_post', text: 'Should fail 501' },
+      {},
+      srvNoSend.url,
+    );
+    assert.equal(noSendRes.status, 501);
+  } finally {
+    await srv.close();
+    await srvNoSend.close();
+    rmSync(baseDir, { recursive: true, force: true });
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});

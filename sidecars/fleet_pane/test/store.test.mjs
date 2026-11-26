@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import {
   executeWorktreeAction,
   parsePorcelainWorktrees,
+  probeMemberWorktree,
   probeWorktreeDiff,
   probeWorktrees,
 } from '../git_probe.mjs';
@@ -14,6 +15,7 @@ import {
   buildSwarmSnapshot,
   computeBurnSummary,
   computeGateReadiness,
+  findCoordinatorConvId,
   listSwarms,
   normalizePlan,
   readTranscriptActivityTail,
@@ -738,6 +740,88 @@ test('git_probe enriches branchFiles, commits, mergeability, collisions (working
     const rmMain = await executeWorktreeAction({ action: 'remove_worktree', path: repoDir });
     assert.equal(rmMain.ok, false);
     assert.equal(rmMain.httpStatus, 400);
+  } finally {
+    rmSync(baseDir, { recursive: true, force: true });
+  }
+});
+
+test('buildSwarmSnapshot computes replyRefs citations and findCoordinatorConvId resolves coordinator across forms', () => {
+  const dir = makeScratchDir('reply-refs-');
+  try {
+    const coordId = '11112222-3333-4444-8555-666677778888';
+    const workerId = '99992222-3333-4444-8555-666677778888';
+    const swarmPath = join(dir, 'brain', coordId, '.system_generated', 'swarm');
+    mkdirSync(swarmPath, { recursive: true });
+
+    const rosterObj = {
+      title: 'Reply Refs Swarm',
+      members: {
+        coordinator: { conversation_id: coordId, role: 'coordinator', last_read_seq: 5 },
+        builder: { conversation_id: workerId, role: 'worker', last_read_seq: 5 },
+      },
+    };
+    writeFileSync(join(swarmPath, 'members.json'), JSON.stringify(rosterObj));
+
+    writeFileSync(
+      join(swarmPath, 'board.jsonl'),
+      [
+        JSON.stringify({ seq: 1, agent: 'coordinator', text: 'Create #backend', control: { op: 'create', channel: 'backend' } }),
+        JSON.stringify({ seq: 2, agent: 'coordinator', text: '@builder Start work on API' }),
+        JSON.stringify({ seq: 3, agent: 'builder', text: 'Re #2: API started, ignoring #1, #999, foo#2, and self #3' }),
+        JSON.stringify({ seq: 4, agent: 'coordinator', text: 'Verified #2 and #3; re-checking #2' }),
+        JSON.stringify({ seq: 5, agent: 'builder', text: 'Follow-up note', replyToSeq: 3 }),
+      ].join('\n') + '\n',
+    );
+
+    const snap = buildSwarmSnapshot(dir, coordId);
+    assert.ok(snap);
+    assert.deepEqual(snap.replyRefs, {
+      2: [3, 4],
+      3: [4, 5],
+    });
+
+    assert.equal(findCoordinatorConvId(dir, coordId), coordId);
+    assert.equal(findCoordinatorConvId(swarmPath), coordId);
+    assert.equal(findCoordinatorConvId(rosterObj), coordId);
+    assert.equal(findCoordinatorConvId(rosterObj.members), coordId);
+    assert.equal(findCoordinatorConvId(snap.members), coordId);
+
+    // Missing or killed coordinator returns null
+    assert.equal(findCoordinatorConvId({ builder: { conversation_id: workerId, role: 'worker' } }), null);
+    assert.equal(findCoordinatorConvId({ coordinator: { conversation_id: coordId, role: 'coordinator', killed: true } }), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('probeMemberWorktree reports dirtyFiles and ahead commits accurately', async () => {
+  const baseDir = makeScratchDir('member-wt-');
+  const repoDir = join(baseDir, 'repo');
+  const wtDir = join(baseDir, 'wt-builder');
+  try {
+    execFileSync('git', ['init', '-b', 'main', repoDir], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoDir, 'config', 'user.email', 'test@example.com'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoDir, 'config', 'user.name', 'Test'], { stdio: 'ignore' });
+    writeFileSync(join(repoDir, 'base.txt'), 'base\n');
+    execFileSync('git', ['-C', repoDir, 'add', '.'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoDir, 'commit', '-m', 'Initial'], { stdio: 'ignore' });
+
+    execFileSync('git', ['-C', repoDir, 'worktree', 'add', '-b', 'feat/builder', wtDir], { stdio: 'ignore' });
+    const cleanProbe = await probeMemberWorktree(wtDir);
+    assert.equal(cleanProbe.ok, true);
+    assert.equal(cleanProbe.isMain, false);
+    assert.equal(cleanProbe.dirtyFiles, 0);
+    assert.equal(cleanProbe.ahead, 0);
+
+    writeFileSync(join(wtDir, 'committed.txt'), 'ahead commit\n');
+    execFileSync('git', ['-C', wtDir, 'add', 'committed.txt'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', wtDir, 'commit', '-m', 'Ahead commit'], { stdio: 'ignore' });
+    writeFileSync(join(wtDir, 'untracked.txt'), 'dirty\n');
+
+    const dirtyProbe = await probeMemberWorktree(wtDir);
+    assert.equal(dirtyProbe.ok, true);
+    assert.equal(dirtyProbe.dirtyFiles, 1);
+    assert.equal(dirtyProbe.ahead, 1);
   } finally {
     rmSync(baseDir, { recursive: true, force: true });
   }
