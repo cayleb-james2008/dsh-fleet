@@ -1,13 +1,17 @@
 import type {
   BoardMessage,
+  ControlDispatchResponse,
   ControlRequest,
   MentionEdge,
   NormalizedPlan,
+  OpActionResponse,
+  OperatorCommand,
+  OperatorOpAction,
+  OpsListResponse,
   PlanMilestone,
   PlanRisk,
   PlanThread,
   PlanWorkstream,
-  SwarmControlOp,
   SwarmDeltaPayload,
   SwarmPlan,
   SwarmSnapshot,
@@ -289,6 +293,7 @@ export function mergeSwarmDelta(
     ...(delta.cost !== undefined ? { cost: delta.cost } : {}),
     ...(delta.byModel !== undefined ? { byModel: delta.byModel } : {}),
     ...(delta.unseen !== undefined ? { unseen: delta.unseen } : {}),
+    ...(delta.ops !== undefined ? { ops: delta.ops } : {}),
     ...(delta.swarms !== undefined ? { swarms: delta.swarms } : {}),
     ...(delta.capabilities !== undefined ? { capabilities: delta.capabilities } : {}),
   };
@@ -350,17 +355,17 @@ export async function runWorktreeAction(
   return data as WorktreeActionPayload;
 }
 
-export async function sendConfirmedNudge(target: string | string[], message: string): Promise<void> {
+export async function sendConfirmedNudge(target: string | string[], message: string): Promise<ControlDispatchResponse> {
   const ids = Array.isArray(target) ? [...new Set(target.filter(Boolean))] : target ? [target] : [];
   if (!ids.length) throw new Error("No target");
   const send = sc()?.agent?.sendMessage;
   if (ids.length === 1 && send) {
-    await send(message, ids[0]);
-    return;
+    const res = (await send(message, ids[0])) as Partial<ControlDispatchResponse> | undefined;
+    return { ok: true, op: "nudge", ...(res && typeof res === "object" ? res : {}) };
   }
   if (ids.length > 1 && !window.__FLEET_LIVE_WEB__ && send) {
     await Promise.all(ids.map((id) => send(message, id)));
-    return;
+    return { ok: true, op: "nudge", delivered: ids.length };
   }
   const body = ids.length === 1 ? { confirm: true, conversationId: ids[0], message } : { confirm: true, conversationIds: ids, message };
   const res = await sidecarFetch("/api/nudge", {
@@ -368,10 +373,11 @@ export async function sendConfirmedNudge(target: string | string[], message: str
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  const data = (await res.json().catch(() => ({}))) as Partial<ControlDispatchResponse>;
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || `Nudge failed (${res.status})`);
+    throw new Error(data.error || `Nudge failed (${res.status})`);
   }
+  return { ok: true, op: "nudge", ...data };
 }
 
 export interface PlanPatchPayload {
@@ -441,47 +447,98 @@ export async function saveSwarmPlan(req: SavePlanRequest): Promise<SavePlanRespo
   return data as SavePlanResponse;
 }
 
-export interface SwarmControlResponse {
-  ok: boolean;
-  op: SwarmControlOp;
-  coordinatorId?: string;
-  directivePreview?: string;
-  deliveredAt?: string;
-  error?: string;
-}
+export type SwarmControlResponse = ControlDispatchResponse;
 
 export class SwarmControlError extends Error {
   status: number;
+  code?: string;
+  workerStatus?: string;
   dirtyFiles?: number;
   ahead?: number;
 
-  constructor(message: string, status: number, extra?: { dirtyFiles?: number; ahead?: number }) {
+  constructor(
+    message: string,
+    status: number,
+    extra?: { code?: string; workerStatus?: string; dirtyFiles?: number; ahead?: number },
+  ) {
     super(message);
     this.name = "SwarmControlError";
     this.status = status;
+    this.code = extra?.code;
+    this.workerStatus = extra?.workerStatus;
     this.dirtyFiles = extra?.dirtyFiles;
     this.ahead = extra?.ahead;
   }
 }
 
-export async function sendSwarmControl(req: ControlRequest): Promise<SwarmControlResponse> {
+export async function sendSwarmControl(req: ControlRequest): Promise<ControlDispatchResponse> {
   if (!req.conversationId) throw new Error("No active swarm");
   const res = await sidecarFetch("/api/control", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ...req, confirm: true }),
   });
-  const data = (await res.json().catch(() => ({}))) as Partial<SwarmControlResponse> & {
+  const data = (await res.json().catch(() => ({}))) as Partial<ControlDispatchResponse> & {
     dirtyFiles?: number;
     ahead?: number;
   };
   if (!res.ok) {
-    throw new SwarmControlError(data.error || `Control action failed (${res.status})`, res.status, {
+    const code = typeof data.error === "string" ? data.error : undefined;
+    const workerStatus = typeof data.status === "string" ? data.status : undefined;
+    const msg =
+      res.status === 409 && code === "worker_not_waiting"
+        ? `Worker is ${workerStatus || "working"} — wait for waiting state or enable override`
+        : code || `Control action failed (${res.status})`;
+    throw new SwarmControlError(msg, res.status, {
+      code,
+      workerStatus,
       dirtyFiles: typeof data.dirtyFiles === "number" ? data.dirtyFiles : undefined,
       ahead: typeof data.ahead === "number" ? data.ahead : undefined,
     });
   }
-  return data as SwarmControlResponse;
+  return data as ControlDispatchResponse;
+}
+
+export async function getOps(conversationId: string, signal?: AbortSignal): Promise<OpsListResponse> {
+  if (!conversationId) return { ok: true, conversationId: "", ops: [] };
+  const res = await sidecarFetch(qs("/api/ops", { conversationId }), signal ? { signal } : undefined);
+  const raw = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const errMsg = raw && typeof raw === "object" && "error" in raw ? String((raw as { error?: unknown }).error || "") : "";
+    throw new Error(errMsg || `Load ops failed (${res.status})`);
+  }
+  if (Array.isArray(raw)) {
+    return { ok: true, conversationId, ops: raw as OperatorCommand[] };
+  }
+  const data = (raw && typeof raw === "object" ? raw : {}) as Partial<OpsListResponse>;
+  return {
+    ok: data.ok ?? true,
+    conversationId: data.conversationId || conversationId,
+    ops: Array.isArray(data.ops) ? data.ops : [],
+  };
+}
+
+export async function postOpAction(req: {
+  conversationId: string;
+  opId: string;
+  action: OperatorOpAction;
+}): Promise<OpActionResponse> {
+  if (!req.conversationId || !req.opId) throw new Error("Missing swarm or opId");
+  const res = await sidecarFetch("/api/ops/action", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      confirm: true,
+      conversationId: req.conversationId,
+      opId: req.opId,
+      action: req.action,
+    }),
+  });
+  const data = (await res.json().catch(() => ({}))) as Partial<OpActionResponse>;
+  if (!res.ok) {
+    throw new Error(data.error || `Op action failed (${res.status})`);
+  }
+  return data as OpActionResponse;
 }
 
 export async function startSwarmPreset(prompt: string, title: string): Promise<boolean> {

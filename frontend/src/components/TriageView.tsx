@@ -30,6 +30,7 @@ import {
 } from "../sidecar";
 import type {
   NormalizedPlan,
+  OperatorCommand,
   PlanMilestoneStatus,
   PlanWorkstreamStatus,
   SwarmMember,
@@ -67,6 +68,7 @@ import {
   openOrCopyPath,
   safePlanText,
   submitNudge,
+  toDispatchedOp,
   toast,
   type TraceTarget,
   useNowMs,
@@ -816,6 +818,7 @@ export function TriageView({
   onCopyHandoffDigest,
   onExportArchive,
   onRefresh,
+  onOpDispatched,
 }: {
   snap: SwarmSnapshot;
   pinnedSeqs: number[];
@@ -827,6 +830,7 @@ export function TriageView({
   onCopyHandoffDigest?: () => void;
   onExportArchive?: (format: "md" | "json") => void;
   onRefresh: () => void;
+  onOpDispatched?: (op: OperatorCommand) => void;
 }) {
   const [nudgeTarget, setNudgeTarget] = useState<{ id: string; member: string; conversationId: string; kind?: string } | null>(null);
   const [nudgeDraft, setNudgeDraft] = useState("");
@@ -892,7 +896,9 @@ export function TriageView({
     if (nudgeLockRef.current || !nudgeTarget) return;
     nudgeLockRef.current = true;
     try {
-      await submitNudge(nudgeTarget.conversationId, nudgeDraft, `Sent nudge to ${nudgeTarget.member}`, setSending, () => {
+      await submitNudge(nudgeTarget.conversationId, nudgeDraft, `nudge to @${nudgeTarget.member}`, setSending, (res) => {
+        const dispatched = toDispatchedOp(res, "nudge", nudgeTarget.member);
+        if (dispatched) onOpDispatched?.(dispatched);
         setNudgeTarget(null);
         setNudgeDraft("");
         onRefresh();
@@ -1060,7 +1066,7 @@ export function TriageView({
           </Card>
         )}
 
-        <GateReadinessCard snap={snap} onJump={onJumpToBoardSeq} onRefresh={onRefresh} />
+        <GateReadinessCard snap={snap} onJump={onJumpToBoardSeq} onRefresh={onRefresh} onOpDispatched={onOpDispatched} />
 
         {triage.length === 0 ? (
           <Card className="p-3 bg-board">

@@ -3433,6 +3433,278 @@ await runChecks("gate", async (check) => {
     );
   });
 
+  await check("Wave E1 working-worker Switch Model guard blocks without override, allows allowWorking, and surfaces 409 + honest dispatch toast", async () => {
+    const gPage = await ctx.newPage();
+    await gPage.setViewportSize({ width: 340, height: 900 });
+    const gErrors = [];
+    const controlReqs = [];
+    let allow409 = false;
+    let forceNext409 = true;
+    gPage.on("pageerror", (e) => gErrors.push(e.message));
+    gPage.on("console", (msg) => {
+      if (msg.type() === "error") {
+        if (allow409 && msg.text().includes("status of 409")) return;
+        gErrors.push(msg.text());
+      }
+    });
+
+    await gPage.route("**/api/swarms*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          swarms: [{ id: "e1-guard", title: "Wave E1 Guard", appData: "gate", head: 2, memberCount: 3, activeCount: 1, waitingCount: 2, killedCount: 0, triageCount: 0, totalTokens: 0, hasPlan: false, lastActivityTs: Date.now() }],
+          defaultConversationId: "e1-guard",
+        }),
+      });
+    });
+
+    await gPage.route(/\/api\/swarm(\?.*)?$/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversationId: "e1-guard",
+          swarm: "e1-guard",
+          member: "coordinator",
+          etag: "e1-g1",
+          id: "e1-guard",
+          title: "Wave E1 Guard",
+          head: 2,
+          members: [
+            { name: "coordinator", conversation_id: "e1-guard", model: "gemini-3-pro", role: "coordinator", wake_mode: "mentions", wait_since: 2, last_read_seq: 2, unread: 0, killed: false, status: "waiting", steps: 2, activity: "", activityKind: "", replied: false, replyAsk: "", narrator: false, roleWorker: false, failure: null, transcriptMtime: Date.now(), startedAt: new Date().toISOString(), lastStepAt: new Date().toISOString(), usage: { inputTokens: 200, cacheReadTokens: 0, outputTokens: 50, totalTokens: 250 }, posts: 1, lastPostSeq: 1, lastPostTime: "12:00:00", lastPostTs: Date.now() },
+            { name: "busy-worker", conversation_id: "e1-busy", model: "gemini-3-pro", role: "worker", wake_mode: "working", wait_since: 0, last_read_seq: 2, unread: 0, killed: false, status: "working", steps: 4, activity: "Editing", activityKind: "tool", replied: false, replyAsk: "", narrator: false, roleWorker: false, failure: null, transcriptMtime: Date.now(), startedAt: new Date().toISOString(), lastStepAt: new Date().toISOString(), usage: { inputTokens: 300, cacheReadTokens: 0, outputTokens: 80, totalTokens: 380 }, posts: 0, lastPostSeq: 0, lastPostTime: "", lastPostTs: null },
+            { name: "idle-worker", conversation_id: "e1-idle", model: "gemini-3-pro", role: "worker", wake_mode: "mentions", wait_since: 2, last_read_seq: 2, unread: 0, killed: false, status: "waiting", steps: 3, activity: "", activityKind: "", replied: false, replyAsk: "", narrator: false, roleWorker: false, failure: null, transcriptMtime: Date.now(), startedAt: new Date().toISOString(), lastStepAt: new Date().toISOString(), usage: { inputTokens: 200, cacheReadTokens: 0, outputTokens: 50, totalTokens: 250 }, posts: 0, lastPostSeq: 0, lastPostTime: "", lastPostTs: null },
+          ],
+          messages: [{ seq: 1, agent: "coordinator", text: "@all Guard check", time: "12:00:00", ts: Date.now(), mentions: [], all: true }],
+          replyRefs: {},
+          edges: [],
+          triage: [],
+          ops: [],
+          usage: { inputTokens: 700, cacheReadTokens: 0, outputTokens: 180, totalTokens: 880 },
+          capabilities: { canSendMessage: true, isSidecar: false, sseStream: false, deltaStream: false },
+        }),
+      });
+    });
+
+    await gPage.route("**/api/control", async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      controlReqs.push(body);
+      if (body.member === "idle-worker" && forceNext409) {
+        forceNext409 = false;
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "worker_not_waiting", status: "working" }),
+        });
+        return;
+      }
+      if (body.member === "idle-worker") {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            ok: true,
+            op: body.op,
+            opId: "op-race-2",
+            status: "dispatched",
+            coordinatorState: { status: "waiting", failure: { kind: "quota", text: "429 quota" } },
+          }),
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ok: true,
+          op: body.op,
+          opId: "op-working-1",
+          status: "dispatched",
+          coordinatorState: { status: "waiting", failure: null },
+        }),
+      });
+    });
+
+    await gPage.goto(BASE, { waitUntil: "domcontentloaded" });
+    await gPage.locator("#tab-roster").click();
+    await gPage.waitForSelector('[data-testid="switch-model-btn-busy-worker"]');
+
+    await gPage.locator('[data-testid="switch-model-btn-busy-worker"]').click();
+    await gPage.waitForSelector('[data-testid="switch-model-working-warn-busy-worker"]');
+    const disabledBefore = await gPage.locator('[data-testid="switch-model-submit-busy-worker"]').isDisabled();
+    const ov340 = await gPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    await gPage.check('[data-testid="switch-model-override-busy-worker"]');
+    const disabledAfter = await gPage.locator('[data-testid="switch-model-submit-busy-worker"]').isDisabled();
+    await gPage.locator('[data-testid="switch-model-submit-busy-worker"]').click();
+    await gPage.waitForFunction(() => !document.querySelector('[data-testid="switch-model-drawer-busy-worker"]'));
+    await gPage.waitForSelector('[role="status"]');
+    const toast1 = await gPage.locator('[role="status"]').last().textContent();
+
+    // 409 worker_not_waiting race & unhealthy coordinator warning notice
+    allow409 = true;
+    await gPage.locator('[data-testid="switch-model-btn-idle-worker"]').click();
+    await gPage.locator('[data-testid="switch-model-submit-idle-worker"]').click();
+    await gPage.waitForSelector('[data-testid="switch-model-error"]');
+    const err409Txt = await gPage.locator('[data-testid="switch-model-error"]').textContent();
+
+    await gPage.locator('[data-testid="switch-model-submit-idle-worker"]').click();
+    await gPage.waitForFunction(() => !document.querySelector('[data-testid="switch-model-drawer-idle-worker"]'));
+    const toast2 = await gPage.locator('[role="status"]').last().textContent();
+
+    await gPage.setViewportSize({ width: 380, height: 900 });
+    await gPage.locator('button[aria-label="Open settings"]').click();
+    await gPage.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();
+    await gPage.locator('button[aria-label="Close dialog"]').click();
+    const ov380Dark = await gPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    await gPage.close();
+    const workingCall = controlReqs.find((c) => c.member === "busy-worker");
+    return (
+      disabledBefore &&
+      !disabledAfter &&
+      workingCall?.allowWorking === true &&
+      Boolean(toast1?.includes("Dispatched op-working-1 (awaiting coordinator)") && !toast1.includes("Switched")) &&
+      Boolean(err409Txt?.includes("working")) &&
+      Boolean(toast2?.includes("Dispatched op-race-2 (awaiting coordinator)") && toast2.includes("coordinator quota")) &&
+      ov340 <= 0 &&
+      ov380Dark <= 0 &&
+      gErrors.length === 0
+    );
+  });
+
+  await check("Wave E1 OperatorOpsStrip renders dispatched spinner, verified #seq link, failure/timeout alerts, and Retry/Mark Verified/Dismiss in Roster & Board at 340px", async () => {
+    const opsPage = await ctx.newPage();
+    await opsPage.setViewportSize({ width: 340, height: 900 });
+    const opsErrors = [];
+    const actionCalls = [];
+    let getOpsCount = 0;
+    opsPage.on("pageerror", (e) => opsErrors.push(e.message));
+    opsPage.on("console", (msg) => {
+      if (msg.type() === "error") opsErrors.push(msg.text());
+    });
+
+    let mockOps = [
+      { opId: "op-disp-1", op: "kill_worker", target: "worker-a", status: "dispatched", createdAt: Date.now() - 4000, updatedAt: Date.now() - 4000 },
+      { opId: "op-ver-2", op: "board_post", target: "backend", status: "verified", resolvedSeq: 2, createdAt: Date.now() - 12000, updatedAt: Date.now() - 10000 },
+      { opId: "op-fail-3", op: "switch_model", target: "worker-b", status: "failed", error: "Worker rejected model switch", createdAt: Date.now() - 20000, updatedAt: Date.now() - 18000 },
+      { opId: "op-to-4", op: "spawn_worker", target: "worker-c", status: "timed_out", error: "Coordinator ack timed out", createdAt: Date.now() - 30000, updatedAt: Date.now() - 25000 },
+    ];
+
+    await opsPage.route("**/api/swarms*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          swarms: [{ id: "e1-ops", title: "Wave E1 Ops", appData: "gate", head: 2, memberCount: 2, activeCount: 0, waitingCount: 2, killedCount: 0, triageCount: 0, totalTokens: 0, hasPlan: false, lastActivityTs: Date.now() }],
+          defaultConversationId: "e1-ops",
+        }),
+      });
+    });
+
+    await opsPage.route(/\/api\/swarm(\?.*)?$/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversationId: "e1-ops",
+          swarm: "e1-ops",
+          member: "coordinator",
+          etag: `e1-ops-${mockOps.map((o) => `${o.opId}:${o.status}`).join(",")}`,
+          id: "e1-ops",
+          title: "Wave E1 Ops",
+          head: 2,
+          members: [
+            { name: "coordinator", conversation_id: "e1-ops", model: "gemini-3-pro", role: "coordinator", wake_mode: "mentions", wait_since: 2, last_read_seq: 2, unread: 0, killed: false, status: "waiting", steps: 2, activity: "", activityKind: "", replied: false, replyAsk: "", narrator: false, roleWorker: false, failure: null, transcriptMtime: Date.now(), startedAt: new Date().toISOString(), lastStepAt: new Date().toISOString(), usage: { inputTokens: 100, cacheReadTokens: 0, outputTokens: 20, totalTokens: 120 }, posts: 1, lastPostSeq: 1, lastPostTime: "12:00:00", lastPostTs: Date.now() },
+          ],
+          messages: [
+            { seq: 1, agent: "coordinator", text: "@all Ops test start", time: "12:00:00", ts: Date.now() - 20000, mentions: [], all: true },
+            { seq: 2, agent: "coordinator", text: "@all Verified board post #2", time: "12:01:00", ts: Date.now() - 10000, mentions: [], all: true },
+          ],
+          replyRefs: {},
+          edges: [],
+          triage: [],
+          ops: mockOps,
+          usage: { inputTokens: 100, cacheReadTokens: 0, outputTokens: 20, totalTokens: 120 },
+          capabilities: { canSendMessage: true, isSidecar: false, sseStream: false, deltaStream: false },
+        }),
+      });
+    });
+
+    await opsPage.route("**/api/ops/action", async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      actionCalls.push(body);
+      mockOps = mockOps.map((o) => {
+        if (o.opId !== body.opId) return o;
+        if (body.action === "retry") return { ...o, status: "dispatched", error: undefined, updatedAt: Date.now() };
+        if (body.action === "mark_verified") return { ...o, status: "verified", error: undefined, resolvedSeq: 2, updatedAt: Date.now() };
+        return { ...o, status: "dismissed", updatedAt: Date.now() };
+      });
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, opId: body.opId, action: body.action, ops: mockOps }),
+      });
+    });
+
+    await opsPage.route(/\/api\/ops(\?.*)?$/, async (route) => {
+      getOpsCount += 1;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, conversationId: "e1-ops", ops: mockOps }),
+      });
+    });
+
+    await opsPage.goto(BASE, { waitUntil: "domcontentloaded" });
+    await opsPage.locator("#tab-roster").click();
+    await opsPage.waitForSelector('[data-testid="operator-ops-strip"]');
+    await opsPage.waitForSelector('[data-testid="op-spinner-op-disp-1"]');
+
+    const stripTxt = await opsPage.locator('[data-testid="operator-ops-strip"]').textContent();
+    const ovRoster340 = await opsPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    await opsPage.locator('[data-testid="op-retry-op-fail-3"]').click();
+    await opsPage.waitForFunction(
+      () => document.querySelector('[data-testid="op-status-op-fail-3"]')?.textContent === "Pending",
+    );
+
+    await opsPage.locator('[data-testid="op-verify-op-to-4"]').click();
+    await opsPage.waitForFunction(
+      () => document.querySelector('[data-testid="op-status-op-to-4"]')?.textContent === "Verified",
+    );
+
+    await opsPage.locator('[data-testid="op-dismiss-op-to-4"]').click();
+    await opsPage.waitForFunction(() => !document.querySelector('[data-testid="op-row-op-to-4"]'));
+
+    await opsPage.locator('[data-testid="ops-refresh-btn"]').click();
+    await opsPage.waitForFunction(() => true);
+
+    await opsPage.locator('[data-testid="op-seq-op-ver-2"]').click();
+    await opsPage.waitForSelector('#panel-board [data-testid="operator-ops-strip"]');
+    await opsPage.waitForSelector('[data-seq="2"][data-highlighted="true"]');
+    const ovBoard340 = await opsPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    await opsPage.locator('button[aria-label="Open settings"]').click();
+    await opsPage.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();
+    await opsPage.locator('button[aria-label="Close dialog"]').click();
+    const ovBoardDark340 = await opsPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    await opsPage.close();
+    return (
+      Boolean(stripTxt?.includes("Worker rejected model switch") && stripTxt.includes("Coordinator ack timed out")) &&
+      actionCalls.some((c) => c.confirm === true && c.opId === "op-fail-3" && c.action === "retry") &&
+      actionCalls.some((c) => c.confirm === true && c.opId === "op-to-4" && c.action === "mark_verified") &&
+      actionCalls.some((c) => c.confirm === true && c.opId === "op-to-4" && c.action === "dismiss") &&
+      getOpsCount >= 1 &&
+      ovRoster340 <= 0 &&
+      ovBoard340 <= 0 &&
+      ovBoardDark340 <= 0 &&
+      opsErrors.length === 0
+    );
+  });
+
   // 26-28: Clean runtime guarantees
   await check("zero console errors", () => consoleErrors.length === 0);
   await check("zero uncaught page errors", () => pageErrors.length === 0);

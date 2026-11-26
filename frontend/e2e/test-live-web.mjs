@@ -689,6 +689,97 @@ await check("0-token worker and empty 0-step trace render cleanly at 380px Light
   );
 });
 
+await check("OperatorOpsStrip shows timed-out op on audit swarm and Retry/Dismiss reconcile via /api/ops & /api/ops/action at 340px", async () => {
+  await page.setViewportSize({ width: 340, height: 900 });
+  await page.selectOption('select[aria-label="Active swarm"]', "demo-audit-0009");
+  await page.locator("#tab-roster").click();
+  await page.waitForSelector('[data-testid="operator-ops-strip"]');
+  await page.waitForSelector('[data-testid="op-row-op-seed-timeout-1"]');
+  const initialStatus = await page.locator('[data-testid="op-status-op-seed-timeout-1"]').textContent();
+  const errText = await page.locator('[data-testid="op-error-op-seed-timeout-1"]').textContent();
+  const ov340 = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+  const opsFetchRes = await page.evaluate(async () => {
+    const r = await fetch("/api/ops?conversationId=demo-audit-0009");
+    return r.json();
+  });
+
+  await page.locator('[data-testid="op-retry-op-seed-timeout-1"]').click();
+  await page.waitForFunction(
+    () => document.querySelector('[data-testid="op-status-op-seed-timeout-1"]')?.textContent === "Verified",
+  );
+  await page.locator('[data-testid="op-dismiss-op-seed-timeout-1"]').click();
+  await page.waitForFunction(() => !document.querySelector('[data-testid="op-row-op-seed-timeout-1"]'));
+
+  return (
+    initialStatus === "Timed out" &&
+    Boolean(errText?.includes("Coordinator ack timed out")) &&
+    Boolean(opsFetchRes?.ops?.some((o) => o.opId === "op-seed-timeout-1")) &&
+    ov340 <= 0
+  );
+});
+
+await check("Working-worker Switch Model guard, 409 worker_not_waiting, honest dispatch toast, and Roster/Board OperatorOpsStrip sync live", async () => {
+  await page.setViewportSize({ width: 380, height: 900 });
+  await page.selectOption('select[aria-label="Active swarm"]', "demo-coord-0001");
+  await page.locator("#tab-roster").click();
+  await page.waitForSelector('[data-testid="switch-model-btn-qa-check"]');
+
+  const direct409 = await page.evaluate(async () => {
+    const r = await fetch("/api/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        confirm: true,
+        op: "switch_model",
+        conversationId: "demo-coord-0001",
+        member: "qa-check",
+        model: "gemini-3-flash",
+      }),
+    });
+    return { status: r.status, body: await r.json() };
+  });
+
+  await page.locator('[data-testid="switch-model-btn-qa-check"]').click();
+  await page.waitForSelector('[data-testid="switch-model-working-warn-qa-check"]');
+  const disabledBefore = await page.locator('[data-testid="switch-model-submit-qa-check"]').isDisabled();
+  await page.check('[data-testid="switch-model-override-qa-check"]');
+  const disabledAfter = await page.locator('[data-testid="switch-model-submit-qa-check"]').isDisabled();
+  await page.locator('[data-testid="switch-model-submit-qa-check"]').click();
+  await page.waitForFunction(() => !document.querySelector('[data-testid="switch-model-drawer-qa-check"]'));
+  await page.waitForSelector('[role="status"]');
+  const toastTxt = await page.locator('[role="status"]').last().textContent();
+
+  await page.waitForSelector('#panel-roster [data-testid="operator-ops-strip"]');
+  await page.waitForFunction(() => {
+    const rows = [...document.querySelectorAll('#panel-roster [data-testid^="op-row-"]')];
+    return rows.some((r) => r.getAttribute("data-op-status") === "verified" && (r.textContent || "").includes("@qa-check"));
+  });
+  const verifiedSeqBtn = page.locator('#panel-roster [data-testid^="op-row-"][data-op-status="verified"] [data-testid^="op-seq-"]').first();
+  await verifiedSeqBtn.click();
+  await page.waitForSelector('#panel-board [data-testid="operator-ops-strip"]');
+
+  const ovLight = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  await page.locator('button[aria-label="Open settings"]').click();
+  await page.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();
+  await page.locator('button[aria-label="Close dialog"]').click();
+  const ovDark = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  await page.locator('button[aria-label="Open settings"]').click();
+  await page.locator('div[role="dialog"] button[role="radio"]:has-text("Light")').click();
+  await page.locator('button[aria-label="Close dialog"]').click();
+
+  return (
+    direct409.status === 409 &&
+    direct409.body?.error === "worker_not_waiting" &&
+    direct409.body?.status === "working" &&
+    disabledBefore &&
+    !disabledAfter &&
+    Boolean(toastTxt?.includes("Dispatched op-") && toastTxt.includes("(awaiting coordinator)") && !toastTxt.includes("Switched")) &&
+    ovLight <= 0 &&
+    ovDark <= 0
+  );
+});
+
 await check("zero external calls, console errors, or page errors", () => externalReqs.length === 0 && consoleErrs.length === 0 && pageErrs.length === 0);
 
 await browser.close();

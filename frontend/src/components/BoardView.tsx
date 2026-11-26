@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "../hooks";
 import { ArrowDown, ClipboardCopy, Filter, Hash, Pin, Plus, Reply, Search, Send, X } from "../icons";
 import { prefersReducedMotion } from "../motion";
 import { extractLocalFilePaths, parseScreenshotLines, sendSwarmControl } from "../sidecar";
-import type { BoardMessage, SwarmSnapshot } from "../types";
-import { Badge, Button, Card, InlineComposer, Input, MediaPathChips, Pill, PinnedList, Textarea, canLiveNudge, cn, copyText, downloadTextFile, fmtClockTime, formatFilteredBoardExport, hasControlChars, openOrCopyPath, submitNudge, toast } from "../ui";
+import type { BoardMessage, OperatorCommand, SwarmSnapshot } from "../types";
+import { Badge, Button, Card, InlineComposer, Input, MediaPathChips, OperatorOpsStrip, Pill, PinnedList, Textarea, canLiveNudge, cn, copyText, downloadTextFile, fmtClockTime, formatFilteredBoardExport, hasControlChars, maskHome, notifyDispatch, openOrCopyPath, submitNudge, toDispatchedOp, toast } from "../ui";
 
 function PostBody({
   text,
@@ -84,6 +84,9 @@ export function BoardView({
   onTogglePin,
   onClearHighlight,
   onRefresh,
+  onOpsUpdate,
+  onOpDispatched,
+  onRefreshOps,
 }: {
   snap: SwarmSnapshot;
   highlightSeq: number | null;
@@ -97,6 +100,9 @@ export function BoardView({
   onTogglePin: (seq: number) => void;
   onClearHighlight: () => void;
   onRefresh?: () => void;
+  onOpsUpdate?: (ops: OperatorCommand[]) => void;
+  onOpDispatched?: (op: OperatorCommand) => void;
+  onRefreshOps?: () => void | Promise<void>;
 }) {
   const [query, setQuery] = useState("");
   const [localAgentFilter, setLocalAgentFilter] = useState<string>("all");
@@ -300,7 +306,9 @@ export function BoardView({
   const canNudge = canLiveNudge(snap);
   const swarmConvId = snap.swarm || snap.conversationId || "";
   const memberByName = new Map(members.map((m) => [m.name, m]));
-  const hasCoordinator = members.some((m) => !m.killed && m.role === "coordinator" && Boolean(m.conversation_id));
+  const coordMember = members.find((m) => !m.killed && m.role === "coordinator");
+  const hasCoordinator = Boolean(coordMember && coordMember.conversation_id);
+  const coordIssue = !hasCoordinator || Boolean(coordMember?.failure);
 
   const openQuoteReply = (m: BoardMessage) => {
     setReplyTarget((cur) => (cur?.seq === m.seq ? null : m));
@@ -317,7 +325,9 @@ export function BoardView({
     }
     replyLockRef.current = true;
     try {
-      await submitNudge(convId, replyDraft, `Sent reply to @${replyTarget.agent} (#${replyTarget.seq})`, setSending, () => {
+      await submitNudge(convId, replyDraft, `reply to @${replyTarget.agent} (#${replyTarget.seq})`, setSending, (res) => {
+        const dispatched = toDispatchedOp(res, "nudge", replyTarget.agent);
+        if (dispatched) onOpDispatched?.(dispatched);
         clear();
         onRefresh?.();
       });
@@ -347,14 +357,16 @@ export function BoardView({
     setComposerSending(true);
     setComposerError("");
     try {
-      await sendSwarmControl({
+      const res = await sendSwarmControl({
         op: "board_post",
         conversationId: swarmConvId,
         channel: composerChannel,
         text: cleanText,
         ...(composerReplyNum > 0 ? { replyToSeq: composerReplyNum } : {}),
       });
-      toast.success(`Posted to #${composerChannel}`);
+      notifyDispatch(res, `post to #${composerChannel}`);
+      const dispatched = toDispatchedOp(res, "board_post", composerChannel);
+      if (dispatched) onOpDispatched?.(dispatched);
       setComposerText("");
       setComposerReplySeq("");
       setComposerConfirm(false);
@@ -383,7 +395,7 @@ export function BoardView({
     setChannelOpSending(true);
     setChannelOpError("");
     try {
-      await sendSwarmControl({
+      const res = await sendSwarmControl({
         op: "channel_op",
         conversationId: swarmConvId,
         action: channelOpAction,
@@ -391,7 +403,9 @@ export function BoardView({
         ...(channelOpAction === "create" && channelOpTopic.trim() ? { topic: channelOpTopic.trim() } : {}),
         ...(channelOpMember.trim() ? { member: channelOpMember.trim() } : {}),
       });
-      toast.success(`Channel ${channelOpAction}: #${channelOpName.trim()}`);
+      notifyDispatch(res, `channel ${channelOpAction} #${channelOpName.trim()}`);
+      const dispatched = toDispatchedOp(res, "channel_op", channelOpName.trim());
+      if (dispatched) onOpDispatched?.(dispatched);
       setChannelOpName("");
       setChannelOpTopic("");
       setChannelMgrOpen(false);
@@ -517,9 +531,11 @@ export function BoardView({
                 <X />
               </Button>
             </div>
-            {members.length > 0 && !hasCoordinator && (
+            {members.length > 0 && coordIssue && (
               <p role="alert" className="rounded-chip border border-warn bg-warn-soft px-2 py-1 text-[12px] text-warn" data-testid="board-missing-coordinator">
-                No active coordinator in roster. Channel directives may fail.
+                {coordMember?.failure
+                  ? `Coordinator ${coordMember.failure.kind}: ${maskHome(coordMember.failure.text)}. Channel directives may fail.`
+                  : "No active coordinator in roster. Channel directives may fail."}
               </p>
             )}
             {channelOpError && (
@@ -665,6 +681,14 @@ export function BoardView({
           </Card>
         )}
       </div>
+
+      <OperatorOpsStrip
+        snap={snap}
+        onJumpToBoardSeq={scrollToSeq}
+        onRefresh={onRefresh}
+        onOpsUpdate={onOpsUpdate}
+        onRefreshOps={onRefreshOps}
+      />
 
       {/* Feed */}
       {filtered.length === 0 ? (
@@ -963,9 +987,11 @@ export function BoardView({
               }}
             />
 
-            {canPostControl && members.length > 0 && !hasCoordinator && (
+            {canPostControl && members.length > 0 && coordIssue && (
               <p role="alert" className="rounded-chip border border-warn bg-warn-soft px-2 py-1 text-[12px] text-warn" data-testid="board-missing-coordinator">
-                No active coordinator in roster. Control posts may fail.
+                {coordMember?.failure
+                  ? `Coordinator ${coordMember.failure.kind}: ${maskHome(coordMember.failure.text)}. Control posts may fail.`
+                  : "No active coordinator in roster. Control posts may fail."}
               </p>
             )}
 

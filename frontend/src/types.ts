@@ -296,6 +296,63 @@ export type SwarmControlOp =
   | "channel_op"
   | "gate_verdict";
 
+export type OperatorCommandStatus =
+  | "dispatched"
+  | "verified"
+  | "failed"
+  | "timed_out"
+  | "dismissed";
+
+export interface OperatorCommand {
+  opId: string;
+  clientOpId?: string;
+  op: string;
+  target?: string;
+  payload?: unknown;
+  status: OperatorCommandStatus;
+  createdAt: number;
+  updatedAt: number;
+  coordinatorId?: string;
+  resolvedSeq?: number;
+  error?: string;
+}
+
+export interface CoordinatorDispatchState {
+  status?: string;
+  failure?: MemberFailure | null;
+}
+
+export interface ControlDispatchResponse {
+  ok: boolean;
+  op?: SwarmControlOp | string;
+  opId?: string;
+  status?: OperatorCommandStatus | string;
+  coordinatorId?: string;
+  coordinatorState?: CoordinatorDispatchState | null;
+  directivePreview?: string;
+  deliveredAt?: string;
+  delivered?: number;
+  error?: string;
+}
+
+export type OperatorOpAction = "retry" | "dismiss" | "mark_verified";
+
+export interface OpsListResponse {
+  ok?: boolean;
+  conversationId?: string;
+  ops: OperatorCommand[];
+  error?: string;
+}
+
+export interface OpActionResponse {
+  ok: boolean;
+  op?: OperatorCommand;
+  ops?: OperatorCommand[];
+  opId?: string;
+  action?: OperatorOpAction;
+  error?: string;
+}
+
 export type ControlRequest =
   | {
       op: "board_post";
@@ -323,6 +380,7 @@ export type ControlRequest =
       member: string;
       model: string;
       reason?: string;
+      allowWorking?: boolean;
     }
   | {
       op: "kill_worker";
@@ -386,6 +444,7 @@ export interface SwarmSnapshot {
   cost?: CostSummary;
   byModel?: Record<string, ModelUsageEntry>;
   unseen?: number[];
+  ops?: OperatorCommand[];
   swarms?: SwarmSummary[];
   capabilities?: {
     canSendMessage: boolean;
@@ -429,6 +488,7 @@ export interface SwarmDeltaPayload {
   cost?: CostSummary;
   byModel?: Record<string, ModelUsageEntry>;
   unseen?: number[];
+  ops?: OperatorCommand[];
   swarms?: SwarmSummary[];
   capabilities?: SwarmSnapshot["capabilities"];
 }

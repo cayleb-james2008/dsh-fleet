@@ -9,6 +9,7 @@
   var UI_ID = "demo-ui-0004";
   var AUDIT_COORD_ID = "demo-audit-0009";
   var NATIVE_COORD_ID = "demo-native-0011";
+  var opCounter = 100;
 
   var now = Date.now();
   var t = function (secAgo) {
@@ -217,6 +218,7 @@
           { name: "ui", topic: "Sidebar layout and live-web parity", created_by: "coordinator", archived: false },
         ],
         frames: [],
+        ops: [],
       },
       [AUDIT_COORD_ID]: {
         id: AUDIT_COORD_ID,
@@ -336,6 +338,18 @@
           },
         ],
         frames: [],
+        ops: [
+          {
+            opId: "op-seed-timeout-1",
+            op: "switch_model",
+            target: "scanner",
+            status: "timed_out",
+            createdAt: t(180),
+            updatedAt: t(150),
+            coordinatorId: AUDIT_COORD_ID,
+            error: "Coordinator ack timed out after 30s",
+          },
+        ],
       },
       [NATIVE_COORD_ID]: {
         id: NATIVE_COORD_ID,
@@ -456,6 +470,7 @@
           },
         ],
         frames: [],
+        ops: [],
       },
     },
     worktrees: [
@@ -1076,7 +1091,7 @@
       conversationId: sw.id,
       swarm: sw.id,
       member: sw.member,
-      etag: "liveweb-" + sw.head + "-" + triage.length + "-" + (sw.planVersion || 1) + "-" + (sw.controlVersion || 0),
+      etag: "liveweb-" + sw.head + "-" + triage.length + "-" + (sw.planVersion || 1) + "-" + (sw.controlVersion || 0) + "-" + (sw.opsVersion || 0),
       id: sw.id,
       title: sw.title,
       head: sw.head,
@@ -1096,6 +1111,7 @@
       contextPct: maxContextPct,
       cost: swarmCost,
       byModel: swarmByModel,
+      ops: (sw.ops || []).slice(),
       capabilities: { canSendMessage: true, isSidecar: false, sseStream: false, deltaStream: true },
     };
   }
@@ -1190,6 +1206,7 @@
           contextPct: full.contextPct,
           cost: full.cost,
           byModel: full.byModel,
+          ops: full.ops,
           capabilities: full.capabilities,
         },
       };
@@ -1212,6 +1229,49 @@
         deltaWaiters.push(w);
       }
     });
+  }
+
+  function coordinatorStateOf(sw) {
+    var coord = (sw.members || []).find(function (m) { return m.role === "coordinator"; });
+    if (!coord) return { status: "missing", failure: null };
+    return { status: coord.killed ? "killed" : coord.status, failure: coord.failure || null };
+  }
+
+  function scheduleOpReconcile(sw, opRec, resolvedSeq) {
+    setTimeout(function () {
+      if (opRec.status !== "dispatched") return;
+      var cState = coordinatorStateOf(sw);
+      if (cState.failure || cState.status === "killed" || cState.status === "missing") {
+        opRec.status = "failed";
+        opRec.error = (cState.failure && cState.failure.text) || ("Coordinator is " + cState.status);
+      } else {
+        opRec.status = "verified";
+        if (resolvedSeq && resolvedSeq > 0) opRec.resolvedSeq = resolvedSeq;
+        opRec.error = undefined;
+      }
+      opRec.updatedAt = Date.now();
+      sw.opsVersion = (sw.opsVersion || 0) + 1;
+      notifyDeltaWaiters(sw.id);
+    }, 90);
+  }
+
+  function dispatchOpRecord(sw, opName, target, payload, resolvedSeq) {
+    var coord = (sw.members || []).find(function (m) { return m.role === "coordinator"; });
+    var ts = Date.now();
+    var opRec = {
+      opId: "op-" + (++opCounter),
+      op: opName,
+      target: target || undefined,
+      payload: payload,
+      status: "dispatched",
+      createdAt: ts,
+      updatedAt: ts,
+      coordinatorId: coord ? coord.conversation_id : undefined,
+    };
+    sw.ops = [opRec].concat(sw.ops || []).slice(0, 50);
+    sw.opsVersion = (sw.opsVersion || 0) + 1;
+    scheduleOpReconcile(sw, opRec, resolvedSeq);
+    return opRec;
   }
 
   function listSwarms() {
@@ -1272,8 +1332,14 @@
           target.replyAsk = "";
           target.status = "working";
         }
+        var opRec = dispatchOpRecord(sw, "nudge", target ? target.name : undefined, { conversationId: convId }, sw.head);
         notifyDeltaWaiters(sw.id);
-        return { ok: true };
+        return {
+          ok: true,
+          opId: opRec.opId,
+          status: "dispatched",
+          coordinatorState: coordinatorStateOf(sw),
+        };
       },
     },
   };
@@ -1409,6 +1475,9 @@
         if (!smTarget || !smModel || smModel.length > 120) return jsonResp({ error: "member and model required" }, 400);
         var smMember = cSw.members.find(function (m) { return !m.killed && m.name === smTarget; });
         if (!smMember) return jsonResp({ error: "Member not found" }, 404);
+        if (smMember.status === "working" && !ctrl.allowWorking) {
+          return jsonResp({ error: "worker_not_waiting", status: smMember.status }, 409);
+        }
         smMember.byModel = memberByModel(smMember);
         if (!smMember.byModel[smModel]) {
           smMember.byModel[smModel] = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
@@ -1509,10 +1578,15 @@
         return jsonResp({ error: "Unsupported op" }, 400);
       }
 
+      var opTarget = ctrl.member || ctrl.targetMember || ctrl.name || ctrl.channel || undefined;
+      var ctrlOpRec = dispatchOpRecord(cSw, ctrl.op, opTarget, ctrl, cSw.head);
       notifyDeltaWaiters(cSw.id);
       return jsonResp({
         ok: true,
         op: ctrl.op,
+        opId: ctrlOpRec.opId,
+        status: "dispatched",
+        coordinatorState: coordinatorStateOf(cSw),
         coordinatorId: coordMember.conversation_id,
         directivePreview: preview,
         deliveredAt: nowIso,
@@ -1607,8 +1681,65 @@
         mentions: hitNames,
         all: /@all\b/i.test(msg),
       });
+      var nudgeOpRec = dispatchOpRecord(sw, "nudge", hitNames.join(", ") || undefined, { conversationIds: targets }, sw.head);
       notifyDeltaWaiters(sw.id);
-      return jsonResp({ ok: true, delivered: targets.length });
+      return jsonResp({
+        ok: true,
+        opId: nudgeOpRec.opId,
+        status: "dispatched",
+        coordinatorState: coordinatorStateOf(sw),
+        delivered: targets.length,
+      });
+    }
+    if (url.pathname === "/api/ops" && (!init || !init.method || String(init.method).toUpperCase() === "GET")) {
+      var opsConv = url.searchParams.get("conversationId") || COORD_ID;
+      var opsSw = findSwarmByConvId(opsConv) || state.swarms[opsConv];
+      if (!opsSw) return jsonResp({ error: "Swarm not found" }, 404);
+      return jsonResp({
+        ok: true,
+        conversationId: opsSw.id,
+        ops: (opsSw.ops || []).slice(),
+      });
+    }
+    if (url.pathname === "/api/ops/action" && init && String(init.method || "").toUpperCase() === "POST") {
+      var actOpBody = {};
+      try { actOpBody = JSON.parse(String(init.body || "{}")); } catch { return jsonResp({ error: "Invalid JSON" }, 400); }
+      if (!actOpBody || actOpBody.confirm !== true || typeof actOpBody.opId !== "string") {
+        return jsonResp({ error: "confirm and opId required" }, 400);
+      }
+      var actAction = String(actOpBody.action || "");
+      if (["retry", "dismiss", "mark_verified"].indexOf(actAction) < 0) {
+        return jsonResp({ error: "Invalid ops action" }, 400);
+      }
+      var actSw = findSwarmByConvId(actOpBody.conversationId) || state.swarms[actOpBody.conversationId];
+      if (!actSw) return jsonResp({ error: "Swarm not found" }, 404);
+      actSw.ops = actSw.ops || [];
+      var targetOp = actSw.ops.find(function (o) { return o.opId === actOpBody.opId; });
+      if (!targetOp) return jsonResp({ error: "Operation not found" }, 404);
+
+      if (actAction === "dismiss") {
+        targetOp.status = "dismissed";
+        targetOp.updatedAt = Date.now();
+      } else if (actAction === "mark_verified") {
+        targetOp.status = "verified";
+        targetOp.error = undefined;
+        if (!targetOp.resolvedSeq && actSw.head > 0) targetOp.resolvedSeq = actSw.head;
+        targetOp.updatedAt = Date.now();
+      } else if (actAction === "retry") {
+        targetOp.status = "dispatched";
+        targetOp.error = undefined;
+        targetOp.updatedAt = Date.now();
+        scheduleOpReconcile(actSw, targetOp, actSw.head);
+      }
+      actSw.opsVersion = (actSw.opsVersion || 0) + 1;
+      notifyDeltaWaiters(actSw.id);
+      return jsonResp({
+        ok: true,
+        opId: targetOp.opId,
+        action: actAction,
+        op: Object.assign({}, targetOp),
+        ops: actSw.ops.slice(),
+      });
     }
     if (url.pathname === "/api/health") {
       return jsonResp({ ok: true, name: "fleet", version: "1.27.0", mode: "live-web", canSendMessage: true, sseStream: false, deltaStream: true, transcriptInspector: true, idleSleep: false, sseClients: 0 });
