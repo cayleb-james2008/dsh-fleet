@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parsePorcelainWorktrees, probeWorktreeDiff, probeWorktrees } from '../git_probe.mjs';
-import { buildSwarmSnapshot, computeBurnSummary, listSwarms, summarizeTranscript } from '../swarm_store.mjs';
+import { buildSwarmSnapshot, computeBurnSummary, computeGateReadiness, listSwarms, summarizeTranscript } from '../swarm_store.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -290,4 +290,40 @@ test('computeBurnSummary flags top consumer share and high-burn levels cleanly',
   );
   assert.equal(warnBurn.topWorker?.level, 'warn');
   assert.equal(warnBurn.topWorker?.sharePct, 53);
+});
+
+test('computeGateReadiness tracks release gate progression and pending #seq jumps', () => {
+  const verifying = computeGateReadiness(
+    [
+      { seq: 4, agent: 'builder', text: '@ux-verifier [done] Ready' },
+      { seq: 5, agent: 'ux-verifier', text: '@scale-auditor [verified] OK' },
+      { seq: 8, agent: 'builder', text: '@ux-verifier [done] Followup' },
+    ],
+    [],
+  );
+  assert.equal(verifying?.state, 'verifying');
+  assert.equal(verifying?.pendingSeq, 8);
+  assert.equal(verifying?.stages[0].count, 2);
+  assert.equal(verifying?.stages[1].seq, 5);
+
+  const blocked = computeGateReadiness(
+    [
+      { seq: 4, agent: 'builder', text: '@ux-verifier [done] Ready' },
+      { seq: 6, agent: 'ux-verifier', text: '@builder [blocked] Fix header icon' },
+    ],
+    [{ kind: 'blocked', severity: 'urgent', seq: 6 }],
+  );
+  assert.equal(blocked?.state, 'blocked');
+  assert.equal(blocked?.pendingSeq, 6);
+
+  const ready = computeGateReadiness(
+    [
+      { seq: 1, agent: 'a', text: '[done]' },
+      { seq: 2, agent: 'b', text: '[verified]' },
+      { seq: 3, agent: 'c', text: '[scale-verified]' },
+    ],
+    [],
+  );
+  assert.equal(ready?.state, 'ready');
+  assert.equal(ready?.pendingSeq, 3);
 });

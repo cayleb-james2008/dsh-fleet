@@ -229,7 +229,7 @@ export function createFleetHandlers({
       healthPacked = pack({
         ok: true,
         name: 'fleet',
-        version: '1.11.0',
+        version: '1.12.0',
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
         sseStream: !isSidecar,
@@ -439,7 +439,7 @@ export function createFleetHandlers({
     const data = await probeWorktrees(rootsKey);
     const packed = pack(data);
     if (worktreesPayloadCache.has(rootsKey)) worktreesPayloadCache.delete(rootsKey);
-    else if (worktreesPayloadCache.size >= 2) worktreesPayloadCache.delete(worktreesPayloadCache.keys().next().value);
+    else if (worktreesPayloadCache.size >= 1) worktreesPayloadCache.delete(worktreesPayloadCache.keys().next().value);
     worktreesPayloadCache.set(rootsKey, { at: now, packed });
     return packed;
   }

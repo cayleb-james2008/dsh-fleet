@@ -102,12 +102,12 @@ export function RosterView({
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="wrap">
-          <h2 className="text-[14px] font-semibold text-ink">
+          <h2 className="h2">
             Roster ({members.length - killedCount} active)
           </h2>
           {killedCount > 0 && <Badge tone="neutral">{killedCount} stopped</Badge>}
         </div>
-        <div className="flex items-center gap-1">
+        <div className="f1">
           {liveTargets.length > 0 && (
             <Button
               variant={broadcastOpen ? "secondary" : "outline"}
@@ -201,13 +201,13 @@ export function RosterView({
                 <div className="row">
                   <div className="wrap gap-1 min-w-0">
                     <StatusDot state={dotState} />
-                    <span className={cn("text-[14px] font-semibold text-ink truncate", m.killed && "line-through")}>{m.name}</span>
+                    <span className={cn("h2 truncate", m.killed && "line-through")}>{m.name}</span>
                     {isYou && <Badge tone="info">you</Badge>}
                     {m.role && m.role !== "worker" && <Badge tone="neutral">{m.role}</Badge>}
                     {m.workspace_mode && m.workspace_mode !== "inherit" && <Badge tone="violet">{m.workspace_mode}</Badge>}
                   </div>
 
-                  <div className="flex items-center gap-1 shrink-0">
+                  <div className="f1 shrink-0">
                     {(tools.length > 0 || m.thinkingHeading) && (
                       <Button variant={peeking ? "secondary" : "ghost"} aria-label={`Peek activity for ${m.name}`} aria-expanded={peeking} onClick={() => setPeekMember(peeking ? null : m.name)}>
                         {peeking ? <ChevronUp /> : <ChevronDown />}

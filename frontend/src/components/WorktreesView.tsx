@@ -71,7 +71,7 @@ export function WorktreesView({
   return (
     <div className="space-y-3">
       <div className="row">
-        <h2 className="text-[14px] font-semibold text-ink">Git worktrees ({worktrees.length})</h2>
+        <h2 className="h2">Git worktrees ({worktrees.length})</h2>
         <Button onClick={onRefresh} disabled={loading}>
           <RefreshCw className={loading ? "motion-safe:animate-spin" : ""} />
           Refresh
@@ -79,7 +79,7 @@ export function WorktreesView({
       </div>
 
       {workspaceUris.length === 0 && (
-        <form onSubmit={handleAdd} className="flex items-center gap-1">
+        <form onSubmit={handleAdd} className="f1">
           <Input
             aria-label="Workspace repository path"
             placeholder="/path/to/repo"
@@ -109,7 +109,7 @@ export function WorktreesView({
                 <div className="min-w-0 space-y-1">
                   <div className="wrap">
                     <GitBranch className="h-3.5 w-3.5 text-info shrink-0" />
-                    <span className="text-[14px] font-semibold text-ink break-all">{wt.branch}</span>
+                    <span className="h2 break-all">{wt.branch}</span>
                     {wt.isMain && <Badge tone="neutral">main</Badge>}
                     <Badge tone={wt.clean ? "success" : "warning"}>
                       {wt.clean
@@ -118,7 +118,7 @@ export function WorktreesView({
                     </Badge>
                   </div>
                   <p
-                    className="text-[12px] text-ink-3 mono truncate"
+                    className="t3 mono truncate"
                     title={maskHome(wt.path)}
                   >
                     <FolderGit2 className="inline h-3 w-3 mr-1 align-text-bottom" />
@@ -161,11 +161,11 @@ export function WorktreesView({
                     return (
                       <li key={f.path} className="py-1 space-y-1">
                         <div className="row flex-wrap">
-                          <div className="flex items-center gap-1 min-w-0 flex-1">
+                          <div className="f1 min-w-0 flex-1">
                             <Badge tone={FILE_TONE[f.state] || "neutral"} className="mono px-1 py-0">{f.state}</Badge>
                             <span className="text-[12px] text-ink mono truncate" title={f.path}>{f.path}</span>
                           </div>
-                          <div className="flex items-center gap-1 shrink-0">
+                          <div className="f1 shrink-0">
                             <Button variant="ghost" aria-label={`Diff peek ${f.path}`} aria-expanded={diffOpen} onClick={() => handleToggleDiff(wt.root, wt.path, f.path)} className="h-7 px-2">
                               {diffOpen ? <ChevronUp /> : <ChevronDown />}
                               Diff
@@ -201,7 +201,7 @@ export function WorktreesView({
                     );
                   })}
                   {wt.filesTruncated && (
-                    <li className="py-1 text-[12px] text-ink-3">
+                    <li className="py-1 t3">
                       {wt.files.length} files shown
                     </li>
                   )}

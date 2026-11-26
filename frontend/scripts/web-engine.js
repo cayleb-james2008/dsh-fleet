@@ -443,6 +443,25 @@
       highBurnCount: burnRows.filter(function (r) { return r.level !== "normal"; }).length,
       workers: burnRows.slice(0, 6),
     };
+    var dC = 0, dS = 0, vC = 0, vS = 0, sC = 0, sS = 0, bC = 0, bS = 0;
+    sw.messages.forEach(function (m) {
+      if (!m || !m.text) return;
+      if (/\[scale-verified\]/i.test(m.text)) { sC++; sS = Math.max(sS, m.seq); }
+      else if (/\[verified\]/i.test(m.text)) { vC++; vS = Math.max(vS, m.seq); }
+      else if (/\[done\]/i.test(m.text)) { dC++; dS = Math.max(dS, m.seq); }
+      if (/\[blocked\]/i.test(m.text)) { bC++; bS = Math.max(bS, m.seq); }
+    });
+    var activeBlk = triage.find(function (x) { return (x.kind === "blocked" || x.severity === "urgent") && x.seq > 0; });
+    var gateReadiness = (dC || vC || sC || bC || activeBlk) ? {
+      state: activeBlk || bS > Math.max(dS, vS, sS) ? "blocked" : sC > 0 && dS <= vS && vS <= sS ? "ready" : "verifying",
+      pendingSeq: activeBlk ? activeBlk.seq : dS > vS ? dS : vS > sS ? vS : bS > Math.max(dS, vS, sS) ? bS : sS || vS || dS || 0,
+      stages: [
+        { key: "done", label: "[done]", count: dC, seq: dS },
+        { key: "verified", label: "[verified]", count: vC, seq: vS },
+        { key: "scale", label: "[scale-verified]", count: sC, seq: sS },
+        { key: "blocked", label: "[blocked]", count: bC, seq: bS },
+      ],
+    } : null;
     return {
       conversationId: sw.id,
       swarm: sw.id,
@@ -458,6 +477,7 @@
       frames: sw.frames,
       triage: triage,
       burnSummary: burnSummary,
+      gateReadiness: gateReadiness,
       usage: usage,
       capabilities: { canSendMessage: true, isSidecar: false, sseStream: false },
     };
@@ -566,7 +586,7 @@
       return jsonResp({ ok: true, delivered: targets.length });
     }
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.11.0", mode: "live-web", canSendMessage: true, sseStream: false });
+      return jsonResp({ ok: true, name: "fleet", version: "1.12.0", mode: "live-web", canSendMessage: true, sseStream: false });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });

@@ -94,7 +94,7 @@ export function GraphView({ snap }: { snap: SwarmSnapshot }) {
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-[14px] font-semibold text-ink">
+        <h2 className="h2">
           @Mention graph ({nodes.length} nodes)
         </h2>
         <div className="wrap">
@@ -183,7 +183,7 @@ export function GraphView({ snap }: { snap: SwarmSnapshot }) {
       {nonControlMsgs.length > 0 && (
         <Card className="p-2 space-y-2">
           <div className="row">
-            <div className="flex items-center gap-1">
+            <div className="f1">
               {([
                 ["Previous post", activeIdx <= 0, SkipBack, () => (setPlaying(false), setReplayIndex(Math.max(0, activeIdx - 1)))],
                 [playing ? "Pause replay" : "Play replay", false, playing ? Pause : Play, () => { if (isLive && !playing) setReplayIndex(0); setPlaying((p) => !p); }],

@@ -148,6 +148,12 @@ export interface BurnSummary {
   workers: BurnWorker[];
 }
 
+export interface GateReadiness {
+  state: "blocked" | "ready" | "verifying";
+  pendingSeq: number;
+  stages: Array<{ key: string; label: string; count: number; seq: number }>;
+}
+
 export interface SwarmSnapshot {
   conversationId: string | null;
   swarm: string | null;
@@ -167,6 +173,7 @@ export interface SwarmSnapshot {
   allowedFiles?: Record<string, string>;
   triage?: TriageItem[];
   burnSummary?: BurnSummary;
+  gateReadiness?: GateReadiness | null;
   usage?: TokenUsage;
   unseen?: number[];
   swarms?: SwarmSummary[];

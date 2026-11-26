@@ -153,6 +153,19 @@ await runChecks("gate", async (check) => {
     return txt.includes("Token burn") && txt.includes("builder") && /\d+%/.test(badge);
   });
 
+  await check("triage Gate Readiness Card tracks tags and jumps to pending #seq on Board", async () => {
+    const card = page.locator('#panel-triage [data-testid="gate-readiness-card"]');
+    if ((await card.count()) !== 1) return false;
+    const txt = await card.textContent();
+    if (!txt.includes("Gate readiness") || !txt.includes("[done]") || !txt.includes("[blocked]")) return false;
+    await card.locator('[data-testid="gate-pending-jump"]').click();
+    await page.waitForSelector("#panel-board");
+    const jumped = (await page.locator('#tab-board[aria-selected="true"]').count()) === 1;
+    await page.locator("#tab-triage").click();
+    await page.waitForSelector("#panel-triage");
+    return jumped;
+  });
+
   // 7-9: #seq jump from Triage -> Board tab + Board filters
   await page.locator('#panel-triage button:has-text("#4")').first().click();
   await page.waitForSelector("#panel-board");

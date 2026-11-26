@@ -200,7 +200,7 @@ export function BoardView({
     <div className="space-y-3">
       {pinnedMessages.length > 0 && (
         <Card className="p-2 space-y-1 bg-board" aria-label="Pinned board posts">
-          <div className="flex items-center gap-1 text-[12px] font-semibold text-ink">
+          <div className="f1 text-[12px] font-semibold text-ink">
             <Pin className="text-info" />
             Pinned ({pinnedMessages.length})
           </div>
@@ -209,7 +209,7 @@ export function BoardView({
       )}
       {/* Pinned Search & Filter Bar */}
       <div className="sticky top-0 z-10 -mx-1 px-1 py-1 bg-canvas space-y-2">
-        <div className="flex items-center gap-1">
+        <div className="f1">
           <div className="relative flex-1 min-w-0">
             <Search className="pointer-events-none absolute left-2 top-2 h-4 w-4 text-ink-3" />
             <Input
@@ -274,7 +274,7 @@ export function BoardView({
               </Pill>
             ))}
           </div>
-          <div className="flex items-center gap-1">
+          <div className="f1">
             {([
               ["md", "text/markdown;charset=utf-8", "Markdown", "export-board-md"],
               ["json", "application/json;charset=utf-8", "JSON", "export-board-json"],
@@ -390,12 +390,12 @@ export function BoardView({
                 >
                   {!grouped && (
                     <div className="row pb-1">
-                      <div className="flex items-center gap-1 min-w-0">
+                      <div className="f1 min-w-0">
                         <span className="text-[13px] font-semibold text-ink truncate">{m.agent}</span>
                         {m.channel && m.channel !== "main" && <Badge tone="violet">#{m.channel}</Badge>}
                         {m.all && <Badge tone="info">@all</Badge>}
                       </div>
-                      <div className="flex items-center gap-1 shrink-0 text-[12px] text-ink-3 num">
+                      <div className="f1 shrink-0 t3 num">
                         <button
                           type="button"
                           aria-label={`Quote reply to #${m.seq}`}

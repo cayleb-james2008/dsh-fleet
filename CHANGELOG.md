@@ -3,6 +3,12 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as a
 ready-to-install Antigravity plugin bundle (`tar.gz` + `zip`) with `SHA256SUMS`.
 
+## 1.12.0 - 2026-11-25
+
+- **1-Click Swarm Handoff Checklist & Gate Readiness Card (`sidecars/fleet_pane/swarm_store.mjs`, `frontend/src/{types.ts,ui.tsx}`, `TriageView.tsx`, `web-engine.js`):** Added `computeGateReadiness` + `<GateReadinessCard />` automatically tracking release-gate progression across `[done]` -> `[verified]` -> `[scale-verified]` / `[blocked]` on the board, rendering `32px`-tall soft-tinted stage jump buttons (`[done]`, `[blocked]`, `Gate #seq`) with `web-engine.js` parity (`0` Sloplint `39b` reflexes).
+- **Sub-`66 MB` `--jitless` RSS & Semantic CSS Consolidation (`sidecars/fleet_pane/{swarm_store.mjs,main.mjs,sidecar.json}`, `frontend/src/index.css`):** Eliminated `2,000` `Buffer.subarray` wrapper allocations on `board.jsonl` streaming, trimmed `worktreesPayloadCache` to `1` entry, bounded V8 old space (`--max-old-space-size=24` in `sidecar.json`), added `info`/`danger` `Button` variants + semantic `.h2`/`.f1`/`.t3` CSS classes, achieving **`65.55 MB` (`67,128 KB`) `--jitless` `VmHWM`** (`5,114.1 req/s` `--jitless`, `21,926.4 req/s` default keep-alive, `0` errors) and **`300,853 B` raw (`293.8 KiB`) / `93,861 B` gz (`91.66 KiB`)** (`484,628 B` `dist-live-web/index.html`).
+- **Verified E2E, Security, Sloplint & Visual Refresh (`docs/screenshots/*.png`, `sidecars/fleet_pane/test/store.test.mjs`, `frontend/e2e/{gate,check,test-live-web}.mjs`):** Refreshed & visually inspected all 8 Light/Dark PNGs showing Gate Readiness (`Blocked · Gate #3`), Token Burn (`High burn · @builder 75%`), and Broadcast Composer; verified `11/11` backend tests, `43/43` gate, `8/8` replay, `11/11` live-web, `0 FAIL / 0 REFLEX / 0 WARN` Sloplint, `30/30` fuzz, and `5/5` SSE streams.
+
 ## 1.11.0 - 2026-11-25
 
 - **Per-Worker Token & Burn-Rate Guard Strip (`sidecars/fleet_pane/swarm_store.mjs`, `frontend/src/{types.ts,ui.tsx}`, `TriageView.tsx`, `RosterView.tsx`, `web-engine.js`):** Added `computeBurnSummary` + shared `<TokenBurnStrip />` (proportional stacked worker token share bar + top-3 consumer legend + automatic `High burn · @worker <pct>%` warning/critical badge) in both **Triage** and **Roster** with offline `web-engine.js` parity so coordinators spot runaway token-burn loops at a glance.
