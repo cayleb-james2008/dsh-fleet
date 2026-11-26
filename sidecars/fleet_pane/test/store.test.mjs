@@ -18,6 +18,7 @@ import {
   computeGateReadiness,
   findCoordinatorConvId,
   getBoardTailStats,
+  getModelSpec,
   listSwarms,
   normalizePlan,
   readTranscriptActivityTail,
@@ -1500,4 +1501,263 @@ test('readTranscriptSteps handles backwards pagination, filters, correlation, sc
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('getModelSpec resolves Gemini 1M, Claude 200k/[1m], OpenAI 128k/200k/400k, and safe unknown fallback', () => {
+  const g4 = getModelSpec('gemini-4-hydrogen-high');
+  assert.equal(g4.family, 'gemini-pro');
+  assert.equal(g4.contextLimit, 1_000_000);
+  assert.equal(g4.pricingKnown, true);
+
+  const g25 = getModelSpec('gemini-2.5-pro');
+  assert.equal(g25.contextLimit, 1_000_000);
+  assert.equal(g25.pricingKnown, true);
+
+  const gFlash = getModelSpec('gemini-3.8-flash-high');
+  assert.equal(gFlash.family, 'gemini-flash');
+  assert.equal(gFlash.contextLimit, 1_000_000);
+  assert.equal(gFlash.pricingKnown, true);
+  assert.ok(gFlash.outPer1M < g25.outPer1M);
+
+  const cSonnet = getModelSpec('claude-sonnet-4-6');
+  assert.equal(cSonnet.family, 'claude-sonnet');
+  assert.equal(cSonnet.contextLimit, 200_000);
+  assert.equal(cSonnet.pricingKnown, true);
+
+  const cOpus = getModelSpec('claude-opus-5-5-high');
+  assert.equal(cOpus.family, 'claude-opus');
+  assert.equal(cOpus.contextLimit, 200_000);
+  assert.equal(cOpus.pricingKnown, true);
+  assert.ok(cOpus.outPer1M > cSonnet.outPer1M);
+
+  const c1mBracket = getModelSpec('claude-sonnet-4-5[1m]');
+  assert.equal(c1mBracket.family, 'claude-sonnet');
+  assert.equal(c1mBracket.contextLimit, 1_000_000);
+  assert.equal(c1mBracket.pricingKnown, true);
+
+  const c1mDash = getModelSpec('claude-opus-4-6-1m');
+  assert.equal(c1mDash.family, 'claude-opus');
+  assert.equal(c1mDash.contextLimit, 1_000_000);
+  assert.equal(c1mDash.pricingKnown, true);
+
+  assert.equal(getModelSpec('gpt-4o').contextLimit, 128_000);
+  assert.equal(getModelSpec('gpt-4o').pricingKnown, true);
+  assert.equal(getModelSpec('o3-mini').contextLimit, 200_000);
+  assert.equal(getModelSpec('o3-mini').pricingKnown, true);
+  assert.equal(getModelSpec('gpt-5').contextLimit, 400_000);
+  assert.equal(getModelSpec('gpt-5').pricingKnown, true);
+
+  for (const bad of ['custom-local-llama', '', null, '__proto__']) {
+    const u = getModelSpec(bad);
+    assert.deepEqual(u, {
+      family: 'unknown',
+      contextLimit: 200_000,
+      inPer1M: 0,
+      cacheReadPer1M: 0,
+      outPer1M: 0,
+      pricingKnown: false,
+    });
+  }
+});
+
+test('summarizeTranscript and buildSwarmSnapshot preserve byModel spend across switch_model and compute 1M contextPct', () => {
+  const dir = makeScratchDir('cost-switch-');
+  try {
+    const coordId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+    const workerId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+    const swarmPath = join(dir, 'brain', coordId, '.system_generated', 'swarm');
+    const logsDir = join(dir, 'brain', workerId, '.system_generated', 'logs');
+    mkdirSync(swarmPath, { recursive: true });
+    mkdirSync(logsDir, { recursive: true });
+
+    writeFileSync(
+      join(swarmPath, 'members.json'),
+      JSON.stringify({
+        title: 'Model Switch Cost Test',
+        members: {
+          coordinator: { conversation_id: coordId, role: 'coordinator', model: 'claude-opus-4-6' },
+          builder: { conversation_id: workerId, role: 'worker', model: 'gemini-4-hydrogen-high' },
+        },
+      }),
+    );
+    writeFileSync(join(swarmPath, 'board.jsonl'), JSON.stringify({ seq: 1, agent: 'coordinator', text: '@builder go' }) + '\n');
+
+    // Include >12 KB filler step between models so fast rawSpan path (>8192 remBytes) is exercised
+    const padding = 'x'.repeat(14_000);
+    const trFile = join(logsDir, 'transcript.jsonl');
+    writeFileSync(
+      trFile,
+      [
+        JSON.stringify({
+          step_index: 0,
+          type: 'PLANNER_RESPONSE',
+          model: 'claude-opus-4-6',
+          input_tokens: 100_000,
+          cache_read_tokens: 400_000,
+          output_tokens: 10_000,
+          content: padding,
+          tool_calls: [{ name: 'swarm', args: { action: 'model', model: 'spoofed-nested-model' } }],
+          created_at: '2026-11-26T10:00:00Z',
+        }),
+        JSON.stringify({
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          model: 'gemini-4-hydrogen-high',
+          input_tokens: 200_000,
+          cache_read_tokens: 100_000,
+          output_tokens: 20_000,
+          tool_calls: [],
+          created_at: '2026-11-26T10:01:00Z',
+        }),
+      ].join('\n') + '\n',
+    );
+
+    const { summary } = summarizeTranscript(dir, workerId);
+    assert.equal(summary.model, 'gemini-4-hydrogen-high');
+    assert.equal(summary.modelSpec.contextLimit, 1_000_000);
+    assert.equal(summary.contextLimit, 1_000_000);
+    // 300k context tokens out of 1M ceiling => 30% (NOT clamped to 100% at 200k!)
+    assert.equal(summary.contextPct, 30);
+    assert.deepEqual(Object.keys(summary.byModel).sort(), ['claude-opus-4-6', 'gemini-4-hydrogen-high']);
+    assert.equal(summary.byModel['claude-opus-4-6'].steps, 1);
+    assert.equal(summary.byModel['claude-opus-4-6'].outputTokens, 10_000);
+    assert.equal(summary.byModel['gemini-4-hydrogen-high'].steps, 1);
+    assert.equal(summary.byModel['gemini-4-hydrogen-high'].inputTokens, 200_000);
+
+    // Opus: 1.50 + 0.60 + 0.75 = 2.85; Gemini Pro: 0.25 + 0.03125 + 0.20 = 0.48125 => 3.33125
+    assert.equal(summary.cost.pricingKnown, true);
+    assert.equal(summary.cost.inputUsd, 1.75);
+    assert.equal(summary.cost.cacheReadUsd, 0.63125);
+    assert.equal(summary.cost.outputUsd, 0.95);
+    assert.equal(summary.cost.totalUsd, 3.33125);
+    // Savings: Opus 400k*(15-1.5)/1e6 = 5.40; Gemini 100k*(1.25-0.3125)/1e6 = 0.09375 => 5.49375
+    assert.equal(summary.cost.cacheSavingsUsd, 5.49375);
+    // Cache hit %: 500k / (300k + 500k) * 100 = 62.5%
+    assert.equal(summary.cost.cacheHitPct, 62.5);
+
+    const snap = buildSwarmSnapshot(dir, coordId);
+    assert.equal(snap.contextLimit, 1_000_000);
+    assert.equal(snap.contextPct, 30);
+    assert.equal(snap.cost.totalUsd, 3.33125);
+    assert.equal(snap.cost.cacheSavingsUsd, 5.49375);
+    assert.equal(snap.cost.cacheHitPct, 62.5);
+    assert.equal(snap.cost.pricingKnown, true);
+    assert.deepEqual(Object.keys(snap.byModel).sort(), ['claude-opus-4-6', 'gemini-4-hydrogen-high']);
+
+    const builder = snap.members.find((m) => m.name === 'builder');
+    assert.equal(builder.contextLimit, 1_000_000);
+    assert.equal(builder.contextPct, 30);
+    assert.equal(builder.cost.totalUsd, 3.33125);
+
+    // Incremental append continues accumulating on the new model without double-counting Opus
+    appendFileSync(
+      trFile,
+      JSON.stringify({
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        model: 'gemini-4-hydrogen-high',
+        input_tokens: 100_000,
+        cache_read_tokens: 0,
+        output_tokens: 0,
+        tool_calls: [],
+      }) + '\n',
+    );
+    const { summary: afterAppend } = summarizeTranscript(dir, workerId);
+    assert.equal(afterAppend.byModel['claude-opus-4-6'].steps, 1);
+    assert.equal(afterAppend.byModel['gemini-4-hydrogen-high'].steps, 2);
+    assert.equal(afterAppend.byModel['gemini-4-hydrogen-high'].inputTokens, 300_000);
+    assert.equal(afterAppend.cost.totalUsd, 3.45625);
+
+    // Truncation/rotation resets and rebuilds byModel cleanly
+    writeFileSync(
+      trFile,
+      JSON.stringify({
+        step_index: 0,
+        type: 'PLANNER_RESPONSE',
+        model: 'claude-sonnet-4-6',
+        input_tokens: 100_000,
+        cache_read_tokens: 50_000,
+        output_tokens: 0,
+        tool_calls: [],
+      }) + '\n',
+    );
+    const { summary: afterTrunc } = summarizeTranscript(dir, workerId);
+    assert.deepEqual(Object.keys(afterTrunc.byModel), ['claude-sonnet-4-6']);
+    assert.equal(afterTrunc.contextLimit, 200_000);
+    assert.equal(afterTrunc.contextPct, 75);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('computeBurnSummary ranks by costUsd over raw tokens for cache-heavy cheap vs output-heavy steps', () => {
+  const cacheSpec = getModelSpec('gemini-3-flash');
+  const opusSpec = getModelSpec('claude-opus-5-5-high');
+
+  // Cache-heavy Gemini Flash: 1,000,000 cached tokens => $0.075 USD
+  // Output-heavy Claude Opus: 10k input + 50k output => $0.15 + $3.75 = $3.90 USD
+  const burn = computeBurnSummary(
+    [
+      {
+        name: 'cache-reader',
+        model: 'gemini-3-flash',
+        roleWorker: false,
+        usage: { inputTokens: 0, cacheReadTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 },
+        cost: {
+          totalUsd: (1_000_000 * cacheSpec.cacheReadPer1M) / 1e6,
+          cacheSavingsUsd: (1_000_000 * (cacheSpec.inPer1M - cacheSpec.cacheReadPer1M)) / 1e6,
+          cacheHitPct: 100,
+          pricingKnown: true,
+        },
+      },
+      {
+        name: 'opus-writer',
+        model: 'claude-opus-5-5-high',
+        roleWorker: false,
+        usage: { inputTokens: 10_000, cacheReadTokens: 0, outputTokens: 50_000, totalTokens: 60_000 },
+        cost: {
+          totalUsd: (10_000 * opusSpec.inPer1M + 50_000 * opusSpec.outPer1M) / 1e6,
+          cacheSavingsUsd: 0,
+          cacheHitPct: 0,
+          pricingKnown: true,
+        },
+      },
+    ],
+    1_060_000,
+  );
+
+  assert.equal(burn.pricingKnown, true);
+  assert.equal(burn.topWorker?.name, 'opus-writer');
+  assert.equal(burn.topWorker?.level, 'critical');
+  assert.equal(burn.topWorker?.costUsd, 3.9);
+  assert.equal(burn.workers[1].name, 'cache-reader');
+  assert.equal(burn.workers[1].level, 'normal');
+  assert.equal(burn.workers[1].cacheHitPct, 100);
+  assert.equal(burn.workers[1].cacheSavingsUsd, 0.225);
+  assert.equal(burn.highBurnCount, 1);
+  assert.equal(burn.costUsd, 3.975);
+  assert.equal(burn.cacheSavingsUsd, 0.225);
+  assert.equal(burn.cacheHitPct, 99);
+
+  // Unknown pricing falls back to token-based ranking
+  const unknownBurn = computeBurnSummary(
+    [
+      {
+        name: 'custom-a',
+        roleWorker: false,
+        usage: { inputTokens: 50_000, cacheReadTokens: 0, outputTokens: 0, totalTokens: 50_000 },
+        cost: { totalUsd: 0, cacheSavingsUsd: 0, cacheHitPct: 0, pricingKnown: false },
+      },
+      {
+        name: 'custom-b',
+        roleWorker: false,
+        usage: { inputTokens: 200_000, cacheReadTokens: 0, outputTokens: 0, totalTokens: 200_000 },
+        cost: { totalUsd: 0, cacheSavingsUsd: 0, cacheHitPct: 0, pricingKnown: false },
+      },
+    ],
+    250_000,
+  );
+  assert.equal(unknownBurn.pricingKnown, false);
+  assert.equal(unknownBurn.topWorker?.name, 'custom-b');
+  assert.equal(unknownBurn.topWorker?.level, 'critical');
 });

@@ -119,6 +119,7 @@ const B_STEP_INDEX = Buffer.from('"step_index":');
 const B_CREATED_AT = Buffer.from('"created_at":');
 const B_PLANNER = Buffer.from('"PLANNER_RESPONSE"');
 const B_MODEL = Buffer.from('"model":');
+const B_TOOL_CALLS = Buffer.from('"tool_calls":');
 const B_USAGE = Buffer.from('"usage":');
 const B_INPUT_TOK = Buffer.from('"input_tokens":');
 const B_INPUT_CAMEL = Buffer.from('"inputTokens":');
@@ -656,9 +657,242 @@ function num(v) {
   return Number.isFinite(v) && v >= 0 ? v : 0;
 }
 
+const UNKNOWN_MODEL_SPEC = Object.freeze({
+  family: 'unknown',
+  contextLimit: 200_000,
+  inPer1M: 0,
+  cacheReadPer1M: 0,
+  outPer1M: 0,
+  pricingKnown: false,
+});
+
+const CLAUDE_1M_RE = /(?:\[1m\]|(?:^|[-_])1m(?:[-_]|$))/i;
+const GEMINI_PRO_FAMILY_RE = /^gemini-(?:2\.5|3(?:\.\d+)?|4(?:\.\d+)?)(?:-|$)|^gemini-.*-pro(?:-|$)|^gemini-pro(?:-|$)/;
+const GEMINI_FLASH_FAMILY_RE = /^gemini-(?:2\.5|3(?:\.\d+)?|4(?:\.\d+)?)-flash(?:-|$)|^gemini-.*-flash(?:-|$)/;
+const OPENAI_O_SERIES_RE = /^(?:o1|o3|o4)(?:$|[-_])/;
+
+/**
+ * Resolve model family, context window ceiling, and per-1M USD token pricing.
+ */
+export function getModelSpec(modelId) {
+  const raw = typeof modelId === 'string' ? modelId.trim().toLowerCase() : '';
+  if (!raw) return { ...UNKNOWN_MODEL_SPEC };
+  const slashIdx = raw.lastIndexOf('/');
+  const id = slashIdx >= 0 ? raw.slice(slashIdx + 1) : raw;
+  if (!id || id === '__proto__' || id === 'constructor' || id === 'prototype') {
+    return { ...UNKNOWN_MODEL_SPEC };
+  }
+
+  if (GEMINI_FLASH_FAMILY_RE.test(id)) {
+    return {
+      family: 'gemini-flash',
+      contextLimit: 1_000_000,
+      inPer1M: 0.30,
+      cacheReadPer1M: 0.075,
+      outPer1M: 2.50,
+      pricingKnown: true,
+    };
+  }
+  if (GEMINI_PRO_FAMILY_RE.test(id)) {
+    return {
+      family: 'gemini-pro',
+      contextLimit: 1_000_000,
+      inPer1M: 1.25,
+      cacheReadPer1M: 0.3125,
+      outPer1M: 10.0,
+      pricingKnown: true,
+    };
+  }
+
+  if (id.startsWith('claude-') || id === 'claude') {
+    const contextLimit = CLAUDE_1M_RE.test(id) ? 1_000_000 : 200_000;
+    if (id.includes('opus')) {
+      return { family: 'claude-opus', contextLimit, inPer1M: 15.0, cacheReadPer1M: 1.50, outPer1M: 75.0, pricingKnown: true };
+    }
+    if (id.includes('sonnet')) {
+      return { family: 'claude-sonnet', contextLimit, inPer1M: 3.0, cacheReadPer1M: 0.30, outPer1M: 15.0, pricingKnown: true };
+    }
+    if (id.includes('haiku')) {
+      return { family: 'claude-haiku', contextLimit, inPer1M: 1.0, cacheReadPer1M: 0.10, outPer1M: 5.0, pricingKnown: true };
+    }
+    return { ...UNKNOWN_MODEL_SPEC, contextLimit };
+  }
+
+  if (id.startsWith('gpt-5')) {
+    if (id.includes('mini') || id.includes('nano')) {
+      return { family: 'openai-gpt5-mini', contextLimit: 400_000, inPer1M: 0.25, cacheReadPer1M: 0.025, outPer1M: 2.0, pricingKnown: true };
+    }
+    return { family: 'openai-gpt5', contextLimit: 400_000, inPer1M: 1.25, cacheReadPer1M: 0.125, outPer1M: 10.0, pricingKnown: true };
+  }
+  if (OPENAI_O_SERIES_RE.test(id)) {
+    if (id.includes('mini')) {
+      return { family: 'openai-o-mini', contextLimit: 200_000, inPer1M: 1.10, cacheReadPer1M: 0.275, outPer1M: 4.40, pricingKnown: true };
+    }
+    return { family: 'openai-o', contextLimit: 200_000, inPer1M: 2.0, cacheReadPer1M: 0.50, outPer1M: 8.0, pricingKnown: true };
+  }
+  if (id.startsWith('gpt-oss') || id.startsWith('gpt-4o-mini')) {
+    return {
+      family: id.startsWith('gpt-oss') ? 'openai-gpt-oss' : 'openai-gpt4o-mini',
+      contextLimit: 128_000,
+      inPer1M: 0.15,
+      cacheReadPer1M: 0.075,
+      outPer1M: 0.60,
+      pricingKnown: true,
+    };
+  }
+  if (id.startsWith('gpt-4') || id.startsWith('gpt-3.5')) {
+    return { family: 'openai-gpt4o', contextLimit: 128_000, inPer1M: 2.50, cacheReadPer1M: 1.25, outPer1M: 10.0, pricingKnown: true };
+  }
+
+  return { ...UNKNOWN_MODEL_SPEC };
+}
+
+function roundUsd(v) {
+  return Math.round(v * 1e6) / 1e6;
+}
+
+function roundPct(v) {
+  return Math.round(v * 10) / 10;
+}
+
+function sanitizeModelKey(model) {
+  const m = typeof model === 'string' ? model.trim() : '';
+  if (!m || m === '__proto__' || m === 'constructor' || m === 'prototype') return 'unknown';
+  return m;
+}
+
+function computeContextPct(contextTokens, contextLimit) {
+  const tok = num(Number(contextTokens));
+  const limit = num(Number(contextLimit));
+  if (limit <= 0 || tok <= 0) return 0;
+  return Math.min(100, Math.max(0, Math.round((tok / limit) * 100)));
+}
+
+function cloneByModel(byModel) {
+  const out = {};
+  if (!byModel || typeof byModel !== 'object') return out;
+  for (const [k, v] of Object.entries(byModel)) {
+    const key = sanitizeModelKey(k);
+    if (!v || typeof v !== 'object') continue;
+    const prev = out[key];
+    if (prev) {
+      prev.inputTokens += num(Number(v.inputTokens));
+      prev.cacheReadTokens += num(Number(v.cacheReadTokens));
+      prev.outputTokens += num(Number(v.outputTokens));
+      prev.steps += num(Number(v.steps));
+    } else {
+      out[key] = {
+        inputTokens: num(Number(v.inputTokens)),
+        cacheReadTokens: num(Number(v.cacheReadTokens)),
+        outputTokens: num(Number(v.outputTokens)),
+        steps: num(Number(v.steps)),
+      };
+    }
+  }
+  return out;
+}
+
+function computeCostFromByModel(byModel, fallbackModel = '') {
+  let inputUsd = 0;
+  let cacheReadUsd = 0;
+  let outputUsd = 0;
+  let cacheSavingsUsd = 0;
+  let totalInputTokens = 0;
+  let totalCacheReadTokens = 0;
+  let anyKnown = false;
+  let hasEntries = false;
+
+  for (const [modelId, entry] of Object.entries(byModel || {})) {
+    if (!entry || typeof entry !== 'object') continue;
+    hasEntries = true;
+    const spec = getModelSpec(modelId);
+    const inp = num(Number(entry.inputTokens));
+    const cac = num(Number(entry.cacheReadTokens));
+    const out = num(Number(entry.outputTokens));
+    totalInputTokens += inp;
+    totalCacheReadTokens += cac;
+    if (spec.pricingKnown) {
+      anyKnown = true;
+      inputUsd += (inp * spec.inPer1M) / 1e6;
+      cacheReadUsd += (cac * spec.cacheReadPer1M) / 1e6;
+      outputUsd += (out * spec.outPer1M) / 1e6;
+      cacheSavingsUsd += (cac * Math.max(0, spec.inPer1M - spec.cacheReadPer1M)) / 1e6;
+    }
+  }
+
+  if (!hasEntries && fallbackModel) {
+    anyKnown = getModelSpec(fallbackModel).pricingKnown;
+  }
+
+  const totalUsd = roundUsd(inputUsd + cacheReadUsd + outputUsd);
+  const cacheHitPct =
+    totalCacheReadTokens > 0
+      ? roundPct((totalCacheReadTokens / Math.max(1, totalInputTokens + totalCacheReadTokens)) * 100)
+      : 0;
+
+  return {
+    totalUsd,
+    inputUsd: roundUsd(inputUsd),
+    cacheReadUsd: roundUsd(cacheReadUsd),
+    outputUsd: roundUsd(outputUsd),
+    cacheSavingsUsd: roundUsd(cacheSavingsUsd),
+    cacheHitPct,
+    pricingKnown: anyKnown,
+  };
+}
+
+function setAccModel(a, model) {
+  const clean = typeof model === 'string' ? model.trim() : '';
+  if (!clean) return '';
+  if (a.model !== clean) {
+    a.model = clean;
+    a.modelBuf = Buffer.from(clean, 'utf8');
+  }
+  return clean;
+}
+
+function extractModelFast(buf, start, end, a) {
+  const idx = buf.indexOf(B_MODEL, start);
+  if (idx < 0 || idx >= end) return '';
+  const tcIdx = buf.indexOf(B_TOOL_CALLS, start);
+  if ((idx > start && buf[idx - 1] === 92) || (tcIdx >= 0 && tcIdx < idx && tcIdx < end)) {
+    try {
+      const parsed = JSON.parse(buf.toString('utf8', start, end));
+      return typeof parsed?.model === 'string' ? setAccModel(a, parsed.model) : '';
+    } catch {
+      return '';
+    }
+  }
+  let pos = idx + B_MODEL.length;
+  while (pos < end && (buf[pos] === 32 || buf[pos] === 9)) pos++;
+  if (pos >= end || buf[pos] !== 34) return '';
+  const qStart = pos + 1;
+  const qEnd = buf.indexOf(34, qStart);
+  if (qEnd < 0 || qEnd >= end) return '';
+  const bs = buf.indexOf(92, qStart);
+  if (bs >= 0 && bs < qEnd) return '';
+  if (a.modelBuf && qEnd - qStart === a.modelBuf.length && buf.compare(a.modelBuf, 0, a.modelBuf.length, qStart, qEnd) === 0) {
+    return a.model;
+  }
+  return setAccModel(a, buf.toString('utf8', qStart, qEnd));
+}
+
+function addByModel(a, modelId, inp, cac, out) {
+  const key = sanitizeModelKey(modelId);
+  let entry = Object.hasOwn(a.byModel, key) ? a.byModel[key] : null;
+  if (!entry) {
+    entry = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
+    a.byModel[key] = entry;
+  }
+  entry.inputTokens += inp;
+  entry.cacheReadTokens += cac;
+  entry.outputTokens += out;
+  entry.steps += 1;
+}
+
 /**
  * Incrementally scan `transcript.jsonl` with near-zero V8 allocations:
- * - Scalar fields (`input_tokens`, `cache_read_tokens`, `output_tokens`, `step_index`)
+ * - Scalar fields (`input_tokens`, `cache_read_tokens`, `output_tokens`, `step_index`, `model`)
  *   are scanned directly across history without retaining JS objects.
  * - Full `JSON.parse` runs only on the newest 32 lines for `recentTools`, `thinkingHeading`,
  *   `activity`, `turnEnded`, `finalReply`, and `lastContextTokens`.
@@ -679,6 +913,8 @@ export function summarizeTranscript(appData, conv) {
     outputTokens: 0,
     lastContextTokens: 0,
     model: '',
+    modelBuf: null,
+    byModel: {},
     startedAt: '',
     lastStepAt: '',
     rawTail: [],
@@ -713,16 +949,17 @@ export function summarizeTranscript(appData, conv) {
           if (!a.startedAt) a.startedAt = preParsed.created_at;
           a.lastStepAt = preParsed.created_at;
         }
-        if (typeof preParsed.model === 'string' && preParsed.model) a.model = preParsed.model;
+        const rawModel = typeof preParsed.model === 'string' ? setAccModel(a, preParsed.model) : '';
         if (preParsed.type === 'PLANNER_RESPONSE') {
           const u = preParsed.usage && typeof preParsed.usage === 'object' ? preParsed.usage : preParsed;
-          const inp = num(Number(u.input_tokens));
+          const inp = num(Number(u.input_tokens ?? u.inputTokens));
           const cac = num(Number(u.cache_read_tokens ?? u.cacheReadTokens));
-          const out = num(Number(u.output_tokens));
+          const out = num(Number(u.output_tokens ?? u.outputTokens));
           a.inputTokens += inp;
           a.cacheReadTokens += cac;
           a.outputTokens += out;
           a.lastContextTokens = inp + cac;
+          addByModel(a, rawModel || a.model || 'unknown', inp, cac, out);
         }
         return;
       }
@@ -740,10 +977,7 @@ export function summarizeTranscript(appData, conv) {
 
       const pIdx = buf.indexOf(B_PLANNER, start);
       if (pIdx >= 0 && pIdx < end) {
-        if (!a.model || remBytes <= 8192) {
-          const m = extractStrSpan(buf, start, end, B_MODEL);
-          if (m) a.model = m;
-        }
+        const stepModel = extractModelFast(buf, start, end, a) || a.model || 'unknown';
 
         let inp = extractIntSpan(buf, start, end, B_INPUT_TOK);
         if (inp < 0) inp = extractIntSpan(buf, start, end, B_INPUT_CAMEL);
@@ -772,6 +1006,7 @@ export function summarizeTranscript(appData, conv) {
         a.cacheReadTokens += cac;
         a.outputTokens += out;
         if (inp + cac > 0 || remBytes <= 12 * 1024) a.lastContextTokens = inp + cac;
+        addByModel(a, stepModel, inp, cac, out);
       }
     },
     { rawSpan: true },
@@ -808,7 +1043,7 @@ export function summarizeTranscript(appData, conv) {
       a.tailSteps[ti % TAIL_CAP] = null;
       continue;
     }
-    if (typeof step.model === 'string' && step.model) a.model = step.model;
+    if (typeof step.model === 'string' && step.model.trim()) setAccModel(a, step.model);
     const stepType = typeof step.type === 'string' ? step.type : '';
     const th = stepType === 'PLANNER_RESPONSE' ? thinkingHeading(step.thinking) : '';
     if (th) a.latestThinking = th;
@@ -877,6 +1112,11 @@ export function summarizeTranscript(appData, conv) {
   const replied = reply !== null;
   const replyAsk = replied ? replyQuestion(reply) : '';
   const totalTokens = a.inputTokens + a.cacheReadTokens + a.outputTokens;
+  const modelSpec = getModelSpec(a.model);
+  const byModel = cloneByModel(a.byModel);
+  const cost = computeCostFromByModel(byModel, a.model);
+  const contextLimit = modelSpec.contextLimit;
+  const contextPct = computeContextPct(a.lastContextTokens || a.inputTokens + a.cacheReadTokens, contextLimit);
   const key = `${res.meta.ino}:${res.meta.mtime}:${res.meta.size}:${a.lineCount}`;
 
   state.result = {
@@ -891,6 +1131,9 @@ export function summarizeTranscript(appData, conv) {
       replyAsk,
       mtime: res.meta.mtime,
       model: a.model,
+      modelSpec,
+      contextLimit,
+      contextPct,
       startedAt: a.startedAt,
       lastStepAt: a.lastStepAt,
       thinkingHeading: a.latestThinking,
@@ -902,6 +1145,8 @@ export function summarizeTranscript(appData, conv) {
         outputTokens: a.outputTokens,
         totalTokens,
       },
+      cost,
+      byModel,
     },
   };
 
@@ -2018,26 +2263,143 @@ export function computeGateReadiness(messages, triage = [], { precomputed = null
   };
 }
 
-/** Compute per-worker token share and high-burn warning state for coordinator guardrails. */
+/** Compute per-worker cost/token share and high-burn warning state for coordinator guardrails. */
 export function computeBurnSummary(members, totalTokens = 0) {
-  const total = Number(totalTokens) || 0;
-  const rows = [];
+  const rawEntries = [];
+  let eligibleTokenSum = 0;
+  let sumInput = 0;
+  let sumCacheRead = 0;
+  let sumCostUsd = 0;
+  let sumCacheSavingsUsd = 0;
+  let anyPricingKnown = false;
+
   for (const m of members || []) {
-    if (m.roleWorker) continue;
-    const tok = Number(m.usage?.totalTokens) || 0;
-    if (tok <= 0) continue;
-    const sharePct = total > 0 ? Math.round((tok / total) * 100) : 0;
-    const level = tok >= 400_000 || (total >= 20_000 && sharePct >= 65 && (members?.length || 0) >= 2)
-      ? 'critical'
-      : tok >= 150_000 || (total >= 10_000 && sharePct >= 45 && (members?.length || 0) >= 2)
-        ? 'warn'
-        : 'normal';
-    rows.push({ name: m.name, totalTokens: tok, sharePct, level, killed: Boolean(m.killed) });
+    if (!m || m.roleWorker) continue;
+    const u = m.usage || {};
+    const inp = num(Number(u.inputTokens));
+    const cac = num(Number(u.cacheReadTokens));
+    const out = num(Number(u.outputTokens));
+    const tok = num(Number(u.totalTokens)) || inp + cac + out;
+
+    let mCost = m.cost && typeof m.cost === 'object' ? m.cost : null;
+    if (!mCost) {
+      if (m.byModel && typeof m.byModel === 'object' && Object.keys(m.byModel).length > 0) {
+        mCost = computeCostFromByModel(m.byModel, m.model || '');
+      } else if (m.model && (inp > 0 || cac > 0 || out > 0)) {
+        mCost = computeCostFromByModel({ [sanitizeModelKey(m.model)]: { inputTokens: inp, cacheReadTokens: cac, outputTokens: out, steps: 1 } }, m.model);
+      }
+    }
+
+    const costUsd = roundUsd(num(Number(mCost?.totalUsd)));
+    const cacheSavingsUsd = roundUsd(num(Number(mCost?.cacheSavingsUsd)));
+    const pricingKnown = Boolean(mCost?.pricingKnown);
+    const cacheHitPct =
+      typeof mCost?.cacheHitPct === 'number' && Number.isFinite(mCost.cacheHitPct)
+        ? roundPct(Math.max(0, Math.min(100, mCost.cacheHitPct)))
+        : cac > 0
+          ? roundPct((cac / Math.max(1, inp + cac)) * 100)
+          : 0;
+
+    if (tok <= 0 && costUsd <= 0) continue;
+
+    eligibleTokenSum += tok;
+    sumInput += inp;
+    sumCacheRead += cac;
+    sumCostUsd += costUsd;
+    sumCacheSavingsUsd += cacheSavingsUsd;
+    if (pricingKnown) anyPricingKnown = true;
+
+    rawEntries.push({
+      name: m.name,
+      totalTokens: tok,
+      costUsd,
+      cacheHitPct,
+      cacheSavingsUsd,
+      pricingKnown,
+      killed: Boolean(m.killed),
+    });
   }
-  rows.sort((a, b) => b.totalTokens - a.totalTokens || a.name.localeCompare(b.name));
+
+  const total = num(Number(totalTokens)) || eligibleTokenSum;
+  const totalCostUsd = roundUsd(sumCostUsd);
+  const totalCacheSavingsUsd = roundUsd(sumCacheSavingsUsd);
+  const totalCacheHitPct =
+    sumInput + sumCacheRead > 0
+      ? roundPct((sumCacheRead / Math.max(1, sumInput + sumCacheRead)) * 100)
+      : eligibleTokenSum > 0
+        ? roundPct(rawEntries.reduce((s, r) => s + r.cacheHitPct * r.totalTokens, 0) / eligibleTokenSum)
+        : 0;
+
+  const eligibleCount = rawEntries.length;
+  const multiEligible = eligibleCount >= 2;
+  const rankByCost = anyPricingKnown && totalCostUsd > 0;
+
+  const rows = rawEntries.map((r) => {
+    let sharePct;
+    let level;
+    if (rankByCost && r.pricingKnown) {
+      sharePct = totalCostUsd > 0 ? Math.round((r.costUsd / totalCostUsd) * 100) : 0;
+      level =
+        r.costUsd >= 5.0 || (totalCostUsd >= 0.25 && sharePct >= 65 && multiEligible)
+          ? 'critical'
+          : r.costUsd >= 1.5 || (totalCostUsd >= 0.10 && sharePct >= 45 && multiEligible)
+            ? 'warn'
+            : 'normal';
+    } else if (rankByCost && !r.pricingKnown) {
+      sharePct = 0;
+      level =
+        r.totalTokens >= 400_000 || (total >= 20_000 && (total > 0 ? Math.round((r.totalTokens / total) * 100) : 0) >= 65 && multiEligible)
+          ? 'critical'
+          : r.totalTokens >= 150_000 || (total >= 10_000 && (total > 0 ? Math.round((r.totalTokens / total) * 100) : 0) >= 45 && multiEligible)
+            ? 'warn'
+            : 'normal';
+    } else {
+      sharePct = total > 0 ? Math.round((r.totalTokens / total) * 100) : 0;
+      level =
+        r.totalTokens >= 400_000 || (total >= 20_000 && sharePct >= 65 && multiEligible)
+          ? 'critical'
+          : r.totalTokens >= 150_000 || (total >= 10_000 && sharePct >= 45 && multiEligible)
+            ? 'warn'
+            : 'normal';
+    }
+
+    return {
+      name: r.name,
+      totalTokens: r.totalTokens,
+      sharePct,
+      level,
+      killed: r.killed,
+      costUsd: r.costUsd,
+      cacheHitPct: r.cacheHitPct,
+      cacheSavingsUsd: r.cacheSavingsUsd,
+      pricingKnown: r.pricingKnown,
+    };
+  });
+
+  if (rankByCost) {
+    rows.sort(
+      (a, b) =>
+        b.costUsd - a.costUsd ||
+        (b.pricingKnown ? 1 : 0) - (a.pricingKnown ? 1 : 0) ||
+        b.totalTokens - a.totalTokens ||
+        a.name.localeCompare(b.name),
+    );
+  } else {
+    rows.sort((a, b) => b.totalTokens - a.totalTokens || a.name.localeCompare(b.name));
+  }
+
   const topWorker = rows[0] || null;
   const highBurnCount = rows.filter((r) => r.level !== 'normal').length;
-  return { totalTokens: total, topWorker, highBurnCount, workers: rows.slice(0, 6) };
+  return {
+    totalTokens: total,
+    costUsd: totalCostUsd,
+    cacheHitPct: totalCacheHitPct,
+    cacheSavingsUsd: totalCacheSavingsUsd,
+    pricingKnown: anyPricingKnown,
+    topWorker,
+    highBurnCount,
+    workers: rows.slice(0, 6),
+  };
 }
 
 const REF_SEQ_RE = /(?:^|[^A-Za-z0-9_@#&])#(\d+)\b/g;
@@ -2330,6 +2692,7 @@ function buildMembersAndTelemetry(appData, id, meta, acc, now) {
   let totalInputTokens = 0;
   let totalCacheReadTokens = 0;
   let totalOutputTokens = 0;
+  const swarmByModel = {};
 
   const members = names.map((name) => {
     const m = roster.members[name];
@@ -2365,10 +2728,41 @@ function buildMembersAndTelemetry(appData, id, meta, acc, now) {
     totalCacheReadTokens += usage.cacheReadTokens;
     totalOutputTokens += usage.outputTokens;
 
+    const memberModel = m.model || tr?.model || '';
+    const modelSpec = getModelSpec(memberModel);
+    const byModel = cloneByModel(tr?.byModel);
+    if (Object.hasOwn(byModel, 'unknown') && !tr?.model && m.model) {
+      const moved = byModel.unknown;
+      delete byModel.unknown;
+      const targetKey = sanitizeModelKey(m.model);
+      if (byModel[targetKey]) {
+        byModel[targetKey].inputTokens += moved.inputTokens;
+        byModel[targetKey].cacheReadTokens += moved.cacheReadTokens;
+        byModel[targetKey].outputTokens += moved.outputTokens;
+        byModel[targetKey].steps += moved.steps;
+      } else {
+        byModel[targetKey] = moved;
+      }
+    }
+    for (const [mk, mv] of Object.entries(byModel)) {
+      if (!swarmByModel[mk]) {
+        swarmByModel[mk] = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
+      }
+      swarmByModel[mk].inputTokens += mv.inputTokens;
+      swarmByModel[mk].cacheReadTokens += mv.cacheReadTokens;
+      swarmByModel[mk].outputTokens += mv.outputTokens;
+      swarmByModel[mk].steps += mv.steps;
+    }
+
+    const cost = computeCostFromByModel(byModel, memberModel);
+    const lastContextTokens = tr?.lastContextTokens || 0;
+    const contextLimit = modelSpec.contextLimit;
+    const contextPct = computeContextPct(lastContextTokens || usage.inputTokens + usage.cacheReadTokens, contextLimit);
+
     return {
       name,
       conversation_id: convId,
-      model: m.model || tr?.model || '',
+      model: memberModel,
       role,
       wake_mode: m.wake_mode || '',
       status,
@@ -2390,8 +2784,12 @@ function buildMembersAndTelemetry(appData, id, meta, acc, now) {
       lastStepAt: tr?.lastStepAt || '',
       thinkingHeading: tr?.thinkingHeading || '',
       recentTools: tr?.recentTools || [],
-      lastContextTokens: tr?.lastContextTokens || 0,
+      lastContextTokens,
+      contextLimit,
+      contextPct,
       usage,
+      cost,
+      byModel,
       ...(typeof m.workspace_mode === 'string' && m.workspace_mode ? { workspace_mode: m.workspace_mode } : {}),
       ...(typeof m.workspace === 'string' && m.workspace ? { workspace: m.workspace } : {}),
       ...(acc.posts.get(name) || { posts: 0, lastPostSeq: 0, lastPostTime: '', lastPostTs: null }),
@@ -2414,6 +2812,23 @@ function buildMembersAndTelemetry(appData, id, meta, acc, now) {
   const totalTokens = totalInputTokens + totalCacheReadTokens + totalOutputTokens;
   const burnSummary = computeBurnSummary(members, totalTokens);
   const gateReadiness = computeGateReadiness(triageMsgs, triage, { precomputed: acc.gateAcc, members, title });
+  const cost = computeCostFromByModel(swarmByModel);
+  if (!Object.keys(swarmByModel).length && members.some((m) => m.cost?.pricingKnown)) {
+    cost.pricingKnown = true;
+  }
+
+  let contextLimit = 200_000;
+  let contextPct = 0;
+  const liveMembers = members.filter((m) => !m.killed);
+  const ctxPool = liveMembers.length > 0 ? liveMembers : members;
+  if (ctxPool.length > 0) {
+    let peak = ctxPool[0];
+    for (let i = 1; i < ctxPool.length; i++) {
+      if (ctxPool[i].contextPct > peak.contextPct) peak = ctxPool[i];
+    }
+    contextLimit = peak.contextLimit;
+    contextPct = peak.contextPct;
+  }
 
   const activeCount = members.filter((m) => !m.killed && m.status === 'working').length;
   const waitingCount = members.filter((m) => !m.killed && m.status === 'waiting').length;
@@ -2438,6 +2853,7 @@ function buildMembersAndTelemetry(appData, id, meta, acc, now) {
       killedCount,
       triageCount: triage.length,
       totalTokens,
+      costUsd: cost.totalUsd,
       hasPlan: Boolean(plan),
       lastActivityTs,
     },
@@ -2450,6 +2866,10 @@ function buildMembersAndTelemetry(appData, id, meta, acc, now) {
     triage,
     burnSummary,
     gateReadiness,
+    contextLimit,
+    contextPct,
+    cost,
+    byModel: swarmByModel,
     usage: {
       inputTokens: totalInputTokens,
       cacheReadTokens: totalCacheReadTokens,
@@ -2542,6 +2962,10 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     triage: telemetry.triage,
     burnSummary: telemetry.burnSummary,
     gateReadiness: telemetry.gateReadiness,
+    contextLimit: telemetry.contextLimit,
+    contextPct: telemetry.contextPct,
+    cost: telemetry.cost,
+    byModel: telemetry.byModel,
     usage: telemetry.usage,
   };
 
@@ -2785,6 +3209,10 @@ export function buildSwarmDelta({ appData, conversationId, since = 0, prevEtag =
     triage: telemetry.triage,
     burnSummary: telemetry.burnSummary,
     gateReadiness: telemetry.gateReadiness,
+    contextLimit: telemetry.contextLimit,
+    contextPct: telemetry.contextPct,
+    cost: telemetry.cost,
+    byModel: telemetry.byModel,
     usage: telemetry.usage,
   };
 }
