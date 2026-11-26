@@ -57,6 +57,13 @@ const SHARED_CHUNK_BUF = Buffer.allocUnsafe(CHUNK_BYTES);
 const TAIL_CAP = 16;
 const RECENT_TOOLS_CAP = 5;
 const MAX_LINE_BYTES = 2 * 1024 * 1024;
+const TAIL_ANCHOR_BYTES = 64;
+
+function cleanTok(v) {
+  if (typeof v === 'boolean' || v === null || v === undefined || v === '') return 0;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
 
 function safeStr(v, fallback = '') {
   if (typeof v === 'string') return v;
@@ -139,10 +146,11 @@ function extractIntSpan(buf, start, end, keyBuf) {
     const c = buf[pos];
     if (c < 48 || c > 57) break;
     val = val * 10 + (c - 48);
+    if (!Number.isFinite(val)) return -1;
     digits++;
     pos++;
   }
-  return digits > 0 ? val : -1;
+  return digits > 0 && Number.isFinite(val) ? val : -1;
 }
 
 function extractStrSpan(buf, start, end, keyBuf) {
@@ -171,12 +179,13 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine, { rawSpan =
     return { exists: true, meta: prevMeta, changed: false };
   }
 
-  const isAppend = Boolean(prevMeta && prevMeta.ino === s.ino && s.size >= prevMeta.size);
+  let isAppend = Boolean(prevMeta && prevMeta.ino === s.ino && s.size > prevMeta.size);
   let offset = isAppend ? prevMeta.size : 0;
   let carryBuf = isAppend && prevMeta.carryBuf ? prevMeta.carryBuf : Buffer.alloc(0);
-  if (!isAppend) onReset();
+  let dropUntilNl = isAppend ? Boolean(prevMeta.dropUntilNl) : false;
+  let tailAnchor = Buffer.alloc(0);
 
-  if (s.size > offset) {
+  if (s.size > 0) {
     let fd;
     try {
       fd = openSync(filePath, 'r');
@@ -184,9 +193,21 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine, { rawSpan =
       return { exists: false, meta: null, changed: Boolean(prevMeta) };
     }
     try {
+      if (isAppend && prevMeta.size > 0 && prevMeta.tailAnchor && prevMeta.tailAnchor.length > 0) {
+        const anchorLen = prevMeta.tailAnchor.length;
+        const anchorBuf = Buffer.allocUnsafe(anchorLen);
+        const anchorRead = readSync(fd, anchorBuf, 0, anchorLen, prevMeta.size - anchorLen);
+        if (anchorRead !== anchorLen || anchorBuf.compare(prevMeta.tailAnchor) !== 0) {
+          isAppend = false;
+          offset = 0;
+          carryBuf = Buffer.alloc(0);
+          dropUntilNl = false;
+        }
+      }
+      if (!isAppend) onReset();
+
       let overflowCarry = carryBuf;
       let sharedCarryLen = 0;
-      let dropUntilNl = false;
       if (!overflowCarry.length) {
         sharedCarryLen = 0;
       } else if (overflowCarry.length < CHUNK_BYTES) {
@@ -251,6 +272,13 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine, { rawSpan =
         }
       }
       carryBuf = sharedCarryLen > 0 ? Buffer.from(SHARED_CHUNK_BUF.subarray(0, sharedCarryLen)) : overflowCarry;
+
+      const anchorLen = Math.min(TAIL_ANCHOR_BYTES, s.size);
+      if (anchorLen > 0) {
+        const anchorBuf = Buffer.allocUnsafe(anchorLen);
+        const anchorRead = readSync(fd, anchorBuf, 0, anchorLen, s.size - anchorLen);
+        if (anchorRead === anchorLen) tailAnchor = anchorBuf;
+      }
     } catch {
       return { exists: false, meta: null, changed: Boolean(prevMeta) };
     } finally {
@@ -258,6 +286,8 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine, { rawSpan =
         closeSync(fd);
       } catch {}
     }
+  } else if (!isAppend) {
+    onReset();
   }
 
   if (carryBuf.length) {
@@ -268,8 +298,8 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine, { rawSpan =
         if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
           if (rawSpan) onLine(carryBuf, 0, carryBuf.length, obj, 0);
           else onLine(trimmedCarry, obj);
-          carryBuf = Buffer.alloc(0);
         }
+        carryBuf = Buffer.alloc(0);
       } catch {
         // Torn trailing line kept in `carryBuf` until next write completes it.
       }
@@ -281,7 +311,7 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine, { rawSpan =
   return {
     exists: true,
     changed: true,
-    meta: { ino: s.ino, size: s.size, mtime: s.mtime, carryBuf },
+    meta: { ino: s.ino, size: s.size, mtime: s.mtime, carryBuf, tailAnchor, dropUntilNl },
   };
 }
 
@@ -654,7 +684,7 @@ export function readTranscriptActivityTail(appData, conv) {
 }
 
 function num(v) {
-  return Number.isFinite(v) && v >= 0 ? v : 0;
+  return cleanTok(v);
 }
 
 const UNKNOWN_MODEL_SPEC = Object.freeze({
@@ -748,11 +778,13 @@ export function getModelSpec(modelId) {
 }
 
 function roundUsd(v) {
-  return Math.round(v * 1e6) / 1e6;
+  const n = Number.isFinite(v) && v > 0 ? v : 0;
+  return Math.round(n * 1e6) / 1e6;
 }
 
 function roundPct(v) {
-  return Math.round(v * 10) / 10;
+  const n = Number.isFinite(v) ? v : 0;
+  return Math.round(n * 10) / 10;
 }
 
 function sanitizeModelKey(model) {
@@ -762,10 +794,11 @@ function sanitizeModelKey(model) {
 }
 
 function computeContextPct(contextTokens, contextLimit) {
-  const tok = num(Number(contextTokens));
-  const limit = num(Number(contextLimit));
+  const tok = cleanTok(contextTokens);
+  const limit = cleanTok(contextLimit);
   if (limit <= 0 || tok <= 0) return 0;
-  return Math.min(100, Math.max(0, Math.round((tok / limit) * 100)));
+  const pct = (tok / limit) * 100;
+  return Number.isFinite(pct) ? Math.min(100, Math.max(0, Math.round(pct))) : 0;
 }
 
 function cloneByModel(byModel) {
@@ -776,16 +809,16 @@ function cloneByModel(byModel) {
     if (!v || typeof v !== 'object') continue;
     const prev = out[key];
     if (prev) {
-      prev.inputTokens += num(Number(v.inputTokens));
-      prev.cacheReadTokens += num(Number(v.cacheReadTokens));
-      prev.outputTokens += num(Number(v.outputTokens));
-      prev.steps += num(Number(v.steps));
+      prev.inputTokens += cleanTok(v.inputTokens);
+      prev.cacheReadTokens += cleanTok(v.cacheReadTokens);
+      prev.outputTokens += cleanTok(v.outputTokens);
+      prev.steps += cleanTok(v.steps);
     } else {
       out[key] = {
-        inputTokens: num(Number(v.inputTokens)),
-        cacheReadTokens: num(Number(v.cacheReadTokens)),
-        outputTokens: num(Number(v.outputTokens)),
-        steps: num(Number(v.steps)),
+        inputTokens: cleanTok(v.inputTokens),
+        cacheReadTokens: cleanTok(v.cacheReadTokens),
+        outputTokens: cleanTok(v.outputTokens),
+        steps: cleanTok(v.steps),
       };
     }
   }
@@ -806,9 +839,9 @@ function computeCostFromByModel(byModel, fallbackModel = '') {
     if (!entry || typeof entry !== 'object') continue;
     hasEntries = true;
     const spec = getModelSpec(modelId);
-    const inp = num(Number(entry.inputTokens));
-    const cac = num(Number(entry.cacheReadTokens));
-    const out = num(Number(entry.outputTokens));
+    const inp = cleanTok(entry.inputTokens);
+    const cac = cleanTok(entry.cacheReadTokens);
+    const out = cleanTok(entry.outputTokens);
     totalInputTokens += inp;
     totalCacheReadTokens += cac;
     if (spec.pricingKnown) {
@@ -825,9 +858,10 @@ function computeCostFromByModel(byModel, fallbackModel = '') {
   }
 
   const totalUsd = roundUsd(inputUsd + cacheReadUsd + outputUsd);
+  const cacheDenom = totalInputTokens + totalCacheReadTokens;
   const cacheHitPct =
-    totalCacheReadTokens > 0
-      ? roundPct((totalCacheReadTokens / Math.max(1, totalInputTokens + totalCacheReadTokens)) * 100)
+    totalCacheReadTokens > 0 && cacheDenom > 0
+      ? roundPct(Math.min(100, Math.max(0, (totalCacheReadTokens / cacheDenom) * 100)))
       : 0;
 
   return {
@@ -884,9 +918,9 @@ function addByModel(a, modelId, inp, cac, out) {
     entry = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
     a.byModel[key] = entry;
   }
-  entry.inputTokens += inp;
-  entry.cacheReadTokens += cac;
-  entry.outputTokens += out;
+  entry.inputTokens += cleanTok(inp);
+  entry.cacheReadTokens += cleanTok(cac);
+  entry.outputTokens += cleanTok(out);
   entry.steps += 1;
 }
 
@@ -952,9 +986,9 @@ export function summarizeTranscript(appData, conv) {
         const rawModel = typeof preParsed.model === 'string' ? setAccModel(a, preParsed.model) : '';
         if (preParsed.type === 'PLANNER_RESPONSE') {
           const u = preParsed.usage && typeof preParsed.usage === 'object' ? preParsed.usage : preParsed;
-          const inp = num(Number(u.input_tokens ?? u.inputTokens));
-          const cac = num(Number(u.cache_read_tokens ?? u.cacheReadTokens));
-          const out = num(Number(u.output_tokens ?? u.outputTokens));
+          const inp = cleanTok(u.input_tokens ?? u.inputTokens);
+          const cac = cleanTok(u.cache_read_tokens ?? u.cacheReadTokens);
+          const out = cleanTok(u.output_tokens ?? u.outputTokens);
           a.inputTokens += inp;
           a.cacheReadTokens += cac;
           a.outputTokens += out;
@@ -991,17 +1025,17 @@ export function summarizeTranscript(appData, conv) {
             try {
               const parsed = JSON.parse(buf.toString('utf8', start, end));
               const u = parsed.usage && typeof parsed.usage === 'object' ? parsed.usage : parsed;
-              inp = num(Number(u.input_tokens ?? u.inputTokens));
-              cac = num(Number(u.cache_read_tokens ?? u.cacheReadTokens));
-              out = num(Number(u.output_tokens ?? u.outputTokens));
+              inp = cleanTok(u.input_tokens ?? u.inputTokens);
+              cac = cleanTok(u.cache_read_tokens ?? u.cacheReadTokens);
+              out = cleanTok(u.output_tokens ?? u.outputTokens);
             } catch {
               // torn line skipped
             }
           }
         }
-        inp = Math.max(0, inp);
-        cac = Math.max(0, cac);
-        out = Math.max(0, out);
+        inp = cleanTok(inp);
+        cac = cleanTok(cac);
+        out = cleanTok(out);
         a.inputTokens += inp;
         a.cacheReadTokens += cac;
         a.outputTokens += out;
@@ -2276,10 +2310,10 @@ export function computeBurnSummary(members, totalTokens = 0) {
   for (const m of members || []) {
     if (!m || m.roleWorker) continue;
     const u = m.usage || {};
-    const inp = num(Number(u.inputTokens));
-    const cac = num(Number(u.cacheReadTokens));
-    const out = num(Number(u.outputTokens));
-    const tok = num(Number(u.totalTokens)) || inp + cac + out;
+    const inp = cleanTok(u.inputTokens);
+    const cac = cleanTok(u.cacheReadTokens);
+    const out = cleanTok(u.outputTokens);
+    const tok = cleanTok(u.totalTokens) || inp + cac + out;
 
     let mCost = m.cost && typeof m.cost === 'object' ? m.cost : null;
     if (!mCost) {
@@ -2290,14 +2324,15 @@ export function computeBurnSummary(members, totalTokens = 0) {
       }
     }
 
-    const costUsd = roundUsd(num(Number(mCost?.totalUsd)));
-    const cacheSavingsUsd = roundUsd(num(Number(mCost?.cacheSavingsUsd)));
+    const costUsd = roundUsd(cleanTok(mCost?.totalUsd));
+    const cacheSavingsUsd = roundUsd(cleanTok(mCost?.cacheSavingsUsd));
     const pricingKnown = Boolean(mCost?.pricingKnown);
+    const cacheDenom = inp + cac;
     const cacheHitPct =
       typeof mCost?.cacheHitPct === 'number' && Number.isFinite(mCost.cacheHitPct)
         ? roundPct(Math.max(0, Math.min(100, mCost.cacheHitPct)))
-        : cac > 0
-          ? roundPct((cac / Math.max(1, inp + cac)) * 100)
+        : cac > 0 && cacheDenom > 0
+          ? roundPct(Math.min(100, Math.max(0, (cac / cacheDenom) * 100)))
           : 0;
 
     if (tok <= 0 && costUsd <= 0) continue;
@@ -3118,6 +3153,9 @@ export function buildSwarmDelta({ appData, conversationId, since = 0, prevEtag =
     streamMeta = res.meta;
     acc = createBoardAcc();
     batchResult = applyBoardBatch(acc, parsed, roster, names, matchMentions);
+    if (batchResult.seqReset) return returnFull();
+    trimRecentMsgs(acc);
+    prevEvictedMaxSeq = acc.evictedMaxSeq;
   }
 
   // If client's since is ahead of board head or older than retained recent window, fall back to full snapshot
@@ -3349,13 +3387,56 @@ const TRANSCRIPT_TEXT_MAX_CHARS = 1200;
 const TRANSCRIPT_PREVIEW_MAX_BYTES = 2048;
 
 const PRIVATE_KEY_RE = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g;
-const BEARER_RE = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]{6,}/gi;
-const AUTH_HDR_RE = /\b(Authorization:\s*(?:Basic|Token)\s+)[A-Za-z0-9._~+/=-]{6,}/gi;
-const SK_TOKEN_RE = /\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{8,}/g;
-const GH_TOKEN_RE = /\b(?:ghp|gho|ghs|ghu)_[A-Za-z0-9_]{8,}|\bgithub_pat_[A-Za-z0-9_]{12,}/g;
-const AIZA_TOKEN_RE = /\bAIza[A-Za-z0-9_-]{8,}/g;
-const SLACK_TOKEN_RE = /\bxox[bpar]-[A-Za-z0-9-]{8,}/g;
-const AWS_TOKEN_RE = /\b(?:AKIA|ASIA)[A-Z0-9]{8,}/g;
+const AUTH_HDR_RE = /\b(Authorization:\s*(?:Basic|Token|Bearer)\s+)[A-Za-z0-9._~+/=-]{4,}/gi;
+const BEARER_PROSE_WORDS = new Set([
+  'token',
+  'tokens',
+  'auth',
+  'authentication',
+  'authorization',
+  'header',
+  'headers',
+  'scheme',
+  'schemes',
+  'format',
+  'formats',
+  'credential',
+  'credentials',
+  'flow',
+  'flows',
+  'mode',
+  'modes',
+  'type',
+  'types',
+  'prefix',
+  'prefixes',
+  'access',
+  'grant',
+  'grants',
+  'client',
+  'clients',
+  'server',
+  'servers',
+  'string',
+  'strings',
+  'value',
+  'values',
+  'should',
+  'must',
+  'will',
+  'would',
+  'could',
+  'shall',
+  'cannot',
+  'present',
+  'missing',
+]);
+const BEARER_RE = /\b(Bearer\s+)([A-Za-z0-9._~+/=-]{4,})/g;
+const SK_TOKEN_RE = /\bsk-(?:proj-|ant-|svcacct-|live-|test-)[A-Za-z0-9_-]{4,}|\bsk-(?=[A-Za-z0-9_-]*[0-9A-Z_])[A-Za-z0-9_-]{4,}|\bsk-[A-Za-z0-9_-]{10,}/g;
+const GH_TOKEN_RE = /\b(?:ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9_]{4,}|\bgithub_pat_[A-Za-z0-9_]{4,}/g;
+const AIZA_TOKEN_RE = /\bAIza[A-Za-z0-9_-]{4,}/g;
+const SLACK_TOKEN_RE = /\bxox[bpaers]-[A-Za-z0-9-]{4,}/g;
+const AWS_TOKEN_RE = /\b(?:AKIA|ASIA)[A-Z0-9]{4,}/g;
 const ENV_SECRET_RE = /\b([A-Z][A-Z0-9_]*(?:API_KEY|SECRET_KEY|ACCESS_KEY|AUTH_TOKEN|BOT_TOKEN|PRIVATE_KEY|PASSWORD|SECRET|TOKEN)\s*=\s*)(?:"[^"\n]{4,}"|'[^'\n]{4,}'|[^\s"'`;,]{6,})/g;
 
 const transcriptCursorCache = new Map(); // realPath -> { ino, size, anchors: Map<stepIndex, byteOffset> }
@@ -3366,8 +3447,14 @@ function scrubTranscriptText(s) {
   if (!out) return '';
   return out
     .replace(PRIVATE_KEY_RE, '[REDACTED:PRIVATE_KEY]')
-    .replace(BEARER_RE, '$1[REDACTED]')
     .replace(AUTH_HDR_RE, '$1[REDACTED]')
+    .replace(BEARER_RE, (full, prefix, tok) => {
+      if (BEARER_PROSE_WORDS.has(tok.toLowerCase())) return full;
+      if (/[0-9._~+/=-]/.test(tok) || (/[A-Z]/.test(tok) && /[a-z]/.test(tok)) || tok.length >= 16) {
+        return `${prefix}[REDACTED]`;
+      }
+      return full;
+    })
     .replace(SK_TOKEN_RE, '[REDACTED:sk]')
     .replace(GH_TOKEN_RE, '[REDACTED:github]')
     .replace(AIZA_TOKEN_RE, '[REDACTED:AIza]')
@@ -3649,7 +3736,12 @@ function readBackwardTranscriptLines(realTr, fileSize, readEndOffset, { before, 
       const toRead = Math.min(TRANSCRIPT_BACK_CHUNK_BYTES, pos, remainingBudget);
       if (toRead <= 0) break;
       const readStart = pos - toRead;
-      const bytesRead = readSync(fd, chunkBuf, 0, toRead, readStart);
+      let bytesRead = 0;
+      try {
+        bytesRead = readSync(fd, chunkBuf, 0, toRead, readStart);
+      } catch {
+        return { error: true };
+      }
       if (bytesRead <= 0) break;
       bytesScanned += bytesRead;
       pos = readStart;
@@ -3847,9 +3939,9 @@ function correlateTranscriptSteps(revLines, reachedBeginning) {
     }
 
     const u = raw.usage && typeof raw.usage === 'object' ? raw.usage : raw;
-    const inputTokens = num(Number(u.input_tokens ?? u.inputTokens));
-    const cacheReadTokens = num(Number(u.cache_read_tokens ?? u.cacheReadTokens));
-    const outputTokens = num(Number(u.output_tokens ?? u.outputTokens));
+    const inputTokens = cleanTok(u.input_tokens ?? u.inputTokens);
+    const cacheReadTokens = cleanTok(u.cache_read_tokens ?? u.cacheReadTokens);
+    const outputTokens = cleanTok(u.output_tokens ?? u.outputTokens);
     const errRaw = safeStr(raw.error) || (type === 'ERROR_MESSAGE' ? safeStr(raw.content) : '');
 
     const entry = {
@@ -4035,7 +4127,7 @@ export function readTranscriptSteps(appDataDirs, opts = {}) {
   let nextBefore = null;
   if (eligibleDesc.length > limit) {
     const oldestReturned = pageRaw[pageRaw.length - 1];
-    if (oldestReturned.stepIndex > 0) {
+    if (oldestReturned.stepIndex > 0 && (before === null || oldestReturned.stepIndex < before)) {
       hasMore = true;
       nextBefore = oldestReturned.stepIndex;
       recordCursorAnchor(confined.realTr, confined.stat, nextBefore, oldestReturned._byteOffset);
@@ -4049,7 +4141,7 @@ export function readTranscriptSteps(appDataDirs, opts = {}) {
       pageRaw.length > 0 && filter === 'all'
         ? pageRaw[pageRaw.length - 1]._byteOffset
         : scan.oldestScannedByteOffset;
-    if (cursorStep !== null && cursorStep > 0) {
+    if (cursorStep !== null && cursorStep > 0 && (before === null || cursorStep < before)) {
       hasMore = true;
       nextBefore = cursorStep;
       recordCursorAnchor(confined.realTr, confined.stat, nextBefore, cursorOffset);

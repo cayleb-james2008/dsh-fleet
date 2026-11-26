@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -1760,4 +1760,309 @@ test('computeBurnSummary ranks by costUsd over raw tokens for cache-heavy cheap 
   assert.equal(unknownBurn.pricingKnown, false);
   assert.equal(unknownBurn.topWorker?.name, 'custom-b');
   assert.equal(unknownBurn.topWorker?.level, 'critical');
+});
+
+test('E1 hardening: buildSwarmDelta handles corrupt partial tail, same-size rewrite, and truncate+grow cleanly', () => {
+  const dir = makeScratchDir('delta-h1-');
+  try {
+    const coordId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+    const workerId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+    const swDir = join(dir, 'brain', coordId, '.system_generated', 'swarm');
+    mkdirSync(swDir, { recursive: true });
+    writeFileSync(
+      join(swDir, 'members.json'),
+      JSON.stringify({
+        title: 'Delta Hardening',
+        members: {
+          coordinator: { conversation_id: coordId, role: 'coordinator' },
+          builder: { conversation_id: workerId, role: 'worker' },
+        },
+      }),
+    );
+
+    const boardPath = join(swDir, 'board.jsonl');
+    const l1 = JSON.stringify({ seq: 1, agent: 'coordinator', text: '@builder start' });
+    const l2 = JSON.stringify({ seq: 2, agent: 'builder', text: '@coordinator working' });
+    writeFileSync(boardPath, l1 + '\n' + l2 + '\n');
+
+    const full0 = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 0 });
+    assert.equal(full0.mode, 'full');
+    assert.equal(full0.head, 2);
+
+    // 1. Corrupt partial tail line followed by newline + valid seq 3 skips corrupt line without losing seq 3
+    appendFileSync(boardPath, '{"seq":99,"broken":true');
+    const midCorrupt = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 2, prevEtag: full0.etag });
+    assert.equal(midCorrupt.mode, 'delta');
+    assert.equal(midCorrupt.head, 2);
+    assert.equal(midCorrupt.messagesDelta.length, 0);
+
+    appendFileSync(boardPath, '\n' + JSON.stringify({ seq: 3, agent: 'builder', text: '@coordinator recovered' }) + '\n');
+    const afterCorrupt = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 2, prevEtag: midCorrupt.etag });
+    assert.equal(afterCorrupt.mode, 'delta');
+    assert.equal(afterCorrupt.head, 3);
+    assert.deepEqual(afterCorrupt.messagesDelta.map((m) => m.seq), [3]);
+
+    // 2. Truncate mid-line and rewrite to LARGER size on same inode -> tailAnchor mismatch forces mode: "full"
+    const oldBuf = readFileSync(boardPath);
+    const padded = JSON.stringify({ seq: 1, agent: 'coordinator', text: '@builder ' + 'P'.repeat(oldBuf.length + 64) }) + '\n';
+    writeFileSync(boardPath, padded);
+    const growRewrite = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 3, prevEtag: afterCorrupt.etag });
+    assert.equal(growRewrite.mode, 'full');
+    assert.equal(growRewrite.head, 1);
+    assert.equal(growRewrite.messages.length, 1);
+
+    // 3. Same-size overwrite with different mtime transitions cleanly to mode: "full" without skipping
+    const prevLen = Buffer.byteLength(padded, 'utf8');
+    const baseSame = JSON.stringify({ seq: 2, agent: 'builder', text: '@coordinator ' }) + '\n';
+    const qFill = 'Q'.repeat(prevLen - Buffer.byteLength(baseSame, 'utf8'));
+    const sameLenLine = JSON.stringify({ seq: 2, agent: 'builder', text: '@coordinator ' + qFill }) + '\n';
+    assert.equal(Buffer.byteLength(sameLenLine, 'utf8'), prevLen);
+    writeFileSync(boardPath, sameLenLine);
+    const tFuture = new Date(Date.now() + 5000);
+    utimesSync(boardPath, tFuture, tFuture);
+    const sameSizeFull = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 1, prevEtag: growRewrite.etag });
+    assert.equal(sameSizeFull.mode, 'full');
+    assert.equal(sameSizeFull.head, 2);
+    assert.equal(sameSizeFull.messages[0].seq, 2);
+
+    // 4. Truncate to 0 bytes -> mode: "full" with head: 0, empty messages
+    truncateSync(boardPath, 0);
+    const zeroFull = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 2, prevEtag: sameSizeFull.etag });
+    assert.equal(zeroFull.mode, 'full');
+    assert.equal(zeroFull.head, 0);
+    assert.equal(zeroFull.messages.length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('E2 hardening: tuned secret scrubbing, UTF-8/binary slice safety, and CWE-59 intermediate symlink checks', () => {
+  const dir = makeScratchDir('tr-h1-');
+  try {
+    const coordId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+    const workerId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+    const logsDirSymId = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
+    const memberDirSymId = 'dddddddd-dddd-dddd-dddd-dddddddddddd';
+    const danglingSymId = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee';
+    const swDir = join(dir, 'brain', coordId, '.system_generated', 'swarm');
+    const workerLogs = join(dir, 'brain', workerId, '.system_generated', 'logs');
+    mkdirSync(swDir, { recursive: true });
+    mkdirSync(workerLogs, { recursive: true });
+
+    const outsideDir = join(dir, 'outside-dir');
+    mkdirSync(outsideDir, { recursive: true });
+    writeFileSync(join(outsideDir, 'transcript.jsonl'), JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: 'LEAK' }) + '\n');
+
+    // Intermediate logs symlink escape
+    const symLogsParent = join(dir, 'brain', logsDirSymId, '.system_generated');
+    mkdirSync(symLogsParent, { recursive: true });
+    symlinkSync(outsideDir, join(symLogsParent, 'logs'));
+
+    // Member dir symlink escape
+    symlinkSync(outsideDir, join(dir, 'brain', memberDirSymId));
+
+    // Dangling transcript symlink
+    const danglingLogs = join(dir, 'brain', danglingSymId, '.system_generated', 'logs');
+    mkdirSync(danglingLogs, { recursive: true });
+    symlinkSync(join(dir, 'does-not-exist.jsonl'), join(danglingLogs, 'transcript.jsonl'));
+
+    writeFileSync(
+      join(swDir, 'members.json'),
+      JSON.stringify({
+        title: 'Transcript Hardening',
+        members: {
+          coordinator: { conversation_id: coordId, role: 'coordinator' },
+          builder: { conversation_id: workerId, role: 'worker' },
+          sym_logs: { conversation_id: logsDirSymId, role: 'worker' },
+          sym_member: { conversation_id: memberDirSymId, role: 'worker' },
+          sym_dangling: { conversation_id: danglingSymId, role: 'worker' },
+        },
+      }),
+    );
+
+    // 1. CWE-59 intermediate & dangling symlinks all rejected with 400
+    for (const badMember of ['sym_logs', 'sym_member', 'sym_dangling']) {
+      const r = readTranscriptSteps([dir], { conversationId: coordId, member: badMember });
+      assert.equal(r.ok, false);
+      assert.equal(r.status, 400);
+    }
+
+    // 2. Tuned secret scrubbing: short tokens scrubbed, normal English prose & tool names intact
+    writeFileSync(
+      join(workerLogs, 'transcript.jsonl'),
+      [
+        JSON.stringify({
+          step_index: 0,
+          type: 'USER_INPUT',
+          content:
+            'The bearer of bad news used Bearer authentication and Bearer token validation for sk-learn desk-check task-runner.',
+        }),
+        JSON.stringify({
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content:
+            'Secrets: Bearer ab12 Authorization: Bearer abcd sk-1234 sk-proj-ab12 ghp_1234 gho_abcd AIza1234 xoxb-1234 AKIA1234',
+          tool_calls: [
+            { name: 'ask_question', args: { prompt: 'Check Bearer header format' } },
+            { name: 'run_command', args: { CommandLine: 'echo sk-ant-xy12' } },
+          ],
+        }),
+      ].join('\n') + '\n',
+    );
+    const scrubRes = readTranscriptSteps([dir], { conversationId: coordId, member: 'builder', limit: 10 });
+    assert.equal(scrubRes.ok, true);
+    const s1 = scrubRes.steps[0];
+    const s0 = scrubRes.steps[1];
+    assert.ok(s0.content.includes('The bearer of bad news'));
+    assert.ok(s0.content.includes('Bearer authentication'));
+    assert.ok(s0.content.includes('Bearer token validation'));
+    assert.ok(s0.content.includes('sk-learn desk-check task-runner'));
+    assert.equal(s1.toolCalls[0].name, 'ask_question');
+    assert.equal(s1.toolCalls[0].args.prompt, 'Check Bearer header format');
+    assert.equal(s1.toolCalls[1].name, 'run_command');
+    for (const secret of ['ab12', 'abcd', 'sk-1234', 'sk-proj-ab12', 'ghp_1234', 'gho_abcd', 'AIza1234', 'xoxb-1234', 'AKIA1234', 'sk-ant-xy12']) {
+      assert.ok(!s1.content.includes(secret) && !JSON.stringify(s1.toolCalls).includes(secret), `Secret leaked: ${secret}`);
+    }
+
+    // 3. Multi-byte UTF-8 across 64 KiB chunk boundary + 512 KiB binary/corrupt block + truncated UTF-8 tail
+    const trPath = join(workerLogs, 'transcript.jsonl');
+    const chunks = [];
+    // Valid early steps
+    for (let i = 0; i < 5; i++) {
+      chunks.push(Buffer.from(JSON.stringify({ step_index: i, type: 'USER_INPUT', content: `early-${i}` }) + '\n', 'utf8'));
+    }
+    // >512 KiB of raw binary/malformed lines with invalid UTF-8 bytes & NUL bytes
+    const binLine = Buffer.concat([Buffer.from([0x7b, 0x00, 0xff, 0xfe, 0x80, 0xc3, 0x28]), Buffer.alloc(4096, 0x81), Buffer.from('\n')]);
+    for (let i = 0; i < 140; i++) chunks.push(binLine);
+    // Valid step spanning >64 KiB chunk boundary with 4-byte UTF-8 emojis 🚀 right around 65536 bytes
+    const emojiPad = '🚀'.repeat(17000); // ~68 KB
+    chunks.push(Buffer.from(JSON.stringify({ step_index: 6, type: 'PLANNER_RESPONSE', content: `utf8-ok-${emojiPad}`, tool_calls: [] }) + '\n', 'utf8'));
+    // Truncated partial line with half of a 4-byte UTF-8 sequence at EOF (no trailing newline)
+    chunks.push(Buffer.concat([Buffer.from('{"step_index":7,"type":"USER_INPUT","content":"torn '), Buffer.from([0xf0, 0x9f])]));
+    writeFileSync(trPath, Buffer.concat(chunks));
+
+    const binP1 = readTranscriptSteps([dir], { conversationId: coordId, member: 'builder', limit: 10 });
+    assert.equal(binP1.ok, true);
+    assert.deepEqual(binP1.steps.map((s) => s.stepIndex), [6]);
+    assert.ok(binP1.steps[0].content.startsWith('utf8-ok-🚀'));
+    // Walk pages to completion without infinite loop
+    let cur = binP1.nextBefore;
+    let guard = 0;
+    while (cur !== null && guard < 10) {
+      const next = readTranscriptSteps([dir], { conversationId: coordId, member: 'builder', before: cur, limit: 10 });
+      assert.equal(next.ok, true);
+      assert.ok(next.nextBefore === null || next.nextBefore < cur, 'nextBefore must strictly decrease');
+      cur = next.nextBefore;
+      guard++;
+    }
+    assert.ok(guard < 10);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('E3 hardening: clamps negative/NaN/Infinity tokens, guards division-by-zero, and resets byModel on shrink/rotate', () => {
+  const dir = makeScratchDir('cost-h1-');
+  try {
+    const workerId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+    const logsDir = join(dir, 'brain', workerId, '.system_generated', 'logs');
+    mkdirSync(logsDir, { recursive: true });
+    const trFile = join(logsDir, 'transcript.jsonl');
+
+    // Mix of negative, NaN string, Infinity, boolean, huge >308-digit integer, and valid padding
+    const hugeDigits = '9'.repeat(320);
+    const pad = 'p'.repeat(14_000);
+    writeFileSync(
+      trFile,
+      [
+        `{"step_index":0,"type":"PLANNER_RESPONSE","model":"claude-opus-4-6","input_tokens":${hugeDigits},"cache_read_tokens":-500,"output_tokens":100,"content":"${pad}","tool_calls":[]}`,
+        JSON.stringify({
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          model: 'gemini-3-pro',
+          usage: { input_tokens: -100, cache_read_tokens: 'NaN', output_tokens: null },
+          tool_calls: [],
+        }),
+        JSON.stringify({
+          step_index: 2,
+          type: 'PLANNER_RESPONSE',
+          model: 'gemini-3-pro',
+          input_tokens: true,
+          cache_read_tokens: 0,
+          output_tokens: 0,
+          tool_calls: [],
+        }),
+      ].join('\n') + '\n',
+    );
+
+    const { summary } = summarizeTranscript(dir, workerId);
+    assert.equal(Number.isFinite(summary.usage.inputTokens), true);
+    assert.equal(summary.usage.inputTokens, 0);
+    assert.equal(summary.usage.cacheReadTokens, 0);
+    assert.equal(summary.usage.outputTokens, 100);
+    assert.equal(summary.cost.cacheHitPct, 0);
+    assert.equal(summary.contextPct, 0);
+    assert.equal(Number.isFinite(summary.cost.totalUsd), true);
+
+    // Same-size overwrite with a different model resets byModel cleanly
+    const stepA = JSON.stringify({
+      step_index: 0,
+      type: 'PLANNER_RESPONSE',
+      model: 'claude-opus-4-6',
+      input_tokens: 1000,
+      cache_read_tokens: 0,
+      output_tokens: 100,
+      tool_calls: [],
+    }) + '\n';
+    writeFileSync(trFile, stepA);
+    const sA = summarizeTranscript(dir, workerId).summary;
+    assert.deepEqual(Object.keys(sA.byModel), ['claude-opus-4-6']);
+
+    const stepB = JSON.stringify({
+      step_index: 0,
+      type: 'PLANNER_RESPONSE',
+      model: 'gpt-4o-mini-xxx',
+      input_tokens: 1000,
+      cache_read_tokens: 0,
+      output_tokens: 100,
+      tool_calls: [],
+    }) + '\n';
+    assert.equal(Buffer.byteLength(stepB, 'utf8'), Buffer.byteLength(stepA, 'utf8'));
+    writeFileSync(trFile, stepB);
+    const fut = new Date(Date.now() + 5000);
+    utimesSync(trFile, fut, fut);
+    const sB = summarizeTranscript(dir, workerId).summary;
+    assert.deepEqual(Object.keys(sB.byModel), ['gpt-4o-mini-xxx']);
+    assert.equal(sB.contextLimit, 128_000);
+
+    // Truncate to 0 bytes resets byModel and cost to 0 cleanly
+    truncateSync(trFile, 0);
+    const sZero = summarizeTranscript(dir, workerId).summary;
+    assert.deepEqual(sZero.byModel, {});
+    assert.equal(sZero.cost.totalUsd, 0);
+    assert.equal(sZero.cost.cacheHitPct, 0);
+    assert.equal(sZero.contextPct, 0);
+
+    // computeBurnSummary guards negative/NaN/Infinity & zero denominators
+    const burn = computeBurnSummary([
+      {
+        name: 'bad-metrics',
+        roleWorker: false,
+        usage: { inputTokens: -10, cacheReadTokens: NaN, outputTokens: Infinity, totalTokens: -5 },
+        cost: { totalUsd: -1, cacheSavingsUsd: NaN, cacheHitPct: Infinity, pricingKnown: true },
+      },
+      {
+        name: 'zero-tok-cost',
+        roleWorker: false,
+        usage: { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, totalTokens: 0 },
+        cost: { totalUsd: 0.5, cacheSavingsUsd: 0, cacheHitPct: 0, pricingKnown: true },
+      },
+    ], 0);
+    assert.equal(burn.cacheHitPct, 0);
+    assert.equal(burn.costUsd, 0.5);
+    assert.equal(Number.isFinite(burn.topWorker?.sharePct), true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
