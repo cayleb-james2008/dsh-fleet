@@ -86,6 +86,10 @@ export function App() {
   const [selectedTriageIdx, setSelectedTriageIdx] = useState(0);
   const [triageReplyNonce, setTriageReplyNonce] = useState(0);
   const [sseConnected, setSseConnected] = useState(false);
+  const [sseStatus, setSseStatus] = useState<"idle" | "live" | "reconnecting">("idle");
+  const [sseNonce, setSseNonce] = useState(0);
+  const [lastSyncAt, setLastSyncAt] = useState(0);
+  const [nowTick, setNowTick] = useState(() => Date.now());
   const [pinnedMap, setPinnedMap] = useState<Record<string, number[]>>(() => {
     try {
       const raw = localStorage.getItem("fleet-pinned-v1");
@@ -144,6 +148,7 @@ export function App() {
           etagRef.current = data.etag || "";
           setSnap(data);
         }
+        setLastSyncAt(Date.now());
         setError("");
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load swarm");
@@ -169,6 +174,12 @@ export function App() {
     return () => clearInterval(id);
   }, [pollMs, sseConnected, refreshSwarm]);
 
+  useEffect(() => {
+    if (!snap?.swarm) return;
+    const id = setInterval(() => setNowTick(Date.now()), 30000);
+    return () => clearInterval(id);
+  }, [snap?.swarm]);
+
   // Live SSE push stream when running on standalone HTTP server (graceful poll fallback inside SidecarApp).
   const refreshRef = useRef(refreshSwarm);
   refreshRef.current = refreshSwarm;
@@ -177,12 +188,20 @@ export function App() {
   useEffect(() => {
     if (!canSse || pollMs === "0" || !activeConvId || typeof EventSource === "undefined") {
       setSseConnected(false);
+      setSseStatus("idle");
       return;
     }
     const q = `?conversationId=${encodeURIComponent(activeConvId)}`;
     const es = new EventSource(`/api/swarm/stream${q}`);
-    es.onopen = () => setSseConnected(true);
+    es.onopen = () => {
+      setSseConnected(true);
+      setSseStatus("live");
+      setLastSyncAt(Date.now());
+    };
     es.addEventListener("swarm", (ev) => {
+      setSseConnected(true);
+      setSseStatus("live");
+      setLastSyncAt(Date.now());
       try {
         const d = JSON.parse((ev as MessageEvent).data || "{}");
         if (d?.etag && d.etag !== etagRef.current) {
@@ -192,14 +211,21 @@ export function App() {
         refreshRef.current(false);
       }
     });
+    es.addEventListener("ping", () => {
+      setSseConnected(true);
+      setSseStatus("live");
+      setLastSyncAt(Date.now());
+    });
     es.onerror = () => {
       setSseConnected(false);
+      setSseStatus("reconnecting");
     };
     return () => {
       setSseConnected(false);
+      setSseStatus("idle");
       es.close();
     };
-  }, [canSse, pollMs, activeConvId]);
+  }, [canSse, pollMs, activeConvId, sseNonce]);
 
   const allRoots = [...new Set([...workspaceUris, ...manualRoots])];
   const allRootsKey = allRoots.join("\0");
@@ -303,7 +329,17 @@ export function App() {
   };
 
   const handleCopyDigest = () => {
-    if (snap?.swarm) void copyText(formatSwarmDigest(snap, pinnedSeqs, worktrees), "Wave digest copied");
+    if (snap?.swarm) void copyText(formatSwarmDigest(snap, pinnedSeqs, worktrees), "Handoff digest copied");
+  };
+
+  const isStaleSync = hasSwarm && lastSyncAt > 0 && nowTick - lastSyncAt > 45000;
+  const showResyncBanner = hasSwarm && (sseStatus === "reconnecting" || pollMs === "0" || isStaleSync);
+  const handleResync = () => {
+    if (pollMs === "0") setPollMs("2000");
+    setSseStatus(canSse ? "live" : "idle");
+    setSseNonce((n) => n + 1);
+    void refreshSwarm(true);
+    void refreshWorktrees();
   };
 
   const handleTabKeyDown = (e: React.KeyboardEvent, idx: number) => {
@@ -402,7 +438,7 @@ export function App() {
             </div>
           )}
 
-          {/* Row 3: Zero-Clip 340px–380px Underline Tabs */}
+          {/* Row 3: Zero-Clip 340px-380px Underline Tabs */}
           <nav aria-label="Primary views" className="-mb-px">
             <div role="tablist" aria-label="Fleet views" className="flex items-center justify-between sm:justify-start sm:gap-2 w-full">
               {TABS.map(({ id, label, Icon }, idx) => {
@@ -440,6 +476,26 @@ export function App() {
         {error && (
           <Card className="mb-3 border-danger bg-bad-soft p-3 text-[13px] text-danger">
             {error}
+          </Card>
+        )}
+
+        {showResyncBanner && (
+          <Card
+            data-testid="sse-resync-banner"
+            className="mb-3 border-warn bg-warn-soft p-2.5 row flex-wrap gap-2 text-[12px]"
+          >
+            <div className="min-w-0">
+              <span className="font-semibold text-ink">
+                {pollMs === "0" ? "Live updates paused" : sseStatus === "reconnecting" ? "Stream reconnecting" : "Swarm sync stale"}
+              </span>
+              <span className="ml-2 text-ink-2">
+                {pollMs === "0" ? "Resume 2s updates or resync now." : "Refreshing stream or manual resync available."}
+              </span>
+            </div>
+            <Button variant="outline" data-testid="sse-resync-btn" onClick={handleResync}>
+              <RefreshCw />
+              Resync
+            </Button>
           </Card>
         )}
 
@@ -504,6 +560,7 @@ export function App() {
                 onSelectIdx={setSelectedTriageIdx}
                 onTogglePin={handleTogglePin}
                 onJumpToBoardSeq={handleJumpToBoard}
+                onCopyHandoffDigest={handleCopyDigest}
                 onRefresh={() => refreshSwarm(true)}
               />
             )}
@@ -584,7 +641,7 @@ export function App() {
           <div className="rounded-card bg-board p-3 text-[12px] text-ink-2 space-y-1">
             <div className="f1 font-medium text-ink">
               <CommandIcon />
-              <span>Fleet Antigravity Plugin v1.16.0</span>
+              <span>Fleet Antigravity Plugin v1.17.0</span>
             </div>
             <p>Reads local swarm files over loopback with no telemetry.</p>
           </div>

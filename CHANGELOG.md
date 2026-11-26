@@ -3,6 +3,12 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as an
 Antigravity plugin archive (`tar.gz` and `zip`) with `SHA256SUMS`.
 
+## 1.17.0 - 2026-11-25
+
+- Added a 1-click **Copy Handoff Digest** control (`[data-testid="copy-handoff-digest"]`) inside the Triage header in `frontend/src/components/TriageView.tsx` and upgraded `formatSwarmDigest` in `frontend/src/ui.tsx` to export plain-prose Markdown covering active goal, verification gate, gate readiness and wave velocity, worker states, verified deliverables, recent commit refs, blockers, and worktree safe-land readiness with zero local `/home/` path leaks.
+- Added a non-intrusive SSE reconnect and sync-staleness banner (`[data-testid="sse-resync-banner"]` and `[data-testid="sse-resync-btn"]`) in `frontend/src/App.tsx`, paired with explicit `event: ping` SSE keepalive frames in `sidecars/fleet_pane/server_core.mjs` so stalled or paused connections surface cleanly and resync in one click.
+- Split standalone HTTP startup into a lean bootstrapper in `sidecars/fleet_pane/main.mjs` (`server_core.mjs` plus lazy `node:zlib` loading copied by `install.sh`) reaching as low as `52.32 ms` unpinned default-V8 cold boot, refreshed all 8 Light and Dark screenshots (`docs/screenshots/*.png`), and verified `11/11` backend tests, `50/50` gate, `8/8` replay, `12/12` live-web, `0` Sloplint issues, `64.56 MB` (`66,108 KB`) `--jitless` `VmHWM` on `2k/50k`, `1,487.4 req/s` (`13.83 ms` p95, `0` errors, `30/30` fuzz, `5/5` SSE) on `audit_runner.py` under `#154` isolation, and `308,802 B` raw / `96,193 B` gz (`93.9 KiB`).
+
 ## 1.16.0 - 2026-11-25
 
 - Added worktree safe-land readiness (`baseBranch`, `ahead`, `behind`, and `landStatus` across `ready`, `rebase`, `dirty`, `merged`, and `main`) in `sidecars/fleet_pane/git_probe.mjs`, `frontend/src/{types.ts,components/WorktreesView.tsx}`, and `frontend/scripts/web-engine.js`, with 1-click copyable safe-merge, rebase, status, and cleanup commands (`[data-testid="wt-land-status-*"]`, `[data-testid="wt-land-cmd-*"]`) masking local home paths with `~/`.

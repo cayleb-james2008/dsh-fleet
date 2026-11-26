@@ -128,6 +128,29 @@ await check("Multi-Swarm Switcher switches to secondary audit swarm", async () =
   return txt.includes("All traversal, symlink, and loopback checks passed");
 });
 
+await check("Triage Copy Handoff Digest & SSE Resync banner work cleanly offline", async () => {
+  await page.locator("#tab-triage").click();
+  await page.evaluate(() => {
+    window.__lwHandoff = "";
+    try {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: async (t) => { window.__lwHandoff = String(t); } },
+      });
+    } catch {}
+  });
+  await page.locator('[data-testid="copy-handoff-digest"]').click();
+  await page.waitForFunction(() => Boolean(window.__lwHandoff));
+  const clip = await page.evaluate(() => window.__lwHandoff);
+  await page.locator('button[aria-label="Open settings"]').click();
+  await page.locator('div[role="dialog"] button[role="radio"]:has-text("Paused")').click();
+  await page.locator('button[aria-label="Close dialog"]').click();
+  await page.waitForSelector('[data-testid="sse-resync-banner"]');
+  await page.locator('[data-testid="sse-resync-btn"]').click();
+  await page.waitForFunction(() => !document.querySelector('[data-testid="sse-resync-banner"]'));
+  return clip.includes("Handoff Digest") && clip.includes("- Active goal:") && !clip.includes("/home/");
+});
+
 await check("Settings Dark mode + 1440px desktop overflow check", async () => {
   await page.locator('button[aria-label="Open settings"]').click();
   await page.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();

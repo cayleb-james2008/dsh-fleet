@@ -185,7 +185,7 @@ export function humanizeStatus(raw: string | undefined): string {
   return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
 }
 
-export const maskHome = (s: string): string => s.replace(/\/home\/[^/\s]+\//g, "~/");
+export const maskHome = (s: string): string => s.replace(/\/(?:home|Users)\/[^/\s]+(\/|$)/g, (_, sep) => `~${sep}`);
 const cleanDigestLine = (s: string, max = 140) => maskHome(s).replace(/\s+/g, " ").trim().slice(0, max);
 
 export function formatBlockerContext(item: TriageItem, member?: SwarmMember, snap?: SwarmSnapshot): string {
@@ -209,24 +209,59 @@ export function formatSwarmDigest(
   const members = snap.members || [];
   const live = members.filter((m) => !m.killed);
   const cnt = (st: string) => live.filter((m) => m.status === st).length;
+  const gate = snap.gateReadiness;
+  const vel = gate?.velocity;
   const lines = [
-    `# ${snap.title || "Fleet"}`,
-    `- ${cnt("working")} working, ${cnt("waiting")} waiting, ${members.length} members, #${snap.head || 0}, ${fmtTokens(snap.usage?.totalTokens)} tok`,
-    snap.plan?.goal && `- Goal: ${snap.plan.goal}`,
-    snap.plan?.gate && `- Gate: \`${snap.plan.gate}\``,
+    `# ${maskHome(snap.title || "Fleet")} Handoff Digest`,
+    `- Status: ${cnt("working")} working, ${cnt("waiting")} waiting, ${members.length} members, #${snap.head || 0}, ${fmtTokens(snap.usage?.totalTokens)} tok`,
+    snap.plan?.goal && `- Active goal: ${cleanDigestLine(snap.plan.goal, 220)}`,
+    snap.plan?.gate && `- Verification gate: \`${maskHome(snap.plan.gate)}\``,
+    gate &&
+      `- Gate readiness: ${gate.state}${vel ? `, ${vel.passRatePct}% pass rate (${vel.wavesPerHr}/hr, ${vel.done} done, ${vel.verified} verified)` : ""}`,
   ].filter(Boolean) as string[];
   const sec = (title: string, rows: string[]) => rows.length && lines.push("", `## ${title}`, ...rows);
   const pinSet = new Set(pinnedSeqs);
-  sec("Pinned", (snap.messages || []).filter((m) => !m.control && pinSet.has(m.seq)).map((pm) => `- #${pm.seq} @${pm.agent}: ${cleanDigestLine(pm.text)}`));
-  sec("Workers", live.map((m) => {
-    const ts = memberLastTs(m);
-    return `- @${m.name}: ${m.status}${ts ? ` ${fmtElapsed(ts)}` : ""} (${m.steps} steps, ${fmtTokens(m.usage.totalTokens)} tok)`;
-  }));
-  sec("Workstreams", (snap.plan?.workstreams || []).map((ws) => `- [${humanizeStatus(ws.status)}] ${ws.title}${ws.owner ? ` (@${ws.owner})` : ""}`));
-  sec("Needs you", (snap.triage || []).map((it) => `- ${it.title}: ${maskHome(it.detail)}`));
-  sec("Deliverables", (snap.messages || []).filter((m) => !m.control && /\[(done|verified|blocked)\]/i.test(m.text)).slice(-5).map((m) => `- #${m.seq} @${m.agent}: ${cleanDigestLine(m.text)}`));
-  sec("Worktrees", (worktrees?.worktrees || []).filter((w) => !w.clean && w.files?.length).map((wt) => `- \`${wt.branch}\` (${maskHome(wt.path)}): ${wt.files!.slice(0, 8).map((f) => `${f.state} ${f.path}`).join(", ")}`));
-  return lines.join("\n");
+  sec(
+    "Pinned",
+    (snap.messages || [])
+      .filter((m) => !m.control && pinSet.has(m.seq))
+      .map((pm) => `- #${pm.seq} @${pm.agent}: ${cleanDigestLine(pm.text)}`),
+  );
+  sec(
+    "Workers",
+    live.map((m) => {
+      const ts = memberLastTs(m);
+      const err = m.failure ? `, issue: ${cleanDigestLine(m.failure.kind, 40)}` : "";
+      return `- @${m.name}: ${m.status}${ts ? ` ${fmtElapsed(ts)}` : ""} (${m.steps} steps, ${fmtTokens(m.usage.totalTokens)} tok${err})`;
+    }),
+  );
+  sec(
+    "Workstreams",
+    (snap.plan?.workstreams || []).map(
+      (ws) => `- [${humanizeStatus(ws.status)}] ${cleanDigestLine(ws.title, 140)}${ws.owner ? ` (@${ws.owner})` : ""}`,
+    ),
+  );
+  sec("Blockers", (snap.triage || []).map((it) => `- ${cleanDigestLine(it.title, 120)}: ${cleanDigestLine(it.detail, 180)}`));
+  const deliverables = (snap.messages || [])
+    .filter((m) => !m.control && /\[(done|verified|scale-verified|blocked)\]/i.test(m.text))
+    .slice(-6)
+    .map((m) => `- #${m.seq} @${m.agent}: ${cleanDigestLine(m.text, 180)}`);
+  const wtCommits = (worktrees?.worktrees || [])
+    .filter((wt) => wt.lastCommitSha)
+    .slice(0, 6)
+    .map((wt) => `- Commit ${wt.lastCommitSha} on ${wt.branch}: ${cleanDigestLine(wt.lastCommitSubject || "(no subject)", 120)}`);
+  sec("Verified deliverables", [...deliverables, ...wtCommits]);
+  sec(
+    "Worktree readiness",
+    (worktrees?.worktrees || []).slice(0, 10).map((wt) => {
+      const land = wt.landStatus || (wt.clean ? "ready" : "dirty");
+      const delta = wt.ahead || wt.behind ? `, +${wt.ahead || 0}/-${wt.behind || 0}` : "";
+      const sha = wt.lastCommitSha ? ` @ ${wt.lastCommitSha}` : "";
+      const files = !wt.clean && wt.files?.length ? ` (${wt.files.slice(0, 6).map((f) => `${f.state} ${f.path}`).join(", ")})` : "";
+      return `- \`${wt.branch}\` [${land}${delta}${sha}] ${maskHome(wt.path)}${files}`;
+    }),
+  );
+  return maskHome(lines.join("\n"));
 }
 
 export function fmtTokens(n: number | undefined): string {

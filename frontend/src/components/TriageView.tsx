@@ -59,6 +59,7 @@ export function TriageView({
   onSelectIdx,
   onTogglePin,
   onJumpToBoardSeq,
+  onCopyHandoffDigest,
   onRefresh,
 }: {
   snap: SwarmSnapshot;
@@ -68,6 +69,7 @@ export function TriageView({
   onSelectIdx?: (idx: number) => void;
   onTogglePin: (seq: number) => void;
   onJumpToBoardSeq: (seq: number, agent?: string) => void;
+  onCopyHandoffDigest?: () => void;
   onRefresh: () => void;
 }) {
   const [nudgeTarget, setNudgeTarget] = useState<{ id: string; member: string; conversationId: string; kind?: string } | null>(null);
@@ -175,16 +177,24 @@ export function TriageView({
           <h2 id="triage-heading" className="h2">
             Needs you ({triage.length})
           </h2>
-          {triage.length === 0 ? (
-            <Badge tone="success">
-              <CheckCircle2 />
-              All clear
-            </Badge>
-          ) : (
-            <div className="hidden sm:flex items-center gap-2 t3 mono">
-              {["j/k move", "o chat", "p pin", "r reply", "? help"].map((k) => <span key={k}>{k}</span>)}
-            </div>
-          )}
+          <div className="f1 flex-wrap justify-end">
+            {onCopyHandoffDigest && (
+              <Button variant="outline" data-testid="copy-handoff-digest" onClick={onCopyHandoffDigest}>
+                <ClipboardCopy />
+                Copy Handoff Digest
+              </Button>
+            )}
+            {triage.length === 0 ? (
+              <Badge tone="success">
+                <CheckCircle2 />
+                All clear
+              </Badge>
+            ) : (
+              <div className="hidden sm:flex items-center gap-2 t3 mono">
+                {["j/k move", "o chat", "p pin", "r reply", "? help"].map((k) => <span key={k}>{k}</span>)}
+              </div>
+            )}
+          </div>
         </div>
 
         {(liveMembers.length > 0 || triage.length > 0) && (

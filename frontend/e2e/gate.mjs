@@ -523,6 +523,43 @@ await runChecks("gate", async (check) => {
     return ok;
   });
 
+  await check("Triage Copy Handoff Digest exports goal, gate readiness, deliverables, and worktrees cleanly", async () => {
+    await page.evaluate(() => {
+      window.__handoffCopied = "";
+      try {
+        Object.defineProperty(navigator, "clipboard", {
+          configurable: true,
+          value: { writeText: async (txt) => { window.__handoffCopied = String(txt); } },
+        });
+      } catch {}
+    });
+    await page.locator('[data-testid="copy-handoff-digest"]').click();
+    await page.waitForFunction(() => Boolean(window.__handoffCopied));
+    const clip = await page.evaluate(() => window.__handoffCopied);
+    return (
+      clip.includes("Handoff Digest") &&
+      clip.includes("- Active goal:") &&
+      clip.includes("- Gate readiness:") &&
+      clip.includes("## Workers") &&
+      clip.includes("## Verified deliverables") &&
+      clip.includes("## Worktree readiness") &&
+      !clip.includes("/home/")
+    );
+  });
+
+  await check("SSE resync banner appears when paused or disconnected and Resync restores live sync", async () => {
+    if ((await page.locator('[data-testid="sse-resync-banner"]').count()) !== 0) return false;
+    await page.locator('button[aria-label="Open settings"]').click();
+    await page.waitForSelector('div[role="dialog"]');
+    await page.locator('div[role="dialog"] button[role="radio"]:has-text("Paused")').click();
+    await page.locator('button[aria-label="Close dialog"]').click();
+    await page.waitForSelector('[data-testid="sse-resync-banner"]');
+    const bannerTxt = await page.locator('[data-testid="sse-resync-banner"]').textContent();
+    await page.locator('[data-testid="sse-resync-btn"]').click();
+    await page.waitForFunction(() => !document.querySelector('[data-testid="sse-resync-banner"]'));
+    return bannerTxt.includes("Live updates paused");
+  });
+
   // 26-28: Clean runtime guarantees
   await check("zero console errors", () => consoleErrors.length === 0);
   await check("zero uncaught page errors", () => pageErrors.length === 0);
