@@ -22,7 +22,7 @@ import {
   parseScreenshotLines,
 } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot, TriageItem } from "../types";
-import { ActivityPeek, Badge, Button, Card, GateReadinessCard, InlineComposer, MediaPathChips, Pill, PinnedList, SegBar, StatusDot, TokenBurnStrip, canLiveNudge, cn, copyText, fmtTimeAgo, fmtTokens, formatBlockerContext, humanizeStatus, memberMeta, openOrCopyPath, submitNudge, useNowMs } from "../ui";
+import { ActivityPeek, Badge, Button, Card, GateReadinessCard, InlineComposer, MediaPathChips, Pill, PinnedList, SegBar, StatusDot, TokenBurnStrip, buildRecoverPrompt, canLiveNudge, cn, copyText, fmtTimeAgo, fmtTokens, formatBlockerContext, humanizeStatus, memberMeta, openOrCopyPath, submitNudge, useNowMs } from "../ui";
 
 const SEVERITY_BADGE: Record<TriageItem["severity"], { tone: "danger" | "warning" | "info"; label: string; Icon: typeof AlertTriangle }> = {
   urgent: { tone: "danger", label: "Urgent", Icon: ShieldAlert },
@@ -67,10 +67,10 @@ export function TriageView({
   replyNonce?: number;
   onSelectIdx?: (idx: number) => void;
   onTogglePin: (seq: number) => void;
-  onJumpToBoardSeq: (seq: number) => void;
+  onJumpToBoardSeq: (seq: number, agent?: string) => void;
   onRefresh: () => void;
 }) {
-  const [nudgeTarget, setNudgeTarget] = useState<TriageItem | null>(null);
+  const [nudgeTarget, setNudgeTarget] = useState<{ id: string; member: string; conversationId: string; kind?: string } | null>(null);
   const [nudgeDraft, setNudgeDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [peekId, setPeekId] = useState<string | null>(null);
@@ -102,6 +102,21 @@ export function TriageView({
       handleCopy(prefix, `Copied reply prefix for @${item.member}`);
     }
   }, [replyNonce]);
+
+  const renderComposer = (headerRight?: React.ReactNode) =>
+    nudgeTarget ? (
+      <InlineComposer
+        id={nudgeTarget.id}
+        label={nudgeTarget.kind === "recover" ? `Recover @${nudgeTarget.member}` : `@${nudgeTarget.member}`}
+        value={nudgeDraft}
+        onChange={setNudgeDraft}
+        onCancel={() => setNudgeTarget(null)}
+        onSubmit={handleConfirmNudge}
+        submitLabel={sending ? "Sending..." : "Confirm & send"}
+        disabled={sending}
+        headerRight={headerRight}
+      />
+    ) : null;
 
   const openNudge = (item: TriageItem, customPrompt?: string) => {
     setNudgeTarget(item);
@@ -135,6 +150,22 @@ export function TriageView({
     { label: "waiting", count: waitingCount, cls: "bg-warn" },
     { label: "blocked", count: blockedCount, cls: "bg-danger" },
   ];
+  const recoveryMembers = liveMembers.filter((m) => {
+    if (m.roleWorker || m.narrator || m.role === "coordinator") return false;
+    const { isStalled } = memberMeta(m, nowMs);
+    return isStalled || Boolean(m.failure) || (m.status === "waiting" && m.unread > 0);
+  });
+
+  const triggerMemberRecover = (m: SwarmMember) => {
+    const prompt = buildRecoverPrompt(m);
+    if (canNudge && m.conversation_id) {
+      const id = `recover-${m.name}`;
+      setNudgeTarget((cur) => (cur?.id === id ? null : { id, member: m.name, conversationId: m.conversation_id, kind: "recover" }));
+      setNudgeDraft(prompt);
+    } else {
+      handleCopy(prompt, `Copied recovery prompt for @${m.name}`);
+    }
+  };
 
   return (
     <div className="space-y-4">
@@ -182,6 +213,43 @@ export function TriageView({
         )}
 
         <TokenBurnStrip snap={snap} />
+
+        {recoveryMembers.length > 0 && (
+          <Card className="p-2 space-y-1" data-testid="worker-recovery-strip">
+            <div className="row flex-wrap t2">
+              <span className="font-semibold text-ink">Worker attention ({recoveryMembers.length})</span>
+              <span className="t3">Idle, unread, or stalled</span>
+            </div>
+            <div className="wrap gap-1">
+              {recoveryMembers.slice(0, 4).map((m) => {
+                const { isStalled } = memberMeta(m, nowMs);
+                const issue = m.failure ? m.failure.kind : isStalled ? "stalled" : `${m.unread} unread`;
+                return (
+                  <div key={m.name} className="f1">
+                    <Button
+                      variant={m.failure || isStalled ? "danger" : "info"}
+                      data-testid={`recover-worker-${m.name}`}
+                      onClick={() => triggerMemberRecover(m)}
+                    >
+                      {canNudge && m.conversation_id ? <Wrench /> : <ClipboardCopy />}
+                      Recover @{m.name} · {issue}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      data-testid={`jump-worker-${m.name}`}
+                      onClick={() => onJumpToBoardSeq(m.lastPostSeq || 0, m.name)}
+                      className="bg-board num"
+                    >
+                      {m.lastPostSeq > 0 ? `#${m.lastPostSeq}` : `@${m.name}`}
+                      <ArrowUpRight />
+                    </Button>
+                  </div>
+                );
+              })}
+            </div>
+            {nudgeTarget?.kind === "recover" && renderComposer()}
+          </Card>
+        )}
 
         <GateReadinessCard snap={snap} onJump={onJumpToBoardSeq} onRefresh={onRefresh} />
 
@@ -284,26 +352,14 @@ export function TriageView({
 
                   {peeking && worker && <ActivityPeek member={worker} mode="triage" />}
 
-                  {editingThis && (
-                    <InlineComposer
-                      id={`nudge-${item.id}`}
-                      label={`@${item.member}`}
-                      value={nudgeDraft}
-                      onChange={setNudgeDraft}
-                      onCancel={() => setNudgeTarget(null)}
-                      onSubmit={handleConfirmNudge}
-                      submitLabel={sending ? "Sending..." : "Confirm & send"}
-                      disabled={sending}
-                      headerRight={
-                        <div className="wrap gap-1">
-                          {presets.map((p) => (
-                            <Pill key={p.label} onClick={() => setNudgeDraft(p.prompt)} className="text-ink hover:bg-hairline">
-                              {p.label}
-                            </Pill>
-                          ))}
-                        </div>
-                      }
-                    />
+                  {editingThis && renderComposer(
+                    <div className="wrap gap-1">
+                      {presets.map((p) => (
+                        <Pill key={p.label} onClick={() => setNudgeDraft(p.prompt)} className="text-ink hover:bg-hairline">
+                          {p.label}
+                        </Pill>
+                      ))}
+                    </div>
                   )}
                 </Card>
               );

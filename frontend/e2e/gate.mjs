@@ -194,6 +194,32 @@ await runChecks("gate", async (check) => {
     return jumped;
   });
 
+  await check("triage Worker attention strip copies recovery prompt and jumps to filtered Board", async () => {
+    const strip = page.locator('#panel-triage [data-testid="worker-recovery-strip"]');
+    if ((await strip.count()) !== 1) return false;
+    await page.evaluate(() => {
+      window.__recCopied = "";
+      try {
+        Object.defineProperty(navigator, "clipboard", {
+          configurable: true,
+          value: { writeText: async (t) => { window.__recCopied = String(t); } },
+        });
+      } catch {}
+    });
+    await strip.locator('[data-testid="recover-worker-verifier"]').click();
+    await page.waitForFunction(() => Boolean(window.__recCopied));
+    const copied = await page.evaluate(() => window.__recCopied);
+    if (!copied.includes("@verifier") || (!copied.includes("unread") && !copied.includes("post status"))) return false;
+    await strip.locator('[data-testid="jump-worker-verifier"]').click();
+    await page.waitForSelector("#panel-board");
+    const verChip = page.locator('#panel-board button:has-text("verifier")');
+    const hasVerPill = (await verChip.count()) >= 1;
+    await page.locator('#panel-board button:has-text("All (4)")').last().click();
+    await page.locator("#tab-triage").click();
+    await page.waitForSelector("#panel-triage");
+    return hasVerPill;
+  });
+
   // 7-9: #seq jump from Triage -> Board tab + Board filters
   await page.locator('#panel-triage button:has-text("#4")').first().click();
   await page.waitForSelector("#panel-board");
@@ -326,6 +352,18 @@ await runChecks("gate", async (check) => {
   await check("roster Token Burn Guard Strip shows top consumer share", async () => {
     const txt = await page.locator('#panel-roster [data-testid="token-burn-strip"]').textContent();
     return txt.includes("Token burn") && txt.includes("builder") && /\d+%/.test(txt);
+  });
+
+  await check("roster Recover and Board (N) direct jump filter Board to worker", async () => {
+    if ((await page.locator('#panel-roster [data-testid="roster-recover-verifier"]').count()) !== 1) return false;
+    await page.locator('#panel-roster [data-testid="roster-board-builder"]').click();
+    await page.waitForSelector("#panel-board");
+    const txt = await page.locator("#panel-board").textContent();
+    const ok = txt.includes("Sidecar ready for cold check") && (await page.locator('#panel-board button:has-text("All (4)")').count()) === 2;
+    await page.locator('#panel-board button:has-text("All (4)")').last().click();
+    await page.locator("#tab-roster").click();
+    await page.waitForSelector("#panel-roster");
+    return ok;
   });
 
   await check("zero horizontal overflow on Roster at 380px", async () => {

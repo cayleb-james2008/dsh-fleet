@@ -731,7 +731,14 @@ export function TokenBurnStrip({ snap }: { snap: SwarmSnapshot }) {
   );
 }
 
-export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnapshot; onJump: (seq: number) => void; onRefresh?: () => void }) {
+export function buildRecoverPrompt(m: Pick<SwarmMember, "name" | "lastPostSeq" | "failure" | "unread" | "status">): string {
+  const ref = m.lastPostSeq > 0 ? ` Re #${m.lastPostSeq}:` : "";
+  if (m.failure) return `@${m.name}${ref} Resume (${m.failure.kind}): ${m.failure.text}.`;
+  if (m.unread > 0 && m.status === "waiting") return `@${m.name}${ref} ${m.unread} unread posts; catch up and post status.`;
+  return `@${m.name}${ref} No update; post status or [blocked].`;
+}
+
+export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnapshot; onJump: (seq: number, agent?: string) => void; onRefresh?: () => void }) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -764,6 +771,12 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
           {gate.pendingSeq > 0 && (
             <Button data-testid="gate-pending-jump" onClick={() => onJump(gate.pendingSeq)} className="bg-board num">
               Gate #{gate.pendingSeq}
+              <ArrowUpRight className="h-3 w-3" />
+            </Button>
+          )}
+          {next && (
+            <Button variant="ghost" data-testid="gate-target-jump" onClick={() => onJump(next.seq || gate.pendingSeq, next.target)} className="bg-board">
+              @{next.target}
               <ArrowUpRight className="h-3 w-3" />
             </Button>
           )}

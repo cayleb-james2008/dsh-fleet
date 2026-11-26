@@ -2,7 +2,7 @@ import { useMemo, useState } from "../hooks";
 import { ChevronDown, ChevronUp, ClipboardCopy, Cpu, Eye, EyeOff, MessageSquare, Radio, Send } from "../icons";
 import { openWorkerConversation } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot } from "../types";
-import { ActivityPeek, Badge, Button, Card, InlineComposer, Pill, StatusDot, TokenBurnStrip, canLiveNudge, cn, copyText, fmtTokens, hasControlChars, memberMeta, submitNudge, useNowMs } from "../ui";
+import { ActivityPeek, Badge, Button, Card, InlineComposer, Pill, StatusDot, TokenBurnStrip, buildRecoverPrompt, canLiveNudge, cn, copyText, fmtTokens, hasControlChars, memberMeta, submitNudge, useNowMs } from "../ui";
 
 const ORDER: Record<SwarmMember["status"], number> = { working: 0, waiting: 1, killed: 2 };
 const CONTEXT_BUDGET_TOKENS = 200_000;
@@ -22,9 +22,11 @@ function contextPressure(m: SwarmMember): { pct: number; tone: "neutral" | "info
 
 export function RosterView({
   snap,
+  onJumpToBoardSeq,
   onRefresh,
 }: {
   snap: SwarmSnapshot;
+  onJumpToBoardSeq?: (seq: number, agent?: string) => void;
   onRefresh: () => void;
 }) {
   const [showKilled, setShowKilled] = useState(false);
@@ -238,17 +240,34 @@ export function RosterView({
                   {m.model && <span className="inline-flex items-center gap-1 text-ink-3 px-1"><Cpu className="h-3 w-3" />{m.model}</span>}
                 </div>
 
-                {!m.killed && m.conversation_id && (
+                {!m.killed && m.conversation_id && (() => {
+                  const act = (p: string, msg: string) =>
+                    canNudge ? (setNudgeMember(m.name), setNudgeText(p)) : void copyText(p, msg);
+                  return (
                   <div className="wrap gap-1">
-                    <Button variant={canNudge ? "outline" : "ghost"} onClick={() => canNudge ? (setNudgeMember(m.name), setNudgeText(askPrompt)) : void copyText(askPrompt, `Copied status check for ${m.name}`)} className="h-7 px-2">
-                      {!canNudge && <ClipboardCopy className="h-3 w-3" />}
+                    {(isStalled || Boolean(m.failure) || (m.status === "waiting" && m.unread > 0)) && (
+                      <Button
+                        variant={isStalled || m.failure ? "danger" : "info"}
+                        data-testid={`roster-recover-${m.name}`}
+                        onClick={() => act(buildRecoverPrompt(m), `Copied recovery prompt for ${m.name}`)}
+                      >
+                        {!canNudge && <ClipboardCopy />}
+                        Recover
+                      </Button>
+                    )}
+                    <Button variant={canNudge ? "outline" : "ghost"} onClick={() => act(askPrompt, `Copied status check for ${m.name}`)}>
+                      {!canNudge && <ClipboardCopy />}
                       Ask status
                     </Button>
-                    {canNudge && (
-                      <Button variant="ghost" onClick={() => (setNudgeMember(m.name), setNudgeText(wrapPrompt))} className="h-7 px-2">Wrap up</Button>
+                    {canNudge && <Button variant="ghost" onClick={() => act(wrapPrompt, "")}>Wrap up</Button>}
+                    {m.posts > 0 && onJumpToBoardSeq && (
+                      <Button variant="ghost" data-testid={`roster-board-${m.name}`} onClick={() => onJumpToBoardSeq(m.lastPostSeq || 0, m.name)} className="num">
+                        Board ({m.posts})
+                      </Button>
                     )}
                   </div>
-                )}
+                  );
+                })()}
 
                 {/* Line 3: Token telemetry & Context saturation bar */}
                 <div className="rounded-chip bg-board px-2 py-1 space-y-1">

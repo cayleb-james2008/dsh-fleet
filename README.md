@@ -67,13 +67,13 @@ Fleet lays out cleanly from a `340px` to `380px` auxiliary sidebar up to `1440px
 
 ## What it does
 
-In **Triage**, Fleet pulls unanswered questions, blocked posts, quota pauses, pending verification stages, and `plan.json` workstreams into a single inbox. A gate readiness card tracks `[done]`, `[verified]`, `[scale-verified]`, and `[blocked]` tags alongside a wave velocity pill showing pass percentage, gate counts, and a jump button to the newest shipped post. A bottleneck bar summarizes working, waiting, and blocked counts, and a token burn strip plots each worker's share of total tokens so high-spend loops stand out quickly.
+In **Triage**, Fleet pulls unanswered questions, blocked posts, quota pauses, stalled worker alerts, and `plan.json` workstreams into a single inbox. A worker attention strip surfaces idle, unread, and stalled workers with 1-click recovery prompts and direct board jumps filtered to that member. A gate readiness card tracks `[done]`, `[verified]`, `[scale-verified]`, and `[blocked]` tags alongside a wave velocity pill, next-gate action button, and direct target jump. A bottleneck bar summarizes working, waiting, and blocked counts, and a token burn strip plots each worker's share of total tokens.
 
 Each triage item includes keyboard shortcuts (`j` and `k` to move, `o` or `Enter` to open chat, `p` to pin `#seq`, `r` to reply, `1` to `5` to switch tabs, `?` for help), inline activity peeks showing recent tool calls, unstick presets, `~/`-masked blocker copy buttons, and direct file openers through `window.sidecar.ui.toggleAuxPane`.
 
-In **Board**, Fleet reads `board.jsonl` with quick filters (`All`, `Needs reply`, `[done]`, `[blocked]`, cycled with `f`), pinned posts, `#seq` quote replies, Markdown wave digests, and `.md` or `.json` board exports stripped of local `/home/` paths. In **Roster**, you can inspect worker duration badges, token breakdowns, and context saturation, or open a confirmation-gated broadcast composer to nudge `@all`, `working`, `waiting`, or custom worker subsets. In **Graph**, a replayable `@mention` graph traces message flow across the swarm. In **Git**, Fleet probes workspace worktrees with `git status --porcelain=v1 -z` and shows bounded inline diffs (`GET /api/worktrees/diff`).
+In **Board**, Fleet reads `board.jsonl` with quick filters (`All`, `Needs reply`, `[done]`, `[blocked]`, cycled with `f`), pinned posts, `#seq` quote replies, Markdown wave digests, and `.md` or `.json` board exports stripped of local `/home/` paths. In **Roster**, you can inspect worker duration badges, token breakdowns, and context saturation, recover stalled or idle workers in one click, jump straight to a worker's filtered board posts, or open a confirmation-gated broadcast composer to nudge `@all`, `working`, `waiting`, or custom worker subsets. In **Graph**, a replayable `@mention` graph traces message flow across the swarm. In **Git**, Fleet probes workspace worktrees with `git status --porcelain=v1 -z` and shows bounded inline diffs (`GET /api/worktrees/diff`).
 
-Live updates stream over `GET /api/swarm/stream` (`text/event-stream`) in standalone mode and fall back to polling inside Antigravity's `SidecarApp` gateway. Under the hood, `swarm_store.mjs` tails `transcript.jsonl` incrementally in 32 KB chunks, parses JSON only for the newest 16 tail lines, and avoids holding large parsed board graphs in memory.
+Live updates stream over `GET /api/swarm/stream` (`text/event-stream`) in standalone mode and fall back to polling inside Antigravity's `SidecarApp` gateway. On startup, `main.mjs` binds the HTTP listener before loading `swarm_store.mjs`, answers `/api/health` immediately, serves synchronous cached `/api/worktrees` responses on cache hit, and tails `transcript.jsonl` incrementally in 32 KB chunks without retaining parsed board graphs in memory.
 
 ---
 
@@ -82,7 +82,7 @@ Live updates stream over `GET /api/swarm/stream` (`text/event-stream`) in standa
 ```mermaid
 flowchart LR
     Host["Antigravity Host<br/>(Aux Side Pane + /preload.js)"] <-->|"SidecarApp RPC + theme-change<br/>toggleConversation / toggleAuxPane"| Backend["Fleet Sidecar Backend<br/>(sidecars/fleet_pane/main.mjs)"]
-    UI["Embedded Sidebar SPA<br/>(294.8 KiB raw / 91.9 KiB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>Pre-Gzipped ETag/304 JSON"| Backend
+    UI["Embedded Sidebar SPA<br/>(297.1 KiB raw / 92.7 KiB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>Pre-Gzipped ETag/304 JSON"| Backend
     Backend -->|"Zero-String Buffer Scan + 16-Line Tail"| Store["swarm_store.mjs"]
     Backend -->|"Debounced TTL + CWE-22/59 Diff Peek"| Git["git_probe.mjs"]
     Store -.->|"Read-Only"| Brain["~/.gemini/antigravity/brain/&lt;conv&gt;<br/>.system_generated/{swarm,logs}"]
@@ -95,15 +95,15 @@ flowchart LR
 
 Measured under `#154` CPU isolation (`taskset -c 24-31`, 16 concurrent polling clients) on a 2,000-board-post and 50,000-transcript-line stress fixture:
 
-| Metric | v1.12.0 | v1.13.0 | **v1.14.0** |
+| Metric | v1.13.0 | v1.14.0 | **v1.15.0** |
 | --- | --- | --- | --- |
-| Embedded sidecar UI (`/`) | `300,853 B` raw / `93,861 B` gz | `301,440 B` raw / `94,030 B` gz | **`301,836 B` raw (`294.8 KiB`) / `94,150 B` gz (`91.94 KiB`)** |
-| Peak RSS (`VmHWM`, `--jitless` 2k/50k) | `65.55 MB` (`67,128 KB`) | `64.87 MB` (`66,424 KB`) | **`63.05 MB` (`64,564 KB`)** |
-| Peak RSS (`VmHWM`, cold default audit) | `69.16 MB` (`16w`) | `119.63 MB` (`16w`) | **`101.73 MB` (`16w`)** |
-| Throughput (`--jitless` keep-alive) | `5,114.1 req/s` | `7,257.0 req/s` | **`3,872.7 req/s`** (`2k/50k` `#154` `nice -n 19`) |
-| Cold audit HTTP (`16w` close) | `16.53 ms` / `23.45 ms` p95 | `2,315.7 req/s` / `9.30 ms` p95 | **`1,272.3 req/s` / `15.30 ms` p95 (`0` errors)** |
+| Embedded sidecar UI (`/`) | `301,440 B` raw / `94,030 B` gz | `301,836 B` raw / `94,150 B` gz | **`304,263 B` raw (`297.1 KiB`) / `94,884 B` gz (`92.7 KiB`)** |
+| Peak RSS (`VmHWM`, `--jitless` 2k/50k) | `64.87 MB` (`66,424 KB`) | `63.05 MB` (`64,564 KB`) | **`63.01 MB` (`64,524 KB`)** |
+| Peak RSS (`VmHWM`, cold default audit) | `119.63 MB` (`16w`) | `101.73 MB` (`16w`) | **`99.27 MB` (`101,648 KB`, `16w`)** |
+| Throughput (`--jitless` keep-alive) | `7,257.0 req/s` | `3,872.7 req/s` | **`7,068.5 req/s` (`2k/50k`)** |
+| Cold audit HTTP (`16w` close) | `2,315.7 req/s` / `9.30 ms` p95 | `1,272.3 req/s` / `15.30 ms` p95 | **`1,005.8 req/s` / `17.89 ms` p95 (`0` errors)** |
 | Simultaneous SSE (`x5` streams) | `5/5` (`0` drops) | `5/5` (`0` drops) | **`5/5` (`0` drops)** |
-| E2E gate, replay, and Sloplint | `43/43` + `8/8` + `0 FAIL` | `43/43` + `8/8` + `0 FAIL` | **`44/44` + `8/8` + `0 FAIL / 0 REFLEX / 0 WARN`** |
+| E2E gate, replay, and Sloplint | `43/43` + `8/8` + `0 FAIL` | `44/44` + `8/8` + `0 FAIL` | **`46/46` + `8/8` + `0 FAIL / 0 REFLEX / 0 WARN`** |
 
 ---
 

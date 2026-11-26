@@ -3,6 +3,12 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as an
 Antigravity plugin archive (`tar.gz` and `zip`) with `SHA256SUMS`.
 
+## 1.15.0 - 2026-11-25
+
+- Added 1-click stalled and idle worker recovery and direct member-filtered Board jumps across `[data-testid="worker-recovery-strip"]` in `TriageView.tsx`, `[data-testid="gate-target-jump"]` in `ui.tsx` (`GateReadinessCard`), `[data-testid="roster-recover-*"]` and `[data-testid="roster-board-*"]` in `RosterView.tsx`, lifted `boardAgentFilter` in `App.tsx` and `BoardView.tsx`, `buildRecoverPrompt` in `ui.tsx`, and `lastPostSeq` triage attachment in `swarm_store.mjs` and `web-engine.js`.
+- Bound standalone TCP listening before lazily importing `./swarm_store.mjs` in `sidecars/fleet_pane/main.mjs`, answered `/api/health` immediately on boot, added a synchronous `getWorktreesPackedSync` cache hit path, widened `swarmPayloadCache` stat checks to 500ms with a 1-entry cap, and tuned `--max-old-space-size=20` in `sidecar.json` (`63.01 MB` `--jitless` `VmHWM` on `2k/50k`, `7,068.5 req/s` `--jitless` keep-alive, `99.27 MB` cold default audit RSS, `1,005.8 req/s` / `17.89 ms` p95 / `30/30` fuzz / `5/5` SSE under `#154` isolation).
+- Rebuilt `dist/index.html` (`304,263 B` raw / `94,884 B` gz, `491,855 B` offline `dist-live-web/index.html`), refreshed all 8 Light and Dark screenshots in `docs/screenshots/`, and verified `11/11` backend tests, `46/46` Playwright gate, `8/8` replay, `11/11` live-web, and `0 FAIL / 0 REFLEX / 0 WARN` Sloplint.
+
 ## 1.14.0 - 2026-11-25
 
 - Added a wave velocity and pass-rate summary pill (`[data-testid="wave-velocity-pill"]`) to `GateReadinessCard` via `computeGateReadiness` in `sidecars/fleet_pane/swarm_store.mjs`, `frontend/src/{types.ts,ui.tsx}`, and `frontend/scripts/web-engine.js`. It reports pass percentage, waves per hour across timestamps, `[done]` / `[verified]` / `[scale-verified]` / `[blocked]` counts, and a 1-click `[data-testid="gate-shipped-jump"]` button targeting the newest shipped or verified `#seq`.

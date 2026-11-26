@@ -11,7 +11,7 @@ import tailwindcss from "@tailwindcss/vite";
 
 const root = import.meta.dirname;
 const STAMP =
-  "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v1.14.0 */";
+  "/* Hallmark · checked: 2026-11-25 · genre: modern-minimal · app scope · built: the project · House Frontend (light + dark) · v1.15.0 */";
 
 function sidecarSingleFile(): Plugin {
   return {
@@ -64,7 +64,7 @@ function sidecarSingleFile(): Plugin {
           .replace(/border-bottom-style:solid;border-bottom-width:1px/g, "border-bottom:1px solid")
           .replace(/border-left-style:solid;border-left-width:2px/g, "border-left:2px solid")
           .replace(/cubic-bezier\(\.4,0,\.6,1\)/g, "ease")
-          .replace(/calc\(var\(--spacing\)\s*\*\s*([\d.]+)\)/g, (_, n) => `${Number(n) * 0.25}rem`)
+          .replace(/calc\(var\(--spacing\)\s*\*\s*(-?[\d.]+)\)/g, (_, n) => `${Number(n) * 0.25}rem`)
           .replace(/var\(--spacing\)/g, ".25rem")
           .replace(/--spacing:\.25rem;/g, "")
           .replace(/font-(?:feature|variation)-settings:inherit;?/g, "")

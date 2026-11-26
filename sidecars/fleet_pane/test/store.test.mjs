@@ -303,10 +303,10 @@ test('computeGateReadiness tracks release gate progression, pending #seq jumps, 
     [
       { seq: 4, agent: 'builder', text: '@ux-verifier [done] Ready' },
       { seq: 5, agent: 'ux-verifier', text: '@scale-auditor [verified] OK' },
-      { seq: 8, agent: 'builder', text: '@ux-verifier [done] Followup\nBranch: release/1.14.0 | Commit: abcdef123456' },
+      { seq: 8, agent: 'builder', text: '@ux-verifier [done] Followup\nBranch: release/1.15.0 | Commit: abcdef123456' },
     ],
     [],
-    { members, title: 'Fleet v1.14.0' },
+    { members, title: 'Fleet v1.15.0' },
   );
   assert.equal(verifying?.state, 'verifying');
   assert.equal(verifying?.pendingSeq, 8);
@@ -318,7 +318,7 @@ test('computeGateReadiness tracks release gate progression, pending #seq jumps, 
   assert.equal(verifying?.nextAction?.target, 'ux-verifier');
   assert.equal(verifying?.nextAction?.conversationId, 'conv-ux');
   assert.ok(verifying?.nextAction?.prompt.includes('Re #8:'));
-  assert.ok(verifying?.nextAction?.prompt.includes('release/1.14.0 @ abcdef12'));
+  assert.ok(verifying?.nextAction?.prompt.includes('release/1.15.0 @ abcdef12'));
 
   const blocked = computeGateReadiness(
     [
@@ -326,7 +326,7 @@ test('computeGateReadiness tracks release gate progression, pending #seq jumps, 
       { seq: 6, agent: 'ux-verifier', text: '@builder [blocked] Fix header icon' },
     ],
     [{ kind: 'blocked', severity: 'urgent', seq: 6, member: 'builder', conversationId: 'conv-bld' }],
-    { members, title: 'Fleet v1.14.0' },
+    { members, title: 'Fleet v1.15.0' },
   );
   assert.equal(blocked?.state, 'blocked');
   assert.equal(blocked?.pendingSeq, 6);
@@ -341,10 +341,10 @@ test('computeGateReadiness tracks release gate progression, pending #seq jumps, 
       { seq: 1, agent: 'a', text: '[done]', ts: 1_000_000 },
       { seq: 2, agent: 'b', text: '[verified]', ts: 1_900_000 },
       { seq: 3, agent: 'c', text: '[scale-verified]', ts: 2_800_000 },
-      { seq: 4, agent: 'release-ops', text: 'v1.14.0 shipped', ts: 4_600_000 },
+      { seq: 4, agent: 'release-ops', text: 'v1.15.0 shipped', ts: 4_600_000 },
     ],
     [],
-    { members, title: 'Fleet v1.14.0' },
+    { members, title: 'Fleet v1.15.0' },
   );
   assert.equal(ready?.state, 'ready');
   assert.equal(ready?.pendingSeq, 3);

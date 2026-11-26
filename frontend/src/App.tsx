@@ -82,6 +82,7 @@ export function App() {
 
   const [highlightSeq, setHighlightSeq] = useState<number | null>(null);
   const [boardQuickFilter, setBoardQuickFilter] = useState<BoardQuickFilter>("all");
+  const [boardAgentFilter, setBoardAgentFilter] = useState<string>("all");
   const [selectedTriageIdx, setSelectedTriageIdx] = useState(0);
   const [triageReplyNonce, setTriageReplyNonce] = useState(0);
   const [sseConnected, setSseConnected] = useState(false);
@@ -290,6 +291,15 @@ export function App() {
   const handleSelectSwarm = (id: string) => {
     etagRef.current = "";
     setSelectedSwarmId(id);
+    setHighlightSeq(null);
+    setBoardAgentFilter("all");
+  };
+
+  const handleJumpToBoard = (seq: number, agent = "all") => {
+    setHighlightSeq(seq > 0 ? seq : null);
+    setBoardAgentFilter(agent || "all");
+    if (agent && agent !== "all") setBoardQuickFilter("all");
+    setTab("board");
   };
 
   const handleCopyDigest = () => {
@@ -493,10 +503,7 @@ export function App() {
                 replyNonce={triageReplyNonce}
                 onSelectIdx={setSelectedTriageIdx}
                 onTogglePin={handleTogglePin}
-                onJumpToBoardSeq={(seq) => {
-                  setHighlightSeq(seq);
-                  setTab("board");
-                }}
+                onJumpToBoardSeq={handleJumpToBoard}
                 onRefresh={() => refreshSwarm(true)}
               />
             )}
@@ -506,14 +513,16 @@ export function App() {
                 highlightSeq={highlightSeq}
                 pinnedSeqs={pinnedSeqs}
                 quickFilter={boardQuickFilter}
+                agentFilter={boardAgentFilter}
                 onQuickFilterChange={setBoardQuickFilter}
+                onAgentFilterChange={setBoardAgentFilter}
                 onCopyWaveDigest={handleCopyDigest}
                 onTogglePin={handleTogglePin}
                 onClearHighlight={() => setHighlightSeq(null)}
                 onRefresh={() => refreshSwarm(true)}
               />
             )}
-            {tab === "roster" && <RosterView snap={snap!} onRefresh={() => refreshSwarm(true)} />}
+            {tab === "roster" && <RosterView snap={snap!} onJumpToBoardSeq={handleJumpToBoard} onRefresh={() => refreshSwarm(true)} />}
             {tab === "graph" && <GraphView snap={snap!} />}
           </div>
         )}
@@ -573,7 +582,7 @@ export function App() {
           <div className="rounded-card bg-board p-3 text-[12px] text-ink-2 space-y-1">
             <div className="f1 font-medium text-ink">
               <CommandIcon />
-              <span>Fleet Antigravity Plugin v1.14.0</span>
+              <span>Fleet Antigravity Plugin v1.15.0</span>
             </div>
             <p>Reads local swarm files over loopback with no telemetry.</p>
           </div>

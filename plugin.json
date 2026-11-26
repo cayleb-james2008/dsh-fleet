@@ -1,7 +1,7 @@
 {
   "name": "fleet",
   "displayName": "Fleet",
-  "version": "1.14.0",
+  "version": "1.15.0",
   "description": "Antigravity sidecar plugin for multi-agent swarms. Shows triage blockers, worker token usage, board posts, mention graphs, and git worktrees.",
   "logo": "assets/logo.svg",
   "repository": {

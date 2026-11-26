@@ -377,6 +377,20 @@
     var triage = [];
     for (var i = 0; i < sw.members.length; i++) {
       var m = sw.members[i];
+      if (!m.killed && m.failure) {
+        triage.push({
+          id: "sys-" + m.name + "-" + m.failure.kind,
+          kind: m.failure.kind,
+          severity: "urgent",
+          member: m.name,
+          conversationId: m.conversation_id,
+          seq: m.lastPostSeq || 0,
+          title: m.name + ": last step failed (" + m.failure.kind + ")",
+          detail: m.failure.text || "Inspect transcript and continue.",
+          suggestedPrompt: "@" + m.name + " Recover and continue.",
+          timestamp: m.transcriptMtime || now,
+        });
+      }
       if (!m.killed && m.replyAsk) {
         triage.push({
           id: "ask-" + m.name,
@@ -638,7 +652,7 @@
       return jsonResp({ ok: true, delivered: targets.length });
     }
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.14.0", mode: "live-web", canSendMessage: true, sseStream: false });
+      return jsonResp({ ok: true, name: "fleet", version: "1.15.0", mode: "live-web", canSendMessage: true, sseStream: false });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });

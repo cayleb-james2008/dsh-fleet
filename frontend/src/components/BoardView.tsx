@@ -75,7 +75,9 @@ export function BoardView({
   highlightSeq,
   pinnedSeqs,
   quickFilter = "all",
+  agentFilter: controlledAgentFilter,
   onQuickFilterChange,
+  onAgentFilterChange,
   onCopyWaveDigest,
   onTogglePin,
   onClearHighlight,
@@ -85,14 +87,21 @@ export function BoardView({
   highlightSeq: number | null;
   pinnedSeqs: number[];
   quickFilter?: BoardQuickFilter;
+  agentFilter?: string;
   onQuickFilterChange?: (f: BoardQuickFilter) => void;
+  onAgentFilterChange?: (a: string) => void;
   onCopyWaveDigest?: () => void;
   onTogglePin: (seq: number) => void;
   onClearHighlight: () => void;
   onRefresh?: () => void;
 }) {
   const [query, setQuery] = useState("");
-  const [agentFilter, setAgentFilter] = useState<string>("all");
+  const [localAgentFilter, setLocalAgentFilter] = useState<string>("all");
+  const agentFilter = controlledAgentFilter ?? localAgentFilter;
+  const setAgentFilter = (next: string) => {
+    setLocalAgentFilter(next);
+    onAgentFilterChange?.(next);
+  };
   const [showFilters, setShowFilters] = useState(false);
   const [follow, setFollow] = useState(true);
   const [visibleLimit, setVisibleLimit] = useState(80);
@@ -306,7 +315,7 @@ export function BoardView({
           </div>
         </div>
 
-        {showFilters && (
+        {(showFilters || agentFilter !== "all") && (
           <Card className="p-2 wrap">
             {["all", ...members.map((m) => m.name)].map((name) => {
               const active = agentFilter === name;

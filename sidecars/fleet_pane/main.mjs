@@ -12,19 +12,7 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { crc32, gunzipSync, gzipSync } from 'node:zlib';
-import {
-  ID_RE,
-  buildSwarmSnapshot,
-  computeSwarmFingerprint,
-  findAppDataDirs,
-  getSwarmMetaKeys,
-  listSwarms,
-  resolveAllowedFrame,
-  resolveConversationSwarm,
-  unseenBy,
-} from './swarm_store.mjs';
 
 if (!process.env.UV_THREADPOOL_SIZE) {
   process.env.UV_THREADPOOL_SIZE = '1';
@@ -33,7 +21,11 @@ if (!process.env.UV_THREADPOOL_SIZE) {
 let gitProbeMod = null;
 const getGitProbe = () => (gitProbeMod ||= import('./git_probe.mjs'));
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+let storeMod = null;
+const getStore = () => (storeMod ||= import('./swarm_store.mjs'));
+
+const __dirname = import.meta.dirname || dirname(new URL(import.meta.url).pathname);
+const SIDE_ID_RE = /^[a-z0-9._-]{3,128}$/i;
 const BIND_HOST = '127.0.0.1';
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -219,13 +211,26 @@ function isLoopbackOrigin(origin) {
 
 /** Build framework-agnostic route handlers with pre-serialized/pre-gzipped response caching. */
 export function createFleetHandlers({
+  store,
+  assets: sharedAssets = null,
   distDir = join(__dirname, 'dist'),
   appDataDir = '',
   defaultConversationId = '',
   isSidecar = false,
   sendMessageFn = null,
 } = {}) {
-  const assets = loadDistAssets(distDir);
+  const {
+    ID_RE = SIDE_ID_RE,
+    buildSwarmSnapshot,
+    computeSwarmFingerprint,
+    findAppDataDirs,
+    getSwarmMetaKeys,
+    listSwarms,
+    resolveAllowedFrame,
+    resolveConversationSwarm,
+    unseenBy,
+  } = store;
+  const assets = sharedAssets || loadDistAssets(distDir);
   let cachedDirs = { at: 0, dirs: null };
   const getAppDirs = () => {
     const now = Date.now();
@@ -251,7 +256,7 @@ export function createFleetHandlers({
       healthPacked = pack({
         ok: true,
         name: 'fleet',
-        version: '1.14.0',
+        version: '1.15.0',
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
         sseStream: !isSidecar,
@@ -294,7 +299,7 @@ export function createFleetHandlers({
       );
       const unchangedPacked = pack({ conversationId: id, swarm: id, member, unchanged: true, etag: fullEtag });
       if (swarmPayloadCache.has(cacheKey)) swarmPayloadCache.delete(cacheKey);
-      else if (swarmPayloadCache.size >= 2) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
+      else if (swarmPayloadCache.size >= 1) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
       swarmPayloadCache.set(cacheKey, {
         checkedAt: now,
         appData,
@@ -355,7 +360,7 @@ export function createFleetHandlers({
     const now = Date.now();
     const hit = !includeRaw ? swarmPayloadCache.get(cacheKey) || swarmPayloadCache.get(convKey) : null;
     if (hit) {
-      if (now - hit.checkedAt < 250) {
+      if (now - hit.checkedAt < 500) {
         if (query.etag && query.etag === hit.fullEtag) return hit.unchangedPacked;
         return hit.packed;
       }
@@ -436,7 +441,7 @@ export function createFleetHandlers({
     if (!includeRaw) {
       const unchangedPacked = pack({ conversationId: conv, swarm: res.swarm, member: res.member, unchanged: true, etag });
       if (swarmPayloadCache.has(cacheKey)) swarmPayloadCache.delete(cacheKey);
-      else if (swarmPayloadCache.size >= 2) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
+      else if (swarmPayloadCache.size >= 1) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
       swarmPayloadCache.set(cacheKey, {
         checkedAt: now,
         appData: res.appData,
@@ -452,19 +457,26 @@ export function createFleetHandlers({
     return packed;
   }
 
-  async function getWorktreesPacked(query = {}) {
-    const rootsKey = String(query.roots || '');
-    const now = Date.now();
-    const hit = worktreesPayloadCache.get(rootsKey);
-    if (hit && now - hit.at < 3000) return hit.packed;
-    const { probeWorktrees } = await getGitProbe();
-    const data = await probeWorktrees(rootsKey);
-    const packed = pack(data);
-    if (worktreesPayloadCache.has(rootsKey)) worktreesPayloadCache.delete(rootsKey);
-    else if (worktreesPayloadCache.size >= 1) worktreesPayloadCache.delete(worktreesPayloadCache.keys().next().value);
-    worktreesPayloadCache.set(rootsKey, { at: now, packed });
-    return packed;
-  }
+    function getWorktreesPackedSync(query = {}) {
+      const rootsKey = String(query.roots || '');
+      const hit = worktreesPayloadCache.get(rootsKey);
+      if (hit && Date.now() - hit.at < 3000) return hit.packed;
+      return null;
+    }
+
+    async function getWorktreesPacked(query = {}) {
+      const sync = getWorktreesPackedSync(query);
+      if (sync) return sync;
+      const rootsKey = String(query.roots || '');
+      const now = Date.now();
+      const { probeWorktrees } = await getGitProbe();
+      const data = await probeWorktrees(rootsKey);
+      const packed = pack(data);
+      if (worktreesPayloadCache.has(rootsKey)) worktreesPayloadCache.delete(rootsKey);
+      else if (worktreesPayloadCache.size >= 1) worktreesPayloadCache.delete(worktreesPayloadCache.keys().next().value);
+      worktreesPayloadCache.set(rootsKey, { at: now, packed });
+      return packed;
+    }
 
   async function getWorktreeDiff(query = {}) {
     const { probeWorktreeDiff } = await getGitProbe();
@@ -582,9 +594,11 @@ export function createFleetHandlers({
 
   return {
     assets,
+    computeSwarmFingerprint,
     getHealthPacked,
     getSwarmsPacked,
     getSwarmPacked,
+    getWorktreesPackedSync,
     getWorktreesPacked,
     getWorktreeDiff,
     getFrame,
@@ -601,14 +615,36 @@ export async function startStandaloneServer({
   appDataDir = '',
   defaultConversationId = '',
   sendMessageFn = null,
+  deferStore = false,
 } = {}) {
-  const handlers = createFleetHandlers({
-    distDir,
-    appDataDir,
-    defaultConversationId,
-    isSidecar: false,
-    sendMessageFn,
+  const assets = loadDistAssets(distDir);
+  let handlers = null;
+  const handlersPromise = getStore().then((store) => {
+    handlers = createFleetHandlers({
+      store,
+      assets,
+      distDir,
+      appDataDir,
+      defaultConversationId,
+      isSidecar: false,
+      sendMessageFn,
+    });
+    return handlers;
   });
+
+  const bootDirs = appDataDir ? [appDataDir] : process.env.FLEET_APP_DATA_DIR ? [process.env.FLEET_APP_DATA_DIR] : [];
+  let quickHealthPacked = null;
+  const getQuickHealthPacked = () =>
+    (quickHealthPacked ||= packJsonPayload({
+      ok: true,
+      name: 'fleet',
+      version: '1.15.0',
+      mode: 'standalone',
+      canSendMessage: Boolean(sendMessageFn),
+      sseStream: true,
+      appDataDirs: bootDirs,
+      conversationId: defaultConversationId || null,
+    }));
 
   let preloadBuf = null;
   let preloadHdrs = null;
@@ -642,7 +678,7 @@ export async function startStandaloneServer({
         const key = `${client.appData}\0${client.swarm}`;
         let fp = fpCache.get(key);
         if (fp === undefined) {
-          fp = computeSwarmFingerprint(client.appData, client.swarm);
+          fp = handlers?.computeSwarmFingerprint ? handlers.computeSwarmFingerprint(client.appData, client.swarm) : null;
           fpCache.set(key, fp);
         }
         if (fp) {
@@ -744,7 +780,6 @@ export async function startStandaloneServer({
     const search = qIdx === -1 ? '' : rawUrl.slice(qIdx);
 
     if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
-      const assets = handlers.assets;
       if (req.headers['if-none-match'] === assets.htmlEtag) {
         res.writeHead(304, assets.rootHdrBase);
         res.end();
@@ -769,8 +804,8 @@ export async function startStandaloneServer({
       return;
     }
 
-    if (req.method === 'GET' && pathname.startsWith('/fonts/') && handlers.assets.fonts.has(pathname)) {
-      const font = handlers.assets.fonts.get(pathname);
+    if (req.method === 'GET' && pathname.startsWith('/fonts/') && assets.fonts.has(pathname)) {
+      const font = assets.fonts.get(pathname);
       if (req.headers['if-none-match'] === font.etag) {
         res.writeHead(304, font.hdr304);
         res.end();
@@ -782,13 +817,23 @@ export async function startStandaloneServer({
     }
 
     if (req.method === 'GET' && pathname === '/api/health') {
-      return sendPacked(req, res, 200, handlers.getHealthPacked());
+      return sendPacked(req, res, 200, handlers ? handlers.getHealthPacked() : getQuickHealthPacked());
     }
+
+    const withHandlers = (fn) => {
+      if (handlers) return fn(handlers);
+      handlersPromise.then(fn, (err) => {
+        res.writeHead(500, { 'Content-Type': 'application/json', ...SECURITY_HEADERS });
+        res.end(JSON.stringify({ error: String(err?.message || err) }));
+      });
+    };
+
     if (req.method === 'GET' && pathname === '/api/swarms') {
-      return sendPacked(req, res, 200, handlers.getSwarmsPacked());
+      return withHandlers((h) => sendPacked(req, res, 200, h.getSwarmsPacked()));
     }
     if (req.method === 'GET' && pathname === '/api/swarm') {
-      return sendPacked(req, res, 200, handlers.getSwarmPacked(parseQueryFast(search)));
+      const q = parseQueryFast(search);
+      return withHandlers((h) => sendPacked(req, res, 200, h.getSwarmPacked(q)));
     }
     if (req.method === 'GET' && pathname === '/api/swarm/stream') {
       if (sseClients.size >= MAX_SSE_CLIENTS) {
@@ -796,61 +841,69 @@ export async function startStandaloneServer({
         res.end(JSON.stringify({ error: 'too many stream clients' }));
         return;
       }
-      const target = handlers.resolveStreamTarget(parseQueryFast(search));
-      if (!target) {
-        res.writeHead(404, { 'Content-Type': 'application/json', ...SECURITY_HEADERS });
-        res.end(JSON.stringify({ error: 'swarm not found' }));
-        return;
-      }
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache, no-transform',
-        Connection: 'keep-alive',
-        'X-Accel-Buffering': 'no',
-        ...SECURITY_HEADERS,
-      });
-      if (typeof res.flushHeaders === 'function') res.flushHeaders();
-      const client = {
-        req,
-        res,
-        conversationId: target.conversationId,
-        appData: target.appData,
-        swarm: target.swarm,
-        member: target.member,
-        lastEtag: target.etag,
-        lastPingAt: Date.now(),
-      };
-      sseClients.add(client);
-      res.write(
-        `: connected\nevent: swarm\ndata: ${JSON.stringify({
+      const q = parseQueryFast(search);
+      return withHandlers((h) => {
+        const target = h.resolveStreamTarget(q);
+        if (!target) {
+          res.writeHead(404, { 'Content-Type': 'application/json', ...SECURITY_HEADERS });
+          res.end(JSON.stringify({ error: 'swarm not found' }));
+          return;
+        }
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          Connection: 'keep-alive',
+          'X-Accel-Buffering': 'no',
+          ...SECURITY_HEADERS,
+        });
+        if (typeof res.flushHeaders === 'function') res.flushHeaders();
+        const client = {
+          req,
+          res,
           conversationId: target.conversationId,
+          appData: target.appData,
           swarm: target.swarm,
-          etag: target.etag,
-        })}\n\n`,
-      );
-      ensureSseTimer();
-      const cleanup = () => {
-        sseClients.delete(client);
-        stopSseTimerIfIdle();
-      };
-      req.on('close', cleanup);
-      res.on('error', cleanup);
-      return;
+          member: target.member,
+          lastEtag: target.etag,
+          lastPingAt: Date.now(),
+        };
+        sseClients.add(client);
+        res.write(
+          `: connected\nevent: swarm\ndata: ${JSON.stringify({
+            conversationId: target.conversationId,
+            swarm: target.swarm,
+            etag: target.etag,
+          })}\n\n`,
+        );
+        ensureSseTimer();
+        const cleanup = () => {
+          sseClients.delete(client);
+          stopSseTimerIfIdle();
+        };
+        req.on('close', cleanup);
+        res.on('error', cleanup);
+      });
     }
     if (req.method === 'GET' && pathname === '/api/worktrees') {
-      handlers.getWorktreesPacked(parseQueryFast(search)).then((packed) => sendPacked(req, res, 200, packed));
-      return;
+      const q = parseQueryFast(search);
+      if (handlers) {
+        const sync = handlers.getWorktreesPackedSync(q);
+        if (sync) return sendPacked(req, res, 200, sync);
+      }
+      return withHandlers((h) => h.getWorktreesPacked(q).then((packed) => sendPacked(req, res, 200, packed)));
     }
     if (req.method === 'GET' && pathname === '/api/worktrees/diff') {
-      handlers.getWorktreeDiff(parseQueryFast(search)).then((out) => sendPacked(req, res, out.status, out.packed));
-      return;
+      const q = parseQueryFast(search);
+      return withHandlers((h) => h.getWorktreeDiff(q).then((out) => sendPacked(req, res, out.status, out.packed)));
     }
     if (req.method === 'GET' && pathname === '/api/frame') {
-      const out = handlers.getFrame(parseQueryFast(search));
-      const buf = Buffer.isBuffer(out.body) ? out.body : Buffer.from(String(out.body));
-      res.writeHead(out.status, { 'Content-Type': out.contentType, 'Content-Length': buf.length, ...(out.headers || SECURITY_HEADERS) });
-      res.end(buf);
-      return;
+      const q = parseQueryFast(search);
+      return withHandlers((h) => {
+        const out = h.getFrame(q);
+        const buf = Buffer.isBuffer(out.body) ? out.body : Buffer.from(String(out.body));
+        res.writeHead(out.status, { 'Content-Type': out.contentType, 'Content-Length': buf.length, ...(out.headers || SECURITY_HEADERS) });
+        res.end(buf);
+      });
     }
 
     if (req.method === 'POST' && pathname === '/api/nudge') {
@@ -892,7 +945,8 @@ export async function startStandaloneServer({
             return sendPacked(req, res, 400, packJsonPayload({ error: 'invalid JSON body' }));
           }
         }
-        const out = await handlers.postNudge(parsed);
+        const h = handlers || (await handlersPromise);
+        const out = await h.postNudge(parsed);
         sendPacked(req, res, out.status, packJsonPayload(out.json));
       });
       return;
@@ -902,6 +956,7 @@ export async function startStandaloneServer({
     res.end('Not found');
   });
 
+  if (!deferStore) await handlersPromise;
   await new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(port, host, () => resolve());
@@ -948,9 +1003,10 @@ async function runCli() {
   }
 
   if (!standalone && process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) {
-    const { SidecarApp, Response } = await import('sidecar_sdk');
+    const [{ SidecarApp, Response }, store] = await Promise.all([import('sidecar_sdk'), getStore()]);
     const app = new SidecarApp();
     const handlers = createFleetHandlers({
+      store,
       appDataDir,
       defaultConversationId: app.config.conversationId || '',
       isSidecar: true,
@@ -995,11 +1051,13 @@ async function runCli() {
     return;
   }
 
-  const srv = await startStandaloneServer({ port, appDataDir });
+  const srv = await startStandaloneServer({ port, appDataDir, deferStore: true });
   console.log(`[fleet_pane] standalone server listening on ${srv.url}`);
 }
 
-const isEntry = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+const isEntry =
+  process.argv[1] &&
+  (import.meta.filename ? import.meta.filename === process.argv[1] : process.argv[1].endsWith('/main.mjs'));
 if (isEntry) {
   runCli().catch((err) => {
     console.error('[fleet_pane] fatal:', err);

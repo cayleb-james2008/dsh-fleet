@@ -931,20 +931,21 @@ function buildTriageItems({ members, messages, sysAttention }) {
   const memberMap = new Map(members.map((m) => [m.name, m]));
 
   for (const sys of sysAttention) {
+    const member = memberMap.get(sys.member);
     items.push({
       id: sys.id,
       kind: sys.kind,
       severity: 'urgent',
       member: sys.member,
       conversationId: sys.conversation_id || '',
-      seq: 0,
+      seq: member?.lastPostSeq || 0,
       title: sys.text,
       detail: sys.detail || 'Inspect transcript and resume or switch model.',
       suggestedPrompt:
         sys.kind === 'quota'
           ? `@${sys.member} Hit quota/rate-limit on last step. Resume or switch model and continue.`
           : `@${sys.member} Last step appears ${sys.kind}. Check diagnostics and continue.`,
-      timestamp: memberMap.get(sys.member)?.transcriptMtime || 0,
+      timestamp: member?.transcriptMtime || 0,
     });
   }
 
