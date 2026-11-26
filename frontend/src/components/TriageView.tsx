@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "../hooks";
 import {
   AlertTriangle,
+  ArrowDown,
   ArrowUpRight,
   CheckCircle2,
   ChevronDown,
@@ -60,6 +61,7 @@ export function TriageView({
   onTogglePin,
   onJumpToBoardSeq,
   onCopyHandoffDigest,
+  onExportArchive,
   onRefresh,
 }: {
   snap: SwarmSnapshot;
@@ -70,6 +72,7 @@ export function TriageView({
   onTogglePin: (seq: number) => void;
   onJumpToBoardSeq: (seq: number, agent?: string) => void;
   onCopyHandoffDigest?: () => void;
+  onExportArchive?: (format: "md" | "json") => void;
   onRefresh: () => void;
 }) {
   const [nudgeTarget, setNudgeTarget] = useState<{ id: string; member: string; conversationId: string; kind?: string } | null>(null);
@@ -173,17 +176,11 @@ export function TriageView({
     <div className="space-y-4">
       {/* Needs-You Triage Inbox */}
       <section aria-labelledby="triage-heading" className="space-y-2">
-        <div className="row flex-wrap gap-2">
-          <h2 id="triage-heading" className="h2">
-            Needs you ({triage.length})
-          </h2>
-          <div className="f1 flex-wrap justify-end">
-            {onCopyHandoffDigest && (
-              <Button variant="outline" data-testid="copy-handoff-digest" onClick={onCopyHandoffDigest}>
-                <ClipboardCopy />
-                Copy Handoff Digest
-              </Button>
-            )}
+        <div className="space-y-1.5">
+          <div className="row flex-wrap gap-2">
+            <h2 id="triage-heading" className="h2">
+              Needs you ({triage.length})
+            </h2>
             {triage.length === 0 ? (
               <Badge tone="success">
                 <CheckCircle2 />
@@ -195,6 +192,28 @@ export function TriageView({
               </div>
             )}
           </div>
+          {(onCopyHandoffDigest || onExportArchive) && (
+            <div className="f1 flex-wrap">
+              {onCopyHandoffDigest && (
+                <Button variant="outline" data-testid="copy-handoff-digest" onClick={onCopyHandoffDigest}>
+                  <ClipboardCopy />
+                  Handoff Digest
+                </Button>
+              )}
+              {onExportArchive && (
+                <>
+                  <Button variant="outline" data-testid="export-archive-md" onClick={() => onExportArchive("md")}>
+                    <ArrowDown />
+                    Archive .md
+                  </Button>
+                  <Button variant="outline" data-testid="export-archive-json" onClick={() => onExportArchive("json")}>
+                    <ArrowDown />
+                    Archive .json
+                  </Button>
+                </>
+              )}
+            </div>
+          )}
         </div>
 
         {(liveMembers.length > 0 || triage.length > 0) && (

@@ -167,6 +167,27 @@ await check("Triage Copy Handoff Digest & SSE Resync banner work cleanly offline
   return clip.includes("Handoff Digest") && clip.includes("- Active goal:") && !clip.includes("/home/");
 });
 
+await check("Full Swarm Archive Export (.md and .json) works offline without /home/ leaks", async () => {
+  const readDl = async (selector) => {
+    const [dl] = await Promise.all([page.waitForEvent("download"), page.locator(selector).click()]);
+    const chunks = [];
+    for await (const c of await dl.createReadStream()) chunks.push(c);
+    return { name: dl.suggestedFilename(), body: Buffer.concat(chunks).toString("utf8") };
+  };
+  const md = await readDl('[data-testid="export-archive-md"]');
+  const js = await readDl('[data-testid="export-archive-json"]');
+  const parsed = JSON.parse(js.body);
+  return (
+    md.name.endsWith(".md") &&
+    md.body.includes("## Full Board Transcript") &&
+    !md.body.includes("/home/") &&
+    js.name.endsWith(".json") &&
+    parsed.schema === "fleet.swarm-archive.v1" &&
+    parsed.messages.length >= 1 &&
+    !js.body.includes("/home/")
+  );
+});
+
 await check("Settings Dark mode + 1440px desktop overflow check", async () => {
   await page.locator('button[aria-label="Open settings"]').click();
   await page.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();

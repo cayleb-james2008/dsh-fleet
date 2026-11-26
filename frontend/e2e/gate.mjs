@@ -579,6 +579,30 @@ await runChecks("gate", async (check) => {
     );
   });
 
+  await check("Triage Full Swarm Archive Export downloads sanitized .md and .json with zero /home/ leaks", async () => {
+    const readDl = async (selector) => {
+      const [dl] = await Promise.all([page.waitForEvent("download"), page.locator(selector).click()]);
+      const chunks = [];
+      for await (const c of await dl.createReadStream()) chunks.push(c);
+      return { name: dl.suggestedFilename(), body: Buffer.concat(chunks).toString("utf8") };
+    };
+    const md = await readDl('[data-testid="export-archive-md"]');
+    const js = await readDl('[data-testid="export-archive-json"]');
+    const parsed = JSON.parse(js.body);
+    return (
+      md.name.endsWith(".md") &&
+      md.body.includes("## Full Board Transcript") &&
+      md.body.includes("## Worktree readiness") &&
+      !md.body.includes("/home/") &&
+      js.name.endsWith(".json") &&
+      parsed.schema === "fleet.swarm-archive.v1" &&
+      Array.isArray(parsed.messages) &&
+      parsed.messages.length >= 4 &&
+      Array.isArray(parsed.members) &&
+      !js.body.includes("/home/")
+    );
+  });
+
   // 26-28: Clean runtime guarantees
   await check("zero console errors", () => consoleErrors.length === 0);
   await check("zero uncaught page errors", () => pageErrors.length === 0);

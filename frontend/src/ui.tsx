@@ -264,6 +264,92 @@ export function formatSwarmDigest(
   return maskHome(lines.join("\n"));
 }
 
+/** Sanitized Full Swarm Archive Export in Markdown or structured JSON (`0` `/home/` leaks). */
+export function formatSwarmArchive(
+  snap: SwarmSnapshot,
+  pinnedSeqs: number[] = [],
+  worktrees: WorktreesPayload | null = null,
+  format: "md" | "json" = "md",
+): string {
+  const msgs = (snap.messages || []).filter((m) => !m.control);
+  if (format === "json") {
+    return maskHome(
+      JSON.stringify(
+        {
+          schema: "fleet.swarm-archive.v1",
+          swarm: snap.id || snap.swarm || "",
+          title: maskHome(snap.title || "Fleet"),
+          head: snap.head || 0,
+          pinnedSeqs,
+          usage: snap.usage || null,
+          plan: snap.plan
+            ? {
+                ...snap.plan,
+                goal: snap.plan.goal ? maskHome(snap.plan.goal) : "",
+                gate: snap.plan.gate ? maskHome(snap.plan.gate) : "",
+              }
+            : null,
+          gateReadiness: snap.gateReadiness || null,
+          burnSummary: snap.burnSummary || null,
+          members: (snap.members || []).map((m) => ({
+            name: m.name,
+            role: m.role,
+            model: m.model,
+            status: m.status,
+            killed: m.killed,
+            steps: m.steps,
+            unread: m.unread,
+            usage: m.usage,
+            activityPeek: m.activityPeek ? { ...m.activityPeek, label: maskHome(m.activityPeek.label) } : null,
+            failure: m.failure ? { ...m.failure, text: maskHome(m.failure.text) } : null,
+          })),
+          triage: (snap.triage || []).map((it) => ({
+            id: it.id,
+            kind: it.kind,
+            severity: it.severity,
+            member: it.member,
+            seq: it.seq,
+            title: maskHome(it.title),
+            detail: maskHome(it.detail),
+          })),
+          messages: msgs.map((m) => ({
+            seq: m.seq,
+            agent: m.agent,
+            time: m.time || "",
+            mentions: m.mentions || [],
+            text: maskHome(m.text),
+          })),
+          worktrees: (worktrees?.worktrees || []).map((wt) => ({
+            branch: wt.branch,
+            path: maskHome(wt.path),
+            clean: wt.clean,
+            landStatus: wt.landStatus || (wt.clean ? "ready" : "dirty"),
+            ahead: wt.ahead || 0,
+            behind: wt.behind || 0,
+            lastCommitSha: wt.lastCommitSha || "",
+            lastCommitSubject: maskHome(wt.lastCommitSubject || ""),
+            files: (wt.files || []).map((f) => ({ state: f.state, path: f.path })),
+          })),
+        },
+        null,
+        2,
+      ),
+    );
+  }
+  const summary = formatSwarmDigest(snap, pinnedSeqs, worktrees);
+  const transcriptRows = msgs.map(
+    (m) => `- #${m.seq}${m.time ? ` \`${m.time}\`` : ""} @${m.agent}: ${cleanDigestLine(m.text, 400)}`,
+  );
+  return maskHome(
+    [
+      summary,
+      "",
+      `## Full Board Transcript (${msgs.length})`,
+      ...(transcriptRows.length ? transcriptRows : ["- No board messages recorded."]),
+    ].join("\n"),
+  );
+}
+
 export function fmtTokens(n: number | undefined): string {
   const v = Number(n) || 0;
   if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(2)}M`;

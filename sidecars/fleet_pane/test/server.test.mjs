@@ -260,7 +260,9 @@ test('install.sh --dest deploys plugin bundle cleanly and installed main.mjs boo
     const json = await health.json();
     assert.equal(json.ok, true);
     assert.equal(json.name, 'fleet');
-    assert.equal(json.version, '1.18.0');
+    assert.equal(json.version, '1.19.0');
+    assert.equal(json.idleSleep, true);
+    assert.equal(json.sseClients, 0);
   } finally {
     if (child && child.exitCode === null) child.kill('SIGTERM');
     if (!hadDist) rmSync(distDir, { recursive: true, force: true });
@@ -367,6 +369,65 @@ test('POST /api/nudge supports confirmation-gated multi-worker conversationIds b
       nudged.map((x) => x.conv),
       [fx.coord, fx.worker],
     );
+  } finally {
+    await srv.close();
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test('Zero-client idle sleep pauses background SSE polling on disconnect and wakes cleanly on next request', async () => {
+  const fx = setupFixtureAppData();
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+  });
+
+  try {
+    // 1. Boots idle with zero background timers
+    assert.deepEqual(srv.getSleepState(), { idleSleep: true, sseClients: 0, timerActive: false });
+    const h0 = await (await fetch(`${srv.url}/api/health`)).json();
+    assert.equal(h0.idleSleep, true);
+    assert.equal(h0.sseClients, 0);
+
+    // 2. SSE connect wakes server and starts timer
+    let sock;
+    await new Promise((resolve, reject) => {
+      sock = net.connect(srv.port, '127.0.0.1', () => {
+        sock.write(`GET /api/swarm/stream?conversationId=${fx.coord} HTTP/1.1\r\nHost: 127.0.0.1:${srv.port}\r\nAccept: text/event-stream\r\n\r\n`);
+      });
+      let buf = '';
+      sock.setEncoding('utf8');
+      sock.on('data', (c) => {
+        buf += c;
+        if (buf.includes('event: swarm\n')) resolve();
+      });
+      sock.on('error', reject);
+    });
+    assert.deepEqual(srv.getSleepState(), { idleSleep: false, sseClients: 1, timerActive: true });
+    const h1 = await (await fetch(`${srv.url}/api/health`)).json();
+    assert.equal(h1.idleSleep, false);
+    assert.equal(h1.sseClients, 1);
+
+    // 3. Disconnecting the last SSE client enters idleSleep and clears sseTimer
+    sock.destroy();
+    const deadline = Date.now() + 1500;
+    while (Date.now() < deadline && !srv.getSleepState().idleSleep) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.deepEqual(srv.getSleepState(), { idleSleep: true, sseClients: 0, timerActive: false });
+    const h2 = await (await fetch(`${srv.url}/api/health`)).json();
+    assert.equal(h2.idleSleep, true);
+    assert.equal(h2.sseClients, 0);
+
+    // 4. Subsequent HTTP request wakes immediately and serves fresh data
+    const snap = await fetch(`${srv.url}/api/swarm?conversationId=${fx.coord}`);
+    assert.equal(snap.status, 200);
+    const snapJson = await snap.json();
+    assert.equal(snapJson.swarm, fx.coord);
+    assert.equal(srv.getSleepState().idleSleep, false);
+    assert.equal(srv.getSleepState().timerActive, false);
   } finally {
     await srv.close();
     rmSync(fx.dir, { recursive: true, force: true });

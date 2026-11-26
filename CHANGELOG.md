@@ -3,6 +3,12 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as an
 Antigravity plugin archive (`tar.gz` and `zip`) with `SHA256SUMS`.
 
+## 1.19.0 - 2026-11-25
+
+- Added zero-client idle sleep mode in `sidecars/fleet_pane/server_core.mjs` (`idleSleep` + `sseClients` state exposed on `/api/health` and `getSleepState()`): servers boot idle with zero polling timers, clear `sseTimer` and re-enter `idleSleep` immediately when the last SSE client disconnects, and wake immediately on the next API or stream request.
+- Added 1-click sanitized Full Swarm Archive Export (`formatSwarmArchive` in `frontend/src/ui.tsx`, `[data-testid="export-archive-md"]` and `[data-testid="export-archive-json"]` in `frontend/src/components/TriageView.tsx` and `App.tsx`) producing `fleet.swarm-archive.v1` JSON and Markdown archives covering plan, gate readiness, worker state, triage, full board transcript, and worktree readiness with zero `/home/` path leaks, plus hidden-tab timer pause in `App.tsx` and offline `web-engine.js` parity.
+- Verified post-final-edit: `13/13` backend unit tests (`458.7 ms`), `52/52` gate, `8/8` replay, `14/14` `test-live-web.mjs`, `SLOP 0/0/0`, `63.74 MB` (`65,268 KB`) `--jitless` `VmHWM` on `2k/50k` (`4,584.3 req/s`), `1,833.4 req/s` (`14.11 ms` p95, `0` errors, `30/30` fuzz, `5/5` SSE) on `audit_runner.py` under `#154` isolation, `311,474 B` raw / `97,019 B` gz (`94.7 KiB`), and refreshed Light and Dark `docs/screenshots/*.png`.
+
 ## 1.18.0 - 2026-11-25
 
 - Added a bounded, strictly read-only, mtime-cached 8 KB tail reader (`readTranscriptActivityTail`) in `sidecars/fleet_pane/swarm_store.mjs` reusing the shared 32 KB chunk buffer and masking `/home/` and `/Users/` paths as `~/`, attaching `activityPeek` (`status`, `label`, `tool`, `ts`) to non-killed members in `buildSwarmSnapshot`, `frontend/src/types.ts`, and `frontend/scripts/web-engine.js`.

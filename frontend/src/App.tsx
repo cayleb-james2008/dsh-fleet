@@ -40,7 +40,9 @@ import {
   StatusDot,
   cn,
   copyText,
+  downloadTextFile,
   fmtTokens,
+  formatSwarmArchive,
   formatSwarmDigest,
   toast,
 } from "./ui";
@@ -176,7 +178,9 @@ export function App() {
 
   useEffect(() => {
     if (!snap?.swarm) return;
-    const id = setInterval(() => setNowTick(Date.now()), 30000);
+    const id = setInterval(() => {
+      if (!document.hidden) setNowTick(Date.now());
+    }, 30000);
     return () => clearInterval(id);
   }, [snap?.swarm]);
 
@@ -330,6 +334,18 @@ export function App() {
 
   const handleCopyDigest = () => {
     if (snap?.swarm) void copyText(formatSwarmDigest(snap, pinnedSeqs, worktrees), "Handoff digest copied");
+  };
+
+  const handleExportArchive = (format: "md" | "json") => {
+    if (!snap?.swarm) return;
+    const slug = (snap.title || snap.swarm || "fleet").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "fleet";
+    const body = formatSwarmArchive(snap, pinnedSeqs, worktrees, format);
+    downloadTextFile(
+      `fleet-archive-${slug}.${format}`,
+      body,
+      format === "json" ? "application/json;charset=utf-8" : "text/markdown;charset=utf-8",
+      `Exported ${format.toUpperCase()} swarm archive`,
+    );
   };
 
   const isStaleSync = hasSwarm && lastSyncAt > 0 && nowTick - lastSyncAt > 45000;
@@ -561,6 +577,7 @@ export function App() {
                 onTogglePin={handleTogglePin}
                 onJumpToBoardSeq={handleJumpToBoard}
                 onCopyHandoffDigest={handleCopyDigest}
+                onExportArchive={handleExportArchive}
                 onRefresh={() => refreshSwarm(true)}
               />
             )}
@@ -641,7 +658,7 @@ export function App() {
           <div className="rounded-card bg-board p-3 text-[12px] text-ink-2 space-y-1">
             <div className="f1 font-medium text-ink">
               <CommandIcon />
-              <span>Fleet Antigravity Plugin v1.18.0</span>
+              <span>Fleet Antigravity Plugin v1.19.0</span>
             </div>
             <p>Reads local swarm files over loopback with no telemetry.</p>
           </div>

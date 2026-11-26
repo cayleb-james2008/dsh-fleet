@@ -262,18 +262,22 @@ export function createFleetHandlers({
   const worktreesPayloadCache = new Map(); // rootsKey -> { at, packed }
   let swarmsListCache = { at: 0, key: '', sig: '', swarms: [], packed: null };
 
-  function getHealthPacked() {
+  function getHealthPacked(sleepState = null) {
     const appDataDirs = getAppDirs();
-    const key = `${appDataDirs.join('\0')}|${isSidecar}|${Boolean(sendMessageFn)}|${defaultConversationId}`;
+    const idleSleep = sleepState ? Boolean(sleepState.idleSleep) : false;
+    const sseCount = sleepState ? Number(sleepState.sseClients) || 0 : 0;
+    const key = `${appDataDirs.join('\0')}|${isSidecar}|${Boolean(sendMessageFn)}|${defaultConversationId}|${idleSleep}|${sseCount}`;
     if (!healthPacked || healthKey !== key) {
       healthKey = key;
       healthPacked = pack({
         ok: true,
         name: 'fleet',
-        version: '1.18.0',
+        version: '1.19.0',
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
         sseStream: !isSidecar,
+        idleSleep,
+        sseClients: sseCount,
         appDataDirs,
         conversationId: defaultConversationId || null,
       });
@@ -648,18 +652,29 @@ export async function createStandaloneRouter({
   if (!deferStore) await ensureHandlers();
 
   const bootDirs = appDataDir ? [appDataDir] : process.env.FLEET_APP_DATA_DIR ? [process.env.FLEET_APP_DATA_DIR] : [];
-  let quickHealthPacked = null;
-  const getQuickHealthPacked = () =>
-    (quickHealthPacked ||= packJsonPayload({
+  let quickHealthAwake = null;
+  let quickHealthSleep = null;
+  const getQuickHealthPacked = () => {
+    const cached = idleSleep ? quickHealthSleep : quickHealthAwake;
+    if (cached && sseClients.size === (idleSleep ? 0 : sseClients.size)) {
+      if (idleSleep || sseClients.size === 0) return cached;
+    }
+    const packed = packJsonPayload({
       ok: true,
       name: 'fleet',
-      version: '1.18.0',
+      version: '1.19.0',
       mode: 'standalone',
       canSendMessage: Boolean(sendMessageFn),
       sseStream: true,
+      idleSleep,
+      sseClients: sseClients.size,
       appDataDirs: bootDirs,
       conversationId: defaultConversationId || null,
-    }));
+    });
+    if (idleSleep && sseClients.size === 0) quickHealthSleep = packed;
+    else if (!idleSleep && sseClients.size === 0) quickHealthAwake = packed;
+    return packed;
+  };
 
   let preloadBuf = null;
   let preloadHdrs = null;
@@ -668,16 +683,25 @@ export async function createStandaloneRouter({
   const SSE_PING_MS = 15000;
   const sseClients = new Set();
   let sseTimer = null;
+  let idleSleep = true;
 
   function stopSseTimerIfIdle() {
-    if (sseClients.size === 0 && sseTimer) {
-      clearInterval(sseTimer);
-      sseTimer = null;
+    if (sseClients.size === 0) {
+      if (sseTimer) {
+        clearInterval(sseTimer);
+        sseTimer = null;
+      }
+      idleSleep = true;
     }
+  }
+
+  function wakeFromIdle() {
+    idleSleep = false;
   }
 
   function ensureSseTimer() {
     if (sseTimer || sseClients.size === 0) return;
+    idleSleep = false;
     sseTimer = setInterval(() => {
       if (sseClients.size === 0) {
         stopSseTimerIfIdle();
@@ -832,10 +856,12 @@ export async function createStandaloneRouter({
     }
 
     if (req.method === 'GET' && pathname === '/api/health') {
-      return sendPacked(req, res, 200, handlers ? handlers.getHealthPacked() : getQuickHealthPacked());
+      const sleepState = { idleSleep, sseClients: sseClients.size };
+      return sendPacked(req, res, 200, handlers ? handlers.getHealthPacked(sleepState) : getQuickHealthPacked());
     }
 
     const withHandlers = (fn) => {
+      wakeFromIdle();
       if (handlers) return fn(handlers);
       ensureHandlers().then(fn, (err) => {
         res.writeHead(500, { 'Content-Type': 'application/json', ...SECURITY_HEADERS });
@@ -974,6 +1000,7 @@ export async function createStandaloneRouter({
   return {
     handleRequest,
     ensureHandlers,
+    getSleepState: () => ({ idleSleep, sseClients: sseClients.size, timerActive: Boolean(sseTimer) }),
     closeClients: () => {
       for (const client of sseClients) {
         try {
@@ -1008,6 +1035,7 @@ export async function startStandaloneServer({
     server,
     port: addr.port,
     url: `http://${host}:${addr.port}`,
+    getSleepState: router.getSleepState,
     close: () => {
       router.closeClients();
       return new Promise((resolve) => server.close(() => resolve()));
