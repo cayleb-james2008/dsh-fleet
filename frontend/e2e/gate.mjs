@@ -303,12 +303,21 @@ await runChecks("gate", async (check) => {
     return ok;
   });
 
-  await check("triage Token Burn Guard Strip renders share percentage and High burn badge", async () => {
+  await check("triage Token Burn Guard Strip renders $ spend, cache-hit %, share %, and suppresses High burn below $0.10", async () => {
     const strip = page.locator('#panel-triage [data-testid="token-burn-strip"]');
     if ((await strip.count()) !== 1) return false;
-    const txt = await strip.textContent();
-    const badge = await strip.locator('[data-testid="high-burn-badge"]').textContent();
-    return txt.includes("Token burn") && txt.includes("builder") && /\d+%/.test(badge);
+    const txt = (await strip.textContent()) || "";
+    const burnUsd = await strip.locator('[data-testid="burn-total-usd"]').textContent();
+    const burnCache = await strip.locator('[data-testid="burn-cache-hit"]').textContent();
+    const highCount = await strip.locator('[data-testid="high-burn-badge"]').count();
+    return (
+      txt.includes("Token burn") &&
+      txt.includes("builder") &&
+      burnUsd === "$0.03" &&
+      Boolean(burnCache?.includes("cache hit")) &&
+      /Top @builder \d+%/.test(txt) &&
+      highCount === 0
+    );
   });
 
   await check("triage Gate Readiness Card tracks tags and jumps to pending #seq on Board", async () => {
@@ -509,7 +518,31 @@ await runChecks("gate", async (check) => {
 
   await check("roster Token Burn Guard Strip shows top consumer share, 1M/200k context ceilings, $ spend, and cache-hit efficiency", async () => {
     const txt = await page.locator('#panel-roster [data-testid="token-burn-strip"]').textContent();
-    if (!txt || !txt.includes("Token burn") || !txt.includes("builder") || !/\d+%/.test(txt)) return false;
+    const realBurnUsd = await page.locator('#panel-roster [data-testid="burn-total-usd"]').textContent();
+    const realBurnCache = await page.locator('#panel-roster [data-testid="burn-cache-hit"]').textContent();
+    const realBuilderCap = await page.locator('#panel-roster [data-testid="roster-ctx-cap-builder"]').textContent();
+    const realBuilderCost = await page.locator('#panel-roster [data-testid="roster-cost-builder"]').textContent();
+    const realBuilderCache = await page.locator('#panel-roster [data-testid="roster-cache-hit-builder"]').textContent();
+    const realDelta = await page.evaluate(async () => {
+      const r = await fetch("/api/swarm/delta?conversationId=11111111-1111-1111-1111-111111111111&since=0");
+      return r.json();
+    });
+    if (
+      !txt ||
+      !txt.includes("Token burn") ||
+      !txt.includes("builder") ||
+      !/\d+%/.test(txt) ||
+      realBurnUsd !== "$0.03" ||
+      !realBurnCache?.includes("cache hit") ||
+      realBuilderCap !== "cap 1M" ||
+      realBuilderCost !== "$0.03" ||
+      !realBuilderCache?.includes("cache hit") ||
+      !realDelta?.cost?.pricingKnown ||
+      !realDelta?.byModel?.["gemini-3-pro"] ||
+      realDelta?.contextLimit !== 1000000
+    ) {
+      return false;
+    }
 
     const costPage = await ctx.newPage();
     const costErrors = [];

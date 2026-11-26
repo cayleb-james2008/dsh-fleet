@@ -732,8 +732,8 @@
     if (id.indexOf("gemini") >= 0) {
       var isFlash = id.indexOf("flash") >= 0;
       return isFlash
-        ? { family: "gemini-flash", contextLimit: 1000000, inPer1M: 0.30, cacheReadPer1M: 0.03, outPer1M: 2.50, pricingKnown: true }
-        : { family: "gemini-pro", contextLimit: 1000000, inPer1M: 1.25, cacheReadPer1M: 0.125, outPer1M: 10.0, pricingKnown: true };
+        ? { family: "gemini-flash", contextLimit: 1000000, inPer1M: 0.30, cacheReadPer1M: 0.075, outPer1M: 2.50, pricingKnown: true }
+        : { family: "gemini-pro", contextLimit: 1000000, inPer1M: 1.25, cacheReadPer1M: 0.3125, outPer1M: 10.0, pricingKnown: true };
     }
     if (id.indexOf("claude") >= 0 || id.indexOf("opus") >= 0 || id.indexOf("sonnet") >= 0 || id.indexOf("haiku") >= 0) {
       var is1m = /(?:^|[^a-z0-9])1m(?:[^a-z0-9]|$)|\[1m\]|-1m\b/.test(id);
@@ -742,7 +742,7 @@
         return { family: "claude-opus", contextLimit: ctx, inPer1M: 15.0, cacheReadPer1M: 1.5, outPer1M: 75.0, pricingKnown: true };
       }
       if (id.indexOf("haiku") >= 0) {
-        return { family: "claude-haiku", contextLimit: ctx, inPer1M: 0.8, cacheReadPer1M: 0.08, outPer1M: 4.0, pricingKnown: true };
+        return { family: "claude-haiku", contextLimit: ctx, inPer1M: 1.0, cacheReadPer1M: 0.10, outPer1M: 5.0, pricingKnown: true };
       }
       return { family: "claude-sonnet", contextLimit: ctx, inPer1M: 3.0, cacheReadPer1M: 0.3, outPer1M: 15.0, pricingKnown: true };
     }
@@ -1603,7 +1603,7 @@
       return jsonResp({ ok: true, delivered: targets.length });
     }
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.25.0", mode: "live-web", canSendMessage: true, sseStream: false, deltaStream: true, transcriptInspector: true, idleSleep: false, sseClients: 0 });
+      return jsonResp({ ok: true, name: "fleet", version: "1.26.0", mode: "live-web", canSendMessage: true, sseStream: false, deltaStream: true, transcriptInspector: true, idleSleep: false, sseClients: 0 });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });
@@ -1818,7 +1818,7 @@
             summary: "Inspect ~/workspace/fleet-ui/package.json",
             args: { Path: "~/workspace/fleet-ui/package.json", StartLine: 1, EndLine: 40 },
             status: "DONE",
-            outputPreview: "{\"name\": \"fleet-frontend\", \"version\": \"1.25.0\"}",
+            outputPreview: "{\"name\": \"fleet-frontend\", \"version\": \"1.26.0\"}",
           });
         } else if (isErrStep) {
           toolCalls.push({
