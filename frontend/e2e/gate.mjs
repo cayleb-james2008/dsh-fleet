@@ -1436,6 +1436,577 @@ await runChecks("gate", async (check) => {
     );
   });
 
+  await check("Triage 409 Conflict reload-and-merge preserves local edits and renders deeply nested plan/view fields safely", async () => {
+    const pPage = await ctx.newPage();
+    await pPage.setViewportSize({ width: 340, height: 900 });
+    const pErrs = [];
+    let allow409 = false;
+    pPage.on("pageerror", (e) => pErrs.push(e.message));
+    pPage.on("console", (msg) => {
+      if (msg.type() === "error") {
+        if (allow409 && msg.text().includes("status of 409")) return;
+        pErrs.push(msg.text());
+      }
+    });
+
+    let diskEtag = "deep-v1";
+    let diskPlan = {
+      etag: diskEtag,
+      goal: { title: "Nested Goal", line: { summary: "Deep line object" } },
+      gate: "npm test",
+      tasks: { dev: { description: "Inspect /home/demo/deep/file.ts" } },
+      workstreams: [{ id: "ws-1", title: "Disk ws", owner: "dev", status: "running", note: { detail: "Nested note" } }],
+      threads: [{ id: "th-1", title: { label: "Nested Thread" }, goal: { text: "Thread goal" }, tasks: ["dev", "dev"] }],
+    };
+    const postedIfMatches = [];
+
+    await pPage.route("**/api/swarm*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversationId: "deep-coord-1",
+          swarm: "deep-coord-1",
+          member: "coordinator",
+          etag: `snap-${diskEtag}`,
+          id: "deep-coord-1",
+          title: "Deep Plan Gate",
+          head: 1,
+          members: [
+            {
+              name: "coordinator",
+              conversation_id: "deep-coord-1",
+              model: "gemini-3-pro",
+              role: "coordinator",
+              wake_mode: "mentions",
+              wait_since: 1,
+              last_read_seq: 1,
+              unread: 0,
+              killed: false,
+              status: "waiting",
+              steps: 1,
+              activity: "",
+              activityKind: "",
+              replied: false,
+              replyAsk: "",
+              narrator: false,
+              roleWorker: false,
+              failure: null,
+              transcriptMtime: Date.now(),
+              startedAt: new Date().toISOString(),
+              lastStepAt: new Date().toISOString(),
+              usage: { inputTokens: 100, cacheReadTokens: 0, outputTokens: 20, totalTokens: 120 },
+              posts: 1,
+              lastPostSeq: 1,
+              lastPostTime: "12:00:00",
+              lastPostTs: Date.now(),
+            },
+          ],
+          messages: [{ seq: 1, agent: "coordinator", text: "@all Deep test", time: "12:00:00", ts: Date.now(), mentions: [], all: true }],
+          edges: [],
+          view: {
+            exists: true,
+            source: "narrator",
+            json: {
+              headline: { text: "Deep narrator headline" },
+              phase: "verifying",
+              running_summary: ["Checking nested", "view fields"],
+              now: { dev: ["step A", { detail: "step B in /home/demo/app.ts" }] },
+              attention: [{ member: { name: "dev" }, detail: { summary: "Nested alert" } }],
+            },
+          },
+          plan: diskPlan,
+          frames: [],
+          triage: [{ id: "t-weird", kind: "stuck", severity: "unknown_sev", member: "dev", conversationId: "", seq: 1, title: "Weird severity item", detail: "Check nested", suggestedPrompt: "@dev status", timestamp: Date.now() }],
+          usage: { inputTokens: 100, cacheReadTokens: 0, outputTokens: 20, totalTokens: 120 },
+          capabilities: { canSendMessage: false, isSidecar: false, sseStream: false },
+        }),
+      });
+    });
+
+    await pPage.route("**/api/plan", async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      postedIfMatches.push(body.ifMatch);
+      if (body.ifMatch !== diskEtag) {
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "plan changed on disk", plan: diskPlan, etag: diskEtag }),
+        });
+        return;
+      }
+      diskEtag = "deep-v3";
+      diskPlan = { ...diskPlan, etag: diskEtag, gate: body.patch?.gate || diskPlan.gate };
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, plan: diskPlan, etag: diskEtag, notified: false }),
+      });
+    });
+
+    await pPage.goto(BASE, { waitUntil: "domcontentloaded" });
+    await pPage.waitForSelector('[data-testid="narrator-view-card"]');
+    const initTxt = await pPage.locator("#panel-triage").textContent();
+
+    await pPage.locator('[data-testid="edit-plan-btn"]').click();
+    await pPage.waitForSelector('[data-testid="plan-editor"]');
+    await pPage.fill('[data-testid="plan-gate-input"]', "npm run custom-gate");
+
+    // Mutate disk plan concurrently before saving
+    diskEtag = "deep-v2";
+    diskPlan = {
+      ...diskPlan,
+      etag: diskEtag,
+      goal: { title: "Nested Goal", line: "Concurrent disk goal" },
+      workstreams: [
+        ...diskPlan.workstreams,
+        { id: "ws-2", title: "Concurrent disk ws", owner: "qa", status: "done" },
+      ],
+    };
+
+    allow409 = true;
+    await pPage.locator('[data-testid="plan-save-btn"]').click();
+    await pPage.waitForSelector('[data-testid="plan-conflict-banner"]');
+    const bannerTxt = await pPage.locator('[data-testid="plan-conflict-banner"]').textContent();
+    await pPage.locator('[data-testid="plan-conflict-merge"]').click();
+    await pPage.waitForFunction(() => !document.querySelector('[data-testid="plan-conflict-banner"]'));
+
+    const preservedGate = await pPage.locator('[data-testid="plan-gate-input"]').inputValue();
+    const mergedGoal = await pPage.locator('[data-testid="plan-goal-input"]').inputValue();
+    const mergedWs1 = await pPage.locator('[data-testid="plan-ws-title-1"]').inputValue();
+
+    await pPage.locator('[data-testid="plan-save-btn"]').click();
+    await pPage.waitForSelector('[data-testid="swarm-plan-card"]');
+    const ov340 = await pPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    await pPage.close();
+
+    return (
+      Boolean(initTxt?.includes("Deep line object") && initTxt.includes("Nested note") && initTxt.includes("Nested Thread") && initTxt.includes("Deep narrator headline") && initTxt.includes("Nested alert") && initTxt.includes("~/deep/file.ts") && !initTxt.includes("[object Object]") && !initTxt.includes("/home/")) &&
+      Boolean(bannerTxt?.includes("409 Conflict") && bannerTxt.includes("Concurrent disk goal")) &&
+      preservedGate === "npm run custom-gate" &&
+      mergedGoal === "Concurrent disk goal" &&
+      mergedWs1 === "Concurrent disk ws" &&
+      postedIfMatches[0] === "deep-v1" &&
+      postedIfMatches[1] === "deep-v2" &&
+      ov340 <= 0 &&
+      pErrs.length === 0
+    );
+  });
+
+  await check("Worktrees 340px collision pill wrapping and ff_merge / remove_worktree / rebase / dry_run error banners work with 0px overflow", async () => {
+    const wtPage = await ctx.newPage();
+    await wtPage.setViewportSize({ width: 340, height: 900 });
+    const wtErrs = [];
+    let allow409 = false;
+    wtPage.on("pageerror", (e) => wtErrs.push(e.message));
+    wtPage.on("console", (msg) => {
+      if (msg.type() === "error") {
+        if (allow409 && msg.text().includes("status of 409")) return;
+        wtErrs.push(msg.text());
+      }
+    });
+
+    await wtPage.route(/\/api\/worktrees(\?.*)?$/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          roots: [{ path: "/mock/repo", uri: "file:///mock/repo", isGit: true, count: 2, error: "" }],
+          collisions: [
+            {
+              file: "frontend/src/components/WorktreesView.tsx",
+              worktrees: ["/mock/alpha", "/mock/beta"],
+              branches: ["feat/very-long-branch-alpha-lane", "feat/very-long-branch-beta-lane"],
+              kind: "mixed",
+            },
+          ],
+          worktrees: [
+            {
+              id: "w-main",
+              root: "/mock/repo",
+              name: "repo",
+              path: "/mock/repo",
+              uri: "file:///mock/repo",
+              isMain: true,
+              exists: true,
+              bare: false,
+              detached: false,
+              locked: false,
+              prunable: false,
+              branch: "main",
+              head: "1111aaa",
+              clean: true,
+              landStatus: "main",
+              mergeability: "main",
+              dirtyFiles: 0,
+              untrackedFiles: 0,
+              stagedFiles: 0,
+              commits: [],
+              lastCommitSha: "1111aaa",
+              lastCommitSubject: "root",
+              lastCommitAt: Date.now(),
+            },
+            {
+              id: "w-alpha",
+              root: "/mock/repo",
+              name: "alpha",
+              path: "/mock/alpha",
+              uri: "file:///mock/alpha",
+              isMain: false,
+              exists: true,
+              bare: false,
+              detached: false,
+              locked: false,
+              prunable: false,
+              branch: "feat/very-long-branch-alpha-lane",
+              head: "2222bbb",
+              clean: true,
+              baseBranch: "main",
+              ahead: 2,
+              behind: 1,
+              landStatus: "rebase",
+              mergeability: "clean",
+              dirtyFiles: 0,
+              untrackedFiles: 0,
+              stagedFiles: 0,
+              files: [],
+              branchFiles: ["frontend/src/components/WorktreesView.tsx"],
+              commits: [{ sha: "2222bbb", subject: "feat: alpha", authorTime: "1m ago" }],
+              lastCommitSha: "2222bbb",
+              lastCommitSubject: "feat: alpha",
+              lastCommitAt: Date.now(),
+            },
+          ],
+          rejected: [],
+        }),
+      });
+    });
+
+    await wtPage.route(/\/api\/worktrees\/action(\?.*)?$/, async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      if (body.action === "dry_run_merge") {
+        // Real backend returns HTTP 200 with ok:true, status:"conflict", clean:false
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            ok: true,
+            action: "dry_run_merge",
+            status: "conflict",
+            clean: false,
+            conflicts: ["frontend/src/components/WorktreesView.tsx"],
+            message: "1 conflict(s) merging into main",
+          }),
+        });
+        return;
+      }
+      if (body.action === "ff_merge") {
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: JSON.stringify({ ok: false, action: "ff_merge", status: "not_ff", message: "Branch cannot be fast-forward merged" }),
+        });
+        return;
+      }
+      if (body.action === "remove_worktree") {
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: JSON.stringify({ ok: false, action: "remove_worktree", status: "unmerged", message: "Worktree has unmerged commits" }),
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ok: false,
+          action: "rebase",
+          status: "conflict",
+          aborted: true,
+          conflicts: ["frontend/src/components/WorktreesView.tsx"],
+          message: "Rebase aborted due to conflicts",
+        }),
+      });
+    });
+
+    await wtPage.goto(BASE, { waitUntil: "domcontentloaded" });
+    await wtPage.locator("#tab-worktrees").click();
+    await wtPage.fill('input[aria-label="Workspace repository path"]', "/mock/repo");
+    await wtPage.locator('#panel-worktrees button:has-text("Inspect")').click();
+    await wtPage.waitForSelector('[data-testid="worktree-collisions-banner"]');
+
+    const branch = "feat/very-long-branch-alpha-lane";
+    // Dry-run HTTP 200 conflict must render alert banner (not green success)
+    await wtPage.locator(`[data-testid="wt-action-dry-run-${branch}"]`).click();
+    await wtPage.waitForSelector(`[data-testid="wt-action-result-${branch}"][role="alert"]`);
+
+    // FF Merge 409 not_ff
+    allow409 = true;
+    await wtPage.locator(`[data-testid="wt-action-ff-merge-${branch}"]`).click();
+    await wtPage.locator(`[data-testid="wt-confirm-submit-${branch}"]`).click();
+    await wtPage.waitForFunction((b) => (document.querySelector(`[data-testid="wt-action-result-${b}"]`)?.textContent || "").includes("Run Rebase first"), branch);
+
+    // Remove Clean 409 unmerged
+    await wtPage.locator(`[data-testid="wt-action-remove-${branch}"]`).click();
+    await wtPage.locator(`[data-testid="wt-confirm-submit-${branch}"]`).click();
+    await wtPage.waitForFunction((b) => (document.querySelector(`[data-testid="wt-action-result-${b}"]`)?.textContent || "").includes("unmerged commits"), branch);
+
+    // Rebase 409 aborted
+    await wtPage.locator(`[data-testid="wt-action-rebase-${branch}"]`).click();
+    await wtPage.locator(`[data-testid="wt-confirm-submit-${branch}"]`).click();
+    await wtPage.waitForFunction((b) => (document.querySelector(`[data-testid="wt-action-result-${b}"]`)?.textContent || "").includes("aborted"), branch);
+    const rebaseTxt = await wtPage.locator(`[data-testid="wt-action-result-${branch}"]`).textContent();
+
+    await wtPage.locator(`[data-testid="wt-action-dismiss-${branch}"]`).click();
+    const dismissed = (await wtPage.locator(`[data-testid="wt-action-result-${branch}"]`).count()) === 0;
+    const ov340 = await wtPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    await wtPage.close();
+
+    return (
+      Boolean(rebaseTxt?.includes("aborted") && rebaseTxt.includes("Working tree restored cleanly")) &&
+      dismissed &&
+      ov340 <= 0 &&
+      wtErrs.length === 0
+    );
+  });
+
+  await check("Board empty channel state, #seq backlink filter-recovery highlight, double-submit lock, and missing-coordinator error", async () => {
+    const bPage = await ctx.newPage();
+    await bPage.setViewportSize({ width: 340, height: 900 });
+    const bErrs = [];
+    const controlPosts = [];
+    let allow404 = false;
+    bPage.on("pageerror", (e) => bErrs.push(e.message));
+    bPage.on("console", (msg) => {
+      if (msg.type() === "error") {
+        if (allow404 && msg.text().includes("status of 404")) return;
+        bErrs.push(msg.text());
+      }
+    });
+
+    await bPage.route("**/api/swarm*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversationId: "no-coord-1",
+          swarm: "no-coord-1",
+          member: "worker-a",
+          etag: "nc-1",
+          id: "no-coord-1",
+          title: "No Coordinator Gate",
+          head: 2,
+          channels: [
+            { name: "backend", topic: "Backend APIs", created_by: "worker-a", archived: false },
+            { name: "empty-qa", topic: "QA staging channel", created_by: "worker-a", archived: false },
+          ],
+          members: [
+            {
+              name: "worker-a",
+              conversation_id: "no-coord-worker-a",
+              model: "gemini-3-pro",
+              role: "worker",
+              wake_mode: "mentions",
+              wait_since: 2,
+              last_read_seq: 2,
+              unread: 0,
+              killed: false,
+              status: "waiting",
+              steps: 4,
+              activity: "",
+              activityKind: "",
+              replied: false,
+              replyAsk: "",
+              narrator: false,
+              roleWorker: false,
+              failure: null,
+              transcriptMtime: Date.now(),
+              startedAt: new Date().toISOString(),
+              lastStepAt: new Date().toISOString(),
+              usage: { inputTokens: 500, cacheReadTokens: 0, outputTokens: 100, totalTokens: 600 },
+              posts: 2,
+              lastPostSeq: 2,
+              lastPostTime: "12:02:00",
+              lastPostTs: Date.now(),
+            },
+          ],
+          messages: [
+            { seq: 1, agent: "worker-a", text: "Root spec in #main", time: "12:00:00", ts: Date.now() - 60000, mentions: [], all: false },
+            { seq: 2, agent: "worker-a", channel: "backend", text: "Implemented #1 endpoint", time: "12:02:00", ts: Date.now(), mentions: [], all: false },
+          ],
+          replyRefs: { 1: [2] },
+          edges: [],
+          triage: [],
+          usage: { inputTokens: 500, cacheReadTokens: 0, outputTokens: 100, totalTokens: 600 },
+          capabilities: { canSendMessage: true, isSidecar: false, sseStream: false },
+        }),
+      });
+    });
+
+    await bPage.route("**/api/control", async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      controlPosts.push(body);
+      await new Promise((r) => setTimeout(r, 120));
+      await route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: "Coordinator conversation not found" }) });
+    });
+
+    await bPage.goto(BASE, { waitUntil: "domcontentloaded" });
+    await bPage.locator("#tab-board").click();
+    await bPage.waitForSelector('[data-testid="board-channel-tabs"]');
+
+    // 1. Empty channel state
+    await bPage.locator('[data-testid="channel-tab-empty-qa"]').click();
+    await bPage.waitForSelector('[data-testid="board-empty-channel"]');
+    const emptyTxt = await bPage.locator('[data-testid="board-empty-channel"]').textContent();
+
+    // 2. Open composer from empty channel -> missing coordinator warning + double-submit lock + 404 inline error
+    await bPage.locator('[data-testid="board-empty-channel-post"]').click();
+    await bPage.waitForSelector('[data-testid="board-missing-coordinator"]');
+    await bPage.fill('[data-testid="board-composer-input"]', "First empty channel post");
+    await bPage.locator('[data-testid="board-composer-stage"]').click();
+    allow404 = true;
+    await bPage.evaluate(() => {
+      const btn = document.querySelector('[data-testid="board-composer-submit"]');
+      btn?.click();
+      btn?.click();
+    });
+    await bPage.waitForSelector('[data-testid="board-composer-error"]');
+    const ctrlErr = await bPage.locator('[data-testid="board-composer-error"]').textContent();
+    await bPage.locator('[data-testid="board-composer-close"]').click();
+
+    // 3. Filter to #backend and click #1 backlink -> clears filter & highlights #1
+    await bPage.locator('[data-testid="channel-tab-backend"]').click();
+    await bPage.locator('#panel-board button:text-is("#1")').first().click();
+    await bPage.waitForSelector('[data-seq="1"][data-highlighted="true"]');
+    const ov340 = await bPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    await bPage.close();
+
+    return (
+      Boolean(emptyTxt?.includes("No posts in #empty-qa yet.") && emptyTxt.includes("QA staging channel")) &&
+      controlPosts.length === 1 &&
+      Boolean(ctrlErr?.includes("Coordinator conversation not found")) &&
+      ov340 <= 0 &&
+      bErrs.length === 0
+    );
+  });
+
+  await check("Roster double-submit locks and missing-coordinator inline error recovery", async () => {
+    const rPage = await ctx.newPage();
+    await rPage.setViewportSize({ width: 340, height: 900 });
+    const rErrs = [];
+    const controlPosts = [];
+    let allow404 = false;
+    rPage.on("pageerror", (e) => rErrs.push(e.message));
+    rPage.on("console", (msg) => {
+      if (msg.type() === "error") {
+        if (allow404 && msg.text().includes("status of 404")) return;
+        rErrs.push(msg.text());
+      }
+    });
+
+    await rPage.route("**/api/swarm*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversationId: "no-coord-1",
+          swarm: "no-coord-1",
+          member: "worker-a",
+          etag: "nc-r1",
+          id: "no-coord-1",
+          title: "Roster No Coord",
+          head: 1,
+          members: [
+            {
+              name: "worker-a",
+              conversation_id: "no-coord-worker-a",
+              model: "gemini-3-pro",
+              role: "worker",
+              wake_mode: "mentions",
+              wait_since: 1,
+              last_read_seq: 1,
+              unread: 0,
+              killed: false,
+              status: "waiting",
+              steps: 4,
+              activity: "",
+              activityKind: "",
+              replied: false,
+              replyAsk: "",
+              narrator: false,
+              roleWorker: false,
+              failure: null,
+              transcriptMtime: Date.now(),
+              startedAt: new Date().toISOString(),
+              lastStepAt: new Date().toISOString(),
+              usage: { inputTokens: 500, cacheReadTokens: 0, outputTokens: 100, totalTokens: 600 },
+              posts: 1,
+              lastPostSeq: 1,
+              lastPostTime: "12:00:00",
+              lastPostTs: Date.now(),
+            },
+          ],
+          messages: [{ seq: 1, agent: "worker-a", text: "Ready", time: "12:00:00", ts: Date.now(), mentions: [], all: false }],
+          edges: [],
+          triage: [],
+          usage: { inputTokens: 500, cacheReadTokens: 0, outputTokens: 100, totalTokens: 600 },
+          capabilities: { canSendMessage: true, isSidecar: false, sseStream: false },
+        }),
+      });
+    });
+
+    await rPage.route("**/api/control", async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      controlPosts.push(body);
+      await new Promise((r) => setTimeout(r, 120));
+      await route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: "Coordinator conversation not found" }) });
+    });
+
+    await rPage.goto(BASE, { waitUntil: "domcontentloaded" });
+    await rPage.locator("#tab-roster").click();
+    await rPage.waitForSelector("#panel-roster");
+
+    await rPage.locator('[data-testid="toggle-spawn-worker"]').click();
+    await rPage.waitForSelector('[data-testid="roster-missing-coordinator"]');
+    await rPage.fill('[data-testid="spawn-worker-name"]', "qa-lock");
+    await rPage.fill('[data-testid="spawn-worker-brief"]', "Test lock");
+    allow404 = true;
+    await rPage.evaluate(() => {
+      const btn = document.querySelector('[data-testid="spawn-worker-submit"]');
+      btn?.click();
+      btn?.click();
+    });
+    await rPage.waitForSelector('[data-testid="spawn-worker-error"]');
+    const spawnErr = await rPage.locator('[data-testid="spawn-worker-error"]').textContent();
+
+    await rPage.locator('[data-testid="switch-model-btn-worker-a"]').click();
+    await rPage.evaluate(() => {
+      const btn = document.querySelector('[data-testid="switch-model-submit-worker-a"]');
+      btn?.click();
+      btn?.click();
+    });
+    await rPage.waitForSelector('[data-testid="switch-model-error"]');
+    const switchErr = await rPage.locator('[data-testid="switch-model-error"]').textContent();
+
+    await rPage.locator('[data-testid="kill-worker-btn-worker-a"]').click();
+    await rPage.locator('[data-testid="kill-worker-submit-worker-a"]').click();
+    await rPage.waitForSelector('[data-testid="kill-worker-error"]');
+    const killErr = await rPage.locator('[data-testid="kill-worker-error"]').textContent();
+
+    const ov340 = await rPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    await rPage.close();
+
+    return (
+      controlPosts.length === 3 &&
+      Boolean(spawnErr?.includes("Coordinator conversation not found")) &&
+      Boolean(switchErr?.includes("Coordinator conversation not found")) &&
+      Boolean(killErr?.includes("Coordinator conversation not found")) &&
+      ov340 <= 0 &&
+      rErrs.length === 0
+    );
+  });
+
   await check("addArtifactComment bridge helper is wired without error", async () => {
     return await page.evaluate(() => {
       if (typeof window.sidecar?.ui?.addArtifactComment !== "function") return false;

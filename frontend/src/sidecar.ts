@@ -88,13 +88,6 @@ export async function fetchWorktreeDiff(
   return data as WorktreeDiffPayload;
 }
 
-export const getWorktreeDiff = (
-  path: string,
-  file: string,
-  mode: WorktreeDiffMode = "working",
-  root?: string,
-): Promise<WorktreeDiffPayload> => fetchWorktreeDiff(root || path, path, file, mode);
-
 export async function runWorktreeAction(
   action: WorktreeActionName,
   path: string,
@@ -114,15 +107,14 @@ export async function runWorktreeAction(
     }),
   });
   const data = (await res.json().catch(() => ({}))) as Partial<WorktreeActionPayload>;
-  if (
-    res.status === 409 ||
-    (data && (Array.isArray(data.conflicts) || Array.isArray(data.conflictFiles) || data.aborted))
-  ) {
-    const conflicts = data.conflicts || data.conflictFiles || [];
+  const conflicts = data.conflicts || data.conflictFiles || [];
+  const hasConflict =
+    data.status === "conflict" || data.clean === false || conflicts.length > 0 || Boolean(data.aborted);
+  if (res.status === 409 || hasConflict) {
     return {
-      ok: Boolean(res.ok && data.ok),
+      ok: Boolean(res.ok && data.ok && !hasConflict),
       action: data.action || action,
-      status: data.status || (res.status === 409 ? "conflict" : undefined),
+      status: data.status || (res.status === 409 ? "conflict" : hasConflict ? "conflict" : undefined),
       result: data.result,
       aborted: data.aborted,
       conflicts,
@@ -216,7 +208,11 @@ export async function saveSwarmPlan(req: SavePlanRequest): Promise<SavePlanRespo
   });
   const data = (await res.json().catch(() => ({}))) as Partial<SavePlanResponse>;
   if (res.status === 409) {
-    throw new PlanConflictError(data.error || "Plan changed on disk", data.plan);
+    const latest =
+      data.plan && typeof data.plan === "object"
+        ? { ...data.plan, ...(data.etag && !data.plan.etag ? { etag: data.etag } : {}) }
+        : data.plan;
+    throw new PlanConflictError(data.error || "Plan changed on disk", latest);
   }
   if (!res.ok) {
     throw new Error(data.error || `Save plan failed (${res.status})`);
@@ -265,14 +261,6 @@ export async function sendSwarmControl(req: ControlRequest): Promise<SwarmContro
     });
   }
   return data as SwarmControlResponse;
-}
-
-export function addArtifactComment(comment: string): boolean {
-  const fn = sc()?.ui?.addArtifactComment;
-  const text = String(comment || "").trim();
-  if (!text || !fn) return false;
-  fn(text);
-  return true;
 }
 
 export async function startSwarmPreset(prompt: string, title: string): Promise<boolean> {

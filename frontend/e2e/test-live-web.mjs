@@ -132,11 +132,15 @@ await check("Graph renders nodes/edges and toggles", async () => {
 });
 
 await check("Worktrees shows simulated branch dirtiness, collisions banner, mergeability, and commits", async () => {
+  await page.setViewportSize({ width: 340, height: 900 });
   await page.locator("#tab-worktrees").click();
   await page.waitForSelector('[data-testid="worktree-collisions-banner"]');
   const txt = await page.locator("#panel-worktrees").textContent();
   const bannerTxt = await page.locator('[data-testid="worktree-collisions-banner"]').textContent();
+  const ov340 = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  await page.setViewportSize({ width: 380, height: 900 });
   return (
+    ov340 <= 0 &&
     txt.includes("lane/sidebar-ui") &&
     txt.includes("4 changed") &&
     txt.includes("Ready to land") &&
@@ -301,9 +305,10 @@ await check("Live Plan Editor handles 409 conflict reload and persists goal, wor
 
   await page.locator('[data-testid="plan-save-btn"]').click();
   await page.waitForSelector('[data-testid="plan-conflict-banner"]');
-  await page.locator('[data-testid="plan-conflict-reload"]').click();
-  const reloadedVal = await page.locator('[data-testid="plan-goal-input"]').inputValue();
-  if (reloadedVal !== "Concurrent disk goal update") return false;
+  await page.locator('[data-testid="plan-conflict-merge"]').click();
+  await page.waitForFunction(() => !document.querySelector('[data-testid="plan-conflict-banner"]'));
+  const mergedGoalVal = await page.locator('[data-testid="plan-goal-input"]').inputValue();
+  if (mergedGoalVal !== "Concurrent disk goal update") return false;
 
   await page.fill('[data-testid="plan-goal-input"]', "Persisted live plan edit");
   await page.locator('[data-testid="plan-add-workstream"]').click();
@@ -407,6 +412,30 @@ await check("Settings Dark mode + 1440px desktop overflow check", async () => {
   const ov = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   const dark = await page.evaluate(() => document.documentElement.getAttribute("data-theme"));
   return ov <= 0 && dark === "dark";
+});
+
+await check("Empty channel state, #seq backlink filter recovery, and 340px layout work live", async () => {
+  await page.setViewportSize({ width: 340, height: 900 });
+  await page.selectOption('select[aria-label="Active swarm"]', "demo-coord-0001");
+  await page.locator("#tab-board").click();
+  await page.locator('[data-testid="toggle-channel-manager"]').click();
+  await page.fill('[data-testid="channel-op-name"]', "qa-empty");
+  await page.fill('[data-testid="channel-op-topic"]', "Empty QA lane");
+  await page.locator('[data-testid="channel-op-submit"]').click();
+  await page.waitForSelector('[data-testid="channel-tab-qa-empty"]');
+  await page.locator('[data-testid="channel-tab-qa-empty"]').click();
+  await page.waitForSelector('[data-testid="board-empty-channel"]');
+  const emptyTxt = await page.locator('[data-testid="board-empty-channel"]').textContent();
+
+  await page.locator('[data-testid="board-empty-channel-all"]').click();
+  await page.fill('input[aria-label="Search board messages"]', "Sync /api/worktrees");
+  await page.locator('#panel-board button:text-is("#2")').first().click();
+  await page.waitForSelector('[data-seq="2"][data-highlighted="true"]');
+  const ovBoard = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+  await page.locator("#tab-worktrees").click();
+  const ovWt = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  return Boolean(emptyTxt?.includes("No posts in #qa-empty yet.") && emptyTxt.includes("Empty QA lane")) && ovBoard <= 0 && ovWt <= 0;
 });
 
 await check("zero external calls, console errors, or page errors", () => externalReqs.length === 0 && consoleErrs.length === 0 && pageErrs.length === 0);

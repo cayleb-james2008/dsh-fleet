@@ -12,6 +12,7 @@ import type {
   TextareaHTMLAttributes,
 } from "react";
 import { ArrowUpRight, CheckCircle2, ClipboardCopy, FileCode2, Image as ImageIcon, Pin, PinOff, Send, X } from "./icons";
+import { animatePanelEnter } from "./motion";
 import { openFileInAuxPane, parseScreenshotLines, sendConfirmedNudge, sendSwarmControl } from "./sidecar";
 import type {
   BoardMessage,
@@ -202,19 +203,47 @@ export const maskHome = (s: unknown): string =>
   String(s ?? "").replace(/\/(?:home|Users)\/[^/\s]+(\/|$)/g, (_, sep) => `~${sep}`);
 const cleanDigestLine = (s: unknown, max = 140) => maskHome(s).replace(/\s+/g, " ").trim().slice(0, max);
 
-export function safePlanText(val: unknown): string {
+export function safePlanText(val: unknown, depth = 0): string {
+  if (depth > 6 || val === null || val === undefined) return "";
   if (typeof val === "string") return val;
-  if (typeof val === "number" || typeof val === "boolean") return String(val);
-  if (val && typeof val === "object" && !Array.isArray(val)) {
+  if (typeof val === "number") return Number.isFinite(val) ? String(val) : "";
+  if (typeof val === "boolean") return String(val);
+  if (Array.isArray(val)) {
+    return val
+      .slice(0, 8)
+      .map((item) => safePlanText(item, depth + 1).trim())
+      .filter(Boolean)
+      .join(", ");
+  }
+  if (typeof val === "object") {
     const o = val as Record<string, unknown>;
-    return (
-      safePlanText(o.line) ||
-      safePlanText(o.title) ||
-      safePlanText(o.summary) ||
-      safePlanText(o.text) ||
-      safePlanText(o.detail) ||
-      ""
-    );
+    const preferred = [
+      "line",
+      "title",
+      "summary",
+      "text",
+      "detail",
+      "description",
+      "label",
+      "name",
+      "message",
+      "note",
+      "status",
+      "value",
+    ];
+    for (const key of preferred) {
+      if (Object.prototype.hasOwnProperty.call(o, key)) {
+        const hit = safePlanText(o[key], depth + 1).trim();
+        if (hit) return hit;
+      }
+    }
+    const fallback: string[] = [];
+    for (const [k, v] of Object.entries(o)) {
+      if (fallback.length >= 3) break;
+      const rendered = safePlanText(v, depth + 1).trim();
+      if (rendered) fallback.push(`${k}: ${rendered}`);
+    }
+    return fallback.join(" · ");
   }
   return "";
 }
@@ -240,18 +269,18 @@ function normalizeMsStatus(raw: unknown): PlanMilestoneStatus {
 
 export function normalizePlan(raw: SwarmPlan | NormalizedPlan | null | undefined): NormalizedPlan | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  let goalTitle = typeof raw.goalTitle === "string" ? raw.goalTitle : undefined;
-  let goalLine = typeof raw.goalLine === "string" ? raw.goalLine : undefined;
+  let goalTitle = safePlanText(raw.goalTitle).trim() || undefined;
+  let goalLine = safePlanText(raw.goalLine).trim() || undefined;
   let goal = "";
   if (typeof raw.goal === "string") {
     goal = raw.goal;
   } else if (raw.goal && typeof raw.goal === "object" && !Array.isArray(raw.goal)) {
     const g = raw.goal as PlanGoalObject;
-    goalTitle = safePlanText(g.title) || goalTitle;
-    goalLine = safePlanText(g.line) || goalLine;
-    goal = goalLine || goalTitle || "";
+    goalTitle = safePlanText(g.title).trim() || goalTitle;
+    goalLine = safePlanText(g.line).trim() || goalLine;
+    goal = goalLine || goalTitle || safePlanText(g).trim();
   } else {
-    goal = goalLine || goalTitle || "";
+    goal = safePlanText(raw.goal).trim() || goalLine || goalTitle || "";
   }
 
   const threads: PlanThread[] = Array.isArray(raw.threads)
@@ -277,14 +306,18 @@ export function normalizePlan(raw: SwarmPlan | NormalizedPlan | null | undefined
   const workstreams: NormalizedPlan["workstreams"] = Array.isArray(raw.workstreams)
     ? raw.workstreams
         .filter((w): w is NonNullable<typeof w> => Boolean(w && typeof w === "object"))
-        .map((w, idx) => ({
-          id: safePlanText(w.id) || `ws-${idx + 1}`,
-          title: safePlanText(w.title),
-          owner: safePlanText(w.owner),
-          status: normalizeWsStatus(w.status),
-          ...(typeof w.note === "string" && w.note ? { note: w.note } : {}),
-          ...(typeof w.threadId === "string" && w.threadId ? { threadId: w.threadId } : {}),
-        }))
+        .map((w, idx) => {
+          const note = safePlanText(w.note).trim();
+          const threadId = safePlanText(w.threadId).trim();
+          return {
+            id: safePlanText(w.id) || `ws-${idx + 1}`,
+            title: safePlanText(w.title),
+            owner: safePlanText(w.owner),
+            status: normalizeWsStatus(w.status),
+            ...(note ? { note } : {}),
+            ...(threadId ? { threadId } : {}),
+          };
+        })
     : [];
 
   const milestones: NormalizedPlan["milestones"] = Array.isArray(raw.milestones)
@@ -734,14 +767,7 @@ export function Modal({
 
   useEffect(() => {
     if (!open) return;
-    const el = panelRef.current;
-    if (el && typeof el.animate === "function" && !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
-      el.animate([{ opacity: 0, transform: "translateY(6px) scale(0.98)" }, { opacity: 1, transform: "none" }], {
-        duration: 220,
-        easing: "cubic-bezier(0.23,1,0.32,1)",
-        fill: "both",
-      });
-    }
+    animatePanelEnter(panelRef.current);
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
@@ -1078,6 +1104,9 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
   const [verdictKind, setVerdictKind] = useState<"verified" | "blocked" | "ship">("verified");
   const [verdictNote, setVerdictNote] = useState("");
   const [verdictSending, setVerdictSending] = useState(false);
+  const [verdictError, setVerdictError] = useState("");
+  const verdictLockRef = useRef(false);
+  const gateNudgeLockRef = useRef(false);
   const gate = snap.gateReadiness;
   if (!gate) return null;
   const tone = gate.state === "blocked" ? "danger" : gate.state === "ready" ? "success" : "info";
@@ -1087,11 +1116,15 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
   const live = Boolean(next && canLiveNudge(snap) && next.conversationId);
   const swarmConvId = snap.swarm || snap.conversationId || "";
   const canControl = Boolean(swarmConvId && canLiveNudge(snap));
+  const members = snap.members || [];
+  const hasCoordinator = members.some((m) => !m.killed && m.role === "coordinator" && Boolean(m.conversation_id));
 
   const submitVerdict = async () => {
     const note = verdictNote.trim();
-    if (!swarmConvId || !note || hasControlChars(note) || note.length > 4000) return;
+    if (verdictLockRef.current || !swarmConvId || !note || hasControlChars(note) || note.length > 4000) return;
+    verdictLockRef.current = true;
     setVerdictSending(true);
+    setVerdictError("");
     try {
       await sendSwarmControl({
         op: "gate_verdict",
@@ -1106,8 +1139,11 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
       setVerdictNote("");
       onRefresh?.();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Verdict failed");
+      const msg = err instanceof Error ? err.message : "Verdict failed";
+      setVerdictError(msg);
+      toast.error(msg);
     } finally {
+      verdictLockRef.current = false;
       setVerdictSending(false);
     }
   };
@@ -1200,13 +1236,34 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
           value={draft}
           onChange={setDraft}
           onCancel={() => setOpen(false)}
-          onSubmit={() => submitNudge(next.conversationId, draft, `Nudged @${next.target}`, setSending, () => { setOpen(false); onRefresh?.(); })}
+          onSubmit={async () => {
+            if (gateNudgeLockRef.current) return;
+            gateNudgeLockRef.current = true;
+            try {
+              await submitNudge(next.conversationId, draft, `Nudged @${next.target}`, setSending, () => {
+                setOpen(false);
+                onRefresh?.();
+              });
+            } finally {
+              gateNudgeLockRef.current = false;
+            }
+          }}
           submitLabel={sending ? "Sending..." : "Confirm & send"}
           disabled={sending}
         />
       )}
       {verdictOpen && (
         <div className="pt-2 border-t border-hairline space-y-2" data-testid="gate-verdict-drawer">
+          {members.length > 0 && !hasCoordinator && (
+            <p role="alert" className="rounded-chip border border-warn bg-warn-soft px-2 py-1 text-[12px] text-warn" data-testid="gate-missing-coordinator">
+              No active coordinator in roster. Verdict delivery may fail.
+            </p>
+          )}
+          {verdictError && (
+            <p role="alert" className="rounded-chip border border-danger bg-bad-soft px-2 py-1 text-[12px] text-danger" data-testid="gate-verdict-error">
+              {verdictError}
+            </p>
+          )}
           <div className="wrap gap-1" role="group" aria-label="Gate verdict">
             {(["verified", "blocked", "ship"] as const).map((kind) => (
               <Pill
@@ -1224,7 +1281,10 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
             data-testid="gate-verdict-note"
             maxLength={4000}
             value={verdictNote}
-            onChange={(e) => setVerdictNote(e.target.value)}
+            onChange={(e) => {
+              setVerdictNote(e.target.value);
+              setVerdictError("");
+            }}
             placeholder="Verdict note"
           />
           <div className="row">

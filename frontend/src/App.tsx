@@ -85,6 +85,7 @@ export function App() {
   const [manualRoots, setManualRoots] = useState<string[]>([]);
   const [worktrees, setWorktrees] = useState<WorktreesPayload | null>(null);
   const [wtLoading, setWtLoading] = useState(false);
+  const [wtError, setWtError] = useState("");
 
   const [highlightSeq, setHighlightSeq] = useState<number | null>(null);
   const [boardQuickFilter, setBoardQuickFilter] = useState<BoardQuickFilter>("all");
@@ -245,9 +246,20 @@ export function App() {
   const allRootsKey = allRoots.join("\0");
 
   const refreshWorktrees = useCallback(async () => {
-    if (!allRootsKey) { setWorktrees(null); return; }
+    if (!allRootsKey) {
+      setWorktrees(null);
+      setWtError("");
+      return;
+    }
     setWtLoading(true);
-    try { setWorktrees(await fetchWorktrees(allRootsKey.split("\0"))); } catch {} finally { setWtLoading(false); }
+    try {
+      setWorktrees(await fetchWorktrees(allRootsKey.split("\0")));
+      setWtError("");
+    } catch (err) {
+      setWtError(err instanceof Error ? err.message : "Failed to inspect worktrees");
+    } finally {
+      setWtLoading(false);
+    }
   }, [allRootsKey]);
 
   useEffect(() => {
@@ -559,6 +571,7 @@ export function App() {
               workspaceUris={workspaceUris}
               payload={worktrees}
               loading={wtLoading}
+              error={wtError}
               manualRoots={manualRoots}
               members={members}
               onAddManualRoot={(r) => setManualRoots((prev) => (prev.includes(r) ? prev : [...prev, r]))}

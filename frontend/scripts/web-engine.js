@@ -613,46 +613,82 @@
     return sw && sw.plan ? "plan-v" + (sw.planVersion || 1) : "";
   }
 
+  function safePlanText(val, depth) {
+    var d = depth || 0;
+    if (d > 6 || val === null || val === undefined) return "";
+    if (typeof val === "string") return val;
+    if (typeof val === "number") return Number.isFinite(val) ? String(val) : "";
+    if (typeof val === "boolean") return String(val);
+    if (Array.isArray(val)) {
+      return val.slice(0, 8).map(function (x) { return safePlanText(x, d + 1).trim(); }).filter(Boolean).join(", ");
+    }
+    if (typeof val === "object") {
+      var keys = ["line", "title", "summary", "text", "detail", "description", "label", "name", "message", "note", "status", "value"];
+      for (var i = 0; i < keys.length; i++) {
+        if (Object.prototype.hasOwnProperty.call(val, keys[i])) {
+          var hit = safePlanText(val[keys[i]], d + 1).trim();
+          if (hit) return hit;
+        }
+      }
+      var fallback = [];
+      Object.keys(val).forEach(function (k) {
+        if (fallback.length >= 3) return;
+        var rendered = safePlanText(val[k], d + 1).trim();
+        if (rendered) fallback.push(k + ": " + rendered);
+      });
+      return fallback.join(" · ");
+    }
+    return "";
+  }
+
   function normalizePlanForSnapshot(raw, etag) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-    var goalTitle = typeof raw.goalTitle === "string" ? raw.goalTitle : undefined;
-    var goalLine = typeof raw.goalLine === "string" ? raw.goalLine : undefined;
+    var goalTitle = safePlanText(raw.goalTitle).trim() || undefined;
+    var goalLine = safePlanText(raw.goalLine).trim() || undefined;
     var goal = "";
     if (typeof raw.goal === "string") {
       goal = raw.goal;
-    } else if (raw.goal && typeof raw.goal === "object") {
-      goalTitle = typeof raw.goal.title === "string" ? raw.goal.title : goalTitle;
-      goalLine = typeof raw.goal.line === "string" ? raw.goal.line : goalLine;
-      goal = goalLine || goalTitle || "";
+    } else if (raw.goal && typeof raw.goal === "object" && !Array.isArray(raw.goal)) {
+      goalTitle = safePlanText(raw.goal.title).trim() || goalTitle;
+      goalLine = safePlanText(raw.goal.line).trim() || goalLine;
+      goal = goalLine || goalTitle || safePlanText(raw.goal).trim();
+    } else {
+      goal = safePlanText(raw.goal).trim() || goalLine || goalTitle || "";
     }
-    var threads = Array.isArray(raw.threads) ? raw.threads.map(function (th, idx) {
+    var threads = Array.isArray(raw.threads) ? raw.threads.filter(function (th) { return th && typeof th === "object"; }).map(function (th, idx) {
       return {
-        id: String((th && th.id) || ("thread-" + (idx + 1))),
-        title: String((th && th.title) || ""),
-        goal: String((th && th.goal) || ""),
-        tasks: Array.isArray(th && th.tasks) ? th.tasks.map(String) : [],
+        id: safePlanText(th.id).trim() || ("thread-" + (idx + 1)),
+        title: safePlanText(th.title),
+        goal: safePlanText(th.goal),
+        tasks: Array.isArray(th.tasks) ? th.tasks.map(function (x) { return safePlanText(x); }).filter(Boolean) : [],
       };
     }) : [];
     var tasks = {};
     if (raw.tasks && typeof raw.tasks === "object" && !Array.isArray(raw.tasks)) {
       Object.keys(raw.tasks).forEach(function (k) {
-        if (raw.tasks[k]) tasks[k] = String(raw.tasks[k]);
+        var desc = safePlanText(raw.tasks[k]).trim();
+        if (k && desc) tasks[k] = desc;
       });
     }
-    var workstreams = Array.isArray(raw.workstreams) ? raw.workstreams.map(function (ws, idx) {
+    var workstreams = Array.isArray(raw.workstreams) ? raw.workstreams.filter(function (ws) { return ws && typeof ws === "object"; }).map(function (ws, idx) {
       return {
-        id: String((ws && ws.id) || ("ws-" + (idx + 1))),
-        title: String((ws && ws.title) || ""),
-        owner: String((ws && ws.owner) || ""),
-        status: String((ws && ws.status) || "pending"),
+        id: safePlanText(ws.id).trim() || ("ws-" + (idx + 1)),
+        title: safePlanText(ws.title),
+        owner: safePlanText(ws.owner),
+        status: safePlanText(ws.status).trim() || "pending",
       };
     }) : [];
-    var milestones = Array.isArray(raw.milestones) ? raw.milestones.map(function (ms) {
-      return { title: String((ms && ms.title) || ""), status: String((ms && ms.status) || "pending") };
+    var milestones = Array.isArray(raw.milestones) ? raw.milestones.filter(function (ms) { return ms && typeof ms === "object"; }).map(function (ms) {
+      return { title: safePlanText(ms.title), status: safePlanText(ms.status).trim() || "pending" };
     }) : [];
     var risks = Array.isArray(raw.risks) ? raw.risks.map(function (r) {
-      return typeof r === "string" ? { title: r } : { title: String((r && r.title) || ""), severity: r && r.severity ? String(r.severity) : undefined };
-    }) : [];
+      if (typeof r === "string") return { title: r };
+      if (r && typeof r === "object") {
+        var sev = safePlanText(r.severity).trim();
+        return { title: safePlanText(r.title), severity: sev || undefined };
+      }
+      return null;
+    }).filter(function (r) { return Boolean(r && r.title); }) : [];
     var hasNative = Boolean(threads.length || Object.keys(tasks).length || goalTitle || goalLine);
     var hasFleet = Boolean(workstreams.length || milestones.length || raw.gate);
     var schema = hasNative && hasFleet ? "hybrid" : hasNative ? "native" : "fleet";
@@ -660,9 +696,9 @@
       {
         schema: schema,
         etag: etag || "",
-        title: String(raw.title || goalTitle || ""),
+        title: safePlanText(raw.title) || goalTitle || "",
         goal: goal,
-        gate: String(raw.gate || ""),
+        gate: safePlanText(raw.gate),
         threads: threads,
         tasks: tasks,
         workstreams: workstreams,

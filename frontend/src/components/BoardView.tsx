@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "../hooks";
 import { ArrowDown, ClipboardCopy, Filter, Hash, Pin, Plus, Reply, Search, Send, X } from "../icons";
+import { prefersReducedMotion } from "../motion";
 import { extractLocalFilePaths, parseScreenshotLines, sendSwarmControl } from "../sidecar";
 import type { BoardMessage, SwarmSnapshot } from "../types";
 import { Badge, Button, Card, InlineComposer, Input, MediaPathChips, Pill, PinnedList, Textarea, canLiveNudge, cn, copyText, downloadTextFile, fmtClockTime, formatFilteredBoardExport, hasControlChars, openOrCopyPath, submitNudge, toast } from "../ui";
@@ -109,6 +110,8 @@ export function BoardView({
   const [follow, setFollow] = useState(true);
   const [visibleLimit, setVisibleLimit] = useState(80);
   const [localHighlightSeq, setLocalHighlightSeq] = useState<number | null>(null);
+  const [highlightNonce, setHighlightNonce] = useState(0);
+  const [pendingScrollSeq, setPendingScrollSeq] = useState<number | null>(null);
   const [replyTarget, setReplyTarget] = useState<BoardMessage | null>(null);
   const [replyDraft, setReplyDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -120,6 +123,7 @@ export function BoardView({
   const [composerText, setComposerText] = useState("");
   const [composerConfirm, setComposerConfirm] = useState(false);
   const [composerSending, setComposerSending] = useState(false);
+  const [composerError, setComposerError] = useState("");
 
   // Channel Manager drawer state (channel_op)
   const [channelMgrOpen, setChannelMgrOpen] = useState(false);
@@ -128,10 +132,14 @@ export function BoardView({
   const [channelOpTopic, setChannelOpTopic] = useState("");
   const [channelOpMember, setChannelOpMember] = useState("");
   const [channelOpSending, setChannelOpSending] = useState(false);
+  const [channelOpError, setChannelOpError] = useState("");
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const rowRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const replyLockRef = useRef(false);
+  const composerLockRef = useRef(false);
+  const channelOpLockRef = useRef(false);
 
   const messages = snap.messages || [];
   const members = snap.members || [];
@@ -180,10 +188,18 @@ export function BoardView({
   }, [composeNonce]);
 
   useEffect(() => {
-    if (channelFilter !== "all" && activeChannels.some((c) => c.name === channelFilter)) {
+    if (channelFilter !== "all" && !channelsMeta.list.some((c) => c.name === channelFilter)) {
+      setChannelFilter("all");
+    } else if (channelFilter !== "all" && activeChannels.some((c) => c.name === channelFilter)) {
       setComposerChannel(channelFilter);
     }
-  }, [channelFilter, activeChannels]);
+  }, [channelFilter, channelsMeta.list, activeChannels]);
+
+  useEffect(() => {
+    if (composerChannel !== "main" && !activeChannels.some((c) => c.name === composerChannel)) {
+      setComposerChannel("main");
+    }
+  }, [composerChannel, activeChannels]);
 
   const isNeedsReply = (m: BoardMessage) => m.text.includes("?") || Boolean(snap.member && m.mentions.includes(snap.member));
 
@@ -226,31 +242,47 @@ export function BoardView({
   const visible = hiddenCount > 0 ? filtered.slice(hiddenCount) : filtered;
 
   const scrollToSeq = (seq: number) => {
+    const publicMsgs = messages.filter((m) => !m.control && !unseenSet.has(m.seq));
+    const exists = seq > 0 && publicMsgs.some((m) => m.seq === seq);
+    if (!exists) {
+      if (seq > 0) toast.message(`Post #${seq} is not visible on this board`);
+      return;
+    }
     setFollow(false);
     setLocalHighlightSeq(seq);
+    setHighlightNonce((n) => n + 1);
+    setPendingScrollSeq(seq);
     const inFiltered = filtered.some((m) => m.seq === seq);
-    if (!inFiltered && messages.some((m) => !m.control && m.seq === seq)) {
+    if (!inFiltered) {
       setChannelFilter("all");
       setAgentFilter("all");
       onQuickFilterChange?.("all");
       setQuery("");
-      requestAnimationFrame(() => rowRefs.current.get(seq)?.scrollIntoView({ behavior: "smooth", block: "center" }));
+      const fullIdx = publicMsgs.findIndex((m) => m.seq === seq);
+      if (fullIdx >= 0 && fullIdx < publicMsgs.length - visibleLimit) {
+        setVisibleLimit(publicMsgs.length - fullIdx + 20);
+      }
       return;
     }
     const idx = filtered.findIndex((m) => m.seq === seq);
     if (idx >= 0 && idx < filtered.length - visibleLimit) {
       setVisibleLimit(filtered.length - idx + 20);
-      requestAnimationFrame(() => rowRefs.current.get(seq)?.scrollIntoView({ behavior: "smooth", block: "center" }));
-      return;
     }
-    rowRefs.current.get(seq)?.scrollIntoView({ behavior: "smooth", block: "center" });
   };
+
+  useEffect(() => {
+    if (!pendingScrollSeq) return;
+    const el = rowRefs.current.get(pendingScrollSeq);
+    if (!el) return;
+    el.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "center" });
+    setPendingScrollSeq(null);
+  }, [pendingScrollSeq, visible]);
 
   useEffect(() => {
     if (!localHighlightSeq) return;
     const t = setTimeout(() => setLocalHighlightSeq(null), 2400);
     return () => clearTimeout(t);
-  }, [localHighlightSeq]);
+  }, [localHighlightSeq, highlightNonce]);
 
   useEffect(() => {
     if (!highlightSeq) return;
@@ -260,12 +292,15 @@ export function BoardView({
   }, [highlightSeq, onClearHighlight]);
 
   useEffect(() => {
-    if (follow && !highlightSeq) bottomRef.current?.scrollIntoView({ block: "end" });
-  }, [filtered.length, follow, highlightSeq]);
+    if (follow && !highlightSeq && !localHighlightSeq && !pendingScrollSeq) {
+      bottomRef.current?.scrollIntoView({ block: "end" });
+    }
+  }, [filtered.length, follow, highlightSeq, localHighlightSeq, pendingScrollSeq]);
 
   const canNudge = canLiveNudge(snap);
   const swarmConvId = snap.swarm || snap.conversationId || "";
   const memberByName = new Map(members.map((m) => [m.name, m]));
+  const hasCoordinator = members.some((m) => !m.killed && m.role === "coordinator" && Boolean(m.conversation_id));
 
   const openQuoteReply = (m: BoardMessage) => {
     setReplyTarget((cur) => (cur?.seq === m.seq ? null : m));
@@ -273,17 +308,22 @@ export function BoardView({
   };
 
   const handleSendQuoteReply = async () => {
-    if (!replyTarget || !replyDraft.trim()) return;
+    if (replyLockRef.current || !replyTarget || !replyDraft.trim()) return;
     const convId = memberByName.get(replyTarget.agent)?.conversation_id || "";
     const clear = () => { setReplyTarget(null); setReplyDraft(""); };
     if (!canNudge || !convId) {
       await copyText(replyDraft.trim(), `Copied reply to #${replyTarget.seq}`);
       return clear();
     }
-    await submitNudge(convId, replyDraft, `Sent reply to @${replyTarget.agent} (#${replyTarget.seq})`, setSending, () => {
-      clear();
-      onRefresh?.();
-    });
+    replyLockRef.current = true;
+    try {
+      await submitNudge(convId, replyDraft, `Sent reply to @${replyTarget.agent} (#${replyTarget.seq})`, setSending, () => {
+        clear();
+        onRefresh?.();
+      });
+    } finally {
+      replyLockRef.current = false;
+    }
   };
 
   const composerBadChars = hasControlChars(composerText);
@@ -292,6 +332,7 @@ export function BoardView({
   const canPostControl = Boolean(swarmConvId && canNudge);
 
   const handleBoardPostSubmit = async () => {
+    if (composerLockRef.current) return;
     const cleanText = composerText.trim();
     if (!cleanText || cleanText.length > 4000 || composerBadChars || !composerReplyValid) return;
     if (!canPostControl) {
@@ -302,7 +343,9 @@ export function BoardView({
       setComposerOpen(false);
       return;
     }
+    composerLockRef.current = true;
     setComposerSending(true);
+    setComposerError("");
     try {
       await sendSwarmControl({
         op: "board_post",
@@ -318,8 +361,11 @@ export function BoardView({
       setComposerOpen(false);
       onRefresh?.();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Board post failed");
+      const msg = err instanceof Error ? err.message : "Board post failed";
+      setComposerError(msg);
+      toast.error(msg);
     } finally {
+      composerLockRef.current = false;
       setComposerSending(false);
     }
   };
@@ -332,8 +378,10 @@ export function BoardView({
     ((channelOpAction !== "subscribe" && channelOpAction !== "unsubscribe") || Boolean(channelOpMember.trim()));
 
   const handleChannelOpSubmit = async () => {
-    if (!channelOpReady) return;
+    if (channelOpLockRef.current || !channelOpReady) return;
+    channelOpLockRef.current = true;
     setChannelOpSending(true);
+    setChannelOpError("");
     try {
       await sendSwarmControl({
         op: "channel_op",
@@ -349,8 +397,11 @@ export function BoardView({
       setChannelMgrOpen(false);
       onRefresh?.();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Channel action failed");
+      const msg = err instanceof Error ? err.message : "Channel action failed";
+      setChannelOpError(msg);
+      toast.error(msg);
     } finally {
+      channelOpLockRef.current = false;
       setChannelOpSending(false);
     }
   };
@@ -466,13 +517,26 @@ export function BoardView({
                 <X />
               </Button>
             </div>
+            {members.length > 0 && !hasCoordinator && (
+              <p role="alert" className="rounded-chip border border-warn bg-warn-soft px-2 py-1 text-[12px] text-warn" data-testid="board-missing-coordinator">
+                No active coordinator in roster. Channel directives may fail.
+              </p>
+            )}
+            {channelOpError && (
+              <p role="alert" className="rounded-chip border border-danger bg-bad-soft px-2 py-1 text-[12px] text-danger" data-testid="channel-op-error">
+                {channelOpError}
+              </p>
+            )}
             <div className="wrap gap-1" role="group" aria-label="Channel action">
               {(["create", "archive", "subscribe", "unsubscribe"] as const).map((act) => (
                 <Pill
                   key={act}
                   active={channelOpAction === act}
                   data-testid={`channel-op-${act}`}
-                  onClick={() => setChannelOpAction(act)}
+                  onClick={() => {
+                    setChannelOpAction(act);
+                    setChannelOpError("");
+                  }}
                 >
                   {act}
                 </Pill>
@@ -484,7 +548,10 @@ export function BoardView({
                 data-testid="channel-op-name"
                 placeholder="channel-name (lowercase)"
                 value={channelOpName}
-                onChange={(e) => setChannelOpName(e.target.value.toLowerCase())}
+                onChange={(e) => {
+                  setChannelOpName(e.target.value.toLowerCase());
+                  setChannelOpError("");
+                }}
               />
               {channelOpAction === "create" && (
                 <Input
@@ -601,23 +668,69 @@ export function BoardView({
 
       {/* Feed */}
       {filtered.length === 0 ? (
-        <Card className="p-4 text-center space-y-2 bg-board">
-          <p className="text-[14px] text-ink-2">
-            {messages.length === 0 ? "No posts yet." : "No matching posts."}
-          </p>
-          {hasActiveFilter && (
-            <Button
-              onClick={() => {
-                setQuery("");
-                setAgentFilter("all");
-                setChannelFilter("all");
-                onQuickFilterChange?.("all");
-              }}
-            >
-              Clear filters
-            </Button>
-          )}
-        </Card>
+        (() => {
+          const activeChannelMeta =
+            channelFilter !== "all" ? channelsMeta.list.find((c) => c.name === channelFilter) : undefined;
+          const isEmptyChannel =
+            Boolean(activeChannelMeta) && !query.trim() && agentFilter === "all" && quickFilter === "all";
+          if (isEmptyChannel && activeChannelMeta) {
+            return (
+              <Card className="p-4 text-center space-y-2 bg-board" data-testid="board-empty-channel">
+                <p className="text-[14px] font-medium text-ink">
+                  No posts in #{activeChannelMeta.name} yet.
+                </p>
+                {activeChannelMeta.topic && (
+                  <p className="text-[12px] text-ink-2 break-words">{activeChannelMeta.topic}</p>
+                )}
+                {activeChannelMeta.archived && (
+                  <p className="text-[12px] text-ink-3">This channel is archived.</p>
+                )}
+                <div className="wrap justify-center gap-2 pt-1">
+                  {!activeChannelMeta.archived && (
+                    <Button
+                      variant="primary"
+                      data-testid="board-empty-channel-post"
+                      onClick={() => {
+                        setComposerChannel(activeChannelMeta.name);
+                        setComposerOpen(true);
+                        requestAnimationFrame(() => composerInputRef.current?.focus());
+                      }}
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                      Post to #{activeChannelMeta.name}
+                    </Button>
+                  )}
+                  <Button
+                    variant="outline"
+                    data-testid="board-empty-channel-all"
+                    onClick={() => setChannelFilter("all")}
+                  >
+                    All channels
+                  </Button>
+                </div>
+              </Card>
+            );
+          }
+          return (
+            <Card className="p-4 text-center space-y-2 bg-board">
+              <p className="text-[14px] text-ink-2">
+                {messages.length === 0 ? "No posts yet." : "No matching posts."}
+              </p>
+              {hasActiveFilter && (
+                <Button
+                  onClick={() => {
+                    setQuery("");
+                    setAgentFilter("all");
+                    setChannelFilter("all");
+                    onQuickFilterChange?.("all");
+                  }}
+                >
+                  Clear filters
+                </Button>
+              )}
+            </Card>
+          );
+        })()
       ) : (
         <div className="space-y-2">
           {hiddenCount > 0 && (
@@ -655,10 +768,12 @@ export function BoardView({
                     if (el) rowRefs.current.set(m.seq, el);
                     else rowRefs.current.delete(m.seq);
                   }}
+                  data-seq={m.seq}
+                  data-highlighted={isHighlighted ? "true" : undefined}
                   className={cn(
                     "rounded-card border px-3 py-2 transition",
                     isHighlighted
-                      ? "border-blue bg-blue-soft"
+                      ? "border-blue bg-blue-soft ring-1 ring-blue"
                       : mentionsMe
                         ? "border-hairline border-l-2 border-l-blue bg-surface"
                         : "border-hairline bg-surface",
@@ -844,8 +959,21 @@ export function BoardView({
               onChange={(e) => {
                 setComposerText(e.target.value);
                 setComposerConfirm(false);
+                setComposerError("");
               }}
             />
+
+            {canPostControl && members.length > 0 && !hasCoordinator && (
+              <p role="alert" className="rounded-chip border border-warn bg-warn-soft px-2 py-1 text-[12px] text-warn" data-testid="board-missing-coordinator">
+                No active coordinator in roster. Control posts may fail.
+              </p>
+            )}
+
+            {composerError && (
+              <p role="alert" className="rounded-chip border border-danger bg-bad-soft px-2 py-1 text-[12px] text-danger" data-testid="board-composer-error">
+                {composerError}
+              </p>
+            )}
 
             {(composerBadChars || !composerReplyValid) && (
               <p className="text-[12px] text-danger">
