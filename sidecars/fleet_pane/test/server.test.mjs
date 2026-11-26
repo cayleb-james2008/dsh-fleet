@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
+import http from 'node:http';
 import { registerHooks } from 'node:module';
 import net from 'node:net';
 import { dirname, join } from 'node:path';
@@ -1718,6 +1719,142 @@ test('GET /api/transcript works across standalone HTTP and runSidecarApp RPC wit
     hook?.deregister?.();
     delete globalThis.__FLEET_TEST_SIDECAR_RPC;
     delete globalThis.__FLEET_TEST_COORD;
+    await srv.close();
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test('E1/E2 HTTP hardening: rapid delta reconnects clean waiters without cap exhaustion and /api/transcript enforces binary/UTF-8 & symlink safety', async () => {
+  const fx = setupFixtureAppData();
+  const swDir = join(fx.appData, 'brain', fx.coord, '.system_generated', 'swarm');
+  const workerLogs = join(fx.appData, 'brain', fx.worker, '.system_generated', 'logs');
+  mkdirSync(workerLogs, { recursive: true });
+
+  const symLogsMember = 'dddddddd-dddd-dddd-dddd-dddddddddddd';
+  const symLogsParent = join(fx.appData, 'brain', symLogsMember, '.system_generated');
+  mkdirSync(symLogsParent, { recursive: true });
+  const outsideDir = join(fx.dir, 'outside-tr');
+  mkdirSync(outsideDir, { recursive: true });
+  writeFileSync(join(outsideDir, 'transcript.jsonl'), JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: 'NOPE' }) + '\n');
+  symlinkSync(outsideDir, join(symLogsParent, 'logs'));
+
+  writeFileSync(
+    join(swDir, 'members.json'),
+    JSON.stringify({
+      title: 'HTTP Hardening',
+      members: {
+        coordinator: { conversation_id: fx.coord, role: 'coordinator' },
+        worker: { conversation_id: fx.worker, role: 'worker' },
+        sym_logs: { conversation_id: symLogsMember, role: 'worker' },
+      },
+    }),
+  );
+  const boardPath = join(swDir, 'board.jsonl');
+  writeFileSync(boardPath, JSON.stringify({ seq: 1, agent: 'coordinator', text: '@worker init' }) + '\n');
+
+  // >512 KiB transcript with binary garbage + valid UTF-8 step + prose vs short secrets
+  const binLine = Buffer.concat([Buffer.from([0x7b, 0xff, 0xfe, 0x00]), Buffer.alloc(4096, 0x80), Buffer.from('\n')]);
+  const trChunks = [];
+  for (let i = 0; i < 135; i++) trChunks.push(binLine);
+  trChunks.push(
+    Buffer.from(
+      JSON.stringify({
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'Bearer authentication ok; leaked Bearer ab12 and ghp_1234 and sk-ab12 🚀',
+        tool_calls: [],
+      }) + '\n',
+      'utf8',
+    ),
+  );
+  writeFileSync(join(workerLogs, 'transcript.jsonl'), Buffer.concat(trChunks));
+
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+  });
+
+  try {
+    const snap = await (await fetch(`${srv.url}/api/swarm/delta?conversationId=${fx.coord}&since=0`)).json();
+    assert.equal(snap.mode, 'full');
+
+    // 1. Rapidly open & abort 80 (> MAX_DELTA_WAITERS=64) long-poll sockets via http.request.destroy() and raw TCP close
+    for (let batch = 0; batch < 5; batch++) {
+      await Promise.all(
+        Array.from({ length: 16 }, (_, idx) =>
+          new Promise((resolve) => {
+            if ((batch * 16 + idx) % 2 === 0) {
+              const req = http.request(
+                {
+                  hostname: '127.0.0.1',
+                  port: srv.port,
+                  path: `/api/swarm/delta?conversationId=${fx.coord}&since=1&etag=${encodeURIComponent(snap.etag)}&waitMs=15000`,
+                },
+                () => {},
+              );
+              req.on('error', () => {});
+              req.end();
+              setTimeout(() => {
+                req.destroy();
+                resolve();
+              }, 15);
+            } else {
+              const sock = net.connect(srv.port, '127.0.0.1', () => {
+                sock.write(
+                  `GET /api/swarm/delta?conversationId=${fx.coord}&since=1&etag=${encodeURIComponent(snap.etag)}&waitMs=15000 HTTP/1.1\r\nHost: 127.0.0.1:${srv.port}\r\n\r\n`,
+                );
+                setTimeout(() => {
+                  sock.destroy();
+                  resolve();
+                }, 15);
+              });
+              sock.on('error', () => resolve());
+            }
+          }),
+        ),
+      );
+    }
+
+    await new Promise((r) => setTimeout(r, 60));
+    assert.deepEqual(srv.getDeltaStats(), { activeWaiters: 0, activeSwarmWatchers: 0, activeFsWatchers: 0 });
+
+    // Next delta long-poll succeeds (never 503 exhausted)
+    const afterStorm = await fetch(
+      `${srv.url}/api/swarm/delta?conversationId=${fx.coord}&since=1&etag=${encodeURIComponent(snap.etag)}&waitMs=60`,
+    );
+    assert.equal(afterStorm.status, 200);
+    const afterStormJson = await afterStorm.json();
+    assert.equal(afterStormJson.unchanged, true);
+    assert.deepEqual(srv.getDeltaStats(), { activeWaiters: 0, activeSwarmWatchers: 0, activeFsWatchers: 0 });
+
+    // 2. Corrupt partial tail line then truncate mid-delta -> transitions cleanly to mode: "full"
+    appendFileSync(boardPath, '{"seq":2,"partial');
+    const partialRes = await (await fetch(`${srv.url}/api/swarm/delta?conversationId=${fx.coord}&since=1&etag=${encodeURIComponent(snap.etag)}&waitMs=0`)).json();
+    assert.equal(partialRes.mode, 'delta');
+    assert.equal(partialRes.head, 1);
+
+    truncateSync(boardPath, 0);
+    const truncRes = await (await fetch(`${srv.url}/api/swarm/delta?conversationId=${fx.coord}&since=1&etag=${encodeURIComponent(partialRes.etag)}&waitMs=0`)).json();
+    assert.equal(truncRes.mode, 'full');
+    assert.equal(truncRes.head, 0);
+
+    // 3. /api/transcript rejects intermediate symlink & %2e%2e traversal, and scrubs short secrets cleanly
+    assert.equal((await fetch(`${srv.url}/api/transcript?conversationId=${fx.coord}&member=sym_logs`)).status, 400);
+    assert.equal((await fetch(`${srv.url}/api/transcript?conversationId=%2e%2e&member=worker`)).status, 400);
+
+    const trRes = await fetch(`${srv.url}/api/transcript?conversationId=${fx.coord}&member=worker&limit=5`);
+    assert.equal(trRes.status, 200);
+    const trJson = await trRes.json();
+    assert.deepEqual(trJson.steps.map((s) => s.stepIndex), [1]);
+    assert.ok(trJson.steps[0].content.includes('Bearer authentication ok'));
+    assert.ok(trJson.steps[0].content.includes('🚀'));
+    assert.ok(!trJson.steps[0].content.includes('ab12'));
+    assert.ok(!trJson.steps[0].content.includes('ghp_1234'));
+    assert.ok(!trJson.steps[0].content.includes('sk-ab12'));
+  } finally {
     await srv.close();
     rmSync(fx.dir, { recursive: true, force: true });
   }

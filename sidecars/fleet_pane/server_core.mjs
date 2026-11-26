@@ -504,18 +504,19 @@ export function createFleetHandlers({
   }
 
   function parseDeltaQuery(query = {}) {
+    const q = query && typeof query === 'object' && !Array.isArray(query) ? query : {};
     let requestedConv = '';
-    if (query.conversationId !== undefined) {
-      if (typeof query.conversationId !== 'string') return { ok: false, status: 400, error: 'Invalid conversationId' };
-      requestedConv = query.conversationId.trim();
+    if (q.conversationId !== undefined) {
+      if (typeof q.conversationId !== 'string') return { ok: false, status: 400, error: 'Invalid conversationId' };
+      requestedConv = q.conversationId.trim();
       if (!requestedConv || !ID_RE.test(requestedConv)) {
         return { ok: false, status: 400, error: 'Invalid conversationId' };
       }
     }
 
     let since = 0;
-    if (query.since !== undefined && query.since !== '') {
-      const s = String(query.since).trim();
+    if (q.since !== undefined && q.since !== '') {
+      const s = String(q.since).trim();
       if (!/^\d+$/.test(s)) return { ok: false, status: 400, error: 'since must be a non-negative integer' };
       since = Number(s);
       if (!Number.isSafeInteger(since) || since < 0) {
@@ -524,8 +525,8 @@ export function createFleetHandlers({
     }
 
     let waitMs = 0;
-    if (query.waitMs !== undefined && query.waitMs !== '') {
-      const s = String(query.waitMs).trim();
+    if (q.waitMs !== undefined && q.waitMs !== '') {
+      const s = String(q.waitMs).trim();
       const w = Number(s);
       if (!Number.isFinite(w) || !Number.isInteger(w) || w < 0 || w > DELTA_MAX_WAIT_MS) {
         return { ok: false, status: 400, error: `waitMs must be an integer between 0 and ${DELTA_MAX_WAIT_MS}` };
@@ -534,11 +535,11 @@ export function createFleetHandlers({
     }
 
     let etag = '';
-    if (query.etag !== undefined) {
-      if (typeof query.etag !== 'string' || query.etag.length > 16384 || /[\x00-\x1f\x7f]/.test(query.etag)) {
+    if (q.etag !== undefined) {
+      if (typeof q.etag !== 'string' || q.etag.length > 16384 || /[\x00-\x1f\x7f]/.test(q.etag)) {
         return { ok: false, status: 400, error: 'Invalid etag' };
       }
-      etag = query.etag;
+      etag = q.etag;
     }
 
     return { ok: true, requestedConv, since, waitMs, etag };
@@ -784,7 +785,13 @@ export function createFleetHandlers({
 
       deltaWaiters.add(waiter);
       acquireSwarmWatcher(res.appData, res.swarm, waiter);
-      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+      if (signal) {
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) {
+          waiter.abort();
+          return;
+        }
+      }
       deadlineTimer = setTimeout(() => finish(evaluateNow), parsed.waitMs);
       deadlineTimer.unref?.();
     });
@@ -1516,22 +1523,28 @@ export async function createStandaloneRouter({
 
   function parseQueryFast(search) {
     if (!search || search.length <= 1) return {};
+    const out = Object.create(null);
     if (search.indexOf('&') === -1) {
       const eq = search.indexOf('=');
       if (eq > 1) {
         const k = search.slice(1, eq);
         const v = search.slice(eq + 1);
         if (k.indexOf('%') === -1 && v.indexOf('%') === -1 && v.indexOf('+') === -1) {
-          return { [k]: v };
+          if (k !== '__proto__' && k !== 'constructor' && k !== 'prototype') out[k] = v;
+          return out;
         }
         try {
-          return { [decodeURIComponent(k.replace(/\+/g, ' '))]: decodeURIComponent(v.replace(/\+/g, ' ')) };
+          const dk = decodeURIComponent(k.replace(/\+/g, ' '));
+          const dv = decodeURIComponent(v.replace(/\+/g, ' '));
+          if (dk !== '__proto__' && dk !== 'constructor' && dk !== 'prototype') out[dk] = dv;
+          return out;
         } catch {}
       }
     }
-    const out = {};
     const sp = new URLSearchParams(search);
-    for (const [k, v] of sp) out[k] = v;
+    for (const [k, v] of sp) {
+      if (k !== '__proto__' && k !== 'constructor' && k !== 'prototype') out[k] = v;
+    }
     return out;
   }
 
@@ -1589,12 +1602,15 @@ export async function createStandaloneRouter({
       return sendPacked(req, res, 200, handlers ? handlers.getHealthPacked(sleepState) : getQuickHealthPacked());
     }
 
-    const withHandlers = (fn) => {
+    const withHandlers = (fn, onReject = null) => {
       wakeFromIdle();
       if (handlers) return fn(handlers);
       ensureHandlers().then(fn, (err) => {
-        res.writeHead(500, { 'Content-Type': 'application/json', ...SECURITY_HEADERS });
-        res.end(JSON.stringify({ error: String(err?.message || err) }));
+        onReject?.();
+        if (!res.writableEnded && !res.destroyed) {
+          res.writeHead(500, { 'Content-Type': 'application/json', ...SECURITY_HEADERS });
+          res.end(JSON.stringify({ error: String(err?.message || err) }));
+        }
       });
     };
 
@@ -1611,25 +1627,38 @@ export async function createStandaloneRouter({
       const onClose = () => {
         if (!res.writableEnded) ac.abort();
       };
+      if (req.aborted || req.destroyed || res.destroyed || req.socket?.destroyed) {
+        ac.abort();
+      }
+      req.on('aborted', onClose);
+      req.on('close', onClose);
+      req.on('error', onClose);
       res.on('close', onClose);
       res.on('error', onClose);
-      return withHandlers((h) =>
-        Promise.resolve(h.getSwarmDelta(q, { signal: ac.signal })).then(
-          (out) => {
-            res.off('close', onClose);
-            res.off('error', onClose);
-            if (!res.writableEnded && !res.destroyed) {
-              sendPacked(req, res, out.status, out.packed);
-            }
-          },
-          (err) => {
-            res.off('close', onClose);
-            res.off('error', onClose);
-            if (!res.writableEnded && !res.destroyed) {
-              sendPacked(req, res, 500, packJsonPayload({ ok: false, error: String(err?.message || err) }));
-            }
-          },
-        ),
+      const detachClose = () => {
+        req.off('aborted', onClose);
+        req.off('close', onClose);
+        req.off('error', onClose);
+        res.off('close', onClose);
+        res.off('error', onClose);
+      };
+      return withHandlers(
+        (h) =>
+          Promise.resolve(h.getSwarmDelta(q, { signal: ac.signal })).then(
+            (out) => {
+              detachClose();
+              if (!res.writableEnded && !res.destroyed) {
+                sendPacked(req, res, out.status, out.packed);
+              }
+            },
+            (err) => {
+              detachClose();
+              if (!res.writableEnded && !res.destroyed) {
+                sendPacked(req, res, 500, packJsonPayload({ ok: false, error: String(err?.message || err) }));
+              }
+            },
+          ),
+        detachClose,
       );
     }
     if (req.method === 'GET' && pathname === '/api/swarm/stream') {
@@ -1678,6 +1707,7 @@ export async function createStandaloneRouter({
           stopSseTimerIfIdle();
         };
         req.on('close', cleanup);
+        res.on('close', cleanup);
         res.on('error', cleanup);
       });
     }
