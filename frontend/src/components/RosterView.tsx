@@ -1,12 +1,21 @@
-import { useMemo, useState } from "../hooks";
-import { ChevronDown, ChevronUp, ClipboardCopy, Cpu, Eye, EyeOff, MessageSquare, Radio, Send } from "../icons";
-import { openWorkerConversation } from "../sidecar";
-import type { SwarmMember, SwarmSnapshot } from "../types";
-import { ActivityPeek, Badge, Button, Card, InlineComposer, MemberActivityLine, Pill, StatusDot, TokenBurnStrip, buildRecoverPrompt, canLiveNudge, cn, copyText, fmtTokens, hasControlChars, memberMeta, submitNudge, useNowMs } from "../ui";
+import { useEffect, useMemo, useRef, useState } from "../hooks";
+import { AlertTriangle, ChevronDown, ChevronUp, ClipboardCopy, Cpu, Eye, EyeOff, MessageSquare, Plus, Radio, Send, Trash2, X } from "../icons";
+import { SwarmControlError, openWorkerConversation, sendSwarmControl } from "../sidecar";
+import type { SwarmMember, SwarmSnapshot, SwarmWorkspaceMode } from "../types";
+import { ActivityPeek, Badge, Button, Card, InlineComposer, Input, MemberActivityLine, Pill, StatusDot, Textarea, TokenBurnStrip, buildRecoverPrompt, canLiveNudge, cn, copyText, fmtTokens, hasControlChars, memberMeta, submitNudge, toast, useNowMs } from "../ui";
 
 const ORDER: Record<SwarmMember["status"], number> = { working: 0, waiting: 1, killed: 2 };
 const CONTEXT_BUDGET_TOKENS = 200_000;
 const STALL_MS = 10 * 60 * 1000;
+const WORKER_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/;
+const MODEL_SUGGESTIONS = ["gemini-3-pro", "gemini-3-flash", "claude-sonnet-4-6", "claude-opus-4-6"];
+
+function pickAltModel(current: string): string {
+  const cur = String(current || "").toLowerCase();
+  if (cur.includes("pro")) return "gemini-3-flash";
+  if (cur.includes("flash")) return "gemini-3-pro";
+  return "gemini-3-pro";
+}
 
 function contextPressure(m: SwarmMember): { pct: number; tone: "neutral" | "info" | "warning" | "danger"; label: string } {
   const ctx = m.lastContextTokens || m.usage.inputTokens + m.usage.cacheReadTokens;
@@ -22,10 +31,12 @@ function contextPressure(m: SwarmMember): { pct: number; tone: "neutral" | "info
 
 export function RosterView({
   snap,
+  spawnNonce = 0,
   onJumpToBoardSeq,
   onRefresh,
 }: {
   snap: SwarmSnapshot;
+  spawnNonce?: number;
   onJumpToBoardSeq?: (seq: number, agent?: string) => void;
   onRefresh: () => void;
 }) {
@@ -37,12 +48,168 @@ export function RosterView({
   const [broadcastTargets, setBroadcastTargets] = useState<string[]>([]);
   const [broadcastText, setBroadcastText] = useState("@all ");
   const [sending, setSending] = useState(false);
+
+  // Spawn Worker drawer state
+  const [spawnOpen, setSpawnOpen] = useState(false);
+  const [spawnName, setSpawnName] = useState("");
+  const [spawnBrief, setSpawnBrief] = useState("");
+  const [spawnWorkspace, setSpawnWorkspace] = useState<SwarmWorkspaceMode>("share");
+  const [spawnChannel, setSpawnChannel] = useState("");
+  const [spawning, setSpawning] = useState(false);
+  const spawnNameRef = useRef<HTMLInputElement>(null);
+
+  // Switch Model drawer state
+  const [switchMember, setSwitchMember] = useState<string | null>(null);
+  const [switchModelVal, setSwitchModelVal] = useState("");
+  const [switchReason, setSwitchReason] = useState("");
+  const [switching, setSwitching] = useState(false);
+
+  // Confirmation-gated Kill Worker state (+ 409 unmerged worktree warning)
+  const [killMember, setKillMember] = useState<string | null>(null);
+  const [killReason, setKillReason] = useState("");
+  const [killing, setKilling] = useState(false);
+  const [kill409, setKill409] = useState<{ member: string; dirtyFiles: number; ahead: number; message: string } | null>(null);
+
   const nowMs = useNowMs();
 
   const members = snap.members || [];
   const liveTargets = members.filter((m) => !m.killed && m.conversation_id);
   const killedCount = members.filter((m) => m.killed).length;
   const canNudge = canLiveNudge(snap);
+  const swarmConvId = snap.swarm || snap.conversationId || "";
+  const activeChannels = (snap.channels || []).filter((c) => !c.archived);
+
+  useEffect(() => {
+    if (!spawnNonce) return;
+    setSpawnOpen(true);
+    requestAnimationFrame(() => spawnNameRef.current?.focus());
+  }, [spawnNonce]);
+
+  const cleanSpawnName = spawnName.trim().toLowerCase();
+  const spawnNameValid =
+    WORKER_NAME_RE.test(cleanSpawnName) &&
+    cleanSpawnName !== "all" &&
+    cleanSpawnName !== "coordinator" &&
+    !members.some((m) => !m.killed && m.name === cleanSpawnName);
+  const spawnBadChars = hasControlChars(spawnBrief) || hasControlChars(spawnName);
+  const spawnReady =
+    Boolean(swarmConvId) &&
+    spawnNameValid &&
+    Boolean(spawnBrief.trim()) &&
+    spawnBrief.trim().length <= 4000 &&
+    !spawnBadChars;
+
+  const handleSpawnSubmit = async () => {
+    if (!spawnReady) return;
+    if (!canNudge) {
+      await copyText(`Spawn @${cleanSpawnName} (${spawnWorkspace}): ${spawnBrief.trim()}`, `Copied spawn brief for @${cleanSpawnName}`);
+      setSpawnOpen(false);
+      return;
+    }
+    setSpawning(true);
+    try {
+      await sendSwarmControl({
+        op: "spawn_worker",
+        conversationId: swarmConvId,
+        name: cleanSpawnName,
+        brief: spawnBrief.trim(),
+        workspaceMode: spawnWorkspace,
+        ...(spawnChannel ? { channel: spawnChannel } : {}),
+      });
+      toast.success(`Requested spawn for @${cleanSpawnName}`);
+      setSpawnName("");
+      setSpawnBrief("");
+      setSpawnChannel("");
+      setSpawnOpen(false);
+      onRefresh();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Spawn worker failed");
+    } finally {
+      setSpawning(false);
+    }
+  };
+
+  const openSwitchModel = (m: SwarmMember) => {
+    if (switchMember === m.name) {
+      setSwitchMember(null);
+      return;
+    }
+    setSwitchMember(m.name);
+    setSwitchModelVal(pickAltModel(m.model));
+    setSwitchReason(
+      m.failure?.kind === "quota"
+        ? "Quota exhausted"
+        : m.failure
+          ? "Step error recovery"
+          : "",
+    );
+  };
+
+  const handleSwitchModelSubmit = async (memberName: string) => {
+    const model = switchModelVal.trim();
+    if (!swarmConvId || !model || hasControlChars(model) || hasControlChars(switchReason)) return;
+    setSwitching(true);
+    try {
+      await sendSwarmControl({
+        op: "switch_model",
+        conversationId: swarmConvId,
+        member: memberName,
+        model,
+        ...(switchReason.trim() ? { reason: switchReason.trim() } : {}),
+      });
+      toast.success(`Switched @${memberName} to ${model}`);
+      setSwitchMember(null);
+      setSwitchReason("");
+      onRefresh();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Switch model failed");
+    } finally {
+      setSwitching(false);
+    }
+  };
+
+  const openKillConfirm = (m: SwarmMember) => {
+    if (killMember === m.name) {
+      setKillMember(null);
+      setKill409(null);
+      return;
+    }
+    setKillMember(m.name);
+    setKillReason("");
+    setKill409(null);
+  };
+
+  const handleKillSubmit = async (memberName: string, forceUnmerged = false) => {
+    if (!swarmConvId || hasControlChars(killReason)) return;
+    setKilling(true);
+    try {
+      await sendSwarmControl({
+        op: "kill_worker",
+        conversationId: swarmConvId,
+        member: memberName,
+        forceUnmerged,
+        ...(killReason.trim() ? { reason: killReason.trim() } : {}),
+      });
+      toast.success(`Killed @${memberName}`);
+      setKillMember(null);
+      setKillReason("");
+      setKill409(null);
+      onRefresh();
+    } catch (err) {
+      if (err instanceof SwarmControlError && err.status === 409) {
+        setKill409({
+          member: memberName,
+          dirtyFiles: err.dirtyFiles ?? 0,
+          ahead: err.ahead ?? 0,
+          message: err.message,
+        });
+      } else {
+        toast.error(err instanceof Error ? err.message : "Kill worker failed");
+      }
+    } finally {
+      setKilling(false);
+    }
+  };
   const broadcastSet = new Set(broadcastTargets);
   const broadcastConvs = liveTargets.filter((m) => broadcastSet.has(m.name)).map((m) => m.conversation_id);
 
@@ -109,7 +276,17 @@ export function RosterView({
           </h2>
           {killedCount > 0 && <Badge tone="neutral">{killedCount} stopped</Badge>}
         </div>
-        <div className="f1">
+        <div className="f1 flex-wrap">
+          {swarmConvId && (
+            <Button
+              variant={spawnOpen ? "secondary" : "primary"}
+              data-testid="toggle-spawn-worker"
+              onClick={() => setSpawnOpen((v) => !v)}
+            >
+              <Plus />
+              Spawn
+            </Button>
+          )}
           {liveTargets.length > 0 && (
             <Button
               variant={broadcastOpen ? "secondary" : "outline"}
@@ -131,6 +308,100 @@ export function RosterView({
           )}
         </div>
       </div>
+
+      {spawnOpen && (
+        <Card className="p-3 space-y-2 bg-board" data-testid="spawn-worker-drawer">
+          <div className="row">
+            <span className="text-[13px] font-semibold text-ink">Spawn worker</span>
+            <Button variant="ghost" size="icon" aria-label="Close spawn worker drawer" onClick={() => setSpawnOpen(false)}>
+              <X />
+            </Button>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <div className="space-y-1">
+              <label htmlFor="spawn-worker-name" className="text-[12px] font-medium text-ink-2">Worker name</label>
+              <Input
+                ref={spawnNameRef}
+                id="spawn-worker-name"
+                data-testid="spawn-worker-name"
+                placeholder="e.g. api-builder"
+                value={spawnName}
+                onChange={(e) => setSpawnName(e.target.value.toLowerCase())}
+              />
+            </div>
+            <div className="space-y-1">
+              <label htmlFor="spawn-worker-workspace" className="text-[12px] font-medium text-ink-2">Workspace</label>
+              <select
+                id="spawn-worker-workspace"
+                data-testid="spawn-worker-workspace"
+                value={spawnWorkspace}
+                onChange={(e) => setSpawnWorkspace(e.target.value as SwarmWorkspaceMode)}
+                className="h-8 w-full rounded-chip border border-hairline-s bg-surface px-2 text-[13px] text-ink cursor-pointer"
+              >
+                <option value="share">share (working copy)</option>
+                <option value="inherit">inherit (shared)</option>
+                <option value="branch">branch (isolated clone)</option>
+              </select>
+            </div>
+          </div>
+
+          {activeChannels.length > 0 && (
+            <div className="space-y-1">
+              <label htmlFor="spawn-worker-channel" className="text-[12px] font-medium text-ink-2">Channel (optional)</label>
+              <select
+                id="spawn-worker-channel"
+                data-testid="spawn-worker-channel"
+                value={spawnChannel}
+                onChange={(e) => setSpawnChannel(e.target.value)}
+                className="h-8 w-full rounded-chip border border-hairline-s bg-surface px-2 text-[13px] text-ink cursor-pointer"
+              >
+                <option value="">#main (default)</option>
+                {activeChannels.map((ch) => (
+                  <option key={ch.name} value={ch.name}>#{ch.name}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          <div className="space-y-1">
+            <label htmlFor="spawn-worker-brief" className="text-[12px] font-medium text-ink-2">Assignment brief</label>
+            <Textarea
+              id="spawn-worker-brief"
+              data-testid="spawn-worker-brief"
+              rows={2}
+              maxLength={4000}
+              placeholder="What this worker owns and what done looks like"
+              value={spawnBrief}
+              onChange={(e) => setSpawnBrief(e.target.value)}
+            />
+          </div>
+
+          {spawnName.trim() && !spawnNameValid && (
+            <p className="text-[12px] text-danger">
+              Use a unique lowercase name (letters, digits, hyphens, max 32).
+            </p>
+          )}
+          {spawnBadChars && (
+            <p className="text-[12px] text-danger">Control characters are not allowed.</p>
+          )}
+
+          <div className="row">
+            <span className="t3 num">{spawnBrief.length}/4000</span>
+            <div className="f1">
+              <Button variant="ghost" onClick={() => setSpawnOpen(false)}>Cancel</Button>
+              <Button
+                variant="primary"
+                data-testid="spawn-worker-submit"
+                disabled={!spawnReady || spawning}
+                onClick={handleSpawnSubmit}
+              >
+                {canNudge ? <Plus /> : <ClipboardCopy />}
+                {spawning ? "Spawning..." : canNudge ? "Confirm & spawn" : "Copy brief"}
+              </Button>
+            </div>
+          </div>
+        </Card>
+      )}
 
       {broadcastOpen && (
         <Card className="p-3 space-y-2 bg-board" data-testid="broadcast-composer">
@@ -243,6 +514,8 @@ export function RosterView({
                 {!m.killed && m.conversation_id && (() => {
                   const act = (p: string, msg: string) =>
                     canNudge ? (setNudgeMember(m.name), setNudgeText(p)) : void copyText(p, msg);
+                  const canSwitchModel = Boolean(swarmConvId && canNudge && m.role !== "coordinator");
+                  const canKill = Boolean(swarmConvId && canNudge && m.role !== "coordinator" && !m.narrator && !m.roleWorker);
                   return (
                   <div className="wrap gap-1">
                     {(isStalled || Boolean(m.failure) || (m.status === "waiting" && m.unread > 0)) && (
@@ -255,6 +528,16 @@ export function RosterView({
                         Recover
                       </Button>
                     )}
+                    {canSwitchModel && (
+                      <Button
+                        variant={m.failure ? "info" : "ghost"}
+                        data-testid={`switch-model-btn-${m.name}`}
+                        onClick={() => openSwitchModel(m)}
+                      >
+                        <Cpu />
+                        Switch model
+                      </Button>
+                    )}
                     <Button variant={canNudge ? "outline" : "ghost"} onClick={() => act(askPrompt, `Copied status check for ${m.name}`)}>
                       {!canNudge && <ClipboardCopy />}
                       Ask status
@@ -263,6 +546,17 @@ export function RosterView({
                     {m.posts > 0 && onJumpToBoardSeq && (
                       <Button variant="ghost" data-testid={`roster-board-${m.name}`} onClick={() => onJumpToBoardSeq(m.lastPostSeq || 0, m.name)} className="num">
                         Board ({m.posts})
+                      </Button>
+                    )}
+                    {canKill && (
+                      <Button
+                        variant="ghost"
+                        data-testid={`kill-worker-btn-${m.name}`}
+                        onClick={() => openKillConfirm(m)}
+                        className="text-danger hover:bg-bad-soft"
+                      >
+                        <Trash2 />
+                        Kill
                       </Button>
                     )}
                   </div>
@@ -302,6 +596,119 @@ export function RosterView({
 
                 {/* Expandable Worker Activity Peek */}
                 {peeking && <ActivityPeek member={m} mode="roster" />}
+
+                {switchMember === m.name && (
+                  <div className="pt-2 border-t border-hairline space-y-2" data-testid={`switch-model-drawer-${m.name}`}>
+                    <div className="row">
+                      <span className="text-[12px] font-semibold text-ink">Switch model for @{m.name}</span>
+                      <Button variant="ghost" size="icon" aria-label={`Close switch model for ${m.name}`} onClick={() => setSwitchMember(null)}>
+                        <X />
+                      </Button>
+                    </div>
+                    <div className="wrap gap-1">
+                      {MODEL_SUGGESTIONS.map((mdl) => (
+                        <Pill
+                          key={mdl}
+                          active={switchModelVal === mdl}
+                          onClick={() => setSwitchModelVal(mdl)}
+                        >
+                          {mdl}
+                        </Pill>
+                      ))}
+                    </div>
+                    <Input
+                      aria-label={`Model for ${m.name}`}
+                      data-testid={`switch-model-input-${m.name}`}
+                      value={switchModelVal}
+                      onChange={(e) => setSwitchModelVal(e.target.value)}
+                      placeholder="Model identifier"
+                    />
+                    <Input
+                      aria-label={`Switch reason for ${m.name}`}
+                      data-testid={`switch-model-reason-${m.name}`}
+                      value={switchReason}
+                      onChange={(e) => setSwitchReason(e.target.value)}
+                      placeholder="Reason (optional)"
+                    />
+                    <div className="row">
+                      <span className="t3">Current: {m.model || "default"}</span>
+                      <div className="f1">
+                        <Button variant="ghost" onClick={() => setSwitchMember(null)}>Cancel</Button>
+                        <Button
+                          variant="primary"
+                          data-testid={`switch-model-submit-${m.name}`}
+                          disabled={switching || !switchModelVal.trim() || hasControlChars(switchModelVal) || hasControlChars(switchReason)}
+                          onClick={() => handleSwitchModelSubmit(m.name)}
+                        >
+                          <Cpu />
+                          {switching ? "Switching..." : "Confirm switch"}
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {killMember === m.name && (
+                  <div className="pt-2 border-t border-hairline space-y-2" data-testid={`kill-worker-confirm-${m.name}`}>
+                    <p className="text-[12px] text-ink">
+                      Permanently stop @{m.name} and clean up its workspace.
+                    </p>
+                    <Input
+                      aria-label={`Kill reason for ${m.name}`}
+                      data-testid={`kill-worker-reason-${m.name}`}
+                      value={killReason}
+                      onChange={(e) => setKillReason(e.target.value)}
+                      placeholder="Reason (optional)"
+                    />
+                    {kill409 && kill409.member === m.name && (
+                      <div
+                        className="rounded-chip border border-danger bg-bad-soft p-2 space-y-2 text-[12px]"
+                        data-testid={`kill-worker-409-${m.name}`}
+                      >
+                        <div className="flex items-start gap-1.5 text-danger">
+                          <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                          <span className="font-medium">
+                            Unmerged worktree warning: {kill409.dirtyFiles} dirty files, {kill409.ahead} commits ahead.
+                          </span>
+                        </div>
+                        <div className="f1 justify-end">
+                          <Button
+                            variant="ghost"
+                            onClick={() => {
+                              setKillMember(null);
+                              setKill409(null);
+                            }}
+                          >
+                            Cancel
+                          </Button>
+                          <Button
+                            variant="danger"
+                            data-testid={`kill-worker-force-${m.name}`}
+                            disabled={killing}
+                            onClick={() => handleKillSubmit(m.name, true)}
+                          >
+                            <Trash2 />
+                            {killing ? "Forcing..." : "Force kill anyway"}
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                    {(!kill409 || kill409.member !== m.name) && (
+                      <div className="f1 justify-end">
+                        <Button variant="ghost" onClick={() => setKillMember(null)}>Cancel</Button>
+                        <Button
+                          variant="danger"
+                          data-testid={`kill-worker-submit-${m.name}`}
+                          disabled={killing || hasControlChars(killReason)}
+                          onClick={() => handleKillSubmit(m.name, false)}
+                        >
+                          <Trash2 />
+                          {killing ? "Killing..." : "Confirm kill"}
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {nudgeMember === m.name && (
                   <InlineComposer

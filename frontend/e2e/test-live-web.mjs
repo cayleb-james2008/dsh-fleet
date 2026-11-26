@@ -27,7 +27,7 @@ page.on("request", (req) => {
   if (!u.startsWith(BASE) && !u.startsWith("data:") && !u.startsWith("blob:")) externalReqs.push(u);
 });
 page.on("console", (msg) => {
-  if (msg.type() === "error") consoleErrs.push(msg.text());
+  if (msg.type() === "error" && !msg.text().includes("status of 409")) consoleErrs.push(msg.text());
 });
 page.on("pageerror", (e) => pageErrs.push(e.message));
 
@@ -330,6 +330,73 @@ await check("Live Plan Editor handles 409 conflict reload and persists goal, wor
     boardTxt.includes("Plan updated: Persisted live plan edit") &&
     overflow380 <= 0
   );
+});
+
+await check("Board channel tabs, replyRefs backlinks, and sticky Board Composer post live", async () => {
+  await page.selectOption('select[aria-label="Active swarm"]', "demo-coord-0001");
+  await page.locator("#tab-board").click();
+  await page.waitForSelector('[data-testid="board-channel-tabs"]');
+  await page.locator('[data-testid="channel-tab-backend"]').click();
+  const backendOnly = await page.locator("#panel-board").textContent();
+  await page.locator('[data-testid="channel-tab-all"]').click();
+
+  const refTxt = await page.locator('[data-testid="board-reply-refs-2"]').textContent();
+  await page.locator('[data-testid="board-reply-refs-2"] button').first().click();
+
+  await page.locator('[data-testid="board-composer-open"]').click();
+  await page.selectOption('[data-testid="board-composer-channel"]', "backend");
+  await page.fill('[data-testid="board-composer-reply-seq"]', "2");
+  await page.fill('[data-testid="board-composer-input"]', "Live web channel post");
+  await page.locator('[data-testid="board-composer-stage"]').click();
+  await page.locator('[data-testid="board-composer-submit"]').click();
+  await page.waitForFunction(() => (document.querySelector("#panel-board")?.textContent || "").includes("Live web channel post"));
+
+  return (
+    Boolean(backendOnly?.includes("CWE-22/59 frame confinement") && !backendOnly.includes("Adapting Needs-You")) &&
+    Boolean(refTxt?.includes("#3"))
+  );
+});
+
+await check("New Swarm Launcher & Command Palette actions work at 360px with 0px overflow", async () => {
+  await page.setViewportSize({ width: 360, height: 900 });
+  await page.locator('[data-testid="open-swarm-launcher"]').click();
+  await page.waitForSelector('[data-testid="swarm-launcher-modal"]');
+  const ov = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  await page.locator('button[aria-label="Close dialog"]').click();
+
+  await page.locator('button[aria-label="Open command palette"]').click();
+  await page.waitForSelector("[cmdk-input]");
+  await page.fill("[cmdk-input]", "Spawn worker");
+  await page.keyboard.press("Enter");
+  await page.waitForSelector('[data-testid="spawn-worker-drawer"]');
+
+  await page.fill('[data-testid="spawn-worker-name"]', "qa-check");
+  await page.selectOption('[data-testid="spawn-worker-workspace"]', "share");
+  await page.selectOption('[data-testid="spawn-worker-channel"]', "backend");
+  await page.fill('[data-testid="spawn-worker-brief"]', "Run live-web parity checks");
+  await page.locator('[data-testid="spawn-worker-submit"]').click();
+  await page.waitForFunction(() => (document.querySelector("#panel-roster")?.textContent || "").includes("qa-check"));
+
+  await page.locator('[data-testid="kill-worker-btn-ui-dev"]').click();
+  await page.locator('[data-testid="kill-worker-submit-ui-dev"]').click();
+  await page.waitForSelector('[data-testid="kill-worker-409-ui-dev"]');
+  const warn409 = await page.locator('[data-testid="kill-worker-409-ui-dev"]').textContent();
+  await page.locator('[data-testid="kill-worker-force-ui-dev"]').click();
+  await page.waitForFunction(() => !(document.querySelector('[data-testid="kill-worker-btn-ui-dev"]')));
+
+  await page.setViewportSize({ width: 380, height: 900 });
+  return ov <= 0 && Boolean(warn409?.includes("4 dirty files, 2 commits ahead"));
+});
+
+await check("Quota card 1-click Switch Model clears failure on audit swarm", async () => {
+  await page.selectOption('select[aria-label="Active swarm"]', "demo-audit-0009");
+  await page.locator("#tab-roster").click();
+  await page.waitForSelector('[data-testid="switch-model-btn-scanner"]');
+  await page.locator('[data-testid="switch-model-btn-scanner"]').click();
+  await page.locator('[data-testid="switch-model-submit-scanner"]').click();
+  await page.waitForFunction(() => !document.querySelector('[data-testid="switch-model-drawer-scanner"]'));
+  const txt = await page.locator("#panel-roster").textContent();
+  return txt.includes("gemini-3-flash") && !txt.includes("429 RESOURCE_EXHAUSTED");
 });
 
 await check("Settings Dark mode + 1440px desktop overflow check", async () => {

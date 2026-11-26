@@ -176,6 +176,7 @@
           {
             seq: 2,
             agent: "builder",
+            channel: "backend",
             text: "@coordinator Implemented sidecar store, CWE-22/59 frame confinement, and 7 unit tests.",
             time: "13:41:12",
             ts: t(230),
@@ -203,12 +204,17 @@
           {
             seq: 5,
             agent: "ui-dev",
+            channel: "ui",
             text: "@coordinator Adapting Needs-You triage cards and @mention graph for 380px aux pane.",
             time: "13:45:01",
             ts: t(12),
             mentions: ["coordinator"],
             all: false,
           },
+        ],
+        channels: [
+          { name: "backend", topic: "Sidecar store, git probe, and security checks", created_by: "coordinator", archived: false },
+          { name: "ui", topic: "Sidebar layout and live-web parity", created_by: "coordinator", archived: false },
         ],
         frames: [],
       },
@@ -279,6 +285,34 @@
             lastPostSeq: 2,
             lastPostTime: "12:36:14",
             lastPostTs: t(3500),
+          },
+          {
+            name: "scanner",
+            conversation_id: "demo-scanner-0013",
+            model: "gemini-3-pro",
+            role: "worker",
+            wake_mode: "mentions",
+            wait_since: 2,
+            last_read_seq: 2,
+            unread: 0,
+            killed: false,
+            status: "waiting",
+            steps: 4,
+            activity: "Waiting after quota limit",
+            activityKind: "tool",
+            replied: false,
+            replyAsk: "",
+            narrator: false,
+            roleWorker: false,
+            failure: { kind: "quota", text: "429 RESOURCE_EXHAUSTED: model quota exceeded" },
+            transcriptMtime: t(200),
+            startedAt: new Date(t(600)).toISOString(),
+            lastStepAt: new Date(t(200)).toISOString(),
+            usage: { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, totalTokens: 0 },
+            posts: 0,
+            lastPostSeq: 0,
+            lastPostTime: "",
+            lastPostTs: null,
           },
         ],
         messages: [
@@ -809,11 +843,30 @@
         { key: "blocked", label: "[blocked]", count: bC, seq: bS },
       ],
     } : null;
+    var replyRefs = {};
+    var seqSet = {};
+    sw.messages.forEach(function (m) {
+      if (m && m.seq && !m.control) seqSet[m.seq] = true;
+    });
+    sw.messages.forEach(function (m) {
+      if (!m || m.control || !m.text) return;
+      var seenRef = {};
+      var reRef = /#(\d+)\b/g;
+      var refMatch;
+      while ((refMatch = reRef.exec(m.text)) !== null) {
+        var refSeq = Number(refMatch[1]);
+        if (refSeq > 0 && refSeq !== m.seq && seqSet[refSeq] && !seenRef[refSeq]) {
+          seenRef[refSeq] = true;
+          if (!replyRefs[refSeq]) replyRefs[refSeq] = [];
+          replyRefs[refSeq].push(m.seq);
+        }
+      }
+    });
     return {
       conversationId: sw.id,
       swarm: sw.id,
       member: sw.member,
-      etag: "liveweb-" + sw.head + "-" + triage.length + "-" + (sw.planVersion || 1),
+      etag: "liveweb-" + sw.head + "-" + triage.length + "-" + (sw.planVersion || 1) + "-" + (sw.controlVersion || 0),
       id: sw.id,
       title: sw.title,
       head: sw.head,
@@ -833,6 +886,8 @@
         });
       }),
       messages: sw.messages,
+      replyRefs: replyRefs,
+      channels: sw.channels || [],
       edges: [],
       view: sw.view || null,
       plan: normalizePlanForSnapshot(sw.plan, planEtagOf(sw)),
@@ -881,6 +936,9 @@
       toggleAuxPane: function (req) {
         console.info("[fleet live-web] toggleAuxPane:", req);
       },
+      addArtifactComment: function (comment) {
+        console.info("[fleet live-web] addArtifactComment:", comment);
+      },
     },
     agent: {
       sendMessage: async function (message, convId) {
@@ -916,6 +974,230 @@
       });
     };
 
+    if (url.pathname === "/api/control" && init && String(init.method || "").toUpperCase() === "POST") {
+      var rawCtrlBody = String(init.body || "{}");
+      if (rawCtrlBody.length > 65536) {
+        return jsonResp({ error: "Payload too large" }, 413);
+      }
+      if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(rawCtrlBody)) {
+        return jsonResp({ error: "Control characters not permitted" }, 400);
+      }
+      var ctrl = {};
+      try { ctrl = JSON.parse(rawCtrlBody); } catch { return jsonResp({ error: "Invalid JSON" }, 400); }
+      if (!ctrl || ctrl.confirm !== true || typeof ctrl.op !== "string") {
+        return jsonResp({ error: "Confirmation (confirm: true) and op required" }, 400);
+      }
+      var cSw = findSwarmByConvId(ctrl.conversationId);
+      if (!cSw) return jsonResp({ error: "Swarm not found" }, 404);
+      var coordMember = cSw.members.find(function (m) { return m.role === "coordinator"; });
+      if (!coordMember) return jsonResp({ error: "Coordinator not found" }, 404);
+
+      var WORKER_RE = /^[a-z][a-z0-9-]{0,31}$/;
+      var CHAN_RE = /^[a-z][a-z0-9-]{0,23}$/;
+      var nowIso = new Date().toISOString();
+      var nowClk = new Date().toTimeString().slice(0, 8);
+      var preview = "";
+
+      function extractMentions(txt) {
+        var names = cSw.members.map(function (m) { return m.name; });
+        var lo = String(txt || "").toLowerCase();
+        var hit = names.filter(function (n) { return lo.indexOf("@" + n.toLowerCase()) >= 0; });
+        return { mentions: hit, all: /@all\b/i.test(lo) };
+      }
+
+      if (ctrl.op === "board_post") {
+        var postText = typeof ctrl.text === "string" ? ctrl.text.trim() : "";
+        if (!postText || postText.length > 4000) return jsonResp({ error: "Valid text required" }, 400);
+        var postCh = typeof ctrl.channel === "string" ? ctrl.channel.trim() : "";
+        if (postCh && postCh !== "main" && !CHAN_RE.test(postCh)) return jsonResp({ error: "Invalid channel name" }, 400);
+        var replySeq = Number(ctrl.replyToSeq) || 0;
+        var finalText = replySeq > 0 && postText.indexOf("#" + replySeq) < 0 ? "Re #" + replySeq + ": " + postText : postText;
+        var mInfo = extractMentions(finalText);
+        cSw.head += 1;
+        cSw.messages.push(Object.assign(
+          {
+            seq: cSw.head,
+            agent: "coordinator",
+            text: finalText,
+            time: nowClk,
+            ts: Date.now(),
+            mentions: mInfo.mentions,
+            all: mInfo.all,
+          },
+          postCh && postCh !== "main" ? { channel: postCh } : {},
+        ));
+        cSw.controlVersion = (cSw.controlVersion || 0) + 1;
+        preview = "[fleet-operator:board_post] " + (postCh || "main") + ": " + finalText.slice(0, 120);
+      } else if (ctrl.op === "spawn_worker") {
+        var wName = typeof ctrl.name === "string" ? ctrl.name.trim() : "";
+        var wBrief = typeof ctrl.brief === "string" ? ctrl.brief.trim() : "";
+        var wMode = ctrl.workspaceMode || "inherit";
+        var wCh = typeof ctrl.channel === "string" ? ctrl.channel.trim() : "";
+        if (!WORKER_RE.test(wName) || wName === "all" || wName === "coordinator") {
+          return jsonResp({ error: "Invalid worker name" }, 400);
+        }
+        if (!wBrief || wBrief.length > 4000) return jsonResp({ error: "Valid brief required" }, 400);
+        if (["inherit", "share", "branch"].indexOf(wMode) < 0) return jsonResp({ error: "Invalid workspaceMode" }, 400);
+        if (wCh && wCh !== "main" && !CHAN_RE.test(wCh)) return jsonResp({ error: "Invalid channel" }, 400);
+        if (cSw.members.some(function (m) { return !m.killed && m.name === wName; })) {
+          return jsonResp({ error: "Worker already exists" }, 409);
+        }
+        var newConvId = "demo-" + wName + "-" + String(Date.now()).slice(-4);
+        cSw.members.push({
+          name: wName,
+          conversation_id: newConvId,
+          model: ctrl.model || "gemini-3-pro",
+          role: "worker",
+          wake_mode: "mentions",
+          wait_since: cSw.head,
+          last_read_seq: cSw.head,
+          unread: 0,
+          killed: false,
+          status: "working",
+          steps: 1,
+          activity: "Starting assigned task",
+          activityKind: "thinking",
+          replied: false,
+          replyAsk: "",
+          narrator: false,
+          roleWorker: false,
+          failure: null,
+          transcriptMtime: Date.now(),
+          startedAt: nowIso,
+          lastStepAt: nowIso,
+          usage: { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, totalTokens: 0 },
+          workspace_mode: wMode,
+          ...(wCh && wCh !== "main" ? { channels: [wCh] } : {}),
+          posts: 0,
+          lastPostSeq: 0,
+          lastPostTime: "",
+          lastPostTs: null,
+        });
+        cSw.head += 1;
+        cSw.messages.push(Object.assign(
+          {
+            seq: cSw.head,
+            agent: "coordinator",
+            text: "@" + wName + " " + wBrief,
+            time: nowClk,
+            ts: Date.now(),
+            mentions: [wName],
+            all: false,
+          },
+          wCh && wCh !== "main" ? { channel: wCh } : {},
+        ));
+        cSw.controlVersion = (cSw.controlVersion || 0) + 1;
+        preview = "[fleet-operator:spawn_worker] @" + wName + " (" + wMode + ")";
+      } else if (ctrl.op === "switch_model") {
+        var smTarget = typeof ctrl.member === "string" ? ctrl.member.trim() : "";
+        var smModel = typeof ctrl.model === "string" ? ctrl.model.trim() : "";
+        if (!smTarget || !smModel || smModel.length > 120) return jsonResp({ error: "member and model required" }, 400);
+        var smMember = cSw.members.find(function (m) { return !m.killed && m.name === smTarget; });
+        if (!smMember) return jsonResp({ error: "Member not found" }, 404);
+        smMember.model = smModel;
+        smMember.failure = null;
+        smMember.status = "working";
+        smMember.activity = "Resumed on " + smModel;
+        smMember.activityPeek = { status: "working", label: "Resumed on " + smModel, tool: "thinking", ts: Date.now() };
+        smMember.transcriptMtime = Date.now();
+        cSw.controlVersion = (cSw.controlVersion || 0) + 1;
+        preview = "[fleet-operator:switch_model] @" + smTarget + " -> " + smModel;
+      } else if (ctrl.op === "kill_worker") {
+        var kwTarget = typeof ctrl.member === "string" ? ctrl.member.trim() : "";
+        if (!kwTarget) return jsonResp({ error: "member required" }, 400);
+        if (kwTarget === "coordinator" || kwTarget === "narrator" || kwTarget === "monitor") {
+          return jsonResp({ error: "Refusing to kill protected role " + kwTarget }, 403);
+        }
+        var kwMember = cSw.members.find(function (m) { return !m.killed && m.name === kwTarget; });
+        if (!kwMember) return jsonResp({ error: "Member not found" }, 404);
+        var kwWt = kwMember.workspace ? state.worktrees.find(function (w) { return w.path === kwMember.workspace; }) : null;
+        if (kwWt && !ctrl.forceUnmerged && (!kwWt.clean || (kwWt.ahead || 0) > 0)) {
+          return jsonResp({
+            error: "unmerged worktree",
+            dirtyFiles: (kwWt.dirtyFiles || 0) + (kwWt.untrackedFiles || 0),
+            ahead: kwWt.ahead || 0,
+          }, 409);
+        }
+        kwMember.killed = true;
+        kwMember.status = "killed";
+        kwMember.activity = "";
+        kwMember.activityPeek = null;
+        cSw.controlVersion = (cSw.controlVersion || 0) + 1;
+        preview = "[fleet-operator:kill_worker] @" + kwTarget;
+      } else if (ctrl.op === "channel_op") {
+        var chAction = ctrl.action;
+        var chName = typeof ctrl.channel === "string" ? ctrl.channel.trim() : "";
+        if (["create", "archive", "subscribe", "unsubscribe"].indexOf(chAction) < 0) {
+          return jsonResp({ error: "Invalid channel action" }, 400);
+        }
+        if (!CHAN_RE.test(chName) || ["main", "all", "here"].indexOf(chName) >= 0) {
+          return jsonResp({ error: "Invalid channel name" }, 400);
+        }
+        cSw.channels = cSw.channels || [];
+        if (chAction === "create") {
+          if (!cSw.channels.some(function (c) { return c.name === chName; })) {
+            cSw.channels.push({ name: chName, topic: String(ctrl.topic || "").trim(), created_by: "coordinator", archived: false });
+          }
+        } else if (chAction === "archive") {
+          var ar = cSw.channels.find(function (c) { return c.name === chName; });
+          if (ar) ar.archived = true;
+        } else {
+          var subTarget = typeof ctrl.member === "string" ? ctrl.member.trim() : "";
+          var subMember = cSw.members.find(function (m) { return !m.killed && m.name === subTarget; });
+          if (!subMember) return jsonResp({ error: "Member not found" }, 404);
+          var curChs = Array.isArray(subMember.channels) ? subMember.channels.slice() : [];
+          if (chAction === "subscribe" && curChs.indexOf(chName) < 0) curChs.push(chName);
+          if (chAction === "unsubscribe") curChs = curChs.filter(function (c) { return c !== chName; });
+          subMember.channels = curChs;
+        }
+        cSw.head += 1;
+        cSw.messages.push({
+          seq: cSw.head,
+          agent: "coordinator",
+          text: "[channel:" + chAction + "] #" + chName,
+          time: nowClk,
+          ts: Date.now(),
+          mentions: [],
+          all: false,
+          control: { op: chAction, channel: chName, topic: ctrl.topic || "" },
+        });
+        cSw.controlVersion = (cSw.controlVersion || 0) + 1;
+        preview = "[fleet-operator:channel_op] " + chAction + " #" + chName;
+      } else if (ctrl.op === "gate_verdict") {
+        var gVerdict = ctrl.verdict;
+        var gSeq = Number(ctrl.seq) || 0;
+        var gNote = typeof ctrl.note === "string" ? ctrl.note.trim() : "";
+        if (["verified", "blocked", "ship"].indexOf(gVerdict) < 0 || gSeq <= 0 || !gNote || gNote.length > 4000) {
+          return jsonResp({ error: "Valid verdict, seq, and note required" }, 400);
+        }
+        var tag = gVerdict === "verified" ? "[verified]" : gVerdict === "blocked" ? "[blocked]" : "shipped";
+        var targetTag = ctrl.targetMember ? "@" + ctrl.targetMember + " " : "";
+        var vText = targetTag + tag + " Re #" + gSeq + ": " + gNote;
+        var vMentions = extractMentions(vText);
+        cSw.head += 1;
+        cSw.messages.push({
+          seq: cSw.head,
+          agent: "coordinator",
+          text: vText,
+          time: nowClk,
+          ts: Date.now(),
+          mentions: vMentions.mentions,
+          all: vMentions.all,
+        });
+        cSw.controlVersion = (cSw.controlVersion || 0) + 1;
+        preview = "[fleet-operator:gate_verdict] " + gVerdict + " #" + gSeq;
+      } else {
+        return jsonResp({ error: "Unsupported op" }, 400);
+      }
+
+      return jsonResp({
+        ok: true,
+        op: ctrl.op,
+        coordinatorId: coordMember.conversation_id,
+        directivePreview: preview,
+        deliveredAt: nowIso,
+      });
+    }
     if (url.pathname === "/api/plan" && init && String(init.method || "").toUpperCase() === "POST") {
       var rawPlanBody = String(init.body || "{}");
       if (rawPlanBody.length > 65536) {
@@ -1007,7 +1289,7 @@
       return jsonResp({ ok: true, delivered: targets.length });
     }
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.19.0", mode: "live-web", canSendMessage: true, sseStream: false, idleSleep: false, sseClients: 0 });
+      return jsonResp({ ok: true, name: "fleet", version: "1.22.0", mode: "live-web", canSendMessage: true, sseStream: false, idleSleep: false, sseClients: 0 });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });
