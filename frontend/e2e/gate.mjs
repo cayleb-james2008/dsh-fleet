@@ -1092,6 +1092,358 @@ await runChecks("gate", async (check) => {
     );
   });
 
+  await check("New Swarm Launcher modal opens from header and Command Palette while swarm is active", async () => {
+    await page.setViewportSize({ width: 360, height: 900 });
+    await page.locator('[data-testid="open-swarm-launcher"]').click();
+    await page.waitForSelector('[data-testid="swarm-launcher-modal"]');
+    const modalTxt = await page.locator('[data-testid="swarm-launcher-modal"]').textContent();
+    const ov1 = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    await page.locator('button[aria-label="Close dialog"]').click();
+
+    await page.locator('button[aria-label="Open command palette"]').click();
+    await page.waitForSelector("[cmdk-input]");
+    await page.fill("[cmdk-input]", "New swarm");
+    await page.keyboard.press("Enter");
+    await page.waitForSelector('[data-testid="swarm-launcher-modal"]');
+    await page.locator('button[aria-label="Close dialog"]').click();
+    await page.setViewportSize({ width: 380, height: 900 });
+    return Boolean(modalTxt?.includes("Feature and verifier") && modalTxt.includes("Custom swarm")) && ov1 <= 0;
+  });
+
+  await check("Command Palette Spawn Worker and Board Post actions jump and open composers", async () => {
+    await page.locator('button[aria-label="Open command palette"]').click();
+    await page.waitForSelector("[cmdk-input]");
+    await page.fill("[cmdk-input]", "Board post");
+    await page.keyboard.press("Enter");
+    await page.waitForSelector('[data-testid="board-composer-form"]');
+    const boardOpen = (await page.locator('[data-testid="board-composer-form"]').count()) === 1;
+    await page.locator('[data-testid="board-composer-close"]').click();
+
+    await page.locator('button[aria-label="Open command palette"]').click();
+    await page.waitForSelector("[cmdk-input]");
+    await page.fill("[cmdk-input]", "Spawn worker");
+    await page.keyboard.press("Enter");
+    await page.waitForSelector('[data-testid="spawn-worker-drawer"]');
+    const spawnOpen = (await page.locator('[data-testid="spawn-worker-drawer"]').count()) === 1;
+    await page.locator('button[aria-label="Close spawn worker drawer"]').click();
+    await page.locator("#tab-triage").click();
+    return boardOpen && spawnOpen;
+  });
+
+  await check("Board channel tabs, replyRefs backlinks, and sticky Board Composer work via /api/control", async () => {
+    const ctrlPage = await ctx.newPage();
+    await ctrlPage.setViewportSize({ width: 360, height: 900 });
+    const ctrlErrors = [];
+    const controlCalls = [];
+    ctrlPage.on("pageerror", (e) => ctrlErrors.push(e.message));
+    ctrlPage.on("console", (msg) => {
+      if (msg.type() === "error") ctrlErrors.push(msg.text());
+    });
+
+    const mockSnap = {
+      conversationId: "ctrl-coord-1",
+      swarm: "ctrl-coord-1",
+      member: "coordinator",
+      etag: "ctrl-v1",
+      id: "ctrl-coord-1",
+      title: "Control Plane Gate",
+      head: 3,
+      channels: [
+        { name: "backend", topic: "Backend API lane", created_by: "coordinator", archived: false },
+      ],
+      members: [
+        {
+          name: "coordinator",
+          conversation_id: "ctrl-coord-1",
+          model: "gemini-3-pro",
+          role: "coordinator",
+          wake_mode: "mentions",
+          wait_since: 3,
+          last_read_seq: 3,
+          unread: 0,
+          killed: false,
+          status: "waiting",
+          steps: 4,
+          activity: "",
+          activityKind: "",
+          replied: false,
+          replyAsk: "",
+          narrator: false,
+          roleWorker: false,
+          failure: null,
+          transcriptMtime: Date.now(),
+          startedAt: new Date().toISOString(),
+          lastStepAt: new Date().toISOString(),
+          usage: { inputTokens: 1000, cacheReadTokens: 0, outputTokens: 200, totalTokens: 1200 },
+          posts: 1,
+          lastPostSeq: 1,
+          lastPostTime: "12:00:00",
+          lastPostTs: Date.now(),
+        },
+        {
+          name: "builder",
+          conversation_id: "ctrl-builder-2",
+          model: "gemini-3-pro",
+          role: "worker",
+          wake_mode: "mentions",
+          wait_since: 2,
+          last_read_seq: 3,
+          unread: 0,
+          killed: false,
+          status: "waiting",
+          steps: 8,
+          activity: "",
+          activityKind: "",
+          replied: false,
+          replyAsk: "",
+          narrator: false,
+          roleWorker: false,
+          failure: null,
+          transcriptMtime: Date.now(),
+          startedAt: new Date().toISOString(),
+          lastStepAt: new Date().toISOString(),
+          usage: { inputTokens: 2000, cacheReadTokens: 0, outputTokens: 300, totalTokens: 2300 },
+          workspace_mode: "share",
+          posts: 1,
+          lastPostSeq: 2,
+          lastPostTime: "12:02:00",
+          lastPostTs: Date.now(),
+        },
+      ],
+      messages: [
+        { seq: 1, agent: "coordinator", text: "@all Kickoff", time: "12:00:00", ts: Date.now(), mentions: [], all: true },
+        { seq: 2, agent: "builder", channel: "backend", text: "@coordinator API ready", time: "12:02:00", ts: Date.now(), mentions: ["coordinator"], all: false },
+        { seq: 3, agent: "coordinator", text: "@builder [done] Re #2: Confirmed", time: "12:03:00", ts: Date.now(), mentions: ["builder"], all: false },
+      ],
+      replyRefs: { 2: [3] },
+      edges: [],
+      triage: [],
+      gateReadiness: {
+        state: "verifying",
+        pendingSeq: 3,
+        nextAction: { kind: "verify", target: "builder", conversationId: "ctrl-builder-2", seq: 3, label: "Nudge @builder", prompt: "@builder Re #3: verify" },
+        stages: [{ key: "done", label: "[done]", count: 1, seq: 3 }],
+      },
+      usage: { inputTokens: 3000, cacheReadTokens: 0, outputTokens: 500, totalTokens: 3500 },
+      capabilities: { canSendMessage: true, isSidecar: false, sseStream: false },
+    };
+
+    await ctrlPage.route("**/api/swarm*", async (route) => {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(mockSnap) });
+    });
+    await ctrlPage.route("**/api/control", async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      controlCalls.push(body);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, op: body.op, coordinatorId: "ctrl-coord-1", directivePreview: body.op, deliveredAt: new Date().toISOString() }),
+      });
+    });
+
+    await ctrlPage.goto(BASE, { waitUntil: "domcontentloaded" });
+    await ctrlPage.locator("#tab-board").click();
+    await ctrlPage.waitForSelector('[data-testid="board-channel-tabs"]');
+    await ctrlPage.locator('[data-testid="channel-tab-backend"]').click();
+    const backendTxt = await ctrlPage.locator("#panel-board").textContent();
+    await ctrlPage.locator('[data-testid="channel-tab-all"]').click();
+
+    const refTxt = await ctrlPage.locator('[data-testid="board-reply-refs-2"]').textContent();
+    await ctrlPage.locator('[data-testid="board-reply-refs-2"] button').first().click();
+
+    await ctrlPage.locator('[data-testid="board-composer-open"]').click();
+    await ctrlPage.selectOption('[data-testid="board-composer-channel"]', "backend");
+    await ctrlPage.fill('[data-testid="board-composer-reply-seq"]', "2");
+    await ctrlPage.fill('[data-testid="board-composer-input"]', "Ship channel update");
+    await ctrlPage.locator('[data-testid="board-composer-stage"]').click();
+    await ctrlPage.locator('[data-testid="board-composer-submit"]').click();
+    await ctrlPage.waitForFunction(() => !document.querySelector('[data-testid="board-composer-form"]'));
+
+    const ov360 = await ctrlPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    await ctrlPage.close();
+
+    const postCall = controlCalls.find((c) => c.op === "board_post");
+    return (
+      Boolean(backendTxt?.includes("API ready") && !backendTxt.includes("Kickoff")) &&
+      Boolean(refTxt?.includes("Replies:") && refTxt.includes("#3")) &&
+      Boolean(postCall?.confirm && postCall.channel === "backend" && postCall.replyToSeq === 2 && postCall.text === "Ship channel update") &&
+      ov360 <= 0 &&
+      ctrlErrors.length === 0
+    );
+  });
+
+  await check("Roster Spawn Worker, Switch Model on quota card, and Kill Worker 409 flow work via /api/control", async () => {
+    const rosterPage = await ctx.newPage();
+    await rosterPage.setViewportSize({ width: 360, height: 900 });
+    const rosterErrors = [];
+    const controlCalls = [];
+    let allow409 = false;
+    rosterPage.on("pageerror", (e) => rosterErrors.push(e.message));
+    rosterPage.on("console", (msg) => {
+      if (msg.type() === "error") {
+        if (allow409 && msg.text().includes("status of 409")) return;
+        rosterErrors.push(msg.text());
+      }
+    });
+
+    const mockSnap = {
+      conversationId: "ctrl-coord-1",
+      swarm: "ctrl-coord-1",
+      member: "coordinator",
+      etag: "ctrl-r1",
+      id: "ctrl-coord-1",
+      title: "Roster Control Gate",
+      head: 2,
+      channels: [{ name: "backend", topic: "Backend", created_by: "coordinator", archived: false }],
+      members: [
+        {
+          name: "coordinator",
+          conversation_id: "ctrl-coord-1",
+          model: "gemini-3-pro",
+          role: "coordinator",
+          wake_mode: "mentions",
+          wait_since: 2,
+          last_read_seq: 2,
+          unread: 0,
+          killed: false,
+          status: "waiting",
+          steps: 3,
+          activity: "",
+          activityKind: "",
+          replied: false,
+          replyAsk: "",
+          narrator: false,
+          roleWorker: false,
+          failure: null,
+          transcriptMtime: Date.now(),
+          startedAt: new Date().toISOString(),
+          lastStepAt: new Date().toISOString(),
+          usage: { inputTokens: 800, cacheReadTokens: 0, outputTokens: 100, totalTokens: 900 },
+          posts: 1,
+          lastPostSeq: 1,
+          lastPostTime: "12:00:00",
+          lastPostTs: Date.now(),
+        },
+        {
+          name: "scout",
+          conversation_id: "ctrl-scout-2",
+          model: "gemini-3-pro",
+          role: "worker",
+          wake_mode: "mentions",
+          wait_since: 2,
+          last_read_seq: 2,
+          unread: 0,
+          killed: false,
+          status: "waiting",
+          steps: 5,
+          activity: "",
+          activityKind: "",
+          replied: false,
+          replyAsk: "",
+          narrator: false,
+          roleWorker: false,
+          failure: { kind: "quota", text: "429 RESOURCE_EXHAUSTED" },
+          transcriptMtime: Date.now(),
+          startedAt: new Date().toISOString(),
+          lastStepAt: new Date().toISOString(),
+          usage: { inputTokens: 1200, cacheReadTokens: 0, outputTokens: 200, totalTokens: 1400 },
+          workspace_mode: "share",
+          posts: 0,
+          lastPostSeq: 0,
+          lastPostTime: "",
+          lastPostTs: null,
+        },
+      ],
+      messages: [{ seq: 1, agent: "coordinator", text: "@all Start", time: "12:00:00", ts: Date.now(), mentions: [], all: true }],
+      edges: [],
+      triage: [],
+      gateReadiness: {
+        state: "verifying",
+        pendingSeq: 1,
+        nextAction: { kind: "verify", target: "scout", conversationId: "ctrl-scout-2", seq: 1, label: "Nudge @scout", prompt: "@scout Re #1: check" },
+        stages: [{ key: "done", label: "[done]", count: 1, seq: 1 }],
+      },
+      usage: { inputTokens: 2000, cacheReadTokens: 0, outputTokens: 300, totalTokens: 2300 },
+      capabilities: { canSendMessage: true, isSidecar: false, sseStream: false },
+    };
+
+    await rosterPage.route("**/api/swarm*", async (route) => {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(mockSnap) });
+    });
+    await rosterPage.route("**/api/control", async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      controlCalls.push(body);
+      if (body.op === "kill_worker" && !body.forceUnmerged) {
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "unmerged worktree", dirtyFiles: 2, ahead: 1 }),
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, op: body.op, coordinatorId: "ctrl-coord-1", directivePreview: body.op, deliveredAt: new Date().toISOString() }),
+      });
+    });
+
+    await rosterPage.goto(BASE, { waitUntil: "domcontentloaded" });
+    await rosterPage.locator('[data-testid="gate-verdict-toggle"]').click();
+    await rosterPage.locator('[data-testid="gate-verdict-submit"]').click();
+    await rosterPage.waitForFunction(() => !document.querySelector('[data-testid="gate-verdict-drawer"]'));
+
+    await rosterPage.locator("#tab-roster").click();
+    await rosterPage.waitForSelector("#panel-roster");
+
+    await rosterPage.locator('[data-testid="toggle-spawn-worker"]').click();
+    await rosterPage.fill('[data-testid="spawn-worker-name"]', "qa-bot");
+    await rosterPage.selectOption('[data-testid="spawn-worker-workspace"]', "branch");
+    await rosterPage.selectOption('[data-testid="spawn-worker-channel"]', "backend");
+    await rosterPage.fill('[data-testid="spawn-worker-brief"]', "Verify control endpoints");
+    await rosterPage.locator('[data-testid="spawn-worker-submit"]').click();
+    await rosterPage.waitForFunction(() => !document.querySelector('[data-testid="spawn-worker-drawer"]'));
+
+    await rosterPage.locator('[data-testid="switch-model-btn-scout"]').click();
+    const reasonVal = await rosterPage.locator('[data-testid="switch-model-reason-scout"]').inputValue();
+    await rosterPage.locator('[data-testid="switch-model-submit-scout"]').click();
+    await rosterPage.waitForFunction(() => !document.querySelector('[data-testid="switch-model-drawer-scout"]'));
+
+    await rosterPage.locator('[data-testid="kill-worker-btn-scout"]').click();
+    allow409 = true;
+    await rosterPage.locator('[data-testid="kill-worker-submit-scout"]').click();
+    await rosterPage.waitForSelector('[data-testid="kill-worker-409-scout"]');
+    const warnTxt = await rosterPage.locator('[data-testid="kill-worker-409-scout"]').textContent();
+    await rosterPage.locator('[data-testid="kill-worker-force-scout"]').click();
+    await rosterPage.waitForFunction(() => !document.querySelector('[data-testid="kill-worker-confirm-scout"]'));
+
+    const ov360 = await rosterPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    await rosterPage.close();
+
+    const verdictCall = controlCalls.find((c) => c.op === "gate_verdict");
+    const spawnCall = controlCalls.find((c) => c.op === "spawn_worker");
+    const switchCall = controlCalls.find((c) => c.op === "switch_model");
+    const forceKillCall = controlCalls.find((c) => c.op === "kill_worker" && c.forceUnmerged === true);
+    return (
+      verdictCall?.verdict === "verified" &&
+      Boolean(spawnCall?.name === "qa-bot" && spawnCall.workspaceMode === "branch" && spawnCall.channel === "backend") &&
+      reasonVal === "Quota exhausted" &&
+      Boolean(switchCall?.member === "scout" && switchCall.model === "gemini-3-flash") &&
+      Boolean(warnTxt?.includes("2 dirty files, 1 commits ahead")) &&
+      Boolean(forceKillCall?.member === "scout") &&
+      ov360 <= 0 &&
+      rosterErrors.length === 0
+    );
+  });
+
+  await check("addArtifactComment bridge helper is wired without error", async () => {
+    return await page.evaluate(() => {
+      if (typeof window.sidecar?.ui?.addArtifactComment !== "function") return false;
+      window.sidecar.ui.addArtifactComment("Fleet gate check");
+      return true;
+    });
+  });
+
   // 26-28: Clean runtime guarantees
   await check("zero console errors", () => consoleErrors.length === 0);
   await check("zero uncaught page errors", () => pageErrors.length === 0);

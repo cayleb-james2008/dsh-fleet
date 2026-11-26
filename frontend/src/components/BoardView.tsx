@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "../hooks";
-import { ArrowDown, ClipboardCopy, Filter, Pin, Reply, Search, X } from "../icons";
-import { extractLocalFilePaths, parseScreenshotLines } from "../sidecar";
+import { ArrowDown, ClipboardCopy, Filter, Hash, Pin, Plus, Reply, Search, Send, X } from "../icons";
+import { extractLocalFilePaths, parseScreenshotLines, sendSwarmControl } from "../sidecar";
 import type { BoardMessage, SwarmSnapshot } from "../types";
-import { Badge, Button, Card, InlineComposer, Input, MediaPathChips, Pill, PinnedList, canLiveNudge, cn, copyText, downloadTextFile, fmtClockTime, formatFilteredBoardExport, openOrCopyPath, submitNudge } from "../ui";
+import { Badge, Button, Card, InlineComposer, Input, MediaPathChips, Pill, PinnedList, Textarea, canLiveNudge, cn, copyText, downloadTextFile, fmtClockTime, formatFilteredBoardExport, hasControlChars, openOrCopyPath, submitNudge, toast } from "../ui";
 
 function PostBody({
   text,
@@ -76,6 +76,7 @@ export function BoardView({
   pinnedSeqs,
   quickFilter = "all",
   agentFilter: controlledAgentFilter,
+  composeNonce = 0,
   onQuickFilterChange,
   onAgentFilterChange,
   onCopyWaveDigest,
@@ -88,6 +89,7 @@ export function BoardView({
   pinnedSeqs: number[];
   quickFilter?: BoardQuickFilter;
   agentFilter?: string;
+  composeNonce?: number;
   onQuickFilterChange?: (f: BoardQuickFilter) => void;
   onAgentFilterChange?: (a: string) => void;
   onCopyWaveDigest?: () => void;
@@ -102,18 +104,38 @@ export function BoardView({
     setLocalAgentFilter(next);
     onAgentFilterChange?.(next);
   };
+  const [channelFilter, setChannelFilter] = useState<string>("all");
   const [showFilters, setShowFilters] = useState(false);
   const [follow, setFollow] = useState(true);
   const [visibleLimit, setVisibleLimit] = useState(80);
+  const [localHighlightSeq, setLocalHighlightSeq] = useState<number | null>(null);
   const [replyTarget, setReplyTarget] = useState<BoardMessage | null>(null);
   const [replyDraft, setReplyDraft] = useState("");
   const [sending, setSending] = useState(false);
 
+  // Sticky Board / Channel Composer state
+  const [composerOpen, setComposerOpen] = useState(false);
+  const [composerChannel, setComposerChannel] = useState("main");
+  const [composerReplySeq, setComposerReplySeq] = useState("");
+  const [composerText, setComposerText] = useState("");
+  const [composerConfirm, setComposerConfirm] = useState(false);
+  const [composerSending, setComposerSending] = useState(false);
+
+  // Channel Manager drawer state (channel_op)
+  const [channelMgrOpen, setChannelMgrOpen] = useState(false);
+  const [channelOpAction, setChannelOpAction] = useState<"create" | "archive" | "subscribe" | "unsubscribe">("create");
+  const [channelOpName, setChannelOpName] = useState("");
+  const [channelOpTopic, setChannelOpTopic] = useState("");
+  const [channelOpMember, setChannelOpMember] = useState("");
+  const [channelOpSending, setChannelOpSending] = useState(false);
+
   const bottomRef = useRef<HTMLDivElement>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const rowRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
   const messages = snap.messages || [];
   const members = snap.members || [];
+  const replyRefs = snap.replyRefs || {};
   const unseenSet = useMemo(() => new Set(snap.unseen || []), [snap.unseen]);
   const viewerMember = useMemo(
     () => (snap.member ? members.find((m) => m.name === snap.member) || null : null),
@@ -121,24 +143,70 @@ export function BoardView({
   );
   const lastReadSeq = viewerMember?.last_read_seq ?? 0;
 
+  const channelsMeta = useMemo(() => {
+    const byName = new Map<string, { name: string; topic: string; archived: boolean; count: number }>();
+    byName.set("main", { name: "main", topic: "Primary swarm board", archived: false, count: 0 });
+    for (const ch of snap.channels || []) {
+      if (!ch?.name) continue;
+      byName.set(ch.name, { name: ch.name, topic: ch.topic || "", archived: Boolean(ch.archived), count: 0 });
+    }
+    let totalCount = 0;
+    for (const m of messages) {
+      if (m.control || unseenSet.has(m.seq)) continue;
+      totalCount++;
+      const chName = m.channel || "main";
+      const existing = byName.get(chName);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        byName.set(chName, { name: chName, topic: "", archived: false, count: 1 });
+      }
+    }
+    return { totalCount, list: [...byName.values()] };
+  }, [snap.channels, messages, unseenSet]);
+
+  const activeChannels = useMemo(
+    () => channelsMeta.list.filter((c) => !c.archived),
+    [channelsMeta.list],
+  );
+
+  useEffect(() => {
+    if (!composeNonce) return;
+    setComposerOpen(true);
+    if (channelFilter !== "all" && activeChannels.some((c) => c.name === channelFilter)) {
+      setComposerChannel(channelFilter);
+    }
+    requestAnimationFrame(() => composerInputRef.current?.focus());
+  }, [composeNonce]);
+
+  useEffect(() => {
+    if (channelFilter !== "all" && activeChannels.some((c) => c.name === channelFilter)) {
+      setComposerChannel(channelFilter);
+    }
+  }, [channelFilter, activeChannels]);
+
   const isNeedsReply = (m: BoardMessage) => m.text.includes("?") || Boolean(snap.member && m.mentions.includes(snap.member));
 
   const quickCounts = useMemo(() => {
     let all = 0, needs_reply = 0, done = 0, blocked = 0;
     for (const m of messages) {
       if (m.control || unseenSet.has(m.seq)) continue;
+      const msgCh = m.channel || "main";
+      if (channelFilter !== "all" && msgCh !== channelFilter) continue;
       all++;
       if (isNeedsReply(m)) needs_reply++;
       if (/\[(done|verified)\]/i.test(m.text)) done++;
       if (/\[blocked\]/i.test(m.text)) blocked++;
     }
     return { all, needs_reply, done, blocked };
-  }, [messages, unseenSet, snap.member]);
+  }, [messages, unseenSet, snap.member, channelFilter]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return messages.filter((m) => {
       if (m.control || unseenSet.has(m.seq)) return false;
+      const msgCh = m.channel || "main";
+      if (channelFilter !== "all" && msgCh !== channelFilter) return false;
       if (quickFilter === "needs_reply" && !isNeedsReply(m)) return false;
       if (quickFilter === "done" && !/\[(done|verified)\]/i.test(m.text)) return false;
       if (quickFilter === "blocked" && !/\[blocked\]/i.test(m.text)) return false;
@@ -146,7 +214,7 @@ export function BoardView({
       if (q && !m.text.toLowerCase().includes(q) && !m.agent.toLowerCase().includes(q) && !`#${m.seq}`.includes(q)) return false;
       return true;
     });
-  }, [messages, agentFilter, query, unseenSet, quickFilter, snap.member]);
+  }, [messages, agentFilter, query, unseenSet, quickFilter, snap.member, channelFilter]);
 
   const firstNewSeq = useMemo(() => {
     if (!viewerMember) return null;
@@ -159,6 +227,16 @@ export function BoardView({
 
   const scrollToSeq = (seq: number) => {
     setFollow(false);
+    setLocalHighlightSeq(seq);
+    const inFiltered = filtered.some((m) => m.seq === seq);
+    if (!inFiltered && messages.some((m) => !m.control && m.seq === seq)) {
+      setChannelFilter("all");
+      setAgentFilter("all");
+      onQuickFilterChange?.("all");
+      setQuery("");
+      requestAnimationFrame(() => rowRefs.current.get(seq)?.scrollIntoView({ behavior: "smooth", block: "center" }));
+      return;
+    }
     const idx = filtered.findIndex((m) => m.seq === seq);
     if (idx >= 0 && idx < filtered.length - visibleLimit) {
       setVisibleLimit(filtered.length - idx + 20);
@@ -167,6 +245,12 @@ export function BoardView({
     }
     rowRefs.current.get(seq)?.scrollIntoView({ behavior: "smooth", block: "center" });
   };
+
+  useEffect(() => {
+    if (!localHighlightSeq) return;
+    const t = setTimeout(() => setLocalHighlightSeq(null), 2400);
+    return () => clearTimeout(t);
+  }, [localHighlightSeq]);
 
   useEffect(() => {
     if (!highlightSeq) return;
@@ -180,6 +264,7 @@ export function BoardView({
   }, [filtered.length, follow, highlightSeq]);
 
   const canNudge = canLiveNudge(snap);
+  const swarmConvId = snap.swarm || snap.conversationId || "";
   const memberByName = new Map(members.map((m) => [m.name, m]));
 
   const openQuoteReply = (m: BoardMessage) => {
@@ -201,7 +286,76 @@ export function BoardView({
     });
   };
 
-  const hasActiveFilter = query.trim().length > 0 || agentFilter !== "all" || quickFilter !== "all";
+  const composerBadChars = hasControlChars(composerText);
+  const composerReplyNum = composerReplySeq.trim() ? Number(composerReplySeq.trim()) : 0;
+  const composerReplyValid = !composerReplySeq.trim() || (Number.isInteger(composerReplyNum) && composerReplyNum > 0);
+  const canPostControl = Boolean(swarmConvId && canNudge);
+
+  const handleBoardPostSubmit = async () => {
+    const cleanText = composerText.trim();
+    if (!cleanText || cleanText.length > 4000 || composerBadChars || !composerReplyValid) return;
+    if (!canPostControl) {
+      const prefix = composerChannel !== "main" ? `@#${composerChannel} ` : "";
+      const cite = composerReplyNum > 0 ? `Re #${composerReplyNum}: ` : "";
+      await copyText(`${prefix}${cite}${cleanText}`, `Copied post for #${composerChannel}`);
+      setComposerConfirm(false);
+      setComposerOpen(false);
+      return;
+    }
+    setComposerSending(true);
+    try {
+      await sendSwarmControl({
+        op: "board_post",
+        conversationId: swarmConvId,
+        channel: composerChannel,
+        text: cleanText,
+        ...(composerReplyNum > 0 ? { replyToSeq: composerReplyNum } : {}),
+      });
+      toast.success(`Posted to #${composerChannel}`);
+      setComposerText("");
+      setComposerReplySeq("");
+      setComposerConfirm(false);
+      setComposerOpen(false);
+      onRefresh?.();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Board post failed");
+    } finally {
+      setComposerSending(false);
+    }
+  };
+
+  const channelNameValid = /^[a-z][a-z0-9-]{0,23}$/.test(channelOpName.trim()) && !["main", "all", "here"].includes(channelOpName.trim());
+  const channelOpReady =
+    Boolean(swarmConvId) &&
+    channelNameValid &&
+    !hasControlChars(channelOpTopic) &&
+    ((channelOpAction !== "subscribe" && channelOpAction !== "unsubscribe") || Boolean(channelOpMember.trim()));
+
+  const handleChannelOpSubmit = async () => {
+    if (!channelOpReady) return;
+    setChannelOpSending(true);
+    try {
+      await sendSwarmControl({
+        op: "channel_op",
+        conversationId: swarmConvId,
+        action: channelOpAction,
+        channel: channelOpName.trim(),
+        ...(channelOpAction === "create" && channelOpTopic.trim() ? { topic: channelOpTopic.trim() } : {}),
+        ...(channelOpMember.trim() ? { member: channelOpMember.trim() } : {}),
+      });
+      toast.success(`Channel ${channelOpAction}: #${channelOpName.trim()}`);
+      setChannelOpName("");
+      setChannelOpTopic("");
+      setChannelMgrOpen(false);
+      onRefresh?.();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Channel action failed");
+    } finally {
+      setChannelOpSending(false);
+    }
+  };
+
+  const hasActiveFilter = query.trim().length > 0 || agentFilter !== "all" || quickFilter !== "all" || channelFilter !== "all";
   const pinnedSet = new Set(pinnedSeqs);
   const pinnedMessages = messages.filter((m) => !m.control && pinnedSet.has(m.seq));
 
@@ -260,6 +414,117 @@ export function BoardView({
             {follow ? "Following" : "Latest"}
           </Button>
         </div>
+
+        {/* Channel Filter Tabs */}
+        <div className="row flex-wrap gap-1" data-testid="board-channel-tabs">
+          <div className="wrap gap-1" role="group" aria-label="Board channels">
+            <Pill
+              active={channelFilter === "all"}
+              aria-pressed={channelFilter === "all"}
+              data-testid="channel-tab-all"
+              onClick={() => setChannelFilter("all")}
+            >
+              All channels
+            </Pill>
+            {channelsMeta.list.map((ch) => {
+              const active = channelFilter === ch.name;
+              return (
+                <Pill
+                  key={ch.name}
+                  active={active}
+                  aria-pressed={active}
+                  data-testid={`channel-tab-${ch.name}`}
+                  title={ch.topic || undefined}
+                  onClick={() => setChannelFilter(active ? "all" : ch.name)}
+                  className={cn("num inline-flex items-center gap-1", ch.archived && !active && "opacity-60")}
+                >
+                  <span>#{ch.name}</span>
+                  <span>({ch.count})</span>
+                  {ch.archived && <span>archived</span>}
+                </Pill>
+              );
+            })}
+          </div>
+          {canPostControl && (
+            <Button
+              variant={channelMgrOpen ? "secondary" : "ghost"}
+              data-testid="toggle-channel-manager"
+              onClick={() => setChannelMgrOpen((v) => !v)}
+              className="h-7 px-2"
+            >
+              <Hash className="h-3 w-3" />
+              Channels
+            </Button>
+          )}
+        </div>
+
+        {channelMgrOpen && canPostControl && (
+          <Card className="p-2.5 space-y-2 bg-board" data-testid="channel-manager-drawer">
+            <div className="row">
+              <span className="text-[12px] font-semibold text-ink">Channel controls</span>
+              <Button variant="ghost" size="icon" aria-label="Close channel controls" onClick={() => setChannelMgrOpen(false)}>
+                <X />
+              </Button>
+            </div>
+            <div className="wrap gap-1" role="group" aria-label="Channel action">
+              {(["create", "archive", "subscribe", "unsubscribe"] as const).map((act) => (
+                <Pill
+                  key={act}
+                  active={channelOpAction === act}
+                  data-testid={`channel-op-${act}`}
+                  onClick={() => setChannelOpAction(act)}
+                >
+                  {act}
+                </Pill>
+              ))}
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+              <Input
+                aria-label="Channel name"
+                data-testid="channel-op-name"
+                placeholder="channel-name (lowercase)"
+                value={channelOpName}
+                onChange={(e) => setChannelOpName(e.target.value.toLowerCase())}
+              />
+              {channelOpAction === "create" && (
+                <Input
+                  aria-label="Channel topic"
+                  data-testid="channel-op-topic"
+                  placeholder="Topic (optional)"
+                  value={channelOpTopic}
+                  onChange={(e) => setChannelOpTopic(e.target.value)}
+                />
+              )}
+              {(channelOpAction === "subscribe" || channelOpAction === "unsubscribe") && (
+                <select
+                  aria-label="Channel member"
+                  data-testid="channel-op-member"
+                  value={channelOpMember}
+                  onChange={(e) => setChannelOpMember(e.target.value)}
+                  className="h-8 rounded-chip border border-hairline-s bg-surface px-2 text-[12px] text-ink"
+                >
+                  <option value="">Select worker...</option>
+                  {members.filter((m) => !m.killed).map((m) => (
+                    <option key={m.name} value={m.name}>@{m.name}</option>
+                  ))}
+                </select>
+              )}
+            </div>
+            <div className="row">
+              <span className="t3">
+                {channelOpName && !channelNameValid ? "Lowercase letters, digits, hyphens (max 24)" : ""}
+              </span>
+              <Button
+                variant="primary"
+                data-testid="channel-op-submit"
+                disabled={!channelOpReady || channelOpSending}
+                onClick={handleChannelOpSubmit}
+              >
+                {channelOpSending ? "Applying..." : `Confirm ${channelOpAction}`}
+              </Button>
+            </div>
+          </Card>
+        )}
 
         {/* Quick-filter strip + 1-click Wave Digest */}
         <div className="row flex-wrap gap-1">
@@ -345,6 +610,7 @@ export function BoardView({
               onClick={() => {
                 setQuery("");
                 setAgentFilter("all");
+                setChannelFilter("all");
                 onQuickFilterChange?.("all");
               }}
             >
@@ -371,7 +637,8 @@ export function BoardView({
               Math.abs(m.ts - prev.ts) < 10 * 60 * 1000 &&
               m.seq !== firstNewSeq;
             const mentionsMe = Boolean(snap.member && m.mentions.includes(snap.member));
-            const isHighlighted = highlightSeq === m.seq;
+            const isHighlighted = highlightSeq === m.seq || localHighlightSeq === m.seq;
+            const childReplies = (replyRefs[m.seq] || []).filter((s) => s > 0 && s !== m.seq);
 
             return (
               <div key={m.seq}>
@@ -449,6 +716,21 @@ export function BoardView({
                       </>
                     );
                   })()}
+                  {childReplies.length > 0 && (
+                    <div className="wrap gap-1 pt-1 text-[12px]" data-testid={`board-reply-refs-${m.seq}`}>
+                      <span className="text-ink-3">Replies:</span>
+                      {childReplies.map((childSeq) => (
+                        <button
+                          key={childSeq}
+                          type="button"
+                          onClick={() => scrollToSeq(childSeq)}
+                          className="inline-flex items-center rounded-chip bg-blue-soft px-1.5 py-0.5 text-[12px] font-medium text-info num cursor-pointer hover:underline"
+                        >
+                          #{childSeq}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                   {replyTarget?.seq === m.seq && (
                     <InlineComposer
                       id={`board-reply-${m.seq}`}
@@ -476,6 +758,147 @@ export function BoardView({
           <div ref={bottomRef} />
         </div>
       )}
+
+      {/* Sticky Board / Channel Composer */}
+      <div
+        className="sticky bottom-0 z-10 -mx-1 px-1 pt-2 pb-1 bg-canvas border-t border-hairline"
+        data-testid="board-composer"
+      >
+        {!composerOpen ? (
+          <div className="row gap-2">
+            <Button
+              variant="outline"
+              data-testid="board-composer-open"
+              onClick={() => setComposerOpen(true)}
+              className="flex-1 justify-start text-ink-2"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              <span>Post to #{composerChannel}...</span>
+            </Button>
+          </div>
+        ) : (
+          <Card className="p-2.5 space-y-2 bg-surface shadow-[var(--elev-raised)]" data-testid="board-composer-form">
+            <div className="row flex-wrap gap-1.5">
+              <div className="f1 min-w-0">
+                <label htmlFor="board-composer-channel" className="text-[12px] font-medium text-ink-2 shrink-0">
+                  Channel
+                </label>
+                <select
+                  id="board-composer-channel"
+                  aria-label="Target channel"
+                  data-testid="board-composer-channel"
+                  value={composerChannel}
+                  onChange={(e) => {
+                    setComposerChannel(e.target.value);
+                    setComposerConfirm(false);
+                  }}
+                  className="h-7 rounded-chip border border-hairline-s bg-board px-2 text-[12px] text-ink cursor-pointer"
+                >
+                  {activeChannels.map((ch) => (
+                    <option key={ch.name} value={ch.name}>#{ch.name}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="f1">
+                <label htmlFor="board-composer-reply" className="text-[12px] text-ink-3 shrink-0">
+                  Reply #
+                </label>
+                <Input
+                  id="board-composer-reply"
+                  aria-label="Optional reply sequence number"
+                  data-testid="board-composer-reply-seq"
+                  type="number"
+                  min={1}
+                  placeholder="seq"
+                  value={composerReplySeq}
+                  onChange={(e) => {
+                    setComposerReplySeq(e.target.value);
+                    setComposerConfirm(false);
+                  }}
+                  className="h-7 w-[72px] px-2 text-[12px] num"
+                />
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Close board composer"
+                  data-testid="board-composer-close"
+                  onClick={() => {
+                    setComposerOpen(false);
+                    setComposerConfirm(false);
+                  }}
+                >
+                  <X />
+                </Button>
+              </div>
+            </div>
+
+            <Textarea
+              ref={composerInputRef}
+              aria-label="Board post message"
+              data-testid="board-composer-input"
+              rows={2}
+              maxLength={4000}
+              placeholder={`Message #${composerChannel} (use @name to wake a worker)`}
+              value={composerText}
+              onChange={(e) => {
+                setComposerText(e.target.value);
+                setComposerConfirm(false);
+              }}
+            />
+
+            {(composerBadChars || !composerReplyValid) && (
+              <p className="text-[12px] text-danger">
+                {composerBadChars ? "Control characters are not allowed." : "Reply sequence must be a positive number."}
+              </p>
+            )}
+
+            {composerConfirm ? (
+              <div className="row flex-wrap gap-2 rounded-chip bg-board px-2 py-1.5" data-testid="board-composer-confirm-bar">
+                <span className="text-[12px] text-ink">
+                  Post to #{composerChannel}{composerReplyNum > 0 ? ` citing #${composerReplyNum}` : ""}?
+                </span>
+                <div className="f1">
+                  <Button variant="ghost" onClick={() => setComposerConfirm(false)}>Edit</Button>
+                  <Button
+                    variant="primary"
+                    data-testid="board-composer-submit"
+                    disabled={composerSending || !composerText.trim() || composerBadChars || !composerReplyValid}
+                    onClick={handleBoardPostSubmit}
+                  >
+                    {canPostControl ? <Send /> : <ClipboardCopy />}
+                    {composerSending ? "Sending..." : canPostControl ? "Confirm & send" : "Copy post"}
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <div className="row">
+                <span className="t3 num">{composerText.length}/4000</span>
+                <div className="f1">
+                  <Button
+                    variant="ghost"
+                    onClick={() => {
+                      setComposerOpen(false);
+                      setComposerConfirm(false);
+                    }}
+                  >
+                    Dismiss
+                  </Button>
+                  <Button
+                    variant="primary"
+                    data-testid="board-composer-stage"
+                    disabled={!composerText.trim() || composerBadChars || !composerReplyValid}
+                    onClick={() => setComposerConfirm(true)}
+                  >
+                    <Send />
+                    Review post
+                  </Button>
+                </div>
+              </div>
+            )}
+          </Card>
+        )}
+      </div>
     </div>
   );
 }

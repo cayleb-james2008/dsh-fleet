@@ -24,6 +24,9 @@ export function CommandPalette({
   onCopyDigest,
   onOpenSettings,
   onOpenShortcuts,
+  onOpenLauncher,
+  onOpenBoardPost,
+  onOpenSpawnWorker,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -36,6 +39,9 @@ export function CommandPalette({
   onCopyDigest: () => void;
   onOpenSettings: () => void;
   onOpenShortcuts: () => void;
+  onOpenLauncher?: () => void;
+  onOpenBoardPost?: () => void;
+  onOpenSpawnWorker?: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [activeIdx, setActiveIdx] = useState(0);
@@ -75,6 +81,13 @@ export function CommandPalette({
         ["a-settings", "Settings", onOpenSettings],
         ["a-keys", "Keyboard shortcuts", onOpenShortcuts, "?"],
       ] as const).map(([id, label, onSelect, meta]) => ({ id, group: "Views", label, meta, onSelect })),
+      ...(onOpenLauncher || (snap?.swarm && (onOpenBoardPost || onOpenSpawnWorker))
+        ? [
+            ...(onOpenLauncher ? [{ id: "act-new-swarm", group: "Actions", label: "New swarm", meta: "Launcher", onSelect: onOpenLauncher }] : []),
+            ...(snap?.swarm && onOpenBoardPost ? [{ id: "act-board-post", group: "Actions", label: "Board post", meta: "Compose", onSelect: onOpenBoardPost }] : []),
+            ...(snap?.swarm && onOpenSpawnWorker ? [{ id: "act-spawn-worker", group: "Actions", label: "Spawn worker", meta: "Roster", onSelect: onOpenSpawnWorker }] : []),
+          ]
+        : []),
       ...members.flatMap((m) => {
         const rows: PaletteItem[] = [
           {
@@ -147,7 +160,7 @@ export function CommandPalette({
       const hay = `${it.group} ${it.label} ${it.meta || ""}`.toLowerCase();
       return terms.every((t) => hay.includes(t));
     });
-  }, [query, snap, swarms, worktrees, onSelectTab, onJumpToBoard, onCopyDigest, onOpenSettings, onOpenShortcuts, onSelectSwarm]);
+  }, [query, snap, swarms, worktrees, onSelectTab, onJumpToBoard, onCopyDigest, onOpenSettings, onOpenShortcuts, onSelectSwarm, onOpenLauncher, onOpenBoardPost, onOpenSpawnWorker]);
 
   useEffect(() => {
     setActiveIdx((i) => (items.length ? Math.min(i, items.length - 1) : 0));

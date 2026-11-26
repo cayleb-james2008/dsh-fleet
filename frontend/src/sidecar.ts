@@ -1,9 +1,11 @@
 import type {
+  ControlRequest,
   NormalizedPlan,
   PlanMilestone,
   PlanRisk,
   PlanThread,
   PlanWorkstream,
+  SwarmControlOp,
   SwarmPlan,
   SwarmSnapshot,
   SwarmSummary,
@@ -28,6 +30,7 @@ interface AntigravitySidecarBridge {
   ui?: {
     toggleAuxPane?: (req: Record<string, unknown>) => void;
     toggleConversation?: (conversationId: string, opts?: Record<string, unknown>) => void;
+    addArtifactComment?: (comment: string) => void | Promise<unknown>;
   };
 }
 
@@ -219,6 +222,57 @@ export async function saveSwarmPlan(req: SavePlanRequest): Promise<SavePlanRespo
     throw new Error(data.error || `Save plan failed (${res.status})`);
   }
   return data as SavePlanResponse;
+}
+
+export interface SwarmControlResponse {
+  ok: boolean;
+  op: SwarmControlOp;
+  coordinatorId?: string;
+  directivePreview?: string;
+  deliveredAt?: string;
+  error?: string;
+}
+
+export class SwarmControlError extends Error {
+  status: number;
+  dirtyFiles?: number;
+  ahead?: number;
+
+  constructor(message: string, status: number, extra?: { dirtyFiles?: number; ahead?: number }) {
+    super(message);
+    this.name = "SwarmControlError";
+    this.status = status;
+    this.dirtyFiles = extra?.dirtyFiles;
+    this.ahead = extra?.ahead;
+  }
+}
+
+export async function sendSwarmControl(req: ControlRequest): Promise<SwarmControlResponse> {
+  if (!req.conversationId) throw new Error("No active swarm");
+  const res = await sidecarFetch("/api/control", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...req, confirm: true }),
+  });
+  const data = (await res.json().catch(() => ({}))) as Partial<SwarmControlResponse> & {
+    dirtyFiles?: number;
+    ahead?: number;
+  };
+  if (!res.ok) {
+    throw new SwarmControlError(data.error || `Control action failed (${res.status})`, res.status, {
+      dirtyFiles: typeof data.dirtyFiles === "number" ? data.dirtyFiles : undefined,
+      ahead: typeof data.ahead === "number" ? data.ahead : undefined,
+    });
+  }
+  return data as SwarmControlResponse;
+}
+
+export function addArtifactComment(comment: string): boolean {
+  const fn = sc()?.ui?.addArtifactComment;
+  const text = String(comment || "").trim();
+  if (!text || !fn) return false;
+  fn(text);
+  return true;
 }
 
 export async function startSwarmPreset(prompt: string, title: string): Promise<boolean> {

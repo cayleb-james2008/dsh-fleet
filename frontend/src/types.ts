@@ -257,6 +257,78 @@ export interface GateReadiness {
   stages: Array<{ key: string; label: string; count: number; seq: number }>;
 }
 
+export type SwarmWorkspaceMode = "inherit" | "share" | "branch";
+
+export type SwarmControlOp =
+  | "board_post"
+  | "spawn_worker"
+  | "switch_model"
+  | "kill_worker"
+  | "channel_op"
+  | "gate_verdict";
+
+export type ControlRequest =
+  | {
+      op: "board_post";
+      conversationId: string;
+      confirm?: boolean;
+      channel?: string;
+      text: string;
+      replyToSeq?: number;
+    }
+  | {
+      op: "spawn_worker";
+      conversationId: string;
+      confirm?: boolean;
+      name: string;
+      brief: string;
+      workspaceMode?: SwarmWorkspaceMode;
+      channel?: string;
+      model?: string;
+      forkFrom?: string;
+    }
+  | {
+      op: "switch_model";
+      conversationId: string;
+      confirm?: boolean;
+      member: string;
+      model: string;
+      reason?: string;
+    }
+  | {
+      op: "kill_worker";
+      conversationId: string;
+      confirm?: boolean;
+      member: string;
+      forceUnmerged?: boolean;
+      reason?: string;
+    }
+  | {
+      op: "channel_op";
+      conversationId: string;
+      confirm?: boolean;
+      action: "create" | "archive" | "subscribe" | "unsubscribe";
+      channel: string;
+      topic?: string;
+      member?: string;
+    }
+  | {
+      op: "gate_verdict";
+      conversationId: string;
+      confirm?: boolean;
+      verdict: "verified" | "blocked" | "ship";
+      seq: number;
+      targetMember?: string;
+      note: string;
+    };
+
+export interface SwarmChannel {
+  name: string;
+  topic: string;
+  created_by: string;
+  archived: boolean;
+}
+
 export interface SwarmSnapshot {
   conversationId: string | null;
   swarm: string | null;
@@ -269,7 +341,8 @@ export interface SwarmSnapshot {
   head?: number;
   members?: SwarmMember[];
   messages?: BoardMessage[];
-  channels?: Array<{ name: string; topic: string; created_by: string; archived: boolean }>;
+  replyRefs?: Record<number, number[]>;
+  channels?: SwarmChannel[];
   edges?: MentionEdge[];
   view?: SwarmViewState | null;
   plan?: SwarmPlan | NormalizedPlan | null;

@@ -11,8 +11,8 @@ import type {
   Ref,
   TextareaHTMLAttributes,
 } from "react";
-import { ArrowUpRight, ClipboardCopy, FileCode2, Image as ImageIcon, Pin, PinOff, Send, X } from "./icons";
-import { openFileInAuxPane, parseScreenshotLines, sendConfirmedNudge } from "./sidecar";
+import { ArrowUpRight, CheckCircle2, ClipboardCopy, FileCode2, Image as ImageIcon, Pin, PinOff, Send, X } from "./icons";
+import { openFileInAuxPane, parseScreenshotLines, sendConfirmedNudge, sendSwarmControl } from "./sidecar";
 import type {
   BoardMessage,
   NormalizedPlan,
@@ -672,11 +672,11 @@ export function Card({
   );
 }
 
-export function Input({ className, ...props }: InputHTMLAttributes<HTMLInputElement>) {
+export function Input({ className, ...props }: InputHTMLAttributes<HTMLInputElement> & { ref?: Ref<HTMLInputElement> }) {
   return <input className={cn("inp h-8 rounded-chip px-2", className)} {...props} />;
 }
 
-export function Textarea({ className, ...props }: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+export function Textarea({ className, ...props }: TextareaHTMLAttributes<HTMLTextAreaElement> & { ref?: Ref<HTMLTextAreaElement> }) {
   return <textarea className={cn("inp rounded-card px-3 py-2", className)} {...props} />;
 }
 
@@ -1074,6 +1074,10 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const [verdictOpen, setVerdictOpen] = useState(false);
+  const [verdictKind, setVerdictKind] = useState<"verified" | "blocked" | "ship">("verified");
+  const [verdictNote, setVerdictNote] = useState("");
+  const [verdictSending, setVerdictSending] = useState(false);
   const gate = snap.gateReadiness;
   if (!gate) return null;
   const tone = gate.state === "blocked" ? "danger" : gate.state === "ready" ? "success" : "info";
@@ -1081,6 +1085,32 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
   const next = gate.nextAction;
   const v = gate.velocity;
   const live = Boolean(next && canLiveNudge(snap) && next.conversationId);
+  const swarmConvId = snap.swarm || snap.conversationId || "";
+  const canControl = Boolean(swarmConvId && canLiveNudge(snap));
+
+  const submitVerdict = async () => {
+    const note = verdictNote.trim();
+    if (!swarmConvId || !note || hasControlChars(note) || note.length > 4000) return;
+    setVerdictSending(true);
+    try {
+      await sendSwarmControl({
+        op: "gate_verdict",
+        conversationId: swarmConvId,
+        verdict: verdictKind,
+        seq: gate.pendingSeq || snap.head || 1,
+        targetMember: next?.target,
+        note,
+      });
+      toast.success(`Recorded ${verdictKind} verdict`);
+      setVerdictOpen(false);
+      setVerdictNote("");
+      onRefresh?.();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Verdict failed");
+    } finally {
+      setVerdictSending(false);
+    }
+  };
 
   return (
     <Card className="p-2 space-y-1" data-testid="gate-readiness-card">
@@ -1089,7 +1119,7 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
           <span className="font-semibold text-ink">Gate readiness</span>
           <Badge tone={tone}>{label}</Badge>
         </div>
-        <div className="f1">
+        <div className="f1 flex-wrap">
           {next && (
             <Button
               variant="primary"
@@ -1098,6 +1128,19 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
             >
               {live ? <Send /> : <ClipboardCopy />}
               {next.label}
+            </Button>
+          )}
+          {canControl && (
+            <Button
+              variant={verdictOpen ? "secondary" : "outline"}
+              data-testid="gate-verdict-toggle"
+              onClick={() => {
+                setVerdictOpen((cur) => !cur);
+                if (!verdictNote) setVerdictNote(`Operator checked gate #${gate.pendingSeq || snap.head || 1}`);
+              }}
+            >
+              <CheckCircle2 />
+              Verdict
             </Button>
           )}
           {gate.pendingSeq > 0 && (
@@ -1161,6 +1204,45 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
           submitLabel={sending ? "Sending..." : "Confirm & send"}
           disabled={sending}
         />
+      )}
+      {verdictOpen && (
+        <div className="pt-2 border-t border-hairline space-y-2" data-testid="gate-verdict-drawer">
+          <div className="wrap gap-1" role="group" aria-label="Gate verdict">
+            {(["verified", "blocked", "ship"] as const).map((kind) => (
+              <Pill
+                key={kind}
+                active={verdictKind === kind}
+                data-testid={`gate-verdict-kind-${kind}`}
+                onClick={() => setVerdictKind(kind)}
+              >
+                {kind === "verified" ? "[verified]" : kind === "blocked" ? "[blocked]" : "ship"}
+              </Pill>
+            ))}
+          </div>
+          <Input
+            aria-label="Gate verdict note"
+            data-testid="gate-verdict-note"
+            maxLength={4000}
+            value={verdictNote}
+            onChange={(e) => setVerdictNote(e.target.value)}
+            placeholder="Verdict note"
+          />
+          <div className="row">
+            <span className="t3 num">Target #{gate.pendingSeq || snap.head || 1}</span>
+            <div className="f1">
+              <Button variant="ghost" onClick={() => setVerdictOpen(false)}>Close</Button>
+              <Button
+                variant={verdictKind === "blocked" ? "danger" : "primary"}
+                data-testid="gate-verdict-submit"
+                disabled={verdictSending || !verdictNote.trim() || hasControlChars(verdictNote)}
+                onClick={submitVerdict}
+              >
+                <CheckCircle2 />
+                {verdictSending ? "Sending..." : "Confirm verdict"}
+              </Button>
+            </div>
+          </div>
+        </div>
       )}
     </Card>
   );

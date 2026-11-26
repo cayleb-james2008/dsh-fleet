@@ -6,6 +6,7 @@ import {
   GitBranch,
   Inbox,
   Network,
+  Plus,
   RefreshCw,
   Rocket,
   Search,
@@ -35,15 +36,18 @@ import {
   Button,
   Card,
   FleetToaster,
+  Input,
   Modal,
   SegmentControl,
   StatusDot,
+  Textarea,
   cn,
   copyText,
   downloadTextFile,
   fmtTokens,
   formatSwarmArchive,
   formatSwarmDigest,
+  hasControlChars,
   toast,
 } from "./ui";
 
@@ -87,6 +91,8 @@ export function App() {
   const [boardAgentFilter, setBoardAgentFilter] = useState<string>("all");
   const [selectedTriageIdx, setSelectedTriageIdx] = useState(0);
   const [triageReplyNonce, setTriageReplyNonce] = useState(0);
+  const [boardComposeNonce, setBoardComposeNonce] = useState(0);
+  const [rosterSpawnNonce, setRosterSpawnNonce] = useState(0);
   const [sseConnected, setSseConnected] = useState(false);
   const [sseStatus, setSseStatus] = useState<"idle" | "live" | "reconnecting">("idle");
   const [sseNonce, setSseNonce] = useState(0);
@@ -101,6 +107,10 @@ export function App() {
     }
   });
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [launcherOpen, setLauncherOpen] = useState(false);
+  const [launchTitle, setLaunchTitle] = useState("");
+  const [launchPrompt, setLaunchPrompt] = useState("/fleet ");
+  const [launching, setLaunching] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
@@ -375,6 +385,7 @@ export function App() {
     try {
       if (await startSwarmPreset(preset.prompt, preset.title)) {
         toast.success(`Started "${preset.title}"`);
+        setLauncherOpen(false);
         setTimeout(() => refreshSwarm(true), 400);
         return;
       }
@@ -383,6 +394,32 @@ export function App() {
       return;
     }
     void copyText(preset.prompt, `Copied "${preset.title}" prompt`);
+  };
+
+  const handleLaunchCustom = async () => {
+    const prompt = launchPrompt.trim();
+    const title = launchTitle.trim() || "Fleet swarm";
+    if (!prompt || prompt.length > 4000 || hasControlChars(prompt) || hasControlChars(title)) {
+      toast.error("Enter a valid swarm prompt without control characters");
+      return;
+    }
+    setLaunching(true);
+    try {
+      if (await startSwarmPreset(prompt, title)) {
+        toast.success(`Started "${title}"`);
+        setLauncherOpen(false);
+        setLaunchTitle("");
+        setLaunchPrompt("/fleet ");
+        setTimeout(() => refreshSwarm(true), 400);
+        return;
+      }
+      await copyText(prompt, `Copied "${title}" prompt`);
+      setLauncherOpen(false);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Launch failed");
+    } finally {
+      setLaunching(false);
+    }
   };
 
   const tabCounts: Partial<Record<TabId, number>> = {
@@ -401,7 +438,7 @@ export function App() {
         <div className="mx-auto w-full max-w-[960px] px-3 pt-2">
           {/* Row 1: Brand + Swarm Switcher + Controls */}
           <div className="row pb-2">
-            <div className="flex items-center gap-2 min-w-0">
+            <div className="flex items-center gap-2 min-w-0 flex-1">
               <span aria-hidden="true" className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-chip bg-[var(--ink-button)] text-[var(--ink-button-fg)]">
                 <Rocket className="h-4 w-4" />
               </span>
@@ -413,7 +450,7 @@ export function App() {
                       aria-label="Active swarm"
                       value={snap?.swarm || selectedSwarmId || ""}
                       onChange={(e) => handleSelectSwarm(e.target.value)}
-                      className="h-7 max-w-[165px] min-[380px]:max-w-[190px] sm:max-w-[320px] truncate rounded-chip border border-[var(--edge)] bg-board px-2 h2 cursor-pointer"
+                      className="h-7 max-w-[128px] min-[380px]:max-w-[164px] sm:max-w-[320px] truncate rounded-chip border border-[var(--edge)] bg-board px-2 h2 cursor-pointer"
                     >
                       {swarms.map((sw) => (
                         <option key={sw.id} value={sw.id}>{sw.title || sw.id} ({sw.activeCount}/{sw.memberCount})</option>
@@ -428,12 +465,13 @@ export function App() {
 
             <div className="f1 shrink-0">
               {([
-                ...(hasSwarm ? [["Copy swarm digest", ClipboardCopy, handleCopyDigest, false] as const] : []),
-                ["Open command palette", Search, () => setPaletteOpen(true), false] as const,
-                ["Refresh swarm", RefreshCw, () => { refreshSwarm(true); refreshWorktrees(); }, loading] as const,
-                ["Open settings", Settings, () => setSettingsOpen(true), false] as const,
-              ]).map(([label, Icon, fn, spin]) => (
-                <Button key={label} variant="ghost" size="icon" aria-label={label} onClick={fn}>
+                ["New swarm", Plus, () => setLauncherOpen(true), false, "open-swarm-launcher"] as const,
+                ...(hasSwarm ? [["Copy swarm digest", ClipboardCopy, handleCopyDigest, false, undefined] as const] : []),
+                ["Open command palette", Search, () => setPaletteOpen(true), false, undefined] as const,
+                ["Refresh swarm", RefreshCw, () => { refreshSwarm(true); refreshWorktrees(); }, loading, undefined] as const,
+                ["Open settings", Settings, () => setSettingsOpen(true), false, undefined] as const,
+              ]).map(([label, Icon, fn, spin, tid]) => (
+                <Button key={label} variant="ghost" size="icon" aria-label={label} data-testid={tid} onClick={fn}>
                   <Icon className={cn("h-4 w-4", spin && "motion-safe:animate-spin")} />
                 </Button>
               ))}
@@ -589,6 +627,7 @@ export function App() {
                 pinnedSeqs={pinnedSeqs}
                 quickFilter={boardQuickFilter}
                 agentFilter={boardAgentFilter}
+                composeNonce={boardComposeNonce}
                 onQuickFilterChange={setBoardQuickFilter}
                 onAgentFilterChange={setBoardAgentFilter}
                 onCopyWaveDigest={handleCopyDigest}
@@ -597,7 +636,14 @@ export function App() {
                 onRefresh={() => refreshSwarm(true)}
               />
             )}
-            {tab === "roster" && <RosterView snap={snap!} onJumpToBoardSeq={handleJumpToBoard} onRefresh={() => refreshSwarm(true)} />}
+            {tab === "roster" && (
+              <RosterView
+                snap={snap!}
+                spawnNonce={rosterSpawnNonce}
+                onJumpToBoardSeq={handleJumpToBoard}
+                onRefresh={() => refreshSwarm(true)}
+              />
+            )}
             {tab === "graph" && <GraphView snap={snap!} />}
           </div>
         )}
@@ -615,7 +661,80 @@ export function App() {
         onCopyDigest={handleCopyDigest}
         onOpenSettings={() => setSettingsOpen(true)}
         onOpenShortcuts={() => setShortcutsOpen(true)}
+        onOpenLauncher={() => setLauncherOpen(true)}
+        onOpenBoardPost={() => {
+          setTab("board");
+          setBoardComposeNonce((n) => n + 1);
+        }}
+        onOpenSpawnWorker={() => {
+          setTab("roster");
+          setRosterSpawnNonce((n) => n + 1);
+        }}
       />
+
+      {/* New Swarm Launcher Modal */}
+      <Modal open={launcherOpen} onClose={() => setLauncherOpen(false)} title="New swarm">
+        <div className="space-y-4" data-testid="swarm-launcher-modal">
+          <div className="space-y-2">
+            <p className="text-[12px] font-medium text-ink-2">Presets</p>
+            <div className="space-y-2">
+              {SWARM_PRESETS.map((p) => (
+                <Card key={p.id} className="p-2.5 space-y-2 bg-board">
+                  <div className="row gap-2">
+                    <div className="min-w-0">
+                      <p className="text-[13px] font-semibold text-ink">{p.title}</p>
+                      <p className="text-[12px] text-ink-2">{p.summary}</p>
+                    </div>
+                    <Button
+                      variant="primary"
+                      data-testid={`launcher-preset-${p.id}`}
+                      onClick={() => handleLaunchPreset(p)}
+                      className="shrink-0"
+                    >
+                      {window.sidecar?.agent?.startConversation ? <><Rocket />Launch</> : <><ClipboardCopy />Copy</>}
+                    </Button>
+                  </div>
+                </Card>
+              ))}
+            </div>
+          </div>
+
+          <div className="space-y-2 border-t border-hairline pt-3">
+            <p className="text-[12px] font-medium text-ink-2">Custom swarm</p>
+            <Input
+              aria-label="Swarm title"
+              data-testid="launcher-title-input"
+              placeholder="Swarm title (optional)"
+              value={launchTitle}
+              onChange={(e) => setLaunchTitle(e.target.value)}
+            />
+            <Textarea
+              aria-label="Swarm prompt"
+              data-testid="launcher-prompt-input"
+              rows={3}
+              maxLength={4000}
+              placeholder="/fleet Describe the goal, workers, and verification gate"
+              value={launchPrompt}
+              onChange={(e) => setLaunchPrompt(e.target.value)}
+            />
+            <div className="row">
+              <span className="t3 num">{launchPrompt.length}/4000</span>
+              <div className="f1">
+                <Button variant="ghost" onClick={() => setLauncherOpen(false)}>Close</Button>
+                <Button
+                  variant="primary"
+                  data-testid="launcher-submit-btn"
+                  disabled={launching || !launchPrompt.trim() || hasControlChars(launchPrompt) || hasControlChars(launchTitle)}
+                  onClick={handleLaunchCustom}
+                >
+                  {window.sidecar?.agent?.startConversation ? <Rocket /> : <ClipboardCopy />}
+                  {launching ? "Starting..." : window.sidecar?.agent?.startConversation ? "Launch swarm" : "Copy prompt"}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </Modal>
 
       {/* Keyboard Shortcuts Cheatsheet (?) */}
       <Modal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} title="Keyboard shortcuts">
@@ -659,7 +778,7 @@ export function App() {
           <div className="rounded-card bg-board p-3 text-[12px] text-ink-2 space-y-1">
             <div className="f1 font-medium text-ink">
               <CommandIcon />
-              <span>Fleet Antigravity Plugin v1.21.0</span>
+              <span>Fleet Antigravity Plugin v1.22.0</span>
             </div>
             <p>Reads local swarm files over loopback with no telemetry.</p>
           </div>
