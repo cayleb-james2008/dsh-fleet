@@ -13,6 +13,8 @@ import type {
   SwarmSnapshot,
   SwarmSummary,
   ThemeMode,
+  TranscriptFilter,
+  TranscriptResponse,
   WorktreeActionName,
   WorktreeActionPayload,
   WorktreeDiffMode,
@@ -75,6 +77,33 @@ export const fetchSwarms = (): Promise<{ swarms: SwarmSummary[]; defaultConversa
 
 export const fetchSwarmSnapshot = (conversationId?: string | null, etag?: string): Promise<SwarmSnapshot> =>
   apiJson(qs("/api/swarm", { conversationId, etag }), "Load swarm failed");
+
+export interface FetchMemberTranscriptOptions {
+  conversationId: string;
+  member: string;
+  before?: number | null;
+  limit?: number;
+  filter?: TranscriptFilter;
+  signal?: AbortSignal;
+}
+
+export async function fetchMemberTranscript(
+  baseUrl: string,
+  opts: FetchMemberTranscriptOptions,
+): Promise<TranscriptResponse> {
+  const prefix = baseUrl ? baseUrl.replace(/\/+$/, "") : "";
+  const url = qs(`${prefix}/api/transcript`, {
+    conversationId: opts.conversationId,
+    member: opts.member,
+    before: typeof opts.before === "number" && opts.before >= 0 ? String(Math.floor(opts.before)) : undefined,
+    limit: typeof opts.limit === "number" && opts.limit > 0 ? String(Math.min(50, Math.floor(opts.limit))) : undefined,
+    filter: opts.filter || undefined,
+  });
+  const res = await sidecarFetch(url, opts.signal ? { signal: opts.signal } : undefined);
+  const data = (await res.json().catch(() => ({}))) as Partial<TranscriptResponse>;
+  if (!res.ok) throw new Error(data.error || `Load transcript failed (${res.status})`);
+  return data as TranscriptResponse;
+}
 
 export interface FetchSwarmDeltaOptions {
   since?: number;

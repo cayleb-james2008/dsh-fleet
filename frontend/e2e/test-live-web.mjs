@@ -393,6 +393,73 @@ await check("New Swarm Launcher & Command Palette actions work at 360px with 0px
   return ov <= 0 && Boolean(warn409?.includes("4 dirty files, 2 commits ahead"));
 });
 
+await check("Forensic trace drawer opens from Roster & Triage, filters Errors, inspects args/stderr, paginates Load older steps at 380px Light & Dark with 0px overflow", async () => {
+  await page.setViewportSize({ width: 380, height: 900 });
+  await page.selectOption('select[aria-label="Active swarm"]', "demo-coord-0001");
+  await page.locator("#tab-roster").click();
+  await page.waitForSelector('[data-testid="inspect-trace-btn"][data-member="builder"]');
+  await page.locator('[data-testid="inspect-trace-btn"][data-member="builder"]').click();
+  await page.waitForSelector('[data-testid="forensic-trace-drawer"]');
+  await page.waitForSelector('[data-testid="trace-step-23"]');
+
+  const ovLightOpen = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  await page.locator('[data-testid="trace-load-older"]').click();
+  await page.waitForSelector('[data-testid="trace-step-0"]');
+
+  await page.locator('[data-testid="trace-filter-errors"]').click();
+  await page.waitForSelector('[data-testid="trace-step-21"]');
+  await page.waitForFunction(() => !document.querySelector('[data-testid="trace-step-23"]'));
+  await page.locator('[data-testid="trace-step-toggle-21"]').click();
+  await page.waitForSelector('[data-testid="trace-step-body-21"]');
+  const errTxt = await page.locator('[data-testid="trace-step-error-21"]').textContent();
+  const argsTxt = await page.locator('[data-testid="trace-tool-args-21-0"]').textContent();
+  const outTxt = await page.locator('[data-testid="trace-tool-output-21-0"]').textContent();
+  const ovLightExpanded = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => !document.querySelector('[data-testid="forensic-trace-drawer"]'));
+
+  await page.locator('button[aria-label="Open settings"]').click();
+  await page.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();
+  await page.locator('button[aria-label="Close dialog"]').click();
+
+  await page.selectOption('select[aria-label="Active swarm"]', "demo-audit-0009");
+  await page.locator("#tab-triage").click();
+  await page.waitForSelector('[data-testid="inspect-trace-btn"][data-member="scanner"]');
+  await page.locator('[data-testid="inspect-trace-btn"][data-member="scanner"]').first().click();
+  await page.waitForSelector('[data-testid="forensic-trace-drawer"]');
+  await page.locator('[data-testid="trace-filter-errors"]').click();
+  await page.waitForSelector('[data-testid="trace-step-22"]');
+  await page.locator('[data-testid="trace-step-toggle-22"]').click();
+  await page.waitForSelector('[data-testid="trace-step-body-22"]');
+  const darkErrTxt = await page.locator('[data-testid="trace-step-error-22"]').textContent();
+  const darkOutTxt = await page.locator('[data-testid="trace-tool-output-22-0"]').textContent();
+  const ovDark380 = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  const isDark = await page.evaluate(() => document.documentElement.getAttribute("data-theme") === "dark");
+  await page.setViewportSize({ width: 1280, height: 900 });
+  const ovDark1280 = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  await page.setViewportSize({ width: 380, height: 900 });
+  await page.locator('[data-testid="trace-close-btn"]').click();
+  await page.waitForFunction(() => !document.querySelector('[data-testid="forensic-trace-drawer"]'));
+
+  await page.locator('button[aria-label="Open settings"]').click();
+  await page.locator('div[role="dialog"] button[role="radio"]:has-text("Light")').click();
+  await page.locator('button[aria-label="Close dialog"]').click();
+
+  return (
+    ovLightOpen <= 0 &&
+    ovLightExpanded <= 0 &&
+    ovDark380 <= 0 &&
+    ovDark1280 <= 0 &&
+    isDark &&
+    Boolean(errTxt?.includes("AssertionError") && !errTxt.includes("/home/")) &&
+    Boolean(argsTxt?.includes("test/security.test.mjs")) &&
+    Boolean(outTxt?.includes("stderr: FAIL")) &&
+    Boolean(darkErrTxt?.includes("429 RESOURCE_EXHAUSTED")) &&
+    Boolean(darkOutTxt?.includes("stderr: 429 RESOURCE_EXHAUSTED"))
+  );
+});
+
 await check("Quota card 1-click Switch Model clears failure on audit swarm", async () => {
   await page.selectOption('select[aria-label="Active swarm"]', "demo-audit-0009");
   await page.locator("#tab-roster").click();
