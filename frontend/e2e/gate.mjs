@@ -2887,6 +2887,552 @@ await runChecks("gate", async (check) => {
     });
   });
 
+  await check("E1 delta client deduplicates out-of-order/replayed seq, caps 5xx backoff, and aborts cleanly on swarm-switch", async () => {
+    const h1Page = await ctx.newPage();
+    await h1Page.setViewportSize({ width: 380, height: 900 });
+    const h1PageErrors = [];
+    h1Page.on("pageerror", (e) => h1PageErrors.push(e.message));
+
+    const deltaTimestamps = [];
+    let deltaStep = 0;
+    let swAAbortedOrLate = false;
+    let swASlowHits = 0;
+
+    await h1Page.route("**/api/swarms*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          swarms: [
+            { id: "h1-sw-a", title: "H1 Delta Swarm A", appData: "gate", head: 1, memberCount: 2, activeCount: 1, waitingCount: 1, killedCount: 0, triageCount: 0, totalTokens: 1000, hasPlan: false, lastActivityTs: Date.now() },
+            { id: "h1-sw-b", title: "H1 Delta Swarm B", appData: "gate", head: 1, memberCount: 1, activeCount: 0, waitingCount: 1, killedCount: 0, triageCount: 0, totalTokens: 200, hasPlan: false, lastActivityTs: Date.now() },
+          ],
+          defaultConversationId: "h1-sw-a",
+        }),
+      });
+    });
+
+    await h1Page.route(/\/api\/swarm(\?.*)?$/, async (route) => {
+      const u = new URL(route.request().url());
+      const conv = u.searchParams.get("conversationId") || "h1-sw-a";
+      if (conv === "h1-sw-b") {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            conversationId: "h1-sw-b",
+            swarm: "h1-sw-b",
+            member: "coordinator",
+            etag: "b-v1",
+            id: "h1-sw-b",
+            title: "H1 Delta Swarm B",
+            head: 1,
+            members: [
+              { name: "coordinator", conversation_id: "h1-sw-b", model: "gemini-3-pro", role: "coordinator", wake_mode: "mentions", wait_since: 1, last_read_seq: 1, unread: 0, killed: false, status: "waiting", steps: 1, activity: "", activityKind: "", replied: false, replyAsk: "", narrator: false, roleWorker: false, failure: null, transcriptMtime: Date.now(), startedAt: new Date().toISOString(), lastStepAt: new Date().toISOString(), usage: { inputTokens: 150, cacheReadTokens: 0, outputTokens: 50, totalTokens: 200 }, posts: 1, lastPostSeq: 1, lastPostTime: "12:00:00", lastPostTs: Date.now() },
+            ],
+            messages: [{ seq: 1, agent: "coordinator", text: "@all Swarm B active cleanly", time: "12:00:00", ts: Date.now(), mentions: [], all: true }],
+            replyRefs: {},
+            edges: [],
+            triage: [],
+            usage: { inputTokens: 150, cacheReadTokens: 0, outputTokens: 50, totalTokens: 200 },
+            capabilities: { canSendMessage: false, isSidecar: true, sseStream: false, deltaStream: false },
+          }),
+        });
+        return;
+      }
+
+      if (swASlowHits > 0) {
+        swAAbortedOrLate = true;
+        await new Promise((r) => setTimeout(r, 450));
+      }
+      swASlowHits += 1;
+      await route
+        .fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            conversationId: "h1-sw-a",
+            swarm: "h1-sw-a",
+            member: "coordinator",
+            etag: "a-v1",
+            id: "h1-sw-a",
+            title: "H1 Delta Swarm A",
+            head: 1,
+            members: [
+              { name: "coordinator", conversation_id: "h1-sw-a", model: "gemini-3-pro", role: "coordinator", wake_mode: "mentions", wait_since: 1, last_read_seq: 1, unread: 0, killed: false, status: "waiting", steps: 2, activity: "", activityKind: "", replied: false, replyAsk: "", narrator: false, roleWorker: false, failure: null, transcriptMtime: Date.now(), startedAt: new Date().toISOString(), lastStepAt: new Date().toISOString(), usage: { inputTokens: 800, cacheReadTokens: 0, outputTokens: 200, totalTokens: 1000 }, posts: 1, lastPostSeq: 1, lastPostTime: "12:00:00", lastPostTs: Date.now() },
+            ],
+            messages: [{ seq: 1, agent: "coordinator", text: "@all Initial A post", time: "12:00:00", ts: Date.now() - 5000, mentions: [], all: true }],
+            replyRefs: {},
+            edges: [],
+            triage: [],
+            usage: { inputTokens: 800, cacheReadTokens: 0, outputTokens: 200, totalTokens: 1000 },
+            capabilities: { canSendMessage: false, isSidecar: true, sseStream: false, deltaStream: true },
+          }),
+        })
+        .catch(() => {});
+    });
+
+    await h1Page.route(/\/api\/swarm\/delta(\?.*)?$/, async (route) => {
+      deltaStep += 1;
+      deltaTimestamps.push(Date.now());
+      if (deltaStep <= 2) {
+        await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Transient 500" }) }).catch(() => {});
+        return;
+      }
+      if (deltaStep === 3) {
+        await route
+          .fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({
+              ok: true,
+              mode: "delta",
+              unchanged: false,
+              conversationId: "h1-sw-a",
+              swarm: "h1-sw-a",
+              etag: "a-v2",
+              since: 1,
+              head: 4,
+              messagesDelta: [
+                { seq: 4, agent: "coordinator", text: "@all Fourth out-of-order post", time: "12:04:00", ts: Date.now(), mentions: [], all: true },
+                { seq: 1, agent: "coordinator", text: "@all Initial A post", time: "12:00:00", ts: Date.now() - 5000, mentions: [], all: true },
+                { seq: 3, agent: "coordinator", text: "@all Third post", time: "12:03:00", ts: Date.now() - 1000, mentions: [], all: true },
+                { seq: 3, agent: "coordinator", text: "@all Third post", time: "12:03:00", ts: Date.now() - 1000, mentions: [], all: true },
+              ],
+              edgesDelta: [{ from: "coordinator", to: "builder", count: 1, direct: 1, viaAll: 0 }],
+            }),
+          })
+          .catch(() => {});
+        return;
+      }
+      if (deltaStep === 4) {
+        // Pure replay of seq 3 with edgesDelta should NOT double-count edges or duplicate seq 3
+        await route
+          .fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({
+              ok: true,
+              mode: "delta",
+              unchanged: false,
+              conversationId: "h1-sw-a",
+              swarm: "h1-sw-a",
+              etag: "a-v2-replay",
+              since: 1,
+              head: 2,
+              messagesDelta: [
+                { seq: 3, agent: "coordinator", text: "@all Third post", time: "12:03:00", ts: Date.now() - 1000, mentions: [], all: true },
+              ],
+              edgesDelta: [{ from: "coordinator", to: "builder", count: 5, direct: 5, viaAll: 0 }],
+            }),
+          })
+          .catch(() => {});
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, unchanged: true, etag: "a-v2-replay", head: 4 }) }).catch(() => {});
+    });
+
+    await h1Page.goto(BASE, { waitUntil: "domcontentloaded" });
+    await h1Page.locator("#tab-board").click();
+    await h1Page.waitForFunction(() => (document.querySelector("#panel-board")?.textContent || "").includes("Fourth out-of-order post"), null, { timeout: 12000 });
+    await h1Page.waitForTimeout(250);
+
+    const seqsOrder = await h1Page.evaluate(() =>
+      [...document.querySelectorAll("#panel-board [data-seq]")].map((el) => Number(el.getAttribute("data-seq"))),
+    );
+    const seq1Count = await h1Page.locator('#panel-board [data-seq="1"]').count();
+    const seq3Count = await h1Page.locator('#panel-board [data-seq="3"]').count();
+
+    // Trigger rapid swarm switch A -> B while A refresh is slow to confirm clean abort & no stale overwrite
+    await h1Page.locator('button[aria-label="Refresh swarm"]').click();
+    await h1Page.selectOption('select[aria-label="Active swarm"]', "h1-sw-b");
+    await h1Page.waitForFunction(() => (document.querySelector("#panel-board")?.textContent || "").includes("Swarm B active cleanly"));
+    await h1Page.waitForTimeout(550);
+    const boardAfterSwitch = await h1Page.locator("#panel-board").textContent();
+
+    await h1Page.close();
+
+    const gap1 = deltaTimestamps.length >= 3 ? deltaTimestamps[1] - deltaTimestamps[0] : 0;
+    const gap2 = deltaTimestamps.length >= 3 ? deltaTimestamps[2] - deltaTimestamps[1] : 0;
+    return (
+      deltaStep >= 3 &&
+      gap1 >= 1500 &&
+      gap2 >= 3000 &&
+      seq1Count === 1 &&
+      seq3Count === 1 &&
+      JSON.stringify(seqsOrder) === "[1,3,4]" &&
+      swAAbortedOrLate &&
+      Boolean(boardAfterSwitch?.includes("Swarm B active cleanly")) &&
+      !boardAfterSwitch?.includes("Fourth out-of-order post") &&
+      h1PageErrors.length === 0
+    );
+  });
+
+  await check("E2 ForensicTranscriptDrawer aborts slow older responses on filter/member/close, closes on Escape, and handles empty/error states at 380px Light & Dark", async () => {
+    const e2Page = await ctx.newPage();
+    await e2Page.setViewportSize({ width: 380, height: 900 });
+    const e2PageErrors = [];
+    e2Page.on("pageerror", (e) => e2PageErrors.push(e.message));
+
+    await e2Page.route("**/api/swarms*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          swarms: [{ id: "e2-sw", title: "E2 Abort Check", appData: "gate", head: 1, memberCount: 2, activeCount: 0, waitingCount: 2, killedCount: 0, triageCount: 0, totalTokens: 0, hasPlan: false, lastActivityTs: Date.now() }],
+          defaultConversationId: "e2-sw",
+        }),
+      });
+    });
+
+    await e2Page.route(/\/api\/swarm(\?.*)?$/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversationId: "e2-sw",
+          swarm: "e2-sw",
+          member: "coordinator",
+          etag: "e2-v1",
+          id: "e2-sw",
+          title: "E2 Abort Check",
+          head: 1,
+          members: [
+            { name: "alpha", conversation_id: "e2-alpha", model: "gemini-3-pro", role: "worker", wake_mode: "mentions", wait_since: 1, last_read_seq: 1, unread: 0, killed: false, status: "waiting", steps: 12, activity: "", activityKind: "", replied: false, replyAsk: "", narrator: false, roleWorker: false, failure: null, transcriptMtime: Date.now(), startedAt: new Date().toISOString(), lastStepAt: new Date().toISOString(), usage: { inputTokens: 500, cacheReadTokens: 0, outputTokens: 100, totalTokens: 600 }, posts: 0, lastPostSeq: 0, lastPostTime: "", lastPostTs: null },
+            { name: "beta", conversation_id: "e2-beta", model: "gemini-3-flash", role: "worker", wake_mode: "mentions", wait_since: 1, last_read_seq: 1, unread: 0, killed: false, status: "waiting", steps: 0, activity: "", activityKind: "", replied: false, replyAsk: "", narrator: false, roleWorker: false, failure: null, transcriptMtime: Date.now(), startedAt: new Date().toISOString(), lastStepAt: new Date().toISOString(), usage: { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, totalTokens: 0 }, posts: 0, lastPostSeq: 0, lastPostTime: "", lastPostTs: null },
+          ],
+          messages: [{ seq: 1, agent: "alpha", text: "@all E2 trace check", time: "12:00:00", ts: Date.now(), mentions: [], all: true }],
+          replyRefs: {},
+          edges: [],
+          triage: [],
+          usage: { inputTokens: 500, cacheReadTokens: 0, outputTokens: 100, totalTokens: 600 },
+          capabilities: { canSendMessage: false, isSidecar: false, sseStream: false, deltaStream: false },
+        }),
+      });
+    });
+
+    let alphaAllCount = 0;
+    let betaErrMode = false;
+    await e2Page.route("**/api/transcript*", async (route) => {
+      const u = new URL(route.request().url());
+      const member = u.searchParams.get("member") || "";
+      const filter = u.searchParams.get("filter") || "all";
+      const before = u.searchParams.get("before");
+
+      if (member === "alpha" && before === "10") {
+        // Slow Load older steps response that must be aborted when filter toggles to Errors
+        await new Promise((r) => setTimeout(r, 450));
+        await route
+          .fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({
+              ok: true,
+              member: "alpha",
+              conversationId: "e2-sw",
+              totalSteps: 12,
+              nextBefore: null,
+              hasMore: false,
+              steps: [{ stepIndex: 5, type: "PLANNER_RESPONSE", status: "DONE", ts: Date.now(), model: "gemini-3-pro", content: "STALE_OLDER_STEP_5", toolCalls: [] }],
+            }),
+          })
+          .catch(() => {});
+        return;
+      }
+
+      if (member === "alpha" && filter === "errors") {
+        await route
+          .fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({
+              ok: true,
+              member: "alpha",
+              conversationId: "e2-sw",
+              totalSteps: 1,
+              nextBefore: null,
+              hasMore: false,
+              steps: [{ stepIndex: 99, type: "PLANNER_RESPONSE", status: "ERROR", ts: Date.now(), model: "gemini-3-pro", error: "Current filter error #99", toolCalls: [] }],
+            }),
+          })
+          .catch(() => {});
+        return;
+      }
+
+      if (member === "alpha") {
+        alphaAllCount += 1;
+        if (alphaAllCount >= 2) {
+          // Slow response when reopening alpha before switching to beta
+          await new Promise((r) => setTimeout(r, 450));
+        }
+        await route
+          .fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({
+              ok: true,
+              member: "alpha",
+              conversationId: "e2-sw",
+              totalSteps: 12,
+              nextBefore: 10,
+              hasMore: true,
+              steps: [{ stepIndex: 10, type: "PLANNER_RESPONSE", status: "DONE", ts: Date.now(), model: "gemini-3-pro", content: "Latest step #10", toolCalls: [] }],
+            }),
+          })
+          .catch(() => {});
+        return;
+      }
+
+      if (member === "beta" && betaErrMode) {
+        await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Transcript read error for /home/demo/secret" }) }).catch(() => {});
+        return;
+      }
+
+      await route
+        .fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ ok: true, member: "beta", conversationId: "e2-sw", totalSteps: 0, nextBefore: null, hasMore: false, steps: [] }),
+        })
+        .catch(() => {});
+    });
+
+    await e2Page.goto(BASE, { waitUntil: "domcontentloaded" });
+    await e2Page.locator("#tab-roster").click();
+    await e2Page.waitForSelector('[data-testid="inspect-trace-btn"][data-member="alpha"]');
+
+    // 1) Slow Load older steps cancelled on filter toggle
+    await e2Page.locator('[data-testid="inspect-trace-btn"][data-member="alpha"]').click();
+    await e2Page.waitForSelector('[data-testid="trace-step-10"]');
+    await e2Page.locator('[data-testid="trace-load-older"]').click();
+    await e2Page.locator('[data-testid="trace-filter-errors"]').click();
+    await e2Page.waitForSelector('[data-testid="trace-step-99"]');
+    await e2Page.waitForTimeout(550);
+    const staleOverwroteFilter = (await e2Page.locator('[data-testid="trace-step-5"]').count()) > 0;
+
+    // 2) Rapid close + switch to beta (empty trace) must not be overwritten by slow alpha
+    await e2Page.keyboard.press("Escape");
+    await e2Page.waitForFunction(() => !document.querySelector('[data-testid="forensic-trace-drawer"]'));
+    await e2Page.locator('[data-testid="inspect-trace-btn"][data-member="alpha"]').click();
+    await e2Page.keyboard.press("Escape");
+    await e2Page.locator('[data-testid="inspect-trace-btn"][data-member="beta"]').click();
+    await e2Page.waitForSelector('[data-testid="trace-empty"]');
+    await e2Page.waitForTimeout(550);
+    const emptyTxt = await e2Page.locator('[data-testid="trace-empty"]').textContent();
+    const staleAlphaOverwroteBeta = (await e2Page.locator('[data-testid="trace-step-10"]').count()) > 0;
+    const ovLight380 = await e2Page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    // 3) Error state in Dark mode at 380px with ~/ masking + 0px overflow
+    await e2Page.keyboard.press("Escape");
+    await e2Page.waitForFunction(() => !document.querySelector('[data-testid="forensic-trace-drawer"]'));
+    await e2Page.locator('button[aria-label="Open settings"]').click();
+    await e2Page.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();
+    await e2Page.locator('button[aria-label="Close dialog"]').click();
+
+    betaErrMode = true;
+    await e2Page.locator('[data-testid="inspect-trace-btn"][data-member="beta"]').click();
+    await e2Page.waitForSelector('[data-testid="trace-error-banner"]');
+    const errTxt = await e2Page.locator('[data-testid="trace-error-banner"]').textContent();
+    const ovDark380 = await e2Page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    await e2Page.keyboard.press("Escape");
+    await e2Page.waitForFunction(() => !document.querySelector('[data-testid="forensic-trace-drawer"]'));
+
+    await e2Page.close();
+    return (
+      !staleOverwroteFilter &&
+      !staleAlphaOverwroteBeta &&
+      Boolean(emptyTxt?.includes("No transcript steps recorded yet.")) &&
+      Boolean(errTxt?.includes("~/secret") && !errTxt.includes("/home/")) &&
+      ovLight380 <= 0 &&
+      ovDark380 <= 0 &&
+      e2PageErrors.length === 0
+    );
+  });
+
+  await check("E3 guards 0-token, NaN/Infinity, negative savings, and unknown contextLimit across TokenBurnStrip, RosterView, digest, and archive at 380px Light & Dark", async () => {
+    const e3Page = await ctx.newPage();
+    await e3Page.setViewportSize({ width: 380, height: 900 });
+    const e3Errors = [];
+    e3Page.on("pageerror", (e) => e3Errors.push(e.message));
+    e3Page.on("console", (msg) => {
+      if (msg.type() === "error") e3Errors.push(msg.text());
+    });
+
+    let activePhase = "zero";
+    await e3Page.route("**/api/swarms*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          swarms: [{ id: "e3-sw", title: "E3 Edge Swarm", appData: "gate", head: 1, memberCount: 2, activeCount: 0, waitingCount: 2, killedCount: 0, triageCount: 0, totalTokens: 0, hasPlan: false, lastActivityTs: Date.now() }],
+          defaultConversationId: "e3-sw",
+        }),
+      });
+    });
+
+    await e3Page.route(/\/api\/swarm(\?.*)?$/, async (route) => {
+      const zeroSnap = {
+        conversationId: "e3-sw",
+        swarm: "e3-sw",
+        member: "coordinator",
+        etag: `e3-${activePhase}`,
+        id: "e3-sw",
+        title: "E3 Edge Swarm",
+        head: 1,
+        members: [
+          {
+            name: "zero-worker",
+            conversation_id: "e3-zero-1",
+            model: "unknown-local",
+            role: "worker",
+            wake_mode: "mentions",
+            wait_since: 1,
+            last_read_seq: 1,
+            unread: 0,
+            killed: false,
+            status: "waiting",
+            steps: 0,
+            activity: "",
+            activityKind: "",
+            replied: false,
+            replyAsk: "",
+            narrator: false,
+            roleWorker: false,
+            failure: null,
+            transcriptMtime: Date.now(),
+            startedAt: new Date().toISOString(),
+            lastStepAt: new Date().toISOString(),
+            contextLimit: "unknown",
+            usage: { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, totalTokens: 0 },
+            cost: { totalUsd: 0, inputUsd: 0, cacheReadUsd: 0, outputUsd: 0, cacheSavingsUsd: -1.5, cacheHitPct: 0, pricingKnown: false },
+            posts: 0,
+            lastPostSeq: 0,
+            lastPostTime: "",
+            lastPostTs: null,
+          },
+        ],
+        messages: [{ seq: 1, agent: "zero-worker", text: "@all Zero token init", time: "12:00:00", ts: Date.now(), mentions: [], all: true }],
+        replyRefs: {},
+        edges: [],
+        triage: [],
+        burnSummary: { totalTokens: 0, topWorker: null, highBurnCount: 0, workers: [], costUsd: 0, cacheHitPct: 0, cacheSavingsUsd: -2, pricingKnown: false },
+        usage: { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, totalTokens: 0 },
+        cost: { totalUsd: 0, inputUsd: 0, cacheReadUsd: 0, outputUsd: 0, cacheSavingsUsd: -2, cacheHitPct: 0, pricingKnown: false },
+        capabilities: { canSendMessage: false, isSidecar: false, sseStream: false, deltaStream: false },
+      };
+
+      const weirdSnap = {
+        ...zeroSnap,
+        members: [
+          zeroSnap.members[0],
+          {
+            ...zeroSnap.members[0],
+            name: "weird-worker",
+            conversation_id: "e3-weird-2",
+            model: "gemini-3-pro",
+            lastContextTokens: 45000,
+            contextLimit: "unknown",
+            contextPct: null,
+            usage: { inputTokens: 45000, cacheReadTokens: 0, outputTokens: 500, totalTokens: 45500 },
+            cost: { totalUsd: 0.06, inputUsd: 0.055, cacheReadUsd: 0, outputUsd: 0.005, cacheSavingsUsd: -4.25, cacheHitPct: 180, pricingKnown: true },
+          },
+        ],
+        burnSummary: {
+          totalTokens: 45500,
+          highBurnCount: 0,
+          costUsd: 0.06,
+          cacheHitPct: 180,
+          cacheSavingsUsd: -4.25,
+          pricingKnown: true,
+          topWorker: { name: "weird-worker", totalTokens: 45500, sharePct: 150, level: "normal", costUsd: 0.06, cacheHitPct: 180, cacheSavingsUsd: -4.25, pricingKnown: true },
+          workers: [
+            { name: "weird-worker", totalTokens: 45500, sharePct: 150, level: "normal", costUsd: 0.06, cacheHitPct: 180, cacheSavingsUsd: -4.25, pricingKnown: true },
+            { name: "zero-worker", totalTokens: 0, sharePct: -10, level: "normal", costUsd: 0, cacheHitPct: 0, cacheSavingsUsd: -1, pricingKnown: false },
+          ],
+        },
+        usage: { inputTokens: 45000, cacheReadTokens: 0, outputTokens: 500, totalTokens: 45500 },
+        cost: { totalUsd: 0.06, inputUsd: 0.055, cacheReadUsd: 0, outputUsd: 0.005, cacheSavingsUsd: -4.25, cacheHitPct: 180, pricingKnown: true },
+      };
+
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(activePhase === "zero" ? zeroSnap : weirdSnap) });
+    });
+
+    await e3Page.goto(BASE, { waitUntil: "domcontentloaded" });
+    await e3Page.waitForSelector("#panel-triage");
+    const zeroBurnHidden = (await e3Page.locator('#panel-triage [data-testid="token-burn-strip"]').count()) === 0;
+    await e3Page.locator("#tab-roster").click();
+    await e3Page.waitForSelector('[data-testid="roster-ctx-cap-zero-worker"]');
+    const zeroBadge = await e3Page.locator('[data-testid="roster-ctx-badge-zero-worker"]').textContent();
+    const zeroCap = await e3Page.locator('[data-testid="roster-ctx-cap-zero-worker"]').textContent();
+    const zeroCost = await e3Page.locator('[data-testid="roster-cost-zero-worker"]').textContent();
+    const zeroOv = await e3Page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    // Switch to weird phase (negative savings, >100% cacheHitPct/sharePct, unknown contextLimit with non-zero tokens)
+    activePhase = "weird";
+    await e3Page.locator('button[aria-label="Refresh swarm"]').click();
+    await e3Page.waitForSelector('[data-testid="token-burn-strip"]');
+    const rosterTxt = await e3Page.locator("#panel-roster").textContent();
+    const weirdBadge = await e3Page.locator('[data-testid="roster-ctx-badge-weird-worker"]').textContent();
+    const weirdCap = await e3Page.locator('[data-testid="roster-ctx-cap-weird-worker"]').textContent();
+    const burnCacheTxt = await e3Page.locator('#panel-roster [data-testid="burn-cache-hit"]').textContent();
+    const ovLight = await e3Page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    await e3Page.locator("#tab-triage").click();
+    await e3Page.evaluate(() => {
+      window.__e3Digest = "";
+      try {
+        Object.defineProperty(navigator, "clipboard", {
+          configurable: true,
+          value: { writeText: async (t) => { window.__e3Digest = String(t); } },
+        });
+      } catch {}
+    });
+    await e3Page.locator('[data-testid="copy-handoff-digest"]').click();
+    await e3Page.waitForFunction(() => Boolean(window.__e3Digest));
+    const e3Digest = await e3Page.evaluate(() => window.__e3Digest);
+
+    const [dlJson] = await Promise.all([
+      e3Page.waitForEvent("download"),
+      e3Page.locator('[data-testid="export-archive-json"]').click(),
+    ]);
+    const dlChunks = [];
+    for await (const c of await dlJson.createReadStream()) dlChunks.push(c);
+    const archiveJsonStr = Buffer.concat(dlChunks).toString("utf8");
+    const archiveObj = JSON.parse(archiveJsonStr);
+
+    await e3Page.locator('button[aria-label="Open settings"]').click();
+    await e3Page.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();
+    await e3Page.locator('button[aria-label="Close dialog"]').click();
+    const ovDark = await e3Page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    await e3Page.close();
+    return (
+      zeroBurnHidden &&
+      zeroBadge === "Idle" &&
+      zeroCap === "cap unknown" &&
+      zeroCost === "Unpriced" &&
+      zeroOv <= 0 &&
+      weirdBadge === "45.0k ctx" &&
+      weirdCap === "cap unknown" &&
+      burnCacheTxt === "100% cache hit" &&
+      !rosterTxt?.includes("NaN") &&
+      !rosterTxt?.includes("Infinity") &&
+      !rosterTxt?.includes("saved") &&
+      !e3Digest.includes("NaN") &&
+      !e3Digest.includes("Infinity") &&
+      !e3Digest.includes("saved") &&
+      e3Digest.includes("45.0k / unknown ctx") &&
+      archiveObj.cost?.cacheSavingsUsd === 0 &&
+      archiveObj.cost?.cacheHitPct === 100 &&
+      archiveObj.burnSummary?.cacheSavingsUsd === 0 &&
+      archiveObj.members?.[0]?.contextLimit === null &&
+      ovLight <= 0 &&
+      ovDark <= 0 &&
+      e3Errors.length === 0
+    );
+  });
+
   // 26-28: Clean runtime guarantees
   await check("zero console errors", () => consoleErrors.length === 0);
   await check("zero uncaught page errors", () => pageErrors.length === 0);

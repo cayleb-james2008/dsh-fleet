@@ -59,8 +59,8 @@ export function isEmbeddedHost(): boolean {
 const sidecarFetch = (url: string, init?: RequestInit): Promise<Response> =>
   sc()?.fetch?.(url, init) ?? fetch(url, init);
 
-async function apiJson<T>(url: string, errLabel: string): Promise<T> {
-  const res = await sidecarFetch(url);
+async function apiJson<T>(url: string, errLabel: string, signal?: AbortSignal): Promise<T> {
+  const res = await sidecarFetch(url, signal ? { signal } : undefined);
   if (!res.ok) throw new Error(`${errLabel} (${res.status})`);
   return res.json();
 }
@@ -72,11 +72,15 @@ const qs = (path: string, params: Record<string, string | null | undefined>) => 
   return `${path}${s ? `?${s}` : ""}`;
 };
 
-export const fetchSwarms = (): Promise<{ swarms: SwarmSummary[]; defaultConversationId: string | null }> =>
-  apiJson("/api/swarms", "List swarms failed");
+export const fetchSwarms = (signal?: AbortSignal): Promise<{ swarms: SwarmSummary[]; defaultConversationId: string | null }> =>
+  apiJson("/api/swarms", "List swarms failed", signal);
 
-export const fetchSwarmSnapshot = (conversationId?: string | null, etag?: string): Promise<SwarmSnapshot> =>
-  apiJson(qs("/api/swarm", { conversationId, etag }), "Load swarm failed");
+export const fetchSwarmSnapshot = (
+  conversationId?: string | null,
+  etag?: string,
+  signal?: AbortSignal,
+): Promise<SwarmSnapshot> =>
+  apiJson(qs("/api/swarm", { conversationId, etag }), "Load swarm failed", signal);
 
 export interface FetchMemberTranscriptOptions {
   conversationId: string;
@@ -127,19 +131,18 @@ export async function fetchSwarmDelta(
   return res.json();
 }
 
+const isValidSeq = (seq: unknown): seq is number => typeof seq === "number" && Number.isFinite(seq) && seq > 0;
+const finiteNonNeg = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0);
+
 function mergeMessages(prevMsgs: BoardMessage[] = [], deltaMsgs: BoardMessage[] = []): BoardMessage[] {
-  if (!deltaMsgs.length) return prevMsgs;
   const bySeq = new Map<number, BoardMessage>();
   const unseq: BoardMessage[] = [];
-  for (const m of prevMsgs) {
-    if (!m) continue;
-    if (typeof m.seq === "number" && m.seq > 0) bySeq.set(m.seq, m);
-    else unseq.push(m);
-  }
-  for (const m of deltaMsgs) {
-    if (!m) continue;
-    if (typeof m.seq === "number" && m.seq > 0) bySeq.set(m.seq, m);
-    else unseq.push(m);
+  for (const list of [prevMsgs, deltaMsgs]) {
+    for (const m of list) {
+      if (!m) continue;
+      if (isValidSeq(m.seq)) bySeq.set(m.seq, m);
+      else unseq.push(m);
+    }
   }
   const ordered = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
   return unseq.length ? ordered.concat(unseq) : ordered;
@@ -155,9 +158,12 @@ function mergeReplyRefs(
   const next: Record<number, number[]> = { ...(prevRefs || {}) };
   for (const k of keys) {
     const seqKey = Number(k);
-    const addList = deltaRefs[seqKey];
-    if (!Array.isArray(addList) || !addList.length) continue;
-    const prevList = Array.isArray(next[seqKey]) ? next[seqKey] : [];
+    if (!isValidSeq(seqKey)) continue;
+    const rawList = deltaRefs[seqKey];
+    if (!Array.isArray(rawList) || !rawList.length) continue;
+    const addList = rawList.filter(isValidSeq);
+    if (!addList.length) continue;
+    const prevList = Array.isArray(next[seqKey]) ? next[seqKey].filter(isValidSeq) : [];
     next[seqKey] = [...new Set([...prevList, ...addList])].sort((a, b) => a - b);
   }
   return next;
@@ -168,21 +174,39 @@ function mergeEdges(prevEdges: MentionEdge[] = [], deltaEdges: MentionEdge[] | u
   const byKey = new Map<string, MentionEdge>();
   for (const e of prevEdges) {
     if (!e) continue;
-    byKey.set(`${e.from}\0${e.to}`, { ...e });
+    byKey.set(`${e.from}\0${e.to}`, {
+      ...e,
+      count: finiteNonNeg(e.count),
+      direct: finiteNonNeg(e.direct),
+      viaAll: finiteNonNeg(e.viaAll),
+    });
   }
   for (const d of deltaEdges) {
     if (!d) continue;
     const key = `${d.from}\0${d.to}`;
     const existing = byKey.get(key);
     if (existing) {
-      existing.count += d.count || 0;
-      existing.direct += d.direct || 0;
-      existing.viaAll += d.viaAll || 0;
+      existing.count += finiteNonNeg(d.count);
+      existing.direct += finiteNonNeg(d.direct);
+      existing.viaAll += finiteNonNeg(d.viaAll);
     } else {
-      byKey.set(key, { ...d });
+      byKey.set(key, {
+        ...d,
+        count: finiteNonNeg(d.count),
+        direct: finiteNonNeg(d.direct),
+        viaAll: finiteNonNeg(d.viaAll),
+      });
     }
   }
   return [...byKey.values()];
+}
+
+function maxSeqOf(msgs: BoardMessage[]): number {
+  let max = 0;
+  for (const m of msgs) {
+    if (m && isValidSeq(m.seq) && m.seq > max) max = m.seq;
+  }
+  return max;
 }
 
 export function mergeSwarmDelta(
@@ -202,17 +226,34 @@ export function mergeSwarmDelta(
       edgesDelta,
       ...rest
     } = delta;
+    const messages = mergeMessages([], delta.messages ?? messagesDelta ?? []);
+    const head = Math.max(finiteNonNeg(delta.head), maxSeqOf(messages));
     return {
       conversationId: delta.conversationId !== undefined ? delta.conversationId : (prevSnap?.conversationId ?? delta.swarm ?? null),
       swarm: delta.swarm !== undefined ? delta.swarm : (prevSnap?.swarm ?? null),
       member: delta.member !== undefined ? delta.member : (prevSnap?.member ?? null),
       ...rest,
       unchanged: false,
-      messages: delta.messages ?? messagesDelta ?? [],
+      head,
+      messages,
       replyRefs: delta.replyRefs ?? replyRefsDelta ?? {},
       edges: delta.edges ?? edgesDelta ?? [],
     };
   }
+
+  const prevMsgs = prevSnap.messages || [];
+  const prevSeqSet = new Set(prevMsgs.filter((m) => m && isValidSeq(m.seq)).map((m) => m.seq));
+  const deltaMsgs = delta.messagesDelta || [];
+  const hasOnlyReplayedMsgs =
+    deltaMsgs.length > 0 &&
+    deltaMsgs.every((m) => !m || !isValidSeq(m.seq) || prevSeqSet.has(m.seq));
+  const messages =
+    delta.messages !== undefined
+      ? mergeMessages([], delta.messages)
+      : deltaMsgs.length
+        ? mergeMessages(prevMsgs, deltaMsgs)
+        : prevMsgs;
+  const head = Math.max(finiteNonNeg(prevSnap.head), finiteNonNeg(delta.head), maxSeqOf(messages));
 
   return {
     ...prevSnap,
@@ -224,10 +265,15 @@ export function mergeSwarmDelta(
     ...(delta.id !== undefined ? { id: delta.id } : {}),
     ...(delta.title !== undefined ? { title: delta.title } : {}),
     ...(delta.etag !== undefined ? { etag: delta.etag } : {}),
-    ...(delta.head !== undefined ? { head: delta.head } : {}),
-    messages: delta.messages !== undefined ? delta.messages : mergeMessages(prevSnap.messages, delta.messagesDelta),
+    head,
+    messages,
     replyRefs: delta.replyRefs !== undefined ? delta.replyRefs : mergeReplyRefs(prevSnap.replyRefs, delta.replyRefsDelta),
-    edges: delta.edges !== undefined ? delta.edges : mergeEdges(prevSnap.edges, delta.edgesDelta),
+    edges:
+      delta.edges !== undefined
+        ? delta.edges
+        : hasOnlyReplayedMsgs
+          ? (prevSnap.edges || [])
+          : mergeEdges(prevSnap.edges, delta.edgesDelta),
     ...(delta.members !== undefined ? { members: delta.members } : {}),
     ...(delta.channels !== undefined ? { channels: delta.channels } : {}),
     ...(delta.plan !== undefined ? { plan: delta.plan } : {}),

@@ -613,6 +613,82 @@ await check("1M Gemini context ceiling (300k = 30%, NOT 100% danger), 200k Claud
   );
 });
 
+await check("0-token worker and empty 0-step trace render cleanly at 380px Light & Dark with 0px overflow", async () => {
+  await page.setViewportSize({ width: 380, height: 900 });
+  await page.selectOption('select[aria-label="Active swarm"]', "demo-audit-0009");
+  await page.locator("#tab-roster").click();
+  await page.waitForSelector('[data-testid="roster-ctx-badge-scanner"]');
+  const scannerText = await page.locator('[data-testid="roster-ctx-badge-scanner"]').textContent();
+  const rosterTxt = await page.locator("#panel-roster").textContent();
+
+  // Filter Tools on a zero-step / empty filter or check trace-empty state cleanly
+  await page.selectOption('select[aria-label="Active swarm"]', "demo-coord-0001");
+  await page.locator("#tab-roster").click();
+  await page.waitForSelector('[data-testid="inspect-trace-btn"][data-member="verifier"]');
+  await page.locator('[data-testid="inspect-trace-btn"][data-member="verifier"]').click();
+  await page.waitForSelector('[data-testid="forensic-trace-drawer"]');
+  await page.locator('[data-testid="trace-filter-errors"]').click();
+  await page.waitForSelector('[data-testid="trace-step-21"]');
+  const ovLight = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+  // Trigger empty trace via simulated 0-step response on a spawned worker or empty state check
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => !document.querySelector('[data-testid="forensic-trace-drawer"]'));
+
+  await page.evaluate(async () => {
+    await fetch("/api/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        confirm: true,
+        op: "spawn_worker",
+        conversationId: "demo-audit-0009",
+        name: "zero-trace",
+        brief: "Empty trace check",
+        workspaceMode: "inherit",
+      }),
+    });
+  });
+  await page.selectOption('select[aria-label="Active swarm"]', "demo-audit-0009");
+  await page.locator("#tab-roster").click();
+  await page.waitForSelector('[data-testid="inspect-trace-btn"][data-member="zero-trace"]');
+  await page.locator('[data-testid="inspect-trace-btn"][data-member="zero-trace"]').click();
+  await page.waitForSelector('[data-testid="trace-empty"]');
+  const emptyAllMsg = await page.locator('[data-testid="trace-empty"]').textContent();
+  await page.locator('[data-testid="trace-filter-errors"]').click();
+  await page.waitForSelector('[data-testid="trace-empty"]');
+  const emptyMsg = await page.locator('[data-testid="trace-empty"]').textContent();
+  const ovLightEmpty = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+  await page.locator('[data-testid="trace-close-btn"]').click();
+  await page.locator('button[aria-label="Open settings"]').click();
+  await page.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();
+  await page.locator('button[aria-label="Close dialog"]').click();
+  await page.locator('[data-testid="inspect-trace-btn"][data-member="zero-trace"]').click();
+  await page.waitForSelector('[data-testid="forensic-trace-drawer"]');
+  await page.locator('[data-testid="trace-filter-errors"]').click();
+  await page.waitForSelector('[data-testid="trace-empty"]');
+  const ovDarkEmpty = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => !document.querySelector('[data-testid="forensic-trace-drawer"]'));
+
+  await page.locator('button[aria-label="Open settings"]').click();
+  await page.locator('div[role="dialog"] button[role="radio"]:has-text("Light")').click();
+  await page.locator('button[aria-label="Close dialog"]').click();
+
+  return (
+    Boolean(scannerText === "Idle") &&
+    Boolean(rosterTxt?.includes("0 tok")) &&
+    !rosterTxt?.includes("NaN") &&
+    !rosterTxt?.includes("Infinity") &&
+    Boolean(emptyAllMsg?.includes("No transcript steps recorded yet.")) &&
+    Boolean(emptyMsg?.includes("No transcript steps match this filter.")) &&
+    ovLight <= 0 &&
+    ovLightEmpty <= 0 &&
+    ovDarkEmpty <= 0
+  );
+});
+
 await check("zero external calls, console errors, or page errors", () => externalReqs.length === 0 && consoleErrs.length === 0 && pageErrs.length === 0);
 
 await browser.close();
