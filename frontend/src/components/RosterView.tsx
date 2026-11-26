@@ -2,7 +2,7 @@ import { useMemo, useState } from "../hooks";
 import { ChevronDown, ChevronUp, ClipboardCopy, Cpu, Eye, EyeOff, MessageSquare, Radio, Send } from "../icons";
 import { openWorkerConversation } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot } from "../types";
-import { ActivityPeek, Badge, Button, Card, InlineComposer, Pill, StatusDot, canLiveNudge, cn, copyText, fmtTokens, hasControlChars, memberMeta, submitNudge, useNowMs } from "../ui";
+import { ActivityPeek, Badge, Button, Card, InlineComposer, Pill, StatusDot, TokenBurnStrip, canLiveNudge, cn, copyText, fmtTokens, hasControlChars, memberMeta, submitNudge, useNowMs } from "../ui";
 
 const ORDER: Record<SwarmMember["status"], number> = { working: 0, waiting: 1, killed: 2 };
 const CONTEXT_BUDGET_TOKENS = 200_000;
@@ -174,6 +174,8 @@ export function RosterView({
           />
         </Card>
       )}
+
+      <TokenBurnStrip snap={snap} />
 
       {sorted.length === 0 ? (
         <Card className="p-4 text-[14px] text-ink-2 bg-board">No workers yet.</Card>

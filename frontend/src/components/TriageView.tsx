@@ -22,7 +22,7 @@ import {
   parseScreenshotLines,
 } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot, TriageItem } from "../types";
-import { ActivityPeek, Badge, Button, Card, InlineComposer, MediaPathChips, Pill, PinnedList, StatusDot, canLiveNudge, cn, copyText, fmtTimeAgo, fmtTokens, formatBlockerContext, humanizeStatus, memberMeta, openOrCopyPath, submitNudge, useNowMs } from "../ui";
+import { ActivityPeek, Badge, Button, Card, InlineComposer, MediaPathChips, Pill, PinnedList, SegBar, StatusDot, TokenBurnStrip, canLiveNudge, cn, copyText, fmtTimeAgo, fmtTokens, formatBlockerContext, humanizeStatus, memberMeta, openOrCopyPath, submitNudge, useNowMs } from "../ui";
 
 const SEVERITY_BADGE: Record<TriageItem["severity"], { tone: "danger" | "warning" | "info"; label: string; Icon: typeof AlertTriangle }> = {
   urgent: { tone: "danger", label: "Urgent", Icon: ShieldAlert },
@@ -174,15 +174,14 @@ export function TriageView({
                 </Button>
               )}
             </div>
-            <div
-              className="h-1 w-full rounded-full overflow-hidden bg-track flex gap-px"
-              role="img"
-              aria-label={`Swarm activity: ${workingCount} working, ${waitingCount} waiting, ${blockedCount} blocked`}
-            >
-              {buckets.map((b) => b.count > 0 && <div key={b.label} className={cn("h-full", b.cls)} style={{ width: `${(b.count / heatTotal) * 100}%` }} />)}
-            </div>
+            <SegBar
+              segments={buckets.map((b) => ({ key: b.label, pct: (b.count / heatTotal) * 100, cls: b.cls }))}
+              label={`Swarm activity: ${workingCount} working, ${waitingCount} waiting, ${blockedCount} blocked`}
+            />
           </Card>
         )}
+
+        <TokenBurnStrip snap={snap} />
 
         {triage.length === 0 ? (
           <Card className="p-3 bg-board">

@@ -82,7 +82,7 @@ function readSmallCached(path, cache, maxBytes = VIEW_MAX_BYTES) {
   } catch {
     return { text: null, ...s };
   }
-  lruSet(cache, path, { key, text }, 24);
+  lruSet(cache, path, { key, text }, 12);
   return { text, ...s };
 }
 
@@ -98,16 +98,15 @@ const B_CACHE_CAMEL = Buffer.from('"cacheReadTokens":');
 const B_OUTPUT_TOK = Buffer.from('"output_tokens":');
 const B_OUTPUT_CAMEL = Buffer.from('"outputTokens":');
 
-function extractIntBuf(lineBuf, keyBuf) {
-  const idx = lineBuf.indexOf(keyBuf);
-  if (idx < 0) return -1;
+function extractIntSpan(buf, start, end, keyBuf) {
+  const idx = buf.indexOf(keyBuf, start);
+  if (idx < 0 || idx >= end) return -1;
   let pos = idx + keyBuf.length;
-  const end = lineBuf.length;
-  while (pos < end && (lineBuf[pos] === 32 || lineBuf[pos] === 9)) pos++;
+  while (pos < end && (buf[pos] === 32 || buf[pos] === 9)) pos++;
   let val = 0;
   let digits = 0;
   while (pos < end) {
-    const c = lineBuf[pos];
+    const c = buf[pos];
     if (c < 48 || c > 57) break;
     val = val * 10 + (c - 48);
     digits++;
@@ -116,19 +115,18 @@ function extractIntBuf(lineBuf, keyBuf) {
   return digits > 0 ? val : -1;
 }
 
-function extractStrBuf(lineBuf, keyBuf) {
-  const idx = lineBuf.indexOf(keyBuf);
-  if (idx < 0) return '';
+function extractStrSpan(buf, start, end, keyBuf) {
+  const idx = buf.indexOf(keyBuf, start);
+  if (idx < 0 || idx >= end) return '';
   let pos = idx + keyBuf.length;
-  const end = lineBuf.length;
-  while (pos < end && (lineBuf[pos] === 32 || lineBuf[pos] === 9)) pos++;
-  if (pos >= end || lineBuf[pos] !== 34) return '';
+  while (pos < end && (buf[pos] === 32 || buf[pos] === 9)) pos++;
+  if (pos >= end || buf[pos] !== 34) return '';
   const qStart = pos + 1;
-  const qEnd = lineBuf.indexOf(34, qStart);
-  if (qEnd < 0) return '';
-  const bs = lineBuf.indexOf(92, qStart);
+  const qEnd = buf.indexOf(34, qStart);
+  if (qEnd < 0 || qEnd >= end) return '';
+  const bs = buf.indexOf(92, qStart);
   if (bs >= 0 && bs < qEnd) return '';
-  return lineBuf.toString('utf8', qStart, qEnd);
+  return buf.toString('utf8', qStart, qEnd);
 }
 
 /**
@@ -187,7 +185,7 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine, { rawSpan =
           while (start < end && activeBuf[start] <= 32) start++;
           while (end > start && activeBuf[end - 1] <= 32) end--;
           if (end > start) {
-            const rem = offset >= s.size && (nl + 1 >= totalLen || activeBuf.indexOf(0x0a, nl + 1) < 0 || activeBuf.indexOf(0x0a, nl + 1) >= totalLen) ? 0 : s.size - offset;
+            const rem = Math.max(0, s.size - offset + (totalLen - nl - 1));
             if (rawSpan) onLine(activeBuf, start, end, null, rem);
             else onLine(activeBuf.subarray(start, end).toString('utf8'));
           }
@@ -519,7 +517,7 @@ export function summarizeTranscript(appData, conv) {
       a.lineCount++;
 
       // Only retain tail line slices near EOF (prevents 50k string allocations during initial scan)
-      if (remBytes <= 16 * 1024 || preParsed) {
+      if (remBytes <= 12 * 1024 || preParsed) {
         a.rawTail[a.tailCursor % TAIL_CAP] = buf.toString('utf8', start, end);
       }
       a.tailCursor++;
@@ -544,39 +542,42 @@ export function summarizeTranscript(appData, conv) {
         return;
       }
 
-      const lineBuf = buf.subarray(start, end);
-      const si = extractIntBuf(lineBuf, B_STEP_INDEX);
+      const si = extractIntSpan(buf, start, end, B_STEP_INDEX);
       if (si >= 0) a.maxStepIndex = Math.max(a.maxStepIndex, si + 1);
 
       if (!a.startedAt || remBytes <= 4096) {
-        const ts = extractStrBuf(lineBuf, B_CREATED_AT);
+        const ts = extractStrSpan(buf, start, end, B_CREATED_AT);
         if (ts) {
           if (!a.startedAt) a.startedAt = ts;
           a.lastStepAt = ts;
         }
       }
 
-      if (lineBuf.indexOf(B_PLANNER) >= 0) {
+      const pIdx = buf.indexOf(B_PLANNER, start);
+      if (pIdx >= 0 && pIdx < end) {
         if (!a.model || remBytes <= 8192) {
-          const m = extractStrBuf(lineBuf, B_MODEL);
+          const m = extractStrSpan(buf, start, end, B_MODEL);
           if (m) a.model = m;
         }
 
-        let inp = extractIntBuf(lineBuf, B_INPUT_TOK);
-        if (inp < 0) inp = extractIntBuf(lineBuf, B_INPUT_CAMEL);
-        let cac = extractIntBuf(lineBuf, B_CACHE_SNAKE);
-        if (cac < 0) cac = extractIntBuf(lineBuf, B_CACHE_CAMEL);
-        let out = extractIntBuf(lineBuf, B_OUTPUT_TOK);
-        if (out < 0) out = extractIntBuf(lineBuf, B_OUTPUT_CAMEL);
-        if (inp < 0 && cac < 0 && out < 0 && remBytes <= 16 * 1024 && lineBuf.indexOf(B_USAGE) >= 0) {
-          try {
-            const parsed = JSON.parse(lineBuf.toString('utf8'));
-            const u = parsed.usage && typeof parsed.usage === 'object' ? parsed.usage : parsed;
-            inp = num(Number(u.input_tokens ?? u.inputTokens));
-            cac = num(Number(u.cache_read_tokens ?? u.cacheReadTokens));
-            out = num(Number(u.output_tokens ?? u.outputTokens));
-          } catch {
-            // torn line skipped
+        let inp = extractIntSpan(buf, start, end, B_INPUT_TOK);
+        if (inp < 0) inp = extractIntSpan(buf, start, end, B_INPUT_CAMEL);
+        let cac = extractIntSpan(buf, start, end, B_CACHE_SNAKE);
+        if (cac < 0) cac = extractIntSpan(buf, start, end, B_CACHE_CAMEL);
+        let out = extractIntSpan(buf, start, end, B_OUTPUT_TOK);
+        if (out < 0) out = extractIntSpan(buf, start, end, B_OUTPUT_CAMEL);
+        if (inp < 0 && cac < 0 && out < 0 && remBytes <= 12 * 1024) {
+          const uIdx = buf.indexOf(B_USAGE, start);
+          if (uIdx >= 0 && uIdx < end) {
+            try {
+              const parsed = JSON.parse(buf.toString('utf8', start, end));
+              const u = parsed.usage && typeof parsed.usage === 'object' ? parsed.usage : parsed;
+              inp = num(Number(u.input_tokens ?? u.inputTokens));
+              cac = num(Number(u.cache_read_tokens ?? u.cacheReadTokens));
+              out = num(Number(u.output_tokens ?? u.outputTokens));
+            } catch {
+              // torn line skipped
+            }
           }
         }
         inp = Math.max(0, inp);
@@ -585,7 +586,7 @@ export function summarizeTranscript(appData, conv) {
         a.inputTokens += inp;
         a.cacheReadTokens += cac;
         a.outputTokens += out;
-        if (inp + cac > 0 || remBytes <= 16 * 1024) a.lastContextTokens = inp + cac;
+        if (inp + cac > 0 || remBytes <= 12 * 1024) a.lastContextTokens = inp + cac;
       }
     },
     { rawSpan: true },
@@ -1064,6 +1065,28 @@ export function getSwarmMetaKeys(appData, id) {
   };
 }
 
+/** Compute per-worker token share and high-burn warning state for coordinator guardrails. */
+export function computeBurnSummary(members, totalTokens = 0) {
+  const total = Number(totalTokens) || 0;
+  const rows = [];
+  for (const m of members || []) {
+    if (m.roleWorker) continue;
+    const tok = Number(m.usage?.totalTokens) || 0;
+    if (tok <= 0) continue;
+    const sharePct = total > 0 ? Math.round((tok / total) * 100) : 0;
+    const level = tok >= 400_000 || (total >= 20_000 && sharePct >= 65 && (members?.length || 0) >= 2)
+      ? 'critical'
+      : tok >= 150_000 || (total >= 10_000 && sharePct >= 45 && (members?.length || 0) >= 2)
+        ? 'warn'
+        : 'normal';
+    rows.push({ name: m.name, totalTokens: tok, sharePct, level, killed: Boolean(m.killed) });
+  }
+  rows.sort((a, b) => b.totalTokens - a.totalTokens || a.name.localeCompare(b.name));
+  const topWorker = rows[0] || null;
+  const highBurnCount = rows.filter((r) => r.level !== 'normal').length;
+  return { totalTokens: total, topWorker, highBurnCount, workers: rows.slice(0, 6) };
+}
+
 /**
  * Build full snapshot of a swarm WITHOUT retaining large message arrays in JS heap cache.
  * Stores compact swarm summary in `summaryMetaCache` for `listSwarms()`.
@@ -1259,6 +1282,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
   const sysAttention = systemAttention(members, now);
   const triage = buildTriageItems({ members, messages, sysAttention });
   const totalTokens = totalInputTokens + totalCacheReadTokens + totalOutputTokens;
+  const burnSummary = computeBurnSummary(members, totalTokens);
 
   const activeCount = members.filter((m) => !m.killed && m.status === 'working').length;
   const waitingCount = members.filter((m) => !m.killed && m.status === 'waiting').length;
@@ -1285,7 +1309,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
       hasPlan: Boolean(plan),
       lastActivityTs,
     },
-  }, 16);
+  }, 8);
 
   const snap = {
     id,
@@ -1304,6 +1328,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     allowedFiles,
     systemAttention: sysAttention,
     triage,
+    burnSummary,
     usage: {
       inputTokens: totalInputTokens,
       cacheReadTokens: totalCacheReadTokens,

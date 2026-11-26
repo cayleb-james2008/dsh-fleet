@@ -145,6 +145,14 @@ await runChecks("gate", async (check) => {
     return ok;
   });
 
+  await check("triage Token Burn Guard Strip renders share percentage and High burn badge", async () => {
+    const strip = page.locator('#panel-triage [data-testid="token-burn-strip"]');
+    if ((await strip.count()) !== 1) return false;
+    const txt = await strip.textContent();
+    const badge = await strip.locator('[data-testid="high-burn-badge"]').textContent();
+    return txt.includes("Token burn") && txt.includes("builder") && /\d+%/.test(badge);
+  });
+
   // 7-9: #seq jump from Triage -> Board tab + Board filters
   await page.locator('#panel-triage button:has-text("#4")').first().click();
   await page.waitForSelector("#panel-board");
@@ -272,6 +280,11 @@ await runChecks("gate", async (check) => {
     const disabled = await box.locator('[data-testid="composer-submit"]').isDisabled();
     await page.locator('[data-testid="toggle-broadcast"]').click();
     return workingCount >= 1 && errVisible && disabled;
+  });
+
+  await check("roster Token Burn Guard Strip shows top consumer share", async () => {
+    const txt = await page.locator('#panel-roster [data-testid="token-burn-strip"]').textContent();
+    return txt.includes("Token burn") && txt.includes("builder") && /\d+%/.test(txt);
   });
 
   await check("zero horizontal overflow on Roster at 380px", async () => {

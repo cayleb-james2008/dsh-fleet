@@ -13,7 +13,7 @@ import type {
 } from "react";
 import { ArrowUpRight, ClipboardCopy, FileCode2, Image as ImageIcon, Pin, PinOff, Send, X } from "./icons";
 import { openFileInAuxPane, parseScreenshotLines, sendConfirmedNudge } from "./sidecar";
-import type { BoardMessage, SwarmMember, SwarmSnapshot, TriageItem, WorktreesPayload } from "./types";
+import type { BoardMessage, BurnSummary, SwarmMember, SwarmSnapshot, TriageItem, WorktreesPayload } from "./types";
 
 export const canLiveNudge = (snap: SwarmSnapshot): boolean =>
   Boolean(snap.capabilities?.canSendMessage || window.sidecar?.agent?.sendMessage);
@@ -677,5 +677,71 @@ export function PinnedList({
         );
       })}
     </ul>
+  );
+}
+
+export function SegBar({ segments, label }: { segments: Array<{ key: string; pct: number; cls: string; title?: string }>; label: string }) {
+  return (
+    <div className="bar" role="img" aria-label={label}>
+      {segments.map((s) => s.pct > 0 && <div key={s.key} title={s.title} className={cn("h-full", s.cls)} style={{ width: `${s.pct}%` }} />)}
+    </div>
+  );
+}
+
+const BURN_COLS = ["bg-blue", "bg-[var(--violet)]", "bg-warn", "bg-danger", "bg-[var(--edge)]"];
+
+export function TokenBurnStrip({ snap }: { snap: SwarmSnapshot }) {
+  const members = snap.members || [];
+  const total = snap.burnSummary?.totalTokens ?? snap.usage?.totalTokens ?? 0;
+  const rows: BurnSummary["workers"] = snap.burnSummary?.workers?.length
+    ? snap.burnSummary.workers
+    : members
+        .filter((m) => !m.roleWorker && m.usage.totalTokens > 0)
+        .map((m) => {
+          const tok = m.usage.totalTokens;
+          const sharePct = total > 0 ? Math.round((tok / total) * 100) : 0;
+          const level: "normal" | "warn" | "critical" = tok >= 400_000 || (total >= 20_000 && sharePct >= 65 && members.length >= 2)
+            ? "critical"
+            : tok >= 150_000 || (total >= 10_000 && sharePct >= 45 && members.length >= 2)
+              ? "warn"
+              : "normal";
+          return { name: m.name, totalTokens: tok, sharePct, level, killed: m.killed };
+        })
+        .sort((a, b) => b.totalTokens - a.totalTokens || a.name.localeCompare(b.name))
+        .slice(0, 6);
+  if (total <= 0 || rows.length === 0) return null;
+  const top = snap.burnSummary?.topWorker || rows[0];
+  const shown = rows.slice(0, 4);
+  const restPct = Math.max(0, 100 - shown.reduce((s, r) => s + r.sharePct, 0));
+  const segs = [
+    ...shown.map((w, i) => ({ key: w.name, pct: w.sharePct, cls: BURN_COLS[i % 4], title: `@${w.name}: ${fmtTokens(w.totalTokens)} (${w.sharePct}%)` })),
+    ...(restPct > 0 ? [{ key: "rest", pct: restPct, cls: "bg-[var(--edge)]" }] : []),
+  ];
+
+  return (
+    <Card className="p-2 space-y-1" data-testid="token-burn-strip">
+      <div className="row flex-wrap t2">
+        <div className="wrap gap-1">
+          <span className="font-semibold text-ink">Token burn</span>
+          <span className="num">{fmtTokens(total)} tok</span>
+        </div>
+        {top.level !== "normal" ? (
+          <Badge tone={top.level === "critical" ? "danger" : "warning"} data-testid="high-burn-badge">
+            High burn · @{top.name} {top.sharePct}%
+          </Badge>
+        ) : (
+          <Badge tone="neutral">Top @{top.name} {top.sharePct}%</Badge>
+        )}
+      </div>
+      <SegBar segments={segs} label={`Token share led by ${top.name} (${top.sharePct}%)`} />
+      <div className="wrap gap-2 t2 num">
+        {rows.slice(0, 3).map((w, i) => (
+          <span key={w.name} className="inline-flex items-center gap-1">
+            <span className={cn("h-2 w-2 rounded-full", BURN_COLS[i % 4])} aria-hidden="true" />
+            <span className="text-ink font-medium">{w.name}</span> {fmtTokens(w.totalTokens)} ({w.sharePct}%)
+          </span>
+        ))}
+      </div>
+    </Card>
   );
 }
