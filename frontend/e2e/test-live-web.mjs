@@ -438,6 +438,42 @@ await check("Empty channel state, #seq backlink filter recovery, and 340px layou
   return Boolean(emptyTxt?.includes("No posts in #qa-empty yet.") && emptyTxt.includes("Empty QA lane")) && ovBoard <= 0 && ovWt <= 0;
 });
 
+await check("live-web exercises GET /api/swarm/delta (unchanged, delta, full) with <200ms UI sync", async () => {
+  await page.selectOption('select[aria-label="Active swarm"]', "demo-coord-0001");
+  await page.locator("#tab-board").click();
+  await page.waitForSelector("#panel-board");
+
+  const apiProbe = await page.evaluate(async () => {
+    const fullRes = await fetch("/api/swarm/delta?conversationId=demo-coord-0001&since=0");
+    const fullJson = await fullRes.json();
+    const unchRes = await fetch(`/api/swarm/delta?conversationId=demo-coord-0001&since=${fullJson.head}&etag=${encodeURIComponent(fullJson.etag)}&waitMs=0`);
+    const unchJson = await unchRes.json();
+
+    const t0 = performance.now();
+    const parkedPromise = fetch(`/api/swarm/delta?conversationId=demo-coord-0001&since=${fullJson.head}&etag=${encodeURIComponent(fullJson.etag)}&waitMs=5000`).then((r) => r.json());
+    await new Promise((r) => setTimeout(r, 20));
+    await fetch("/api/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true, op: "board_post", conversationId: "demo-coord-0001", text: "Live web delta sync check" }),
+    });
+    const deltaJson = await parkedPromise;
+    const wakeMs = performance.now() - t0;
+    return { fullJson, unchJson, deltaJson, wakeMs };
+  });
+
+  await page.waitForFunction(() => (document.querySelector("#panel-board")?.textContent || "").includes("Live web delta sync check"));
+  return (
+    apiProbe.fullJson.mode === "full" &&
+    Array.isArray(apiProbe.fullJson.messages) &&
+    apiProbe.unchJson.unchanged === true &&
+    apiProbe.deltaJson.mode === "delta" &&
+    Array.isArray(apiProbe.deltaJson.messagesDelta) &&
+    apiProbe.deltaJson.messagesDelta.some((m) => m.text.includes("Live web delta sync check")) &&
+    apiProbe.wakeMs < 200
+  );
+});
+
 await check("zero external calls, console errors, or page errors", () => externalReqs.length === 0 && consoleErrs.length === 0 && pageErrs.length === 0);
 
 await browser.close();

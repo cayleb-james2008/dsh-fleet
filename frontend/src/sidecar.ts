@@ -1,11 +1,14 @@
 import type {
+  BoardMessage,
   ControlRequest,
+  MentionEdge,
   NormalizedPlan,
   PlanMilestone,
   PlanRisk,
   PlanThread,
   PlanWorkstream,
   SwarmControlOp,
+  SwarmDeltaPayload,
   SwarmPlan,
   SwarmSnapshot,
   SwarmSummary,
@@ -72,6 +75,145 @@ export const fetchSwarms = (): Promise<{ swarms: SwarmSummary[]; defaultConversa
 
 export const fetchSwarmSnapshot = (conversationId?: string | null, etag?: string): Promise<SwarmSnapshot> =>
   apiJson(qs("/api/swarm", { conversationId, etag }), "Load swarm failed");
+
+export interface FetchSwarmDeltaOptions {
+  since?: number;
+  etag?: string;
+  waitMs?: number;
+  signal?: AbortSignal;
+}
+
+export async function fetchSwarmDelta(
+  conversationId?: string | null,
+  opts: FetchSwarmDeltaOptions = {},
+): Promise<SwarmDeltaPayload> {
+  const url = qs("/api/swarm/delta", {
+    conversationId,
+    since: typeof opts.since === "number" && opts.since >= 0 ? String(Math.floor(opts.since)) : undefined,
+    etag: opts.etag || undefined,
+    waitMs: typeof opts.waitMs === "number" && opts.waitMs >= 0 ? String(Math.floor(opts.waitMs)) : undefined,
+  });
+  const res = await sidecarFetch(url, opts.signal ? { signal: opts.signal } : undefined);
+  if (!res.ok) throw new Error(`Load swarm delta failed (${res.status})`);
+  return res.json();
+}
+
+function mergeMessages(prevMsgs: BoardMessage[] = [], deltaMsgs: BoardMessage[] = []): BoardMessage[] {
+  if (!deltaMsgs.length) return prevMsgs;
+  const bySeq = new Map<number, BoardMessage>();
+  const unseq: BoardMessage[] = [];
+  for (const m of prevMsgs) {
+    if (!m) continue;
+    if (typeof m.seq === "number" && m.seq > 0) bySeq.set(m.seq, m);
+    else unseq.push(m);
+  }
+  for (const m of deltaMsgs) {
+    if (!m) continue;
+    if (typeof m.seq === "number" && m.seq > 0) bySeq.set(m.seq, m);
+    else unseq.push(m);
+  }
+  const ordered = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+  return unseq.length ? ordered.concat(unseq) : ordered;
+}
+
+function mergeReplyRefs(
+  prevRefs: Record<number, number[]> | undefined,
+  deltaRefs: Record<number, number[]> | undefined,
+): Record<number, number[]> | undefined {
+  if (!deltaRefs) return prevRefs;
+  const keys = Object.keys(deltaRefs);
+  if (!keys.length) return prevRefs;
+  const next: Record<number, number[]> = { ...(prevRefs || {}) };
+  for (const k of keys) {
+    const seqKey = Number(k);
+    const addList = deltaRefs[seqKey];
+    if (!Array.isArray(addList) || !addList.length) continue;
+    const prevList = Array.isArray(next[seqKey]) ? next[seqKey] : [];
+    next[seqKey] = [...new Set([...prevList, ...addList])].sort((a, b) => a - b);
+  }
+  return next;
+}
+
+function mergeEdges(prevEdges: MentionEdge[] = [], deltaEdges: MentionEdge[] | undefined): MentionEdge[] {
+  if (!deltaEdges || !deltaEdges.length) return prevEdges;
+  const byKey = new Map<string, MentionEdge>();
+  for (const e of prevEdges) {
+    if (!e) continue;
+    byKey.set(`${e.from}\0${e.to}`, { ...e });
+  }
+  for (const d of deltaEdges) {
+    if (!d) continue;
+    const key = `${d.from}\0${d.to}`;
+    const existing = byKey.get(key);
+    if (existing) {
+      existing.count += d.count || 0;
+      existing.direct += d.direct || 0;
+      existing.viaAll += d.viaAll || 0;
+    } else {
+      byKey.set(key, { ...d });
+    }
+  }
+  return [...byKey.values()];
+}
+
+export function mergeSwarmDelta(
+  prevSnap: SwarmSnapshot | null,
+  delta: SwarmDeltaPayload | null | undefined,
+): SwarmSnapshot | null {
+  if (!delta) return prevSnap;
+  if (delta.unchanged && prevSnap) return prevSnap;
+
+  if (delta.mode === "full" || !prevSnap) {
+    const {
+      ok: _ok,
+      mode: _mode,
+      since: _since,
+      messagesDelta,
+      replyRefsDelta,
+      edgesDelta,
+      ...rest
+    } = delta;
+    return {
+      conversationId: delta.conversationId !== undefined ? delta.conversationId : (prevSnap?.conversationId ?? delta.swarm ?? null),
+      swarm: delta.swarm !== undefined ? delta.swarm : (prevSnap?.swarm ?? null),
+      member: delta.member !== undefined ? delta.member : (prevSnap?.member ?? null),
+      ...rest,
+      unchanged: false,
+      messages: delta.messages ?? messagesDelta ?? [],
+      replyRefs: delta.replyRefs ?? replyRefsDelta ?? {},
+      edges: delta.edges ?? edgesDelta ?? [],
+    };
+  }
+
+  return {
+    ...prevSnap,
+    unchanged: false,
+    ...(delta.conversationId !== undefined ? { conversationId: delta.conversationId } : {}),
+    ...(delta.swarm !== undefined ? { swarm: delta.swarm } : {}),
+    ...(delta.member !== undefined ? { member: delta.member } : {}),
+    ...(delta.resolvedFrom !== undefined ? { resolvedFrom: delta.resolvedFrom } : {}),
+    ...(delta.id !== undefined ? { id: delta.id } : {}),
+    ...(delta.title !== undefined ? { title: delta.title } : {}),
+    ...(delta.etag !== undefined ? { etag: delta.etag } : {}),
+    ...(delta.head !== undefined ? { head: delta.head } : {}),
+    messages: delta.messages !== undefined ? delta.messages : mergeMessages(prevSnap.messages, delta.messagesDelta),
+    replyRefs: delta.replyRefs !== undefined ? delta.replyRefs : mergeReplyRefs(prevSnap.replyRefs, delta.replyRefsDelta),
+    edges: delta.edges !== undefined ? delta.edges : mergeEdges(prevSnap.edges, delta.edgesDelta),
+    ...(delta.members !== undefined ? { members: delta.members } : {}),
+    ...(delta.channels !== undefined ? { channels: delta.channels } : {}),
+    ...(delta.plan !== undefined ? { plan: delta.plan } : {}),
+    ...(delta.view !== undefined ? { view: delta.view } : {}),
+    ...(delta.frames !== undefined ? { frames: delta.frames } : {}),
+    ...(delta.allowedFiles !== undefined ? { allowedFiles: delta.allowedFiles } : {}),
+    ...(delta.triage !== undefined ? { triage: delta.triage } : {}),
+    ...(delta.burnSummary !== undefined ? { burnSummary: delta.burnSummary } : {}),
+    ...(delta.gateReadiness !== undefined ? { gateReadiness: delta.gateReadiness } : {}),
+    ...(delta.usage !== undefined ? { usage: delta.usage } : {}),
+    ...(delta.unseen !== undefined ? { unseen: delta.unseen } : {}),
+    ...(delta.swarms !== undefined ? { swarms: delta.swarms } : {}),
+    ...(delta.capabilities !== undefined ? { capabilities: delta.capabilities } : {}),
+  };
+}
 
 export const fetchWorktrees = (roots: string[]): Promise<WorktreesPayload> =>
   apiJson(qs("/api/worktrees", { roots: roots.join(",") }), "Worktrees failed");

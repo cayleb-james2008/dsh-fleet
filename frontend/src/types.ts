@@ -358,7 +358,42 @@ export interface SwarmSnapshot {
     canSendMessage: boolean;
     isSidecar: boolean;
     sseStream?: boolean;
+    deltaStream?: boolean;
   };
+}
+
+export interface SwarmDeltaPayload {
+  ok?: boolean;
+  mode?: "delta" | "full";
+  unchanged?: boolean;
+  conversationId?: string | null;
+  swarm?: string | null;
+  member?: string | null;
+  resolvedFrom?: "conversation" | "latest";
+  id?: string;
+  title?: string;
+  etag?: string;
+  since?: number;
+  head?: number;
+  messagesDelta?: BoardMessage[];
+  replyRefsDelta?: Record<number, number[]>;
+  edgesDelta?: MentionEdge[];
+  messages?: BoardMessage[];
+  replyRefs?: Record<number, number[]>;
+  edges?: MentionEdge[];
+  members?: SwarmMember[];
+  channels?: SwarmChannel[];
+  plan?: SwarmPlan | NormalizedPlan | null;
+  view?: SwarmViewState | null;
+  frames?: FrameAsset[];
+  allowedFiles?: Record<string, string>;
+  triage?: TriageItem[];
+  burnSummary?: BurnSummary;
+  gateReadiness?: GateReadiness | null;
+  usage?: TokenUsage;
+  unseen?: number[];
+  swarms?: SwarmSummary[];
+  capabilities?: SwarmSnapshot["capabilities"];
 }
 
 export type WorktreeMergeability =

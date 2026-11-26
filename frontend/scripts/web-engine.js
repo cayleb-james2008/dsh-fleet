@@ -924,7 +924,7 @@
       messages: sw.messages,
       replyRefs: replyRefs,
       channels: sw.channels || [],
-      edges: [],
+      edges: computeEdgesForMessages(sw.members, sw.messages),
       view: sw.view || null,
       plan: normalizePlanForSnapshot(sw.plan, planEtagOf(sw)),
       frames: sw.frames,
@@ -932,8 +932,118 @@
       burnSummary: burnSummary,
       gateReadiness: gateReadiness,
       usage: usage,
-      capabilities: { canSendMessage: true, isSidecar: false, sseStream: false },
+      capabilities: { canSendMessage: true, isSidecar: false, sseStream: false, deltaStream: true },
     };
+  }
+
+  function computeEdgesForMessages(members, msgs) {
+    var byKey = {};
+    var names = (members || []).filter(function (m) { return !m.roleWorker; }).map(function (m) { return m.name; });
+    var nameSet = {};
+    names.forEach(function (n) { nameSet[n] = true; });
+    (msgs || []).forEach(function (m) {
+      if (!m || m.control) return;
+      var from = m.agent;
+      if (!nameSet[from]) return;
+      var seen = {};
+      var mentions = Array.isArray(m.mentions) ? m.mentions : [];
+      if (m.all) {
+        names.forEach(function (to) {
+          if (to === from || seen[to]) return;
+          seen[to] = true;
+          var key = from + "\0" + to;
+          var e = byKey[key] || (byKey[key] = { from: from, to: to, count: 0, direct: 0, viaAll: 0 });
+          e.count += 1;
+          if (mentions.indexOf(to) >= 0) e.direct += 1;
+          else e.viaAll += 1;
+        });
+      } else {
+        mentions.forEach(function (to) {
+          if (to === from || !nameSet[to] || seen[to]) return;
+          seen[to] = true;
+          var key = from + "\0" + to;
+          var e = byKey[key] || (byKey[key] = { from: from, to: to, count: 0, direct: 0, viaAll: 0 });
+          e.count += 1;
+          e.direct += 1;
+        });
+      }
+    });
+    return Object.values(byKey);
+  }
+
+  function computeDelta(conv, since, etag) {
+    var sw = findSwarmByConvId(conv) || state.swarms[conv];
+    if (!sw) {
+      return { status: 404, body: { ok: false, error: "Swarm not found" } };
+    }
+    var full = computeSnapshot(sw.id);
+    if (etag && etag === full.etag && (since === 0 || since <= full.head)) {
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          unchanged: true,
+          conversationId: conv,
+          swarm: full.swarm,
+          member: full.member,
+          etag: full.etag,
+          head: full.head,
+        },
+      };
+    }
+    if (since > 0 && since <= full.head) {
+      var messagesDelta = (full.messages || []).filter(function (m) { return m.seq > since; });
+      var replyRefsDelta = {};
+      Object.keys(full.replyRefs || {}).forEach(function (k) {
+        var added = (full.replyRefs[k] || []).filter(function (s) { return s > since; });
+        if (added.length) replyRefsDelta[k] = added;
+      });
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          mode: "delta",
+          unchanged: false,
+          conversationId: conv,
+          swarm: full.swarm,
+          member: full.member,
+          etag: full.etag,
+          since: since,
+          head: full.head,
+          messagesDelta: messagesDelta,
+          replyRefsDelta: replyRefsDelta,
+          edgesDelta: computeEdgesForMessages(full.members, messagesDelta),
+          members: full.members,
+          channels: full.channels,
+          plan: full.plan,
+          view: full.view,
+          frames: full.frames,
+          triage: full.triage,
+          burnSummary: full.burnSummary,
+          gateReadiness: full.gateReadiness,
+          usage: full.usage,
+          capabilities: full.capabilities,
+        },
+      };
+    }
+    return {
+      status: 200,
+      body: Object.assign({ ok: true, mode: "full", unchanged: false }, full, { conversationId: conv }),
+    };
+  }
+
+  var deltaWaiters = [];
+  function notifyDeltaWaiters(swarmId) {
+    if (!deltaWaiters.length) return;
+    var active = deltaWaiters.slice();
+    deltaWaiters = [];
+    active.forEach(function (w) {
+      if (!swarmId || !w.swarmId || w.swarmId === swarmId) {
+        w.wake();
+      } else {
+        deltaWaiters.push(w);
+      }
+    });
   }
 
   function listSwarms() {
@@ -978,7 +1088,7 @@
     },
     agent: {
       sendMessage: async function (message, convId) {
-        var sw = state.swarms[COORD_ID];
+        var sw = findSwarmByConvId(convId) || state.swarms[COORD_ID];
         var target = sw.members.find(function (m) { return m.conversation_id === convId; });
         sw.head += 1;
         sw.messages.push({
@@ -994,6 +1104,7 @@
           target.replyAsk = "";
           target.status = "working";
         }
+        notifyDeltaWaiters(sw.id);
         return { ok: true };
       },
     },
@@ -1226,6 +1337,7 @@
         return jsonResp({ error: "Unsupported op" }, 400);
       }
 
+      notifyDeltaWaiters(cSw.id);
       return jsonResp({
         ok: true,
         op: ctrl.op,
@@ -1291,6 +1403,7 @@
           all: false,
         });
       }
+      notifyDeltaWaiters(targetSw.id);
       return jsonResp({ ok: true, plan: normalizePlanForSnapshot(targetSw.plan, nextEtag), etag: nextEtag, notified: notified });
     }
     if (url.pathname === "/api/nudge" && init && String(init.method || "").toUpperCase() === "POST") {
@@ -1322,10 +1435,11 @@
         mentions: hitNames,
         all: /@all\b/i.test(msg),
       });
+      notifyDeltaWaiters(sw.id);
       return jsonResp({ ok: true, delivered: targets.length });
     }
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.23.0", mode: "live-web", canSendMessage: true, sseStream: false, idleSleep: false, sseClients: 0 });
+      return jsonResp({ ok: true, name: "fleet", version: "1.23.0", mode: "live-web", canSendMessage: true, sseStream: false, deltaStream: true, idleSleep: false, sseClients: 0 });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });
@@ -1337,6 +1451,57 @@
         return jsonResp({ conversationId: conv, swarm: snap.swarm, member: snap.member, unchanged: true, etag: snap.etag });
       }
       return jsonResp(snap);
+    }
+    if (url.pathname === "/api/swarm/delta") {
+      var signal = init && init.signal;
+      if (signal && signal.aborted) {
+        throw new DOMException("The operation was aborted.", "AbortError");
+      }
+      var dConv = url.searchParams.get("conversationId") || COORD_ID;
+      var rawSince = url.searchParams.get("since");
+      var sinceNum = 0;
+      if (rawSince !== null && rawSince !== "") {
+        sinceNum = Number(rawSince);
+        if (!Number.isInteger(sinceNum) || sinceNum < 0) {
+          return jsonResp({ ok: false, error: "Invalid since parameter" }, 400);
+        }
+      }
+      var dEtag = url.searchParams.get("etag") || "";
+      var rawWait = Number(url.searchParams.get("waitMs") || 0);
+      var waitMs = Number.isFinite(rawWait) ? Math.max(0, Math.min(25000, Math.floor(rawWait))) : 0;
+      var firstRes = computeDelta(dConv, sinceNum, dEtag);
+      if (firstRes.status !== 200 || !firstRes.body.unchanged || waitMs <= 0) {
+        return jsonResp(firstRes.body, firstRes.status);
+      }
+      await new Promise(function (resolve, reject) {
+        var settled = false;
+        var timer = null;
+        var waiter = {
+          swarmId: firstRes.body.swarm,
+          wake: function () {
+            if (settled) return;
+            settled = true;
+            if (timer) clearTimeout(timer);
+            if (signal) signal.removeEventListener("abort", onAbort);
+            resolve();
+          },
+        };
+        function onAbort() {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          deltaWaiters = deltaWaiters.filter(function (w) { return w !== waiter; });
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        }
+        if (signal) signal.addEventListener("abort", onAbort, { once: true });
+        deltaWaiters.push(waiter);
+        timer = setTimeout(function () {
+          deltaWaiters = deltaWaiters.filter(function (w) { return w !== waiter; });
+          waiter.wake();
+        }, waitMs);
+      });
+      var nextRes = computeDelta(dConv, sinceNum, dEtag);
+      return jsonResp(nextRes.body, nextRes.status);
     }
     if (url.pathname === "/api/worktrees") {
       return jsonResp({
