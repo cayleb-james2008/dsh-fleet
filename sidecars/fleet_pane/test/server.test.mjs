@@ -1095,3 +1095,40 @@ test('POST /api/control executes all 6 ops, enforces 400/403/404/409/413/501 gua
     rmSync(fx.dir, { recursive: true, force: true });
   }
 });
+
+test('GET /api/swarm serves swarms with channel control records without ReferenceError', async () => {
+  const fx = setupFixtureAppData();
+  const boardPath = join(fx.appData, 'brain', fx.coord, '.system_generated', 'swarm', 'board.jsonl');
+  writeFileSync(
+    boardPath,
+    [
+      { seq: 1, agent: 'coordinator', text: '@all Launch', time: '12:00:00', control: { op: 'create', channel: 'backend', topic: 'Backend' } },
+      { seq: 2, agent: 'coordinator', channel: 'backend', text: '@worker Build API', time: '12:01:00' },
+      { seq: 3, agent: 'worker', channel: 'backend', text: '@coordinator Re #2: Ready', time: '12:02:00' },
+    ]
+      .map((line) => JSON.stringify(line))
+      .join('\n') + '\n',
+  );
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+  });
+  try {
+    const res = await fetch(`${srv.url}/api/swarm?conversationId=${fx.coord}`);
+    assert.equal(res.status, 200);
+    const snap = await res.json();
+    assert.equal(snap.channels?.length, 1);
+    assert.equal(snap.channels[0].name, 'backend');
+    assert.deepEqual(snap.replyRefs, { 2: [3] });
+
+    const workerRes = await fetch(`${srv.url}/api/swarm?conversationId=${fx.worker}`);
+    assert.equal(workerRes.status, 200);
+    const workerSnap = await workerRes.json();
+    assert.ok(Array.isArray(workerSnap.unseen));
+  } finally {
+    await srv.close();
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});

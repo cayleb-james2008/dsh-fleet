@@ -35,6 +35,7 @@ import {
   createMentionsMatcher,
   currentChannels,
   effectiveChannels,
+  memberView,
   visibleUnread,
 } from './channels.mjs';
 

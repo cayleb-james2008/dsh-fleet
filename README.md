@@ -110,7 +110,7 @@ Measured under `#154` CPU isolation (`taskset -c 24-31`, 16 concurrent polling c
 | Cold boot & RSS (`16w` audit) | `64.59 ms` / `100.02 MB` | `91.09 ms` / `100.22 MB` (`ETag 304`) | **`50.03 ms` / `113.51 MB` (`ETag 304`)** |
 | Cold audit HTTP (`16w` close) | `1,588.3 req/s` / `12.14 ms` p95 | `828.5 req/s` / `22.29 ms` p95 (`0/2,080` errors) | **`2,350.6 req/s` / `11.24 ms` p95 (`0/5,897` errors)** |
 | Simultaneous SSE (`x5` streams) | `5/5` (`0` drops) | `5/5` (`0` drops) | **`5/5` (`0` drops)** |
-| Raw-TCP fuzz & backend tests | `30/30` fuzz + `16/16` unit | `30/30` fuzz + `18/18` unit (incl. worktree ops) | **`30/30` fuzz + `21/21` unit (incl. control plane)** |
+| Raw-TCP fuzz & backend tests | `30/30` fuzz + `16/16` unit | `30/30` fuzz + `18/18` unit (incl. worktree ops) | **`30/30` fuzz + `22/22` unit (incl. control plane)** |
 | E2E gate, replay, and Sloplint | `52/52` + `8/8` + `16/16` live-web | `52/52` + `8/8` + `18/18` live-web + `0 FAIL / 0 WARN` | **`57/57` + `8/8` + `21/21` live-web + `0 FAIL / 0 WARN`** |
 
 ---
