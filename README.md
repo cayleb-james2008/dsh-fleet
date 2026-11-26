@@ -90,6 +90,15 @@ Fleet lays out cleanly from a `340px` to `380px` auxiliary sidebar up to `1440px
   </picture>
 </p>
 
+<p align="center">
+  <strong>Cycle 3 E1 to E3 delta, transcript, and cost boundary hardening</strong><br />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/hardening-c3-dark.png" />
+    <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/hardening-c3-light.png" />
+    <img alt="Fleet v1.27.0 Roster showing live delta sync, token burn strip, 1M and 200k ceilings, and zero-token guard" src="docs/screenshots/hardening-c3-light.png" width="380" />
+  </picture>
+</p>
+
 ---
 
 ## What it does
@@ -109,7 +118,7 @@ Live updates stream over `GET /api/swarm/stream` (`text/event-stream`) with ping
 ```mermaid
 flowchart LR
     Host["Antigravity Host<br/>(Aux Side Pane + /preload.js)"] <-->|"SidecarApp RPC + theme-change<br/>toggleConversation / toggleAuxPane"| Backend["Fleet Sidecar Bootstrap<br/>(sidecars/fleet_pane/main.mjs)"]
-    UI["Embedded Sidebar SPA<br/>(380.8 KiB raw / 114.1 KiB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>+ /api/swarm/delta + 304 JSON"| Backend
+    UI["Embedded Sidebar SPA<br/>(385.3 KiB raw / 115.3 KiB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>+ /api/swarm/delta + 304 JSON"| Backend
     Backend -->|"Lazy Route + Store Load"| Core["server_core.mjs + swarm_store.mjs"]
     Core -->|"Collision, Merge-Tree & Worktree Actions"| Git["git_probe.mjs"]
     Core -.->|"Read-Only 8 KB Tail + Scan"| Brain["~/.gemini/antigravity/brain/&lt;conv&gt;<br/>.system_generated/{swarm,logs}"]
@@ -122,14 +131,14 @@ flowchart LR
 
 Measured under `#154` CPU isolation (`taskset -c 24-31`, 16 concurrent polling clients) on a 2,000-board-post and 50,000-transcript-line stress fixture:
 
-| Metric | v1.24.0 | v1.25.0 | **v1.26.0** |
+| Metric | v1.25.0 | v1.26.0 | **v1.27.0** |
 | --- | --- | --- | --- |
-| Embedded sidecar UI (`/`) | `373,794 B` raw (`365.0 KiB`) / `113,137 B` gz (`110.5 KiB`) | `385,808 B` raw (`376.8 KiB`) / `115,758 B` gz (`113.0 KiB`) | **`389,954 B` raw (`380.8 KiB`) / `116,886 B` gz (`114.1 KiB`)** |
-| Cold boot & RSS (`16w` audit) | `55.13 ms` / `110.22 MB` (`ETag 304`) | `51.54 ms` / `105.93 MB` (`ETag 304`) | **`39.7 ms` / `108.97 MB` (`ETag 304`)** |
-| Cold audit HTTP (`16w` close) | `1,387.7 req/s` / `15.49 ms` p95 (`0/3,480` errors) | `1,373.1 req/s` / `16.91 ms` p95 (`0/3,439` errors) | **`1,739.0 req/s` / `12.93 ms` p95 (`0/4,364` errors)** |
+| Embedded sidecar UI (`/`) | `385,808 B` raw (`376.8 KiB`) / `115,758 B` gz (`113.0 KiB`) | `389,954 B` raw (`380.8 KiB`) / `116,886 B` gz (`114.1 KiB`) | **`394,513 B` raw (`385.3 KiB`) / `118,034 B` gz (`115.3 KiB`)** |
+| Cold boot & RSS (`16w` audit) | `51.54 ms` / `105.93 MB` (`ETag 304`) | `39.7 ms` / `108.97 MB` (`ETag 304`) | **`51.48 ms` / `105.63 MB` (`ETag 304`)** |
+| Cold audit HTTP (`16w` close) | `1,373.1 req/s` / `16.91 ms` p95 (`0/3,439` errors) | `1,739.0 req/s` / `12.93 ms` p95 (`0/4,364` errors) | **`1,240.8 req/s` / `22.24 ms` p95 (`0/3,113` errors)** |
 | Simultaneous SSE (`x5` streams) | `5/5` (`0` drops) | `5/5` (`0` drops) | **`5/5` (`0` drops)** |
-| Raw-TCP fuzz & backend tests | `30/30` fuzz + `31/31` unit | `30/30` fuzz + `33/33` unit | **`30/30` fuzz + `36/36` unit** |
-| E2E gate, replay, and Sloplint | `63/63` + `8/8` + `23/23` live-web + `0 FAIL / 0 WARN` | `64/64` + `8/8` + `24/24` live-web + `0 FAIL / 0 WARN` | **`64/64` + `8/8` + `25/25` live-web + `0 FAIL / 0 WARN`** |
+| Raw-TCP fuzz & backend tests | `30/30` fuzz + `33/33` unit | `30/30` fuzz + `36/36` unit | **`30/30` fuzz + `40/40` unit** |
+| E2E gate, replay, and Sloplint | `64/64` + `8/8` + `24/24` live-web + `0 FAIL / 0 WARN` | `64/64` + `8/8` + `25/25` live-web + `0 FAIL / 0 WARN` | **`67/67` + `8/8` + `26/26` live-web + `0 FAIL / 0 WARN`** |
 
 ---
 

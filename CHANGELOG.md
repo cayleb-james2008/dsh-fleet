@@ -3,6 +3,12 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as an
 Antigravity plugin archive (`tar.gz` and `zip`) with `SHA256SUMS`.
 
+## 1.27.0 - 2026-11-26
+
+- Hardened backend delta, transcript, and cost boundary paths in `sidecars/fleet_pane/{server_core,swarm_store}.mjs`: cleaned up aborted `GET /api/swarm/delta` waiters without hitting the waiter cap, rejected prototype-polluting query keys in `parseQueryFast`, handled corrupt partial tails, same-size rewrites, and truncate-then-grow resets in `buildSwarmDelta`, added intermediate symlink CWE-59 checks, tuned Bearer/token scrubbing, and UTF-8-safe byte slicing in `readTranscriptSteps`, and clamped negative, `NaN`, and `Infinity` token/cost values while resetting `byModel` on transcript shrink or rotation.
+- Hardened Cycle 3 frontend sync, trace inspection, and cost bounds in `frontend/src/{App.tsx,sidecar.ts,ui.tsx}`, `frontend/src/components/{RosterView,TriageView}.tsx`, and `frontend/scripts/web-engine.js`: deduplicated out-of-order and replayed `seq` frames and capped 5xx backoff with abort cleanup on swarm switch, added epoch and `AbortController` guards for overlapping `ForensicTranscriptDrawer` loads plus Escape close and empty-trace states, and guarded 0-token, `NaN`/`Infinity`, negative savings, and unknown `contextLimit` states across `TokenBurnStrip`, `RosterView`, digests, and archives.
+- Captured light and dark `docs/screenshots/hardening-c3-{light,dark}.png`, bumped all manifests and runtime endpoints to `1.27.0`, and verified post-final-edit: `40/40` backend unit tests, `67/67` gate, `8/8` replay, `26/26` `test-live-web.mjs`, `SLOP 0/0/0` (`frontend/src` and built `dist`), `394,513 B` raw (`385.3 KiB`) / `118,034 B` gz (`115.3 KiB`), `51.48 ms` boot, `105.63 MB` RSS, `1,240.8 req/s` (`22.24 ms` p95, `0/3,113` errors), `5/5` SSE, and `30/30` fuzz.
+
 ## 1.26.0 - 2026-11-26
 
 - Added `getModelSpec` (covering Gemini 1M, Claude 200k and `[1m]`, OpenAI 128k/200k/400k, and safe unknown fallbacks) and incremental per-model `byModel` spend tracking across `switch_model` in `sidecars/fleet_pane/swarm_store.mjs`. Each `SwarmMember`, `SwarmSnapshot`, `SwarmSummary`, and `buildSwarmDelta` payload now carries `contextLimit`, `contextPct`, `cost` (`totalUsd`, `inputUsd`, `cacheReadUsd`, `outputUsd`, `cacheSavingsUsd`, `cacheHitPct`, `pricingKnown`), and `byModel`, while `computeBurnSummary` ranks workers by USD spend when pricing is known and weights cache-read savings.
