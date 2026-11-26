@@ -13,7 +13,20 @@ import type {
 } from "react";
 import { ArrowUpRight, ClipboardCopy, FileCode2, Image as ImageIcon, Pin, PinOff, Send, X } from "./icons";
 import { openFileInAuxPane, parseScreenshotLines, sendConfirmedNudge } from "./sidecar";
-import type { BoardMessage, SwarmMember, SwarmSnapshot, TriageItem, WorktreesPayload } from "./types";
+import type {
+  BoardMessage,
+  NormalizedPlan,
+  PlanGoalObject,
+  PlanMilestoneStatus,
+  PlanRisk,
+  PlanThread,
+  PlanWorkstreamStatus,
+  SwarmMember,
+  SwarmPlan,
+  SwarmSnapshot,
+  TriageItem,
+  WorktreesPayload,
+} from "./types";
 
 export const canLiveNudge = (snap: SwarmSnapshot): boolean =>
   Boolean(snap.capabilities?.canSendMessage || window.sidecar?.agent?.sendMessage);
@@ -185,8 +198,149 @@ export function humanizeStatus(raw: string | undefined): string {
   return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
 }
 
-export const maskHome = (s: string): string => s.replace(/\/(?:home|Users)\/[^/\s]+(\/|$)/g, (_, sep) => `~${sep}`);
-const cleanDigestLine = (s: string, max = 140) => maskHome(s).replace(/\s+/g, " ").trim().slice(0, max);
+export const maskHome = (s: unknown): string =>
+  String(s ?? "").replace(/\/(?:home|Users)\/[^/\s]+(\/|$)/g, (_, sep) => `~${sep}`);
+const cleanDigestLine = (s: unknown, max = 140) => maskHome(s).replace(/\s+/g, " ").trim().slice(0, max);
+
+export function safePlanText(val: unknown): string {
+  if (typeof val === "string") return val;
+  if (typeof val === "number" || typeof val === "boolean") return String(val);
+  if (val && typeof val === "object" && !Array.isArray(val)) {
+    const o = val as Record<string, unknown>;
+    return (
+      safePlanText(o.line) ||
+      safePlanText(o.title) ||
+      safePlanText(o.summary) ||
+      safePlanText(o.text) ||
+      safePlanText(o.detail) ||
+      ""
+    );
+  }
+  return "";
+}
+
+const WS_STATUSES = new Set<PlanWorkstreamStatus>(["pending", "running", "done", "verified", "blocked"]);
+const MS_STATUSES = new Set<PlanMilestoneStatus>(["pending", "in_progress", "done", "blocked"]);
+
+function normalizeWsStatus(raw: unknown): PlanWorkstreamStatus {
+  const s = safePlanText(raw).trim().toLowerCase();
+  if (s === "in_progress") return "running";
+  if (s === "completed") return "done";
+  if (s === "failed") return "blocked";
+  return WS_STATUSES.has(s as PlanWorkstreamStatus) ? (s as PlanWorkstreamStatus) : "pending";
+}
+
+function normalizeMsStatus(raw: unknown): PlanMilestoneStatus {
+  const s = safePlanText(raw).trim().toLowerCase();
+  if (s === "running") return "in_progress";
+  if (s === "completed" || s === "verified") return "done";
+  if (s === "failed") return "blocked";
+  return MS_STATUSES.has(s as PlanMilestoneStatus) ? (s as PlanMilestoneStatus) : "pending";
+}
+
+export function normalizePlan(raw: SwarmPlan | NormalizedPlan | null | undefined): NormalizedPlan | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  let goalTitle = typeof raw.goalTitle === "string" ? raw.goalTitle : undefined;
+  let goalLine = typeof raw.goalLine === "string" ? raw.goalLine : undefined;
+  let goal = "";
+  if (typeof raw.goal === "string") {
+    goal = raw.goal;
+  } else if (raw.goal && typeof raw.goal === "object" && !Array.isArray(raw.goal)) {
+    const g = raw.goal as PlanGoalObject;
+    goalTitle = safePlanText(g.title) || goalTitle;
+    goalLine = safePlanText(g.line) || goalLine;
+    goal = goalLine || goalTitle || "";
+  } else {
+    goal = goalLine || goalTitle || "";
+  }
+
+  const threads: PlanThread[] = Array.isArray(raw.threads)
+    ? raw.threads
+        .filter((t): t is NonNullable<typeof t> => Boolean(t && typeof t === "object"))
+        .map((t, idx) => ({
+          id: safePlanText(t.id) || `thread-${idx + 1}`,
+          title: safePlanText(t.title),
+          goal: safePlanText(t.goal),
+          tasks: Array.isArray(t.tasks) ? t.tasks.map((x) => safePlanText(x)).filter(Boolean) : [],
+        }))
+    : [];
+
+  const tasks: Record<string, string> = {};
+  if (raw.tasks && typeof raw.tasks === "object" && !Array.isArray(raw.tasks)) {
+    for (const [k, v] of Object.entries(raw.tasks)) {
+      const key = String(k || "").trim();
+      const desc = safePlanText(v).trim();
+      if (key && desc) tasks[key] = desc;
+    }
+  }
+
+  const workstreams: NormalizedPlan["workstreams"] = Array.isArray(raw.workstreams)
+    ? raw.workstreams
+        .filter((w): w is NonNullable<typeof w> => Boolean(w && typeof w === "object"))
+        .map((w, idx) => ({
+          id: safePlanText(w.id) || `ws-${idx + 1}`,
+          title: safePlanText(w.title),
+          owner: safePlanText(w.owner),
+          status: normalizeWsStatus(w.status),
+          ...(typeof w.note === "string" && w.note ? { note: w.note } : {}),
+          ...(typeof w.threadId === "string" && w.threadId ? { threadId: w.threadId } : {}),
+        }))
+    : [];
+
+  const milestones: NormalizedPlan["milestones"] = Array.isArray(raw.milestones)
+    ? raw.milestones
+        .filter((m): m is NonNullable<typeof m> => Boolean(m && typeof m === "object"))
+        .map((m) => ({
+          title: safePlanText(m.title),
+          status: normalizeMsStatus(m.status),
+        }))
+    : [];
+
+  const risks: PlanRisk[] = Array.isArray(raw.risks)
+    ? raw.risks
+        .map((r) => {
+          if (typeof r === "string") return { title: r };
+          if (r && typeof r === "object") {
+            const sev = safePlanText((r as PlanRisk).severity);
+            return {
+              title: safePlanText((r as PlanRisk).title),
+              ...(sev ? { severity: sev } : {}),
+            };
+          }
+          return null;
+        })
+        .filter((r): r is PlanRisk => Boolean(r && r.title))
+    : [];
+
+  const gate = safePlanText(raw.gate);
+  const title = safePlanText(raw.title) || goalTitle || "";
+  const hasNative = threads.length > 0 || Object.keys(tasks).length > 0 || Boolean(goalTitle || goalLine);
+  const hasFleet = workstreams.length > 0 || milestones.length > 0 || Boolean(gate);
+  const schema =
+    raw.schema === "native" || raw.schema === "fleet" || raw.schema === "hybrid"
+      ? raw.schema
+      : hasNative && hasFleet
+        ? "hybrid"
+        : hasNative
+          ? "native"
+          : "fleet";
+
+  return {
+    schema,
+    etag: typeof raw.etag === "string" ? raw.etag : "",
+    title,
+    goal,
+    ...(goalTitle ? { goalTitle } : {}),
+    ...(goalLine ? { goalLine } : {}),
+    gate,
+    ...(typeof raw.repo === "string" && raw.repo ? { repo: raw.repo } : {}),
+    threads,
+    tasks,
+    workstreams,
+    milestones,
+    risks,
+  };
+}
 
 export function formatBlockerContext(item: TriageItem, member?: SwarmMember, snap?: SwarmSnapshot): string {
   const ts = memberLastTs(member, item.timestamp || 0);
@@ -211,11 +365,12 @@ export function formatSwarmDigest(
   const cnt = (st: string) => live.filter((m) => m.status === st).length;
   const gate = snap.gateReadiness;
   const vel = gate?.velocity;
+  const plan = normalizePlan(snap.plan);
   const lines = [
     `# ${maskHome(snap.title || "Fleet")} Handoff Digest`,
     `- Status: ${cnt("working")} working, ${cnt("waiting")} waiting, ${members.length} members, #${snap.head || 0}, ${fmtTokens(snap.usage?.totalTokens)} tok`,
-    snap.plan?.goal && `- Active goal: ${cleanDigestLine(snap.plan.goal, 220)}`,
-    snap.plan?.gate && `- Verification gate: \`${maskHome(snap.plan.gate)}\``,
+    plan?.goal && `- Active goal: ${cleanDigestLine(plan.goal, 220)}`,
+    plan?.gate && `- Verification gate: \`${maskHome(plan.gate)}\``,
     gate &&
       `- Gate readiness: ${gate.state}${vel ? `, ${vel.passRatePct}% pass rate (${vel.wavesPerHr}/hr, ${vel.done} done, ${vel.verified} verified)` : ""}`,
   ].filter(Boolean) as string[];
@@ -236,8 +391,18 @@ export function formatSwarmDigest(
     }),
   );
   sec(
+    "Threads",
+    (plan?.threads || []).map(
+      (th) => `- ${cleanDigestLine(th.title || th.id, 120)}${th.goal ? `: ${cleanDigestLine(th.goal, 140)}` : ""}${th.tasks.length ? ` (${th.tasks.map((t) => `@${t}`).join(", ")})` : ""}`,
+    ),
+  );
+  sec(
+    "Tasks",
+    Object.entries(plan?.tasks || {}).map(([owner, desc]) => `- @${owner}: ${cleanDigestLine(desc, 160)}`),
+  );
+  sec(
     "Workstreams",
-    (snap.plan?.workstreams || []).map(
+    (plan?.workstreams || []).map(
       (ws) => `- [${humanizeStatus(ws.status)}] ${cleanDigestLine(ws.title, 140)}${ws.owner ? ` (@${ws.owner})` : ""}`,
     ),
   );
@@ -272,6 +437,7 @@ export function formatSwarmArchive(
   format: "md" | "json" = "md",
 ): string {
   const msgs = (snap.messages || []).filter((m) => !m.control);
+  const plan = normalizePlan(snap.plan);
   if (format === "json") {
     return maskHome(
       JSON.stringify(
@@ -282,11 +448,36 @@ export function formatSwarmArchive(
           head: snap.head || 0,
           pinnedSeqs,
           usage: snap.usage || null,
-          plan: snap.plan
+          plan: plan
             ? {
-                ...snap.plan,
-                goal: snap.plan.goal ? maskHome(snap.plan.goal) : "",
-                gate: snap.plan.gate ? maskHome(snap.plan.gate) : "",
+                ...plan,
+                title: maskHome(plan.title),
+                goal: maskHome(plan.goal),
+                ...(plan.goalTitle ? { goalTitle: maskHome(plan.goalTitle) } : {}),
+                ...(plan.goalLine ? { goalLine: maskHome(plan.goalLine) } : {}),
+                gate: maskHome(plan.gate),
+                ...(plan.repo ? { repo: maskHome(plan.repo) } : {}),
+                threads: plan.threads.map((th) => ({
+                  ...th,
+                  title: maskHome(th.title),
+                  goal: maskHome(th.goal),
+                })),
+                tasks: Object.fromEntries(
+                  Object.entries(plan.tasks).map(([k, v]) => [k, maskHome(v)]),
+                ),
+                workstreams: plan.workstreams.map((ws) => ({
+                  ...ws,
+                  title: maskHome(ws.title),
+                  ...(ws.note ? { note: maskHome(ws.note) } : {}),
+                })),
+                milestones: plan.milestones.map((ms) => ({
+                  ...ms,
+                  title: maskHome(ms.title),
+                })),
+                risks: plan.risks.map((r) => ({
+                  ...r,
+                  title: maskHome(r.title),
+                })),
               }
             : null,
           gateReadiness: snap.gateReadiness || null,

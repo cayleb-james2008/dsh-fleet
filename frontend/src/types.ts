@@ -85,26 +85,98 @@ export interface MentionEdge {
   viaAll: number;
 }
 
+export type PlanWorkstreamStatus = "pending" | "running" | "done" | "verified" | "blocked";
+export type PlanMilestoneStatus = "pending" | "in_progress" | "done" | "blocked";
+
 export interface PlanWorkstream {
   id?: string;
   title: string;
   owner?: string;
-  status?: string;
+  status?: PlanWorkstreamStatus | string;
+  note?: string;
+  threadId?: string;
 }
 
 export interface PlanMilestone {
   title: string;
-  status?: string;
+  status?: PlanMilestoneStatus | string;
+}
+
+export interface PlanThread {
+  id: string;
+  title: string;
+  goal: string;
+  tasks: string[];
+}
+
+export interface PlanRisk {
+  title: string;
+  severity?: "low" | "med" | "high" | string;
+}
+
+export interface PlanGoalObject {
+  title?: string;
+  line?: string;
+}
+
+export interface NormalizedPlan {
+  schema: "native" | "fleet" | "hybrid";
+  etag: string;
+  title: string;
+  goal: string;
+  goalTitle?: string;
+  goalLine?: string;
+  gate: string;
+  repo?: string;
+  threads: PlanThread[];
+  tasks: Record<string, string>;
+  workstreams: Array<{
+    id: string;
+    title: string;
+    owner: string;
+    status: PlanWorkstreamStatus;
+    note?: string;
+    threadId?: string;
+  }>;
+  milestones: Array<{
+    title: string;
+    status: PlanMilestoneStatus;
+  }>;
+  risks: PlanRisk[];
 }
 
 export interface SwarmPlan {
+  schema?: "native" | "fleet" | "hybrid";
+  etag?: string;
   title?: string;
-  goal?: string;
+  goal?: string | PlanGoalObject;
+  goalTitle?: string;
+  goalLine?: string;
   gate?: string;
   repo?: string;
+  threads?: Array<Partial<PlanThread> & { goal?: string | PlanGoalObject }>;
+  tasks?: Record<string, unknown>;
   workstreams?: PlanWorkstream[];
   milestones?: PlanMilestone[];
-  risks?: Array<string | { title: string; severity?: string }>;
+  risks?: Array<string | PlanRisk>;
+}
+
+export interface NarratorViewJson {
+  headline?: string;
+  phase?: string;
+  running_summary?: string;
+  now?: Record<string, unknown>;
+  attention?: Array<string | { title?: string; detail?: string; member?: string; severity?: string; text?: string }>;
+  feedback_ack?: unknown;
+}
+
+export interface SwarmViewState {
+  exists: boolean;
+  dir?: string;
+  source?: "swarm" | "narrator";
+  json?: NarratorViewJson | null;
+  jsonMtime?: number;
+  jsonError?: string;
 }
 
 export interface TriageItem {
@@ -199,7 +271,8 @@ export interface SwarmSnapshot {
   messages?: BoardMessage[];
   channels?: Array<{ name: string; topic: string; created_by: string; archived: boolean }>;
   edges?: MentionEdge[];
-  plan?: SwarmPlan | null;
+  view?: SwarmViewState | null;
+  plan?: SwarmPlan | NormalizedPlan | null;
   frames?: FrameAsset[];
   allowedFiles?: Record<string, string>;
   triage?: TriageItem[];

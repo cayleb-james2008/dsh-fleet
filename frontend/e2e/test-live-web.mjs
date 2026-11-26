@@ -188,6 +188,95 @@ await check("Full Swarm Archive Export (.md and .json) works offline without /ho
   );
 });
 
+await check("Native plan.json {goal:{title,line},tasks,threads} and narrator view.json render without crash or /home/ leaks", async () => {
+  await page.selectOption('select[aria-label="Active swarm"]', "demo-native-0011");
+  await page.locator("#tab-triage").click();
+  await page.waitForSelector('[data-testid="narrator-view-card"]');
+  const txt = await page.locator("#panel-triage").textContent();
+  await page.evaluate(() => {
+    window.__nativeClip = "";
+    try {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: async (t) => { window.__nativeClip = String(t); } },
+      });
+    } catch {}
+  });
+  await page.locator('[data-testid="copy-handoff-digest"]').click();
+  await page.waitForFunction(() => Boolean(window.__nativeClip));
+  const clip = await page.evaluate(() => window.__nativeClip);
+  return (
+    txt.includes("Native Plan Schema Support") &&
+    txt.includes("Render native goal.{title,line}, tasks, threads, and narrator view.json cleanly.") &&
+    txt.includes("Plan Normalization Thread") &&
+    txt.includes("@api-worker") &&
+    txt.includes("~/fleet") &&
+    txt.includes("Narrator tracking native plan normalization") &&
+    txt.includes("Executing") &&
+    txt.includes("~/swarm_store.mjs") &&
+    txt.includes("Confirm native schema compatibility before merge") &&
+    !txt.includes("/home/") &&
+    clip.includes("- Active goal: Render native goal.{title,line}") &&
+    !clip.includes("/home/")
+  );
+});
+
+await check("Live Plan Editor handles 409 conflict reload and persists goal, workstream, and coordinator notify at 380px", async () => {
+  await page.locator('[data-testid="edit-plan-btn"]').click();
+  await page.waitForSelector('[data-testid="plan-editor"]');
+
+  // Simulate concurrent plan mutation on server so editor holds stale ifMatch etag
+  await page.evaluate(async () => {
+    await fetch("/api/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        confirm: true,
+        conversationId: "demo-native-0011",
+        ifMatch: "plan-v1",
+        mode: "patch",
+        patch: {
+          goalTitle: "Native Plan Schema Support",
+          goalLine: "Concurrent disk goal update",
+          goal: "Concurrent disk goal update",
+        },
+      }),
+    });
+  });
+
+  await page.locator('[data-testid="plan-save-btn"]').click();
+  await page.waitForSelector('[data-testid="plan-conflict-banner"]');
+  await page.locator('[data-testid="plan-conflict-reload"]').click();
+  const reloadedVal = await page.locator('[data-testid="plan-goal-input"]').inputValue();
+  if (reloadedVal !== "Concurrent disk goal update") return false;
+
+  await page.fill('[data-testid="plan-goal-input"]', "Persisted live plan edit");
+  await page.locator('[data-testid="plan-add-workstream"]').click();
+  await page.fill('[data-testid="plan-ws-title-0"]', "Verify live plan CAS write");
+  await page.fill('[data-testid="plan-ws-owner-0"]', "ui-worker");
+  await page.selectOption('[data-testid="plan-ws-status-0"]', "done");
+  await page.check('[data-testid="plan-notify-coord"]');
+  await page.locator('[data-testid="plan-save-btn"]').click();
+  await page.waitForSelector('[data-testid="swarm-plan-card"]');
+  await page.waitForFunction(
+    () => (document.querySelector('[data-testid="swarm-plan-card"]')?.textContent || "").includes("Persisted live plan edit"),
+  );
+  const triageTxt = await page.locator("#panel-triage").textContent();
+  const overflow380 = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+  await page.locator("#tab-board").click();
+  const boardTxt = await page.locator("#panel-board").textContent();
+  await page.locator("#tab-triage").click();
+
+  return (
+    triageTxt.includes("Persisted live plan edit") &&
+    triageTxt.includes("Verify live plan CAS write") &&
+    triageTxt.includes("Done") &&
+    boardTxt.includes("Plan updated: Persisted live plan edit") &&
+    overflow380 <= 0
+  );
+});
+
 await check("Settings Dark mode + 1440px desktop overflow check", async () => {
   await page.locator('button[aria-label="Open settings"]').click();
   await page.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();
