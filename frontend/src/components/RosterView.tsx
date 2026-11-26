@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "../hooks";
 import { AlertTriangle, ChevronDown, ChevronUp, ClipboardCopy, Cpu, Eye, EyeOff, FileCode2, MessageSquare, Plus, Radio, Send, Trash2, X } from "../icons";
 import { SwarmControlError, openWorkerConversation, sendSwarmControl } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot, SwarmWorkspaceMode } from "../types";
-import { ActivityPeek, Badge, Button, Card, ForensicTranscriptDrawer, InlineComposer, Input, MemberActivityLine, Pill, StatusDot, Textarea, TokenBurnStrip, type TraceTarget, buildRecoverPrompt, canLiveNudge, cn, copyText, fmtContextCap, fmtTokens, fmtUsd, hasControlChars, memberMeta, submitNudge, toast, useNowMs } from "../ui";
+import { ActivityPeek, Badge, Button, Card, ForensicTranscriptDrawer, InlineComposer, Input, MemberActivityLine, Pill, StatusDot, Textarea, TokenBurnStrip, type TraceTarget, buildRecoverPrompt, canLiveNudge, cn, copyText, fmtContextCap, fmtTokens, fmtUsd, hasControlChars, memberMeta, safeFiniteNonNeg, safePct, submitNudge, toast, useNowMs } from "../ui";
 
 const ORDER: Record<SwarmMember["status"], number> = { working: 0, waiting: 1, killed: 2 };
 const STALL_MS = 10 * 60 * 1000;
@@ -17,19 +17,26 @@ function pickAltModel(current: string): string {
 }
 
 function contextPressure(m: SwarmMember): { pct: number; limit: number; capLabel: string; tone: "neutral" | "info" | "warning" | "danger"; label: string } {
-  const limit = m.contextLimit && m.contextLimit > 0 ? m.contextLimit : 200_000;
-  const capLabel = fmtContextCap(limit);
-  const ctx = m.lastContextTokens || m.usage.inputTokens + m.usage.cacheReadTokens;
-  const computedPct = Math.min(100, Math.round((ctx / limit) * 100));
-  const pct = typeof m.contextPct === "number" && Number.isFinite(m.contextPct)
-    ? Math.min(100, Math.max(0, Math.round(m.contextPct)))
-    : computedPct;
+  const rawLimit = Number(m.contextLimit);
+  const hasLimit = Number.isFinite(rawLimit) && rawLimit > 0;
+  const limit = hasLimit ? rawLimit : 0;
+  const capLabel = hasLimit ? fmtContextCap(limit) : "unknown";
+  const ctx = safeFiniteNonNeg(m.lastContextTokens) || safeFiniteNonNeg(m.usage?.inputTokens) + safeFiniteNonNeg(m.usage?.cacheReadTokens);
+  const hasExplicitPct = typeof m.contextPct === "number" && Number.isFinite(m.contextPct);
+  const pct = hasExplicitPct
+    ? safePct(m.contextPct)
+    : hasLimit
+      ? safePct((ctx / limit) * 100)
+      : 0;
   if (m.failure?.kind === "quota") return { pct, limit, capLabel, tone: "danger", label: "Quota" };
   if (m.failure) return { pct, limit, capLabel, tone: "danger", label: "Error" };
   if (m.status === "working" && m.transcriptMtime && Date.now() - m.transcriptMtime > STALL_MS) {
     return { pct, limit, capLabel, tone: "warning", label: "Stalled" };
   }
   if (ctx > 0 || pct > 0) {
+    if (!hasLimit && !hasExplicitPct) {
+      return { pct: 0, limit: 0, capLabel: "unknown", tone: "neutral", label: `${fmtTokens(ctx)} ctx` };
+    }
     const tone = pct >= 70 ? "danger" : pct >= 45 ? "warning" : "info";
     return { pct, limit, capLabel, tone, label: `${pct}% ctx` };
   }
@@ -101,6 +108,10 @@ export function RosterView({
     setSpawnOpen(true);
     requestAnimationFrame(() => spawnNameRef.current?.focus());
   }, [spawnNonce]);
+
+  useEffect(() => {
+    setTraceTarget(null);
+  }, [swarmConvId]);
 
   const cleanSpawnName = spawnName.trim().toLowerCase();
   const spawnNameValid =
@@ -648,8 +659,8 @@ export function RosterView({
                 <div className="rounded-chip bg-board px-2 py-1 space-y-1">
                   <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-[12px] text-ink-2">
                     <div className="flex flex-wrap items-center gap-2 tabular-nums">
-                      <span className="font-semibold text-ink">{fmtTokens(m.usage.totalTokens)} tok</span>
-                      {([["in", m.usage.inputTokens], ["cache", m.usage.cacheReadTokens], ["out", m.usage.outputTokens]] as const).map(([k, v]) => (
+                      <span className="font-semibold text-ink">{fmtTokens(m.usage?.totalTokens)} tok</span>
+                      {([["in", m.usage?.inputTokens], ["cache", m.usage?.cacheReadTokens], ["out", m.usage?.outputTokens]] as const).map(([k, v]) => (
                         <span key={k}>{k} {fmtTokens(v)}</span>
                       ))}
                     </div>
@@ -661,13 +672,13 @@ export function RosterView({
                             <span
                               className="font-semibold text-ink"
                               data-testid={`roster-cost-${m.name}`}
-                              title={m.byModel ? Object.entries(m.byModel).map(([mdl, u]) => `${mdl}: ${fmtTokens(u.inputTokens + u.cacheReadTokens + u.outputTokens)}`).join(", ") : undefined}
+                              title={m.byModel ? Object.entries(m.byModel).map(([mdl, u]) => `${mdl}: ${fmtTokens(safeFiniteNonNeg(u?.inputTokens) + safeFiniteNonNeg(u?.cacheReadTokens) + safeFiniteNonNeg(u?.outputTokens))}`).join(", ") : undefined}
                             >
                               {fmtUsd(m.cost.totalUsd)}
                             </span>
-                            {m.cost.cacheHitPct > 0 && (
+                            {typeof m.cost.cacheHitPct === "number" && Number.isFinite(m.cost.cacheHitPct) && m.cost.cacheHitPct > 0 && (
                               <span className="text-ok" data-testid={`roster-cache-hit-${m.name}`}>
-                                {Math.round(m.cost.cacheHitPct)}% cache hit
+                                {safePct(m.cost.cacheHitPct)}% cache hit
                               </span>
                             )}
                           </>
@@ -688,7 +699,7 @@ export function RosterView({
                               ? "bg-[var(--dot-amber)]"
                               : "bg-blue",
                         )}
-                        style={{ width: `${Math.max(4, pressure.pct)}%` }}
+                        style={{ width: `${Math.min(100, Math.max(4, pressure.pct))}%` }}
                       />
                     </div>
                   )}

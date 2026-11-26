@@ -761,15 +761,21 @@
     return { family: "unknown", contextLimit: 200000, inPer1M: 0, cacheReadPer1M: 0, outPer1M: 0, pricingKnown: false };
   }
 
+  function safeNonNeg(v) {
+    var n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  }
+
   function memberByModel(m) {
     if (m.byModel && Object.keys(m.byModel).length > 0) return m.byModel;
     var mdl = m.model || "unknown";
+    var u = m.usage || {};
     var res = {};
     res[mdl] = {
-      inputTokens: m.usage.inputTokens || 0,
-      cacheReadTokens: m.usage.cacheReadTokens || 0,
-      outputTokens: m.usage.outputTokens || 0,
-      steps: m.steps || 0,
+      inputTokens: safeNonNeg(u.inputTokens),
+      cacheReadTokens: safeNonNeg(u.cacheReadTokens),
+      outputTokens: safeNonNeg(u.outputTokens),
+      steps: safeNonNeg(m.steps),
     };
     return res;
   }
@@ -787,9 +793,9 @@
       var mdl = keys[i];
       var e = byModel[mdl];
       if (!e) continue;
-      var inp = Number(e.inputTokens) || 0;
-      var cac = Number(e.cacheReadTokens) || 0;
-      var out = Number(e.outputTokens) || 0;
+      var inp = safeNonNeg(e.inputTokens);
+      var cac = safeNonNeg(e.cacheReadTokens);
+      var out = safeNonNeg(e.outputTokens);
       totalIn += inp;
       totalCache += cac;
       var spec = getModelSpec(mdl);
@@ -804,15 +810,15 @@
     if (!anyKnown && activeModel) {
       anyKnown = getModelSpec(activeModel).pricingKnown;
     }
-    var totalUsd = inputUsd + cacheReadUsd + outputUsd;
+    var totalUsd = Math.max(0, inputUsd + cacheReadUsd + outputUsd);
     var denom = totalIn + totalCache;
-    var cacheHitPct = denom > 0 ? Math.round((totalCache / denom) * 1000) / 10 : 0;
+    var cacheHitPct = denom > 0 ? Math.min(100, Math.max(0, Math.round((totalCache / denom) * 1000) / 10)) : 0;
     return {
       totalUsd: totalUsd,
-      inputUsd: inputUsd,
-      cacheReadUsd: cacheReadUsd,
-      outputUsd: outputUsd,
-      cacheSavingsUsd: cacheSavingsUsd,
+      inputUsd: Math.max(0, inputUsd),
+      cacheReadUsd: Math.max(0, cacheReadUsd),
+      outputUsd: Math.max(0, outputUsd),
+      cacheSavingsUsd: Math.max(0, cacheSavingsUsd),
       cacheHitPct: cacheHitPct,
       pricingKnown: anyKnown,
     };
@@ -877,10 +883,11 @@
     }
     var usage = sw.members.reduce(
       function (acc, m) {
-        acc.inputTokens += m.usage.inputTokens;
-        acc.cacheReadTokens += m.usage.cacheReadTokens;
-        acc.outputTokens += m.usage.outputTokens;
-        acc.totalTokens += m.usage.totalTokens;
+        var u = m.usage || {};
+        acc.inputTokens += safeNonNeg(u.inputTokens);
+        acc.cacheReadTokens += safeNonNeg(u.cacheReadTokens);
+        acc.outputTokens += safeNonNeg(u.outputTokens);
+        acc.totalTokens += safeNonNeg(u.totalTokens);
         return acc;
       },
       { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, totalTokens: 0 },
@@ -889,19 +896,20 @@
     var maxContextLimit = 200000;
     var maxContextPct = 0;
     var enrichedMembers = sw.members.map(function (m) {
+      var u = m.usage || {};
       var bm = memberByModel(m);
       Object.keys(bm).forEach(function (mdl) {
         var e = bm[mdl];
         if (!swarmByModel[mdl]) swarmByModel[mdl] = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
-        swarmByModel[mdl].inputTokens += e.inputTokens || 0;
-        swarmByModel[mdl].cacheReadTokens += e.cacheReadTokens || 0;
-        swarmByModel[mdl].outputTokens += e.outputTokens || 0;
-        swarmByModel[mdl].steps += e.steps || 0;
+        swarmByModel[mdl].inputTokens += safeNonNeg(e.inputTokens);
+        swarmByModel[mdl].cacheReadTokens += safeNonNeg(e.cacheReadTokens);
+        swarmByModel[mdl].outputTokens += safeNonNeg(e.outputTokens);
+        swarmByModel[mdl].steps += safeNonNeg(e.steps);
       });
       var spec = getModelSpec(m.model);
-      var contextLimit = spec.contextLimit;
-      var ctxTok = m.lastContextTokens || (m.usage.inputTokens + m.usage.cacheReadTokens);
-      var contextPct = Math.min(100, Math.round((ctxTok / contextLimit) * 100));
+      var contextLimit = Number.isFinite(spec.contextLimit) && spec.contextLimit > 0 ? spec.contextLimit : 0;
+      var ctxTok = safeNonNeg(m.lastContextTokens) || (safeNonNeg(u.inputTokens) + safeNonNeg(u.cacheReadTokens));
+      var contextPct = contextLimit > 0 ? Math.min(100, Math.max(0, Math.round((ctxTok / contextLimit) * 100))) : 0;
       var cost = computeCostFromByModel(bm, m.model);
       if (contextLimit > maxContextLimit) maxContextLimit = contextLimit;
       if (!m.killed && contextPct > maxContextPct) maxContextPct = contextPct;
@@ -1361,7 +1369,7 @@
           unread: 0,
           killed: false,
           status: "working",
-          steps: 1,
+          steps: 0,
           activity: "Starting assigned task",
           activityKind: "thinking",
           replied: false,
@@ -1804,6 +1812,17 @@
       if (!tMemObj) return jsonResp({ ok: false, error: "Unknown member" }, 404);
 
       var mName = tMemObj.name;
+      if (tMemObj.steps === 0) {
+        return jsonResp({
+          ok: true,
+          member: mName,
+          conversationId: tMemObj.conversation_id || tSw.id,
+          totalSteps: 0,
+          nextBefore: null,
+          hasMore: false,
+          steps: [],
+        });
+      }
       var mModel = tMemObj.model || "gemini-3-pro";
       var stepsAll = [];
       for (var si = 0; si < 24; si++) {

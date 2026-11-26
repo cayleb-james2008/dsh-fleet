@@ -84,6 +84,9 @@ export function App() {
   const etagRef = useRef<string>("");
   const snapRef = useRef<SwarmSnapshot | null>(null);
   snapRef.current = snap;
+  const selectedSwarmIdRef = useRef<string | null>(selectedSwarmId);
+  selectedSwarmIdRef.current = selectedSwarmId;
+  const refreshAbortRef = useRef<AbortController | null>(null);
   const lastSwarmsFetchRef = useRef<number>(0);
 
   const [workspaceUris, setWorkspaceUris] = useState<string[]>([]);
@@ -170,12 +173,17 @@ export function App() {
 
   const refreshSwarm = useCallback(
     async (force = false) => {
+      refreshAbortRef.current?.abort();
+      const ac = new AbortController();
+      refreshAbortRef.current = ac;
+      const targetSwarmId = selectedSwarmId;
       try {
         if (force) etagRef.current = "";
         const [data, listData] = await Promise.all([
-          fetchSwarmSnapshot(selectedSwarmId, force ? "" : etagRef.current),
-          fetchSwarms().catch(() => null),
+          fetchSwarmSnapshot(targetSwarmId, force ? "" : etagRef.current, ac.signal),
+          fetchSwarms(ac.signal).catch(() => null),
         ]);
+        if (ac.signal.aborted || selectedSwarmIdRef.current !== targetSwarmId) return;
         if (listData?.swarms) {
           setSwarms(listData.swarms);
           lastSwarmsFetchRef.current = Date.now();
@@ -188,9 +196,17 @@ export function App() {
         setLastSyncAt(Date.now());
         setError("");
       } catch (err) {
+        if (
+          ac.signal.aborted ||
+          (err instanceof DOMException && err.name === "AbortError") ||
+          selectedSwarmIdRef.current !== targetSwarmId
+        ) {
+          return;
+        }
         setError(err instanceof Error ? err.message : "Failed to load swarm");
       } finally {
-        setLoading(false);
+        if (refreshAbortRef.current === ac) refreshAbortRef.current = null;
+        if (!ac.signal.aborted && selectedSwarmIdRef.current === targetSwarmId) setLoading(false);
       }
     },
     [selectedSwarmId],
@@ -213,6 +229,8 @@ export function App() {
         signal,
       });
       if (signal?.aborted) return;
+      const latestSnap = snapRef.current;
+      if (!latestSnap || (latestSnap.swarm !== convId && latestSnap.conversationId !== convId)) return;
       setLastSyncAt(Date.now());
       setError("");
       const isNoop =
@@ -225,7 +243,7 @@ export function App() {
         maybeRefreshSwarmsList(false);
         return;
       }
-      const merged = mergeSwarmDelta(curSnap, delta);
+      const merged = mergeSwarmDelta(latestSnap, delta);
       if (merged) {
         etagRef.current = merged.etag || "";
         snapRef.current = merged;
@@ -239,7 +257,10 @@ export function App() {
 
   useEffect(() => {
     etagRef.current = "";
-    refreshSwarm(true);
+    void refreshSwarm(true);
+    return () => {
+      refreshAbortRef.current?.abort();
+    };
   }, [refreshSwarm]);
 
   useEffect(() => {
@@ -306,6 +327,7 @@ export function App() {
     document.addEventListener("visibilitychange", onVisibility);
 
     const runLoop = async () => {
+      let consecutiveErrors = 0;
       setDeltaLive(true);
       while (!cancelled) {
         if (document.hidden) {
@@ -313,7 +335,11 @@ export function App() {
           continue;
         }
         const curSnap = snapRef.current;
-        const since = curSnap && typeof curSnap.head === "number" && curSnap.head > 0 ? curSnap.head : 0;
+        if (!curSnap || (curSnap.swarm !== deltaTargetId && curSnap.conversationId !== deltaTargetId)) {
+          await sleepAbortable(ms);
+          continue;
+        }
+        const since = typeof curSnap.head === "number" && curSnap.head > 0 ? curSnap.head : 0;
         const reqEtag = etagRef.current || curSnap?.etag || "";
         controller = new AbortController();
         const startedAt = Date.now();
@@ -326,6 +352,7 @@ export function App() {
           });
           if (cancelled || controller.signal.aborted) break;
 
+          consecutiveErrors = 0;
           const elapsed = Date.now() - startedAt;
           setDeltaLive(true);
           setLastSyncAt(Date.now());
@@ -346,9 +373,12 @@ export function App() {
           }
 
           const latestSnap = snapRef.current;
+          if (!latestSnap || (latestSnap.swarm !== deltaTargetId && latestSnap.conversationId !== deltaTargetId)) {
+            continue;
+          }
           const prevHead = latestSnap?.head ?? 0;
           const prevMembersSig = membersSigOf(latestSnap);
-          if (delta.etag && delta.etag === etagRef.current && latestSnap) {
+          if (delta.etag && delta.etag === etagRef.current) {
             maybeRefreshSwarmsList(false);
             if (elapsed < 250) {
               await sleepAbortable(ms);
@@ -364,15 +394,19 @@ export function App() {
             maybeRefreshSwarmsList(listChanged);
           }
         } catch (err) {
-          if (cancelled || (err instanceof DOMException && err.name === "AbortError")) break;
+          if (cancelled || controller?.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) break;
+          consecutiveErrors += 1;
+          const baseBackoff = Math.min(Math.max(ms, 1000), 5000);
+          const backoffMs = Math.min(30_000, baseBackoff * Math.pow(2, Math.min(consecutiveErrors - 1, 4)));
           const msg = err instanceof Error ? err.message : "";
           if (msg.includes("(404)")) {
             await refreshRef.current(false);
-            await sleepAbortable(ms);
+            if (cancelled) break;
+            await sleepAbortable(consecutiveErrors === 1 ? ms : backoffMs);
           } else {
             setDeltaLive(false);
             setError(msg || "Failed to load swarm delta");
-            await sleepAbortable(Math.min(Math.max(ms, 1000), 5000));
+            await sleepAbortable(backoffMs);
           }
         } finally {
           controller = null;
@@ -396,16 +430,23 @@ export function App() {
     const ms = Number(pollMs);
     if (!ms) return;
     if (!canSse && canDelta && deltaTargetId) return;
+    const pollController = new AbortController();
     const effectiveMs = sseConnected ? Math.max(ms, 15000) : ms;
     const id = setInterval(() => {
-      if (document.hidden) return;
+      if (document.hidden || pollController.signal.aborted) return;
       if (canSse && canDelta && activeConvId && snapRef.current) {
-        void syncDeltaRef.current(activeConvId).catch(() => refreshRef.current(false));
+        void syncDeltaRef.current(activeConvId, pollController.signal).catch((err) => {
+          if (pollController.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) return;
+          return refreshRef.current(false);
+        });
       } else {
         void refreshRef.current(false);
       }
     }, effectiveMs);
-    return () => clearInterval(id);
+    return () => {
+      pollController.abort();
+      clearInterval(id);
+    };
   }, [pollMs, canSse, canDelta, sseConnected, deltaTargetId, activeConvId]);
 
   // Live SSE push stream when running on standalone HTTP server (delta long-poll inside SidecarApp).
@@ -420,11 +461,13 @@ export function App() {
     const q = `?conversationId=${encodeURIComponent(activeConvId)}`;
     const es = new EventSource(`/api/swarm/stream${q}`);
     es.onopen = () => {
+      if (sseController.signal.aborted) return;
       setSseConnected(true);
       setSseStatus("live");
       setLastSyncAt(Date.now());
     };
     es.addEventListener("swarm", (ev) => {
+      if (sseController.signal.aborted) return;
       setSseConnected(true);
       setSseStatus("live");
       setLastSyncAt(Date.now());
@@ -444,10 +487,11 @@ export function App() {
           }
         }
       } catch {
-        void refreshRef.current(false);
+        if (!sseController.signal.aborted) void refreshRef.current(false);
       }
     });
     es.addEventListener("ping", () => {
+      if (sseController.signal.aborted) return;
       setSseConnected(true);
       setSseStatus("live");
       setLastSyncAt(Date.now());
@@ -466,6 +510,7 @@ export function App() {
       }
     });
     es.onerror = () => {
+      if (sseController.signal.aborted) return;
       setSseConnected(false);
       setSseStatus("reconnecting");
     };

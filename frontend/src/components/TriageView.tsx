@@ -837,6 +837,7 @@ export function TriageView({
   const nowMs = useNowMs();
   const cardRefs = useRef<Array<HTMLDivElement | null>>([]);
 
+  const swarmId = snap.swarm || snap.conversationId || "";
   const triage = snap.triage || [];
   const plan = normalizePlan(snap.plan);
   const frames = snap.frames || [];
@@ -844,6 +845,10 @@ export function TriageView({
   const pinnedMsgs = (snap.messages || []).filter((m) => !m.control && pinnedSet.has(m.seq));
   const memberByName = new Map((snap.members || []).map((m) => [m.name, m]));
   const canNudge = canLiveNudge(snap);
+
+  useEffect(() => {
+    setTraceTarget(null);
+  }, [swarmId]);
 
   useEffect(() => {
     const el = cardRefs.current[selectedIdx];

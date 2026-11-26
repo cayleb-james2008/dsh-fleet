@@ -16,6 +16,8 @@ import { animatePanelEnter } from "./motion";
 import { fetchMemberTranscript, openFileInAuxPane, parseScreenshotLines, sendConfirmedNudge, sendSwarmControl } from "./sidecar";
 import type {
   BoardMessage,
+  BurnSummary,
+  CostSummary,
   NormalizedPlan,
   PlanGoalObject,
   PlanMilestoneStatus,
@@ -25,6 +27,7 @@ import type {
   SwarmMember,
   SwarmPlan,
   SwarmSnapshot,
+  TokenUsage,
   TranscriptFilter,
   TranscriptStep,
   TriageItem,
@@ -390,6 +393,75 @@ export function formatBlockerContext(item: TriageItem, member?: SwarmMember, sna
   ].filter(Boolean).join("\n");
 }
 
+export function safeFiniteNonNeg(val: unknown, fallback = 0): number {
+  const n = Number(val);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+export function safePct(val: unknown): number {
+  const n = Number(val);
+  return Number.isFinite(n) ? Math.min(100, Math.max(0, Math.round(n))) : 0;
+}
+
+function finiteOptNonNeg(val: unknown): number | undefined {
+  if (typeof val !== "number") return undefined;
+  return Number.isFinite(val) && val >= 0 ? val : undefined;
+}
+
+function sanitizeUsage(u: TokenUsage | undefined | null): TokenUsage | null {
+  if (!u || typeof u !== "object") return null;
+  return {
+    inputTokens: Math.round(safeFiniteNonNeg(u.inputTokens)),
+    cacheReadTokens: Math.round(safeFiniteNonNeg(u.cacheReadTokens)),
+    outputTokens: Math.round(safeFiniteNonNeg(u.outputTokens)),
+    totalTokens: Math.round(safeFiniteNonNeg(u.totalTokens)),
+  };
+}
+
+function sanitizeCost(c: CostSummary | undefined | null): CostSummary | null {
+  if (!c || typeof c !== "object") return null;
+  return {
+    totalUsd: safeFiniteNonNeg(c.totalUsd),
+    inputUsd: safeFiniteNonNeg(c.inputUsd),
+    cacheReadUsd: safeFiniteNonNeg(c.cacheReadUsd),
+    outputUsd: safeFiniteNonNeg(c.outputUsd),
+    cacheSavingsUsd: safeFiniteNonNeg(c.cacheSavingsUsd),
+    cacheHitPct: safePct(c.cacheHitPct),
+    pricingKnown: Boolean(c.pricingKnown),
+  };
+}
+
+function sanitizeContextLimit(v: unknown): number | null {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : null;
+}
+
+function sanitizeContextPct(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? safePct(v) : null;
+}
+
+function sanitizeBurnSummary(b: BurnSummary | undefined | null): BurnSummary | null {
+  if (!b || typeof b !== "object") return null;
+  const sanitizeWorker = (w: BurnSummary["workers"][number]) => ({
+    ...w,
+    totalTokens: Math.round(safeFiniteNonNeg(w.totalTokens)),
+    sharePct: safePct(w.sharePct),
+    ...(w.costUsd !== undefined ? { costUsd: safeFiniteNonNeg(w.costUsd) } : {}),
+    ...(w.cacheHitPct !== undefined ? { cacheHitPct: safePct(w.cacheHitPct) } : {}),
+    ...(w.cacheSavingsUsd !== undefined ? { cacheSavingsUsd: safeFiniteNonNeg(w.cacheSavingsUsd) } : {}),
+  });
+  return {
+    ...b,
+    totalTokens: Math.round(safeFiniteNonNeg(b.totalTokens)),
+    highBurnCount: Math.round(safeFiniteNonNeg(b.highBurnCount)),
+    topWorker: b.topWorker ? sanitizeWorker(b.topWorker) : null,
+    workers: Array.isArray(b.workers) ? b.workers.map(sanitizeWorker) : [],
+    ...(b.costUsd !== undefined ? { costUsd: safeFiniteNonNeg(b.costUsd) } : {}),
+    ...(b.cacheHitPct !== undefined ? { cacheHitPct: safePct(b.cacheHitPct) } : {}),
+    ...(b.cacheSavingsUsd !== undefined ? { cacheSavingsUsd: safeFiniteNonNeg(b.cacheSavingsUsd) } : {}),
+  };
+}
+
 export function formatSwarmDigest(
   snap: SwarmSnapshot,
   pinnedSeqs: number[] = [],
@@ -402,12 +474,13 @@ export function formatSwarmDigest(
   const vel = gate?.velocity;
   const plan = normalizePlan(snap.plan);
   const b = snap.burnSummary;
-  const totalUsd = snap.cost?.totalUsd ?? b?.costUsd;
+  const totalUsd = finiteOptNonNeg(snap.cost?.totalUsd) ?? finiteOptNonNeg(b?.costUsd);
   const pricingKnown = snap.cost?.pricingKnown ?? b?.pricingKnown;
-  const cacheHitPct = snap.cost?.cacheHitPct ?? b?.cacheHitPct;
-  const cacheSavingsUsd = snap.cost?.cacheSavingsUsd ?? b?.cacheSavingsUsd;
-  const spendSummary = pricingKnown && typeof totalUsd === "number"
-    ? `, ${fmtUsd(totalUsd)} spend${typeof cacheHitPct === "number" && cacheHitPct > 0 ? `, ${Math.round(cacheHitPct)}% cache hit` : ""}${typeof cacheSavingsUsd === "number" && cacheSavingsUsd >= 0.005 ? ` (${fmtUsd(cacheSavingsUsd)} saved)` : ""}`
+  const rawHit = typeof snap.cost?.cacheHitPct === "number" ? snap.cost.cacheHitPct : b?.cacheHitPct;
+  const cacheHitPct = typeof rawHit === "number" && Number.isFinite(rawHit) && rawHit > 0 ? safePct(rawHit) : 0;
+  const cacheSavingsUsd = finiteOptNonNeg(snap.cost?.cacheSavingsUsd) ?? finiteOptNonNeg(b?.cacheSavingsUsd);
+  const spendSummary = pricingKnown && totalUsd !== undefined
+    ? `, ${fmtUsd(totalUsd)} spend${cacheHitPct > 0 ? `, ${cacheHitPct}% cache hit` : ""}${cacheSavingsUsd !== undefined && cacheSavingsUsd >= 0.005 ? ` (${fmtUsd(cacheSavingsUsd)} saved)` : ""}`
     : pricingKnown === false
       ? ", Unpriced"
       : "";
@@ -417,7 +490,7 @@ export function formatSwarmDigest(
     plan?.goal && `- Active goal: ${cleanDigestLine(plan.goal, 220)}`,
     plan?.gate && `- Verification gate: \`${maskHome(plan.gate)}\``,
     gate &&
-      `- Gate readiness: ${gate.state}${vel ? `, ${vel.passRatePct}% pass rate (${vel.wavesPerHr}/hr, ${vel.done} done, ${vel.verified} verified)` : ""}`,
+      `- Gate readiness: ${gate.state}${vel ? `, ${safePct(vel.passRatePct)}% pass rate (${safeFiniteNonNeg(vel.wavesPerHr)}/hr, ${safeFiniteNonNeg(vel.done)} done, ${safeFiniteNonNeg(vel.verified)} verified)` : ""}`,
   ].filter(Boolean) as string[];
   const sec = (title: string, rows: string[]) => rows.length && lines.push("", `## ${title}`, ...rows);
   const pinSet = new Set(pinnedSeqs);
@@ -432,17 +505,24 @@ export function formatSwarmDigest(
     live.map((m) => {
       const ts = memberLastTs(m);
       const err = m.failure ? `, issue: ${cleanDigestLine(m.failure.kind, 40)}` : "";
-      const limit = m.contextLimit && m.contextLimit > 0 ? m.contextLimit : 0;
-      const ctxTok = m.lastContextTokens || m.usage.inputTokens + m.usage.cacheReadTokens;
-      const cap = limit
-        ? `, ${typeof m.contextPct === "number" ? Math.min(100, Math.max(0, Math.round(m.contextPct))) : Math.min(100, Math.round((ctxTok / limit) * 100))}% of ${fmtContextCap(limit)} ctx`
-        : "";
+      const limit = sanitizeContextLimit(m.contextLimit) || 0;
+      const ctxTok = safeFiniteNonNeg(m.lastContextTokens) || safeFiniteNonNeg(m.usage?.inputTokens) + safeFiniteNonNeg(m.usage?.cacheReadTokens);
+      const pctVal = sanitizeContextPct(m.contextPct) ?? (limit > 0 ? safePct((ctxTok / limit) * 100) : null);
+      const cap =
+        limit > 0 && pctVal !== null
+          ? `, ${pctVal}% of ${fmtContextCap(limit)} ctx`
+          : ctxTok > 0
+            ? `, ${fmtTokens(ctxTok)} / unknown ctx`
+            : "";
+      const mHit = m.cost && typeof m.cost.cacheHitPct === "number" && Number.isFinite(m.cost.cacheHitPct) && m.cost.cacheHitPct > 0
+        ? safePct(m.cost.cacheHitPct)
+        : 0;
       const spend = m.cost
         ? m.cost.pricingKnown
-          ? `, ${fmtUsd(m.cost.totalUsd)}${m.cost.cacheHitPct > 0 ? `, ${Math.round(m.cost.cacheHitPct)}% cache hit` : ""}`
+          ? `, ${fmtUsd(m.cost.totalUsd)}${mHit > 0 ? `, ${mHit}% cache hit` : ""}`
           : ", Unpriced"
         : "";
-      return `- @${m.name}: ${m.status}${ts ? ` ${fmtElapsed(ts)}` : ""} (${m.steps} steps, ${fmtTokens(m.usage.totalTokens)} tok${cap}${spend}${err})`;
+      return `- @${m.name}: ${m.status}${ts ? ` ${fmtElapsed(ts)}` : ""} (${safeFiniteNonNeg(m.steps)} steps, ${fmtTokens(m.usage?.totalTokens)} tok${cap}${spend}${err})`;
     }),
   );
   sec(
@@ -502,10 +582,10 @@ export function formatSwarmArchive(
           title: maskHome(snap.title || "Fleet"),
           head: snap.head || 0,
           pinnedSeqs,
-          usage: snap.usage || null,
-          contextLimit: snap.contextLimit ?? null,
-          contextPct: snap.contextPct ?? null,
-          cost: snap.cost || null,
+          usage: sanitizeUsage(snap.usage),
+          contextLimit: sanitizeContextLimit(snap.contextLimit),
+          contextPct: sanitizeContextPct(snap.contextPct),
+          cost: sanitizeCost(snap.cost),
           byModel: snap.byModel || null,
           plan: plan
             ? {
@@ -540,19 +620,19 @@ export function formatSwarmArchive(
               }
             : null,
           gateReadiness: snap.gateReadiness || null,
-          burnSummary: snap.burnSummary || null,
+          burnSummary: sanitizeBurnSummary(snap.burnSummary),
           members: (snap.members || []).map((m) => ({
             name: m.name,
             role: m.role,
             model: m.model,
             status: m.status,
             killed: m.killed,
-            steps: m.steps,
-            unread: m.unread,
-            usage: m.usage,
-            contextLimit: m.contextLimit ?? null,
-            contextPct: m.contextPct ?? null,
-            cost: m.cost || null,
+            steps: Math.round(safeFiniteNonNeg(m.steps)),
+            unread: Math.round(safeFiniteNonNeg(m.unread)),
+            usage: sanitizeUsage(m.usage),
+            contextLimit: sanitizeContextLimit(m.contextLimit),
+            contextPct: sanitizeContextPct(m.contextPct),
+            cost: sanitizeCost(m.cost),
             byModel: m.byModel || null,
             activityPeek: m.activityPeek ? { ...m.activityPeek, label: maskHome(m.activityPeek.label) } : null,
             failure: m.failure ? { ...m.failure, text: maskHome(m.failure.text) } : null,
@@ -605,7 +685,7 @@ export function formatSwarmArchive(
 }
 
 export function fmtTokens(n: number | undefined): string {
-  const v = Number(n) || 0;
+  const v = Math.round(safeFiniteNonNeg(n, 0));
   if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(2)}M`;
   if (v >= 1_000) return `${(v / 1_000).toFixed(1)}k`;
   return String(v);
@@ -621,13 +701,13 @@ export function fmtUsd(n: number | undefined): string {
 
 export function fmtContextCap(limit: number | undefined): string {
   const v = Number(limit);
-  if (!Number.isFinite(v) || v <= 0) return "200k";
+  if (!Number.isFinite(v) || v <= 0) return "unknown";
   if (v >= 1_000_000) {
     const m = v / 1_000_000;
     return Number.isInteger(m) ? `${m}M` : `${m.toFixed(1)}M`;
   }
   if (v >= 1_000) return `${Math.round(v / 1_000)}k`;
-  return String(v);
+  return String(Math.round(v));
 }
 
 function fmtRel(ts: number | string | null | undefined, nowMs: number, withAgo: boolean): string {
@@ -1101,32 +1181,39 @@ const BURN_COLS = ["bg-blue", "bg-[var(--violet)]", "bg-warn", "bg-danger", "bg-
 
 export function TokenBurnStrip({ snap }: { snap: SwarmSnapshot }) {
   const b = snap.burnSummary;
-  if (!b || b.totalTokens <= 0 || !b.workers.length) return null;
+  if (!b || !Number.isFinite(b.totalTokens) || b.totalTokens <= 0 || !Array.isArray(b.workers) || !b.workers.length) return null;
   const top = b.topWorker || b.workers[0];
+  const topPct = safePct(top.sharePct);
   const shown = b.workers.slice(0, 4);
-  const restPct = Math.max(0, 100 - shown.reduce((s, r) => s + r.sharePct, 0));
+  const restPct = Math.max(0, 100 - shown.reduce((s, r) => s + safePct(r.sharePct), 0));
 
   const memberCosts = (snap.members || []).filter((m) => m.cost);
   const fallbackTotalUsd = memberCosts.length
-    ? memberCosts.reduce((sum, m) => sum + (m.cost?.pricingKnown ? m.cost.totalUsd : 0), 0)
+    ? memberCosts.reduce((sum, m) => sum + (m.cost?.pricingKnown ? safeFiniteNonNeg(m.cost.totalUsd) : 0), 0)
     : undefined;
   const fallbackSavingsUsd = memberCosts.length
-    ? memberCosts.reduce((sum, m) => sum + (m.cost?.pricingKnown ? m.cost.cacheSavingsUsd : 0), 0)
+    ? memberCosts.reduce((sum, m) => sum + (m.cost?.pricingKnown ? safeFiniteNonNeg(m.cost.cacheSavingsUsd) : 0), 0)
     : undefined;
   const fallbackKnown = memberCosts.length ? memberCosts.some((m) => m.cost?.pricingKnown) : undefined;
-  const totalUsd = typeof b.costUsd === "number" ? b.costUsd : snap.cost?.totalUsd ?? fallbackTotalUsd;
+  const totalUsd = finiteOptNonNeg(b.costUsd) ?? finiteOptNonNeg(snap.cost?.totalUsd) ?? fallbackTotalUsd;
   const pricingKnown = b.pricingKnown ?? snap.cost?.pricingKnown ?? fallbackKnown;
-  const cacheHitPct = typeof b.cacheHitPct === "number" ? b.cacheHitPct : snap.cost?.cacheHitPct;
-  const cacheSavingsUsd = typeof b.cacheSavingsUsd === "number" ? b.cacheSavingsUsd : snap.cost?.cacheSavingsUsd ?? fallbackSavingsUsd;
-  const topCostText = top.pricingKnown && typeof top.costUsd === "number" ? ` · ${fmtUsd(top.costUsd)}` : "";
+  const rawCacheHit = typeof b.cacheHitPct === "number" ? b.cacheHitPct : snap.cost?.cacheHitPct;
+  const cacheHitPct = typeof rawCacheHit === "number" && Number.isFinite(rawCacheHit) && rawCacheHit > 0 ? safePct(rawCacheHit) : 0;
+  const cacheSavingsUsd = finiteOptNonNeg(b.cacheSavingsUsd) ?? finiteOptNonNeg(snap.cost?.cacheSavingsUsd) ?? fallbackSavingsUsd;
+  const topCostVal = finiteOptNonNeg(top.costUsd);
+  const topCostText = top.pricingKnown && topCostVal !== undefined ? ` · ${fmtUsd(topCostVal)}` : "";
 
   const segs = [
-    ...shown.map((w, i) => ({
-      key: w.name,
-      pct: w.sharePct,
-      cls: BURN_COLS[i % 4],
-      title: `@${w.name}: ${w.pricingKnown && typeof w.costUsd === "number" ? `${fmtUsd(w.costUsd)} · ` : ""}${fmtTokens(w.totalTokens)} (${w.sharePct}%)`,
-    })),
+    ...shown.map((w, i) => {
+      const pct = safePct(w.sharePct);
+      const wCost = finiteOptNonNeg(w.costUsd);
+      return {
+        key: w.name,
+        pct,
+        cls: BURN_COLS[i % 4],
+        title: `@${w.name}: ${w.pricingKnown && wCost !== undefined ? `${fmtUsd(wCost)} · ` : ""}${fmtTokens(w.totalTokens)} (${pct}%)`,
+      };
+    }),
     ...(restPct > 0 ? [{ key: "rest", pct: restPct, cls: "bg-[var(--edge)]" }] : []),
   ];
 
@@ -1135,38 +1222,42 @@ export function TokenBurnStrip({ snap }: { snap: SwarmSnapshot }) {
       <div className="row flex-wrap gap-1.5 t2">
         <div className="wrap gap-1.5">
           <span className="font-semibold text-ink">Token burn</span>
-          {pricingKnown && typeof totalUsd === "number" ? (
+          {pricingKnown && totalUsd !== undefined ? (
             <span className="font-semibold text-ink tabular-nums" data-testid="burn-total-usd">{fmtUsd(totalUsd)}</span>
           ) : pricingKnown === false ? (
             <span className="text-ink-3" data-testid="burn-total-usd">Unpriced</span>
           ) : null}
           <span className="tabular-nums">{fmtTokens(b.totalTokens)} tok</span>
-          {typeof cacheHitPct === "number" && cacheHitPct > 0 && (
+          {cacheHitPct > 0 && (
             <span className="text-ok tabular-nums" data-testid="burn-cache-hit">
-              {Math.round(cacheHitPct)}% cache hit{typeof cacheSavingsUsd === "number" && cacheSavingsUsd >= 0.005 ? ` (${fmtUsd(cacheSavingsUsd)} saved)` : ""}
+              {cacheHitPct}% cache hit{cacheSavingsUsd !== undefined && cacheSavingsUsd >= 0.005 ? ` (${fmtUsd(cacheSavingsUsd)} saved)` : ""}
             </span>
           )}
         </div>
         {top.level !== "normal" ? (
           <Badge tone={top.level === "critical" ? "danger" : "warning"} data-testid="high-burn-badge">
-            High burn · @{top.name} {top.sharePct}%{topCostText}
+            High burn · @{top.name} {topPct}%{topCostText}
           </Badge>
         ) : (
-          <Badge tone="neutral">Top @{top.name} {top.sharePct}%{topCostText}</Badge>
+          <Badge tone="neutral">Top @{top.name} {topPct}%{topCostText}</Badge>
         )}
       </div>
-      <SegBar segments={segs} label={`Token share led by ${top.name} (${top.sharePct}%)`} />
+      <SegBar segments={segs} label={`Token share led by ${top.name} (${topPct}%)`} />
       <div className="wrap gap-x-2 gap-y-1 t2">
-        {b.workers.slice(0, 3).map((w, i) => (
-          <span key={w.name} className="inline-flex items-center gap-1">
-            <span className={cn("h-2 w-2 rounded-full shrink-0", BURN_COLS[i % 4])} aria-hidden="true" />
-            <span className="text-ink font-medium">{w.name}</span>
-            <span className="tabular-nums">
-              {w.pricingKnown && typeof w.costUsd === "number" ? `${fmtUsd(w.costUsd)} · ` : ""}
-              {fmtTokens(w.totalTokens)} ({w.sharePct}%)
+        {b.workers.slice(0, 3).map((w, i) => {
+          const pct = safePct(w.sharePct);
+          const wCost = finiteOptNonNeg(w.costUsd);
+          return (
+            <span key={w.name} className="inline-flex items-center gap-1">
+              <span className={cn("h-2 w-2 rounded-full shrink-0", BURN_COLS[i % 4])} aria-hidden="true" />
+              <span className="text-ink font-medium">{w.name}</span>
+              <span className="tabular-nums">
+                {w.pricingKnown && wCost !== undefined ? `${fmtUsd(wCost)} · ` : ""}
+                {fmtTokens(w.totalTokens)} ({pct}%)
+              </span>
             </span>
-          </span>
-        ))}
+          );
+        })}
       </div>
     </Card>
   );
@@ -1484,8 +1575,8 @@ export function StepInspector({
         </div>
 
         {(step.model || step.usage || toolCalls.length > 0) && (
-          <div className="wrap gap-2 text-[12px] text-ink-3">
-            {step.model && <span>{step.model}</span>}
+          <div className="wrap gap-2 text-[12px] text-ink-3 min-w-0">
+            {step.model && <span className="truncate max-w-full">{step.model}</span>}
             {toolCalls.length > 0 && <span className="num">{toolCalls.length} tools</span>}
             {step.usage && (
               <span className="inline-flex items-center gap-2 num">
@@ -1563,7 +1654,7 @@ export function StepInspector({
                     className="rounded-chip border border-hairline bg-surface p-2 space-y-1.5 min-w-0"
                   >
                     <div className="wrap gap-1.5 min-w-0">
-                      <code className="text-[12px] font-medium text-ink">{tc.name}</code>
+                      <code className="text-[12px] font-medium text-ink break-all min-w-0">{tc.name}</code>
                       {tc.status && (
                         <Badge tone={tcErr ? "danger" : tcStatus === "DONE" || tcStatus === "OK" ? "success" : "neutral"}>
                           {humanizeStatus(tc.status)}
@@ -1571,7 +1662,7 @@ export function StepInspector({
                       )}
                     </div>
                     {tc.summary && (
-                      <p className="text-[12px] text-ink-2 break-words">{maskHome(tc.summary)}</p>
+                      <p className="text-[12px] text-ink-2 break-words min-w-0">{maskHome(tc.summary)}</p>
                     )}
                     {argsText && (
                       <div className="space-y-1 min-w-0">
@@ -1617,8 +1708,12 @@ const TRACE_FILTERS: Array<{ value: TranscriptFilter; label: string }> = [
 
 function mergeTraceSteps(prev: TranscriptStep[], incoming: TranscriptStep[]): TranscriptStep[] {
   const byIdx = new Map<number, TranscriptStep>();
-  for (const s of prev) byIdx.set(s.stepIndex, s);
-  for (const s of incoming) byIdx.set(s.stepIndex, s);
+  for (const s of prev) {
+    if (s && typeof s.stepIndex === "number" && Number.isFinite(s.stepIndex)) byIdx.set(s.stepIndex, s);
+  }
+  for (const s of incoming) {
+    if (s && typeof s.stepIndex === "number" && Number.isFinite(s.stepIndex)) byIdx.set(s.stepIndex, s);
+  }
   return [...byIdx.values()].sort((a, b) => b.stepIndex - a.stepIndex);
 }
 
@@ -1635,7 +1730,17 @@ export function ForensicTranscriptDrawer({
   onClose: () => void;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const loadOlderAcRef = useRef<AbortController | null>(null);
+  const traceEpochRef = useRef(0);
+  const targetKey = target ? `${target.member}\0${target.conversationId}` : "";
+  const [prevTargetKey, setPrevTargetKey] = useState(targetKey);
   const [filter, setFilter] = useState<TranscriptFilter>("all");
+  if (targetKey !== prevTargetKey) {
+    setPrevTargetKey(targetKey);
+    if (filter !== "all") setFilter("all");
+  }
   const [steps, setSteps] = useState<TranscriptStep[]>([]);
   const [totalSteps, setTotalSteps] = useState(0);
   const [nextBefore, setNextBefore] = useState<number | null>(null);
@@ -1647,27 +1752,44 @@ export function ForensicTranscriptDrawer({
   const [reloadNonce, setReloadNonce] = useState(0);
 
   useEffect(() => {
-    setFilter("all");
-  }, [target?.member, target?.conversationId]);
+    if (!open || !targetKey) return;
+    animatePanelEnter(panelRef.current);
+  }, [open, targetKey]);
 
   useEffect(() => {
     if (!open) return;
-    animatePanelEnter(panelRef.current);
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onCloseRef.current();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+  }, [open]);
 
   useEffect(() => {
-    if (!open || !target) return;
+    traceEpochRef.current += 1;
+    loadOlderAcRef.current?.abort();
+    loadOlderAcRef.current = null;
+    setLoadingMore(false);
+
+    if (!open || !target) {
+      setLoading(false);
+      setError("");
+      return;
+    }
     const convId = swarmConversationId || target.conversationId;
-    if (!convId || !target.member) return;
+    if (!convId || !target.member) {
+      setLoading(false);
+      return;
+    }
+    const reqEpoch = traceEpochRef.current;
     const ac = new AbortController();
     setLoading(true);
     setError("");
     setSteps([]);
+    setTotalSteps(0);
     setNextBefore(null);
     setHasMore(false);
     setExpanded({});
@@ -1679,26 +1801,41 @@ export function ForensicTranscriptDrawer({
       signal: ac.signal,
     })
       .then((res) => {
-        if (ac.signal.aborted) return;
-        setSteps(mergeTraceSteps([], res.steps || []));
-        setTotalSteps(typeof res.totalSteps === "number" ? res.totalSteps : (res.steps || []).length);
-        setNextBefore(typeof res.nextBefore === "number" ? res.nextBefore : null);
+        if (ac.signal.aborted || traceEpochRef.current !== reqEpoch) return;
+        const incoming = Array.isArray(res.steps) ? res.steps : [];
+        setSteps(mergeTraceSteps([], incoming));
+        setTotalSteps(
+          typeof res.totalSteps === "number" && Number.isFinite(res.totalSteps) && res.totalSteps >= 0
+            ? res.totalSteps
+            : incoming.length,
+        );
+        setNextBefore(typeof res.nextBefore === "number" && Number.isFinite(res.nextBefore) ? res.nextBefore : null);
         setHasMore(Boolean(res.hasMore));
       })
       .catch((err) => {
-        if (ac.signal.aborted) return;
+        if (ac.signal.aborted || traceEpochRef.current !== reqEpoch) return;
+        if (err instanceof DOMException && err.name === "AbortError") return;
         setError(err instanceof Error ? err.message : "Failed to load transcript");
       })
       .finally(() => {
-        if (!ac.signal.aborted) setLoading(false);
+        if (!ac.signal.aborted && traceEpochRef.current === reqEpoch) setLoading(false);
       });
-    return () => ac.abort();
+    return () => {
+      traceEpochRef.current += 1;
+      ac.abort();
+      loadOlderAcRef.current?.abort();
+      loadOlderAcRef.current = null;
+    };
   }, [open, target?.member, target?.conversationId, swarmConversationId, filter, reloadNonce]);
 
   const handleLoadOlder = async () => {
-    if (!target || loadingMore || !hasMore || nextBefore === null) return;
+    if (!open || !target || loading || loadingMore || !hasMore || nextBefore === null) return;
     const convId = swarmConversationId || target.conversationId;
-    if (!convId) return;
+    if (!convId || !target.member) return;
+    loadOlderAcRef.current?.abort();
+    const ac = new AbortController();
+    loadOlderAcRef.current = ac;
+    const reqEpoch = traceEpochRef.current;
     setLoadingMore(true);
     setError("");
     try {
@@ -1708,15 +1845,23 @@ export function ForensicTranscriptDrawer({
         before: nextBefore,
         limit: 20,
         filter,
+        signal: ac.signal,
       });
-      setSteps((prev) => mergeTraceSteps(prev, res.steps || []));
-      if (typeof res.totalSteps === "number") setTotalSteps(res.totalSteps);
-      setNextBefore(typeof res.nextBefore === "number" ? res.nextBefore : null);
+      if (ac.signal.aborted || traceEpochRef.current !== reqEpoch) return;
+      const incoming = Array.isArray(res.steps) ? res.steps : [];
+      setSteps((prev) => mergeTraceSteps(prev, incoming));
+      if (typeof res.totalSteps === "number" && Number.isFinite(res.totalSteps) && res.totalSteps >= 0) {
+        setTotalSteps(res.totalSteps);
+      }
+      setNextBefore(typeof res.nextBefore === "number" && Number.isFinite(res.nextBefore) ? res.nextBefore : null);
       setHasMore(Boolean(res.hasMore));
     } catch (err) {
+      if (ac.signal.aborted || traceEpochRef.current !== reqEpoch) return;
+      if (err instanceof DOMException && err.name === "AbortError") return;
       setError(err instanceof Error ? err.message : "Failed to load older steps");
     } finally {
-      setLoadingMore(false);
+      if (loadOlderAcRef.current === ac) loadOlderAcRef.current = null;
+      if (!ac.signal.aborted && traceEpochRef.current === reqEpoch) setLoadingMore(false);
     }
   };
 
@@ -1747,9 +1892,9 @@ export function ForensicTranscriptDrawer({
                 {totalSteps > 0 && <Badge tone="neutral">{totalSteps} steps</Badge>}
               </div>
               {(target.model || target.status) && (
-                <div className="wrap gap-2 t3">
+                <div className="wrap gap-2 t3 min-w-0">
                   {target.status && <span>{humanizeStatus(target.status)}</span>}
-                  {target.model && <span>{target.model}</span>}
+                  {target.model && <span className="truncate max-w-full">{target.model}</span>}
                 </div>
               )}
             </div>
@@ -1814,8 +1959,8 @@ export function ForensicTranscriptDrawer({
               Loading transcript steps…
             </div>
           ) : steps.length === 0 && !error ? (
-            <div className="rounded-chip border border-hairline bg-board p-3 space-y-2 text-[13px] text-ink-2" data-testid="trace-empty">
-              <p>No transcript steps match this filter.</p>
+            <div className="rounded-chip border border-hairline bg-board p-3 space-y-2 text-[13px] text-ink-2 min-w-0" data-testid="trace-empty">
+              <p>{filter === "all" ? "No transcript steps recorded yet." : "No transcript steps match this filter."}</p>
               {filter !== "all" && (
                 <Button variant="outline" onClick={() => setFilter("all")}>
                   Show all steps
