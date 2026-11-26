@@ -3,6 +3,13 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as an
 Antigravity plugin archive (`tar.gz` and `zip`) with `SHA256SUMS`.
 
+## 1.23.0 - 2026-11-26
+
+- Hardened the Node sidecar in `sidecars/fleet_pane/{swarm_store,channels,git_probe,server_core}.mjs`: added primitive type guards (`safeStr`, `safeSeq`) against non-primitive JSON payloads, bounded 2 MiB line buffering in `streamLinesIncremental`, last-good `view.json` fallback on transient parse errors, content-hash `plan.json` ETags for same-size CAS conflict detection, bounded LRU caches, CWE-59 symlink and escaping-root guards in `git_probe.mjs`, streaming bounded git diff execution, custom default branch fallbacks, and strict `/api/plan` and `/api/control` input validation (including coordinator kill protection, 404/409 target checks, and control-character rejection).
+- Hardened the React sidebar UI in `frontend/src/{App,ui,sidecar,icons}.tsx` and `frontend/src/components/{TriageView,WorktreesView,BoardView,RosterView}.tsx`: added 3-way `Reload & merge` recovery on `409 Conflict` in the Live Plan Editor, depth-guarded `safePlanText` and `view.json` error cards, HTTP 200 `dry_run_merge` conflict classification with inline recovery hints and dismiss controls, 340px collision pill wrapping, synchronous ref double-submit locks on `/api/control` actions, missing-coordinator warnings, empty-channel fallback states, and `#seq` backlink filter recovery.
+- Removed obsolete legacy UI component copies, `frontend/scripts/sync-used.mjs`, and `frontend/e2e/fixtures/agent.sh`, cleaned `frontend/tsconfig.json`, and updated `frontend/e2e/README.md` for the Node sidecar E2E suite.
+- Captured light and dark `docs/screenshots/hardening-{light,dark}.png`, bumped all manifests and runtime endpoints to `1.23.0`, and verified post-final-edit: `29/29` backend unit tests (`753.9 ms`), `61/61` gate, `8/8` replay, `22/22` `test-live-web.mjs`, `SLOP 0/0/0`, `367,693 B` raw (`359.1 KiB`) / `111,231 B` gz (`108.6 KiB`), `52.47 ms` boot, `122.0 MB` RSS, `2,189.3 req/s` (`9.77 ms` p95, `0/5,487` errors), `5/5` SSE, and `30/30` fuzz.
+
 ## 1.22.0 - 2026-11-26
 
 - Added `POST /api/control` in `sidecars/fleet_pane/server_core.mjs` (both the standalone router and `runSidecarApp`) supporting `board_post`, `spawn_worker`, `switch_model`, `kill_worker`, `channel_op`, and `gate_verdict`, with Host-403, Origin-403, 64 KB `413` checks, `confirm: true` validation, `404` coordinator resolution, `501` non-sidecar guard, `409` unmerged worktree protection via `probeMemberWorktree` in `sidecars/fleet_pane/git_probe.mjs`, and `[fleet-operator:<op>]` directive formatting documented in `skills/fleet/SKILL.md` and `rules/AGENTS.md`.
