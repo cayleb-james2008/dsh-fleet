@@ -507,9 +507,303 @@ await runChecks("gate", async (check) => {
     return workingCount >= 1 && errVisible && disabled;
   });
 
-  await check("roster Token Burn Guard Strip shows top consumer share", async () => {
+  await check("roster Token Burn Guard Strip shows top consumer share, 1M/200k context ceilings, $ spend, and cache-hit efficiency", async () => {
     const txt = await page.locator('#panel-roster [data-testid="token-burn-strip"]').textContent();
-    return txt.includes("Token burn") && txt.includes("builder") && /\d+%/.test(txt);
+    if (!txt || !txt.includes("Token burn") || !txt.includes("builder") || !/\d+%/.test(txt)) return false;
+
+    const costPage = await ctx.newPage();
+    const costErrors = [];
+    costPage.on("pageerror", (err) => costErrors.push(err.message));
+    costPage.on("console", (msg) => {
+      if (msg.type() === "error") costErrors.push(msg.text());
+    });
+
+    await costPage.route("**/api/swarms*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          swarms: [
+            {
+              id: "cost-gate-1",
+              title: "Cost & Context Gate",
+              appData: "gate",
+              head: 1,
+              memberCount: 3,
+              activeCount: 1,
+              waitingCount: 2,
+              killedCount: 0,
+              triageCount: 0,
+              totalTokens: 539000,
+              hasPlan: false,
+              lastActivityTs: Date.now(),
+            },
+          ],
+          defaultConversationId: "cost-gate-1",
+        }),
+      });
+    });
+
+    await costPage.route(/\/api\/swarm\/delta(\?.*)?$/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ok: true,
+          unchanged: true,
+          conversationId: "cost-gate-1",
+          swarm: "cost-gate-1",
+          member: "coordinator",
+          etag: "cost-v1",
+          head: 1,
+        }),
+      });
+    });
+
+    await costPage.route(/\/api\/swarm(\?.*)?$/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversationId: "cost-gate-1",
+          swarm: "cost-gate-1",
+          member: "coordinator",
+          etag: "cost-v1",
+          id: "cost-gate-1",
+          title: "Cost & Context Gate",
+          head: 1,
+          contextLimit: 1000000,
+          contextPct: 80,
+          cost: {
+            totalUsd: 1.49,
+            inputUsd: 0.39,
+            cacheReadUsd: 0.04,
+            outputUsd: 1.06,
+            cacheSavingsUsd: 0.42,
+            cacheHitPct: 54.2,
+            pricingKnown: true,
+          },
+          members: [
+            {
+              name: "gemini-worker",
+              conversation_id: "cost-gem-1",
+              model: "gemini-3-pro",
+              role: "worker",
+              wake_mode: "working",
+              wait_since: 0,
+              last_read_seq: 1,
+              unread: 0,
+              killed: false,
+              status: "working",
+              steps: 10,
+              activity: "Indexing 1M context",
+              activityKind: "thinking",
+              replied: false,
+              replyAsk: "",
+              narrator: false,
+              roleWorker: false,
+              failure: null,
+              transcriptMtime: Date.now(),
+              startedAt: new Date().toISOString(),
+              lastStepAt: new Date().toISOString(),
+              lastContextTokens: 300000,
+              contextLimit: 1000000,
+              contextPct: 30,
+              usage: { inputTokens: 120000, cacheReadTokens: 180000, outputTokens: 8000, totalTokens: 308000 },
+              cost: {
+                totalUsd: 0.25,
+                inputUsd: 0.15,
+                cacheReadUsd: 0.02,
+                outputUsd: 0.08,
+                cacheSavingsUsd: 0.20,
+                cacheHitPct: 60,
+                pricingKnown: true,
+              },
+              byModel: {
+                "gemini-3-pro": { inputTokens: 120000, cacheReadTokens: 180000, outputTokens: 8000, steps: 10 },
+              },
+              posts: 1,
+              lastPostSeq: 1,
+              lastPostTime: "12:00:00",
+              lastPostTs: Date.now(),
+            },
+            {
+              name: "claude-worker",
+              conversation_id: "cost-cld-1",
+              model: "claude-sonnet-4-6",
+              role: "worker",
+              wake_mode: "mentions",
+              wait_since: 1,
+              last_read_seq: 1,
+              unread: 0,
+              killed: false,
+              status: "waiting",
+              steps: 8,
+              activity: "",
+              activityKind: "",
+              replied: false,
+              replyAsk: "",
+              narrator: false,
+              roleWorker: false,
+              failure: null,
+              transcriptMtime: Date.now(),
+              startedAt: new Date().toISOString(),
+              lastStepAt: new Date().toISOString(),
+              lastContextTokens: 160000,
+              contextLimit: 200000,
+              contextPct: 80,
+              usage: { inputTokens: 80000, cacheReadTokens: 80000, outputTokens: 50000, totalTokens: 210000 },
+              cost: {
+                totalUsd: 1.24,
+                inputUsd: 0.24,
+                cacheReadUsd: 0.02,
+                outputUsd: 0.98,
+                cacheSavingsUsd: 0.22,
+                cacheHitPct: 50,
+                pricingKnown: true,
+              },
+              posts: 0,
+              lastPostSeq: 0,
+              lastPostTime: "",
+              lastPostTs: null,
+            },
+            {
+              name: "custom-worker",
+              conversation_id: "cost-cst-1",
+              model: "local-custom-7b",
+              role: "worker",
+              wake_mode: "mentions",
+              wait_since: 1,
+              last_read_seq: 1,
+              unread: 0,
+              killed: false,
+              status: "waiting",
+              steps: 2,
+              activity: "",
+              activityKind: "",
+              replied: false,
+              replyAsk: "",
+              narrator: false,
+              roleWorker: false,
+              failure: null,
+              transcriptMtime: Date.now(),
+              startedAt: new Date().toISOString(),
+              lastStepAt: new Date().toISOString(),
+              lastContextTokens: 20000,
+              contextLimit: 200000,
+              contextPct: 10,
+              usage: { inputTokens: 20000, cacheReadTokens: 0, outputTokens: 1000, totalTokens: 21000 },
+              cost: {
+                totalUsd: 0,
+                inputUsd: 0,
+                cacheReadUsd: 0,
+                outputUsd: 0,
+                cacheSavingsUsd: 0,
+                cacheHitPct: 0,
+                pricingKnown: false,
+              },
+              posts: 0,
+              lastPostSeq: 0,
+              lastPostTime: "",
+              lastPostTs: null,
+            },
+          ],
+          messages: [{ seq: 1, agent: "gemini-worker", text: "@all Cost & 1M ceiling check", time: "12:00:00", ts: Date.now(), mentions: [], all: true }],
+          replyRefs: {},
+          edges: [],
+          triage: [],
+          burnSummary: {
+            totalTokens: 539000,
+            costUsd: 1.49,
+            cacheHitPct: 54.2,
+            cacheSavingsUsd: 0.42,
+            pricingKnown: true,
+            highBurnCount: 1,
+            topWorker: {
+              name: "claude-worker",
+              totalTokens: 210000,
+              sharePct: 83,
+              level: "critical",
+              costUsd: 1.24,
+              cacheHitPct: 50,
+              cacheSavingsUsd: 0.22,
+              pricingKnown: true,
+            },
+            workers: [
+              { name: "claude-worker", totalTokens: 210000, sharePct: 83, level: "critical", costUsd: 1.24, cacheHitPct: 50, cacheSavingsUsd: 0.22, pricingKnown: true },
+              { name: "gemini-worker", totalTokens: 308000, sharePct: 17, level: "normal", costUsd: 0.25, cacheHitPct: 60, cacheSavingsUsd: 0.20, pricingKnown: true },
+              { name: "custom-worker", totalTokens: 21000, sharePct: 0, level: "normal", costUsd: 0, cacheHitPct: 0, cacheSavingsUsd: 0, pricingKnown: false },
+            ],
+          },
+          usage: { inputTokens: 220000, cacheReadTokens: 260000, outputTokens: 59000, totalTokens: 539000 },
+          capabilities: { canSendMessage: false, isSidecar: false, sseStream: false, deltaStream: false },
+        }),
+      });
+    });
+
+    await costPage.setViewportSize({ width: 380, height: 900 });
+    await costPage.goto(BASE, { waitUntil: "networkidle" });
+    await costPage.waitForSelector('#panel-triage [data-testid="token-burn-strip"]');
+    const burnUsd = await costPage.locator('#panel-triage [data-testid="burn-total-usd"]').textContent();
+    const burnCache = await costPage.locator('#panel-triage [data-testid="burn-cache-hit"]').textContent();
+    const highBadge = await costPage.locator('#panel-triage [data-testid="high-burn-badge"]').textContent();
+
+    await costPage.evaluate(() => {
+      window.__costDigest = "";
+      try {
+        Object.defineProperty(navigator, "clipboard", {
+          configurable: true,
+          value: { writeText: async (t) => { window.__costDigest = String(t); } },
+        });
+      } catch {}
+    });
+    await costPage.locator('button[aria-label="Copy swarm digest"]').click();
+    await costPage.waitForFunction(() => Boolean(window.__costDigest));
+    const costDigest = await costPage.evaluate(() => window.__costDigest);
+
+    await costPage.locator("#tab-roster").click();
+    await costPage.waitForSelector('[data-testid="roster-ctx-badge-gemini-worker"]');
+    const gemBadge = await costPage.locator('[data-testid="roster-ctx-badge-gemini-worker"]').textContent();
+    const gemClass = await costPage.locator('[data-testid="roster-ctx-badge-gemini-worker"]').getAttribute("class");
+    const gemCap = await costPage.locator('[data-testid="roster-ctx-cap-gemini-worker"]').textContent();
+    const gemCost = await costPage.locator('[data-testid="roster-cost-gemini-worker"]').textContent();
+    const gemCache = await costPage.locator('[data-testid="roster-cache-hit-gemini-worker"]').textContent();
+    const cldBadge = await costPage.locator('[data-testid="roster-ctx-badge-claude-worker"]').textContent();
+    const cldClass = await costPage.locator('[data-testid="roster-ctx-badge-claude-worker"]').getAttribute("class");
+    const cldCap = await costPage.locator('[data-testid="roster-ctx-cap-claude-worker"]').textContent();
+    const cldCost = await costPage.locator('[data-testid="roster-cost-claude-worker"]').textContent();
+    const cstCost = await costPage.locator('[data-testid="roster-cost-custom-worker"]').textContent();
+    const ovLight380 = await costPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    await costPage.locator('button[aria-label="Open settings"]').click();
+    await costPage.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();
+    await costPage.locator('button[aria-label="Close dialog"]').click();
+    const ovDark380 = await costPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    const isDark = await costPage.evaluate(() => document.documentElement.getAttribute("data-theme") === "dark");
+    await costPage.close();
+
+    return (
+      burnUsd === "$1.49" &&
+      Boolean(burnCache?.includes("54% cache hit") && burnCache.includes("$0.42 saved")) &&
+      Boolean(highBadge?.includes("@claude-worker") && highBadge.includes("$1.24")) &&
+      costDigest.includes("$1.49 spend") &&
+      costDigest.includes("54% cache hit") &&
+      costDigest.includes("30% of 1M ctx") &&
+      gemBadge === "30% ctx" &&
+      !gemClass?.includes("text-danger") &&
+      gemCap === "cap 1M" &&
+      gemCost === "$0.25" &&
+      gemCache === "60% cache hit" &&
+      cldBadge === "80% ctx" &&
+      Boolean(cldClass?.includes("text-danger")) &&
+      cldCap === "cap 200k" &&
+      cldCost === "$1.24" &&
+      cstCost === "Unpriced" &&
+      ovLight380 <= 0 &&
+      ovDark380 <= 0 &&
+      isDark &&
+      costErrors.length === 0
+    );
   });
 
   await check("roster Recover and Board (N) direct jump filter Board to worker", async () => {
