@@ -157,10 +157,23 @@ export interface GateNextAction {
   prompt: string;
 }
 
+export interface WaveVelocity {
+  passRatePct: number;
+  waves: number;
+  wavesPerHr: number;
+  shippedSeq: number;
+  exactShipped: boolean;
+  done: number;
+  verified: number;
+  scaleVerified: number;
+  blocked: number;
+}
+
 export interface GateReadiness {
   state: "blocked" | "ready" | "verifying";
   pendingSeq: number;
   nextAction?: GateNextAction;
+  velocity?: WaveVelocity;
   stages: Array<{ key: string; label: string; count: number; seq: number }>;
 }
 

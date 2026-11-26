@@ -1066,15 +1066,31 @@ export function getSwarmMetaKeys(appData, id) {
 }
 
 function scanGateTags(messages) {
-  const g = { doneC: 0, doneSeq: 0, doneText: '', verC: 0, verSeq: 0, verText: '', scaleC: 0, scaleSeq: 0, scaleText: '', blkC: 0, blkSeq: 0, blkAgent: '' };
+  const g = { doneC: 0, doneSeq: 0, doneText: '', verC: 0, verSeq: 0, verText: '', scaleC: 0, scaleSeq: 0, scaleText: '', blkC: 0, blkSeq: 0, blkAgent: '', shipC: 0, shipSeq: 0, firstTs: 0, lastTs: 0 };
   for (const m of messages || []) {
-    if (!m || m.control || !m.text || m.text.indexOf('[') < 0) continue;
+    if (!m || m.control || !m.text) continue;
     const t = m.text;
+    const hasBrk = t.indexOf('[') >= 0;
+    const hasShip = t.indexOf('shipped') >= 0 || t.indexOf('Shipped') >= 0 || t.indexOf('SHIPPED') >= 0;
+    if (!hasBrk && !hasShip) continue;
     const seq = Number(m.seq) || 0;
-    if (/\[scale-verified\]/i.test(t)) { g.scaleC++; if (seq >= g.scaleSeq) { g.scaleSeq = seq; g.scaleText = t; } }
-    else if (/\[verified\]/i.test(t)) { g.verC++; if (seq >= g.verSeq) { g.verSeq = seq; g.verText = t; } }
-    else if (/\[done\]/i.test(t)) { g.doneC++; if (seq >= g.doneSeq) { g.doneSeq = seq; g.doneText = t; } }
-    if (/\[blocked\]/i.test(t)) { g.blkC++; if (seq >= g.blkSeq) { g.blkSeq = seq; g.blkAgent = m.agent || ''; } }
+    const ts = Number(m.ts) || boardTimeMs(m.time || '') || 0;
+    let hit = false;
+    if (hasBrk) {
+      if (/\[scale-verified\]/i.test(t)) { g.scaleC++; if (seq >= g.scaleSeq) { g.scaleSeq = seq; g.scaleText = t; } hit = true; }
+      else if (/\[verified\]/i.test(t)) { g.verC++; if (seq >= g.verSeq) { g.verSeq = seq; g.verText = t; } hit = true; }
+      else if (/\[done\]/i.test(t)) { g.doneC++; if (seq >= g.doneSeq) { g.doneSeq = seq; g.doneText = t; } hit = true; }
+      if (/\[blocked\]/i.test(t)) { g.blkC++; if (seq >= g.blkSeq) { g.blkSeq = seq; g.blkAgent = m.agent || ''; } hit = true; }
+    }
+    if (hasShip && /\bshipped\b/i.test(t)) {
+      g.shipC++;
+      if (seq >= g.shipSeq) g.shipSeq = seq;
+      hit = true;
+    }
+    if (hit && ts > 0) {
+      if (!g.firstTs || ts < g.firstTs) g.firstTs = ts;
+      if (ts > g.lastTs) g.lastTs = ts;
+    }
   }
   return g;
 }
@@ -1084,7 +1100,7 @@ export function computeGateReadiness(messages, triage = [], { precomputed = null
   const g = precomputed || scanGateTags(messages);
   const { doneC, doneSeq, verC, verSeq, scaleC, scaleSeq, blkC, blkSeq, blkAgent } = g;
   const activeBlk = (triage || []).find((x) => (x.kind === 'blocked' || x.severity === 'urgent') && x.seq > 0);
-  if (!doneC && !verC && !scaleC && !blkC && !activeBlk) return null;
+  if (!doneC && !verC && !scaleC && !blkC && !g.shipC && !activeBlk) return null;
   const maxStage = Math.max(doneSeq, verSeq, scaleSeq);
   const pendingSeq = activeBlk ? activeBlk.seq
     : doneSeq > verSeq ? doneSeq
@@ -1150,14 +1166,34 @@ export function computeGateReadiness(messages, triage = [], { precomputed = null
       conversationId: hit.conversation_id || '',
       seq: scaleSeq || pendingSeq,
       label: `Nudge @${hit.name}`,
-      prompt: `@${hit.name} Re #${scaleSeq || pendingSeq}: ${scope}${ctxFrom(g.scaleText || g.doneText)} is [scale-verified] — ready to ship.`,
+      prompt: `@${hit.name} Re #${scaleSeq || pendingSeq}: ${scope}${ctxFrom(g.scaleText || g.doneText)} is [scale-verified] and ready to ship.`,
     };
   }
+
+  const okCount = doneC + verC + scaleC;
+  const totalCount = okCount + blkC;
+  const passRatePct = totalCount > 0 ? Math.round((okCount / totalCount) * 100) : 0;
+  const waves = Math.max(g.shipC || 0, scaleC) || (verC > 0 ? verC : doneC);
+  const spanMs = g.firstTs > 0 && g.lastTs > g.firstTs ? g.lastTs - g.firstTs : 0;
+  const wavesPerHr = spanMs >= 60_000 ? Number(((waves * 3_600_000) / spanMs).toFixed(1)) : 0;
+  const shippedSeq = g.shipSeq || scaleSeq || verSeq || doneSeq || 0;
+  const exactShipped = Boolean(g.shipSeq || scaleSeq);
 
   return {
     state,
     pendingSeq,
     nextAction,
+    velocity: {
+      passRatePct,
+      waves,
+      wavesPerHr,
+      shippedSeq,
+      exactShipped,
+      done: doneC,
+      verified: verC,
+      scaleVerified: scaleC,
+      blocked: blkC,
+    },
     stages: [
       { key: 'done', label: '[done]', count: doneC, seq: doneSeq },
       { key: 'verified', label: '[verified]', count: verC, seq: verSeq },
@@ -1238,7 +1274,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
 
   // Transform board messages in-place so peak heap does not hold 2x 2k-object graphs
   const seen = new Set();
-  const gateAcc = { doneC: 0, doneSeq: 0, doneText: '', verC: 0, verSeq: 0, verText: '', scaleC: 0, scaleSeq: 0, scaleText: '', blkC: 0, blkSeq: 0, blkAgent: '' };
+  const gateAcc = { doneC: 0, doneSeq: 0, doneText: '', verC: 0, verSeq: 0, verText: '', scaleC: 0, scaleSeq: 0, scaleText: '', blkC: 0, blkSeq: 0, blkAgent: '', shipC: 0, shipSeq: 0, firstTs: 0, lastTs: 0 };
   for (let i = 0; i < msgs.length; i++) {
     const m = msgs[i];
     const seq = Number(m.seq) || 0;
@@ -1260,11 +1296,25 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
       m.control = control;
       continue;
     }
-    if (text.indexOf('[') >= 0) {
-      if (/\[scale-verified\]/i.test(text)) { gateAcc.scaleC++; if (seq >= gateAcc.scaleSeq) { gateAcc.scaleSeq = seq; gateAcc.scaleText = text; } }
-      else if (/\[verified\]/i.test(text)) { gateAcc.verC++; if (seq >= gateAcc.verSeq) { gateAcc.verSeq = seq; gateAcc.verText = text; } }
-      else if (/\[done\]/i.test(text)) { gateAcc.doneC++; if (seq >= gateAcc.doneSeq) { gateAcc.doneSeq = seq; gateAcc.doneText = text; } }
-      if (/\[blocked\]/i.test(text)) { gateAcc.blkC++; if (seq >= gateAcc.blkSeq) { gateAcc.blkSeq = seq; gateAcc.blkAgent = agent; } }
+    const hasBrk = text.indexOf('[') >= 0;
+    const hasShip = text.indexOf('shipped') >= 0 || text.indexOf('Shipped') >= 0 || text.indexOf('SHIPPED') >= 0;
+    if (hasBrk || hasShip) {
+      let hit = false;
+      if (hasBrk) {
+        if (/\[scale-verified\]/i.test(text)) { gateAcc.scaleC++; if (seq >= gateAcc.scaleSeq) { gateAcc.scaleSeq = seq; gateAcc.scaleText = text; } hit = true; }
+        else if (/\[verified\]/i.test(text)) { gateAcc.verC++; if (seq >= gateAcc.verSeq) { gateAcc.verSeq = seq; gateAcc.verText = text; } hit = true; }
+        else if (/\[done\]/i.test(text)) { gateAcc.doneC++; if (seq >= gateAcc.doneSeq) { gateAcc.doneSeq = seq; gateAcc.doneText = text; } hit = true; }
+        if (/\[blocked\]/i.test(text)) { gateAcc.blkC++; if (seq >= gateAcc.blkSeq) { gateAcc.blkSeq = seq; gateAcc.blkAgent = agent; } hit = true; }
+      }
+      if (hasShip && /\bshipped\b/i.test(text)) {
+        gateAcc.shipC++;
+        if (seq >= gateAcc.shipSeq) gateAcc.shipSeq = seq;
+        hit = true;
+      }
+      if (hit && ts > 0) {
+        if (!gateAcc.firstTs || ts < gateAcc.firstTs) gateAcc.firstTs = ts;
+        if (ts > gateAcc.lastTs) gateAcc.lastTs = ts;
+      }
     }
     const { mentions, all } = matchMentions(text);
     const ch = byChannel ? byChannel(i, text) : null;

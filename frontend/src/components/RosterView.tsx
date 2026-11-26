@@ -100,7 +100,7 @@ export function RosterView({
 
   return (
     <div className="space-y-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
+      <div className="row flex-wrap gap-2">
         <div className="wrap">
           <h2 className="h2">
             Roster ({members.length - killedCount} active)

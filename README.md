@@ -2,7 +2,7 @@
 
 # Fleet
 
-**Antigravity-native Swarm Sidebar Plugin** — turn native multi-agent swarms (`swarm`, `post_message`, `read_board`, `swarm_wait`, `plan.json`, and worker transcripts) into a keyboard-first auxiliary side pane inside Antigravity.
+An Antigravity sidecar plugin for multi-agent swarms. It reads native swarm boards, worker transcripts, `plan.json` milestones, and workspace git worktrees into a compact sidebar inside Antigravity.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/cayleb-james2008/fleet/release.yml?branch=main&label=CI&style=flat-square)](https://github.com/cayleb-james2008/fleet/actions/workflows/release.yml)
 [![Release](https://img.shields.io/github/v/release/cayleb-james2008/fleet?style=flat-square&color=blue)](https://github.com/cayleb-james2008/fleet/releases/latest)
@@ -15,21 +15,21 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/triage-dark.png" />
   <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/triage-light.png" />
-  <img alt="Fleet Antigravity Swarm Sidebar — Needs-You Triage & Swarm Plan" src="docs/screenshots/triage-light.png" width="380" />
+  <img alt="Fleet sidebar showing Triage inbox, gate readiness, and swarm plan" src="docs/screenshots/triage-light.png" width="380" />
 </picture>
 
 </div>
 
 ---
 
-## Sidebar Gallery
+## Sidebar gallery
 
-Fleet scales from `340px–380px` Antigravity auxiliary sidebars up to wide `1440px` panes with live host theme luminance sync (`theme-change` postMessage) and a Settings-only Light/Dark theme switch.
+Fleet lays out cleanly from a `340px` to `380px` auxiliary sidebar up to `1440px` desktop views. It listens for Antigravity `theme-change` luminance updates and keeps the manual Light and Dark switch inside Settings.
 
 <table>
   <tr>
     <td align="center" width="25%">
-      <strong>Triage &amp; Plan</strong><br />
+      <strong>Triage and plan</strong><br />
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/triage-dark.png" />
         <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/triage-light.png" />
@@ -37,7 +37,7 @@ Fleet scales from `340px–380px` Antigravity auxiliary sidebars up to wide `144
       </picture>
     </td>
     <td align="center" width="25%">
-      <strong>Board &amp; Pins</strong><br />
+      <strong>Board and pins</strong><br />
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/board-dark.png" />
         <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/board-light.png" />
@@ -45,7 +45,7 @@ Fleet scales from `340px–380px` Antigravity auxiliary sidebars up to wide `144
       </picture>
     </td>
     <td align="center" width="25%">
-      <strong>Roster &amp; Telemetry</strong><br />
+      <strong>Roster and telemetry</strong><br />
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/roster-dark.png" />
         <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/roster-light.png" />
@@ -53,7 +53,7 @@ Fleet scales from `340px–380px` Antigravity auxiliary sidebars up to wide `144
       </picture>
     </td>
     <td align="center" width="25%">
-      <strong>Git Worktrees</strong><br />
+      <strong>Git worktrees</strong><br />
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/worktrees-dark.png" />
         <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/worktrees-light.png" />
@@ -65,17 +65,15 @@ Fleet scales from `340px–380px` Antigravity auxiliary sidebars up to wide `144
 
 ---
 
-## Capabilities
+## What it does
 
-- **1-Click Gate Readiness & Context-Aware Next-Gate Action:** Automatically tracks `[done]` -> `[verified]` -> `[scale-verified]` / `[blocked]` board gates into a compact **Gate readiness** strip in **Triage** with 1-click `#seq` stage jumps plus a **Nudge / Unblock Next Gate** button pre-filling `Re #<seq>:` + branch/commit context into a confirmation-gated composer.
-- **Per-Worker Token & Burn-Rate Guard Strip:** Inspect proportional per-worker token consumption right in **Triage** and **Roster** with a live stacked segment bar, top-3 consumer share percentages, and automatic `High burn` alerts flagging runaway workers at a glance.
-- **Swarm Bottleneck Heat Bar & 1-Click Copy Blocker:** Spot swarm saturation at a glance from a proportional `working` / `waiting` / `blocked` strip on Needs You, jump straight to the highest-impact thread via `Top #seq`, and copy a concise `~/`-masked Markdown escalation with 1-click **Copy blocker**.
-- **Multi-Worker Broadcast & Filtered Board Export:** Select `@all`, `working`, `waiting`, or custom worker subsets inside **Roster -> Broadcast** to dispatch confirmation-gated multi-worker nudges (`conversationIds`), and export active **Board** filters in 1 click as sanitized `.md` or `.json` reports (`~/`-masked paths, zero `/home/` leaks).
-- **Keyboard-First Sidebar Triage & `#seq` Quote-Reply:** Navigate Needs-You escalations with `j`/`k`, jump tabs with `1`–`5`, open worker chat with `o`/`Enter`, pin `#seq` with `p`, reply (`Re #<seq>:`) with `r` or Board `#seq` / **Reply** buttons, cycle Board quick filters (`All` / `Needs reply` / `[done]` / `[blocked]`) with `f`, and press `?` anytime for the keyboard cheatsheet.
-- **1-Click Wave Digest, Unstick Presets & File Links:** Generate clean Markdown **Wave digest** summaries (pinned `#seq`s, active/waiting/stalled worker durations, and `~/`-masked dirty worktree files), expand worker **Activity Peek**, dispatch confirmation-gated **Unstick / Resume** nudges, inspect sanitized `Screenshot:` chips, and open files via `window.sidecar.ui.toggleAuxPane({ tabType: "fileView", uri })`.
-- **Live SSE Push Stream & Polling Fallback:** Streams instant board/transcript fingerprint deltas over `GET /api/swarm/stream` (`text/event-stream`) with automatic interval fallback inside Antigravity's `SidecarApp` gateway.
-- **Worker Roster, Context Saturation & `@mention` Graph:** Incrementally tails `transcript.jsonl` with bounded 16 KB tail rings to track real `input` / `cache_read` / `output` tokens, `% ctx` context saturation, shimmering active work, and replayable `@mention` topology.
-- **Confined Workspace Git Worktrees & Inline Diff Peek:** Listens to `sidecar.getWorkspaceUris()` / `onWorkspaceChange()`, runs `git status --porcelain=v1 -z` and bounded (`<= 8 KB`) `GET /api/worktrees/diff` hunks with strict root + `realpathSync` CWE-22/CWE-59 symlink confinement, and exposes dirty/staged/untracked file rows with 1-click **Diff** peek drawers and **Open** actions.
+In **Triage**, Fleet pulls unanswered questions, blocked posts, quota pauses, pending verification stages, and `plan.json` workstreams into a single inbox. A gate readiness card tracks `[done]`, `[verified]`, `[scale-verified]`, and `[blocked]` tags alongside a wave velocity pill showing pass percentage, gate counts, and a jump button to the newest shipped post. A bottleneck bar summarizes working, waiting, and blocked counts, and a token burn strip plots each worker's share of total tokens so high-spend loops stand out quickly.
+
+Each triage item includes keyboard shortcuts (`j` and `k` to move, `o` or `Enter` to open chat, `p` to pin `#seq`, `r` to reply, `1` to `5` to switch tabs, `?` for help), inline activity peeks showing recent tool calls, unstick presets, `~/`-masked blocker copy buttons, and direct file openers through `window.sidecar.ui.toggleAuxPane`.
+
+In **Board**, Fleet reads `board.jsonl` with quick filters (`All`, `Needs reply`, `[done]`, `[blocked]`, cycled with `f`), pinned posts, `#seq` quote replies, Markdown wave digests, and `.md` or `.json` board exports stripped of local `/home/` paths. In **Roster**, you can inspect worker duration badges, token breakdowns, and context saturation, or open a confirmation-gated broadcast composer to nudge `@all`, `working`, `waiting`, or custom worker subsets. In **Graph**, a replayable `@mention` graph traces message flow across the swarm. In **Git**, Fleet probes workspace worktrees with `git status --porcelain=v1 -z` and shows bounded inline diffs (`GET /api/worktrees/diff`).
+
+Live updates stream over `GET /api/swarm/stream` (`text/event-stream`) in standalone mode and fall back to polling inside Antigravity's `SidecarApp` gateway. Under the hood, `swarm_store.mjs` tails `transcript.jsonl` incrementally in 32 KB chunks, parses JSON only for the newest 16 tail lines, and avoids holding large parsed board graphs in memory.
 
 ---
 
@@ -84,8 +82,8 @@ Fleet scales from `340px–380px` Antigravity auxiliary sidebars up to wide `144
 ```mermaid
 flowchart LR
     Host["Antigravity Host<br/>(Aux Side Pane + /preload.js)"] <-->|"SidecarApp RPC + theme-change<br/>toggleConversation / toggleAuxPane"| Backend["Fleet Sidecar Backend<br/>(sidecars/fleet_pane/main.mjs)"]
-    UI["Embedded Sidebar SPA<br/>(294.4 KiB raw / 91.8 KiB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>Pre-Gzipped ETag/304 JSON"| Backend
-    Backend -->|"Zero-String Buffer Scan + 16 KB Ring"| Store["swarm_store.mjs"]
+    UI["Embedded Sidebar SPA<br/>(294.8 KiB raw / 91.9 KiB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>Pre-Gzipped ETag/304 JSON"| Backend
+    Backend -->|"Zero-String Buffer Scan + 16-Line Tail"| Store["swarm_store.mjs"]
     Backend -->|"Debounced TTL + CWE-22/59 Diff Peek"| Git["git_probe.mjs"]
     Store -.->|"Read-Only"| Brain["~/.gemini/antigravity/brain/&lt;conv&gt;<br/>.system_generated/{swarm,logs}"]
     Git -.->|"git status + bounded diff"| WT["Workspace Git Worktrees"]
@@ -93,46 +91,43 @@ flowchart LR
 
 ---
 
-## Verified Benchmarks
+## Verified benchmarks
 
-Measured under `#154` CPU isolation (`taskset -c 24-31`, `16` concurrent polling workers) on a 16–20 worker / 2,000-board-post / 50,000-transcript-line stress fixture:
+Measured under `#154` CPU isolation (`taskset -c 24-31`, 16 concurrent polling clients) on a 2,000-board-post and 50,000-transcript-line stress fixture:
 
-| Metric | v1.11.0 | v1.12.0 | **v1.13.0** |
+| Metric | v1.12.0 | v1.13.0 | **v1.14.0** |
 | --- | --- | --- | --- |
-| Embedded Sidecar UI (`/`) | `301,090 B` raw (`294.0 KiB`) / `93,839 B` gz (`91.64 KiB`) | `300,853 B` raw (`293.8 KiB`) / `93,861 B` gz (`91.66 KiB`) | **`301,440 B` raw (`294.4 KiB`) / `94,030 B` gz (`91.83 KiB`)** |
-| Peak RSS (`VmHWM`, `--jitless` 16w) | `64.79 MB` (`66,340 KB` `--jitless` 2k/50k, `95.49 MB` default) | `65.55 MB` (`67,128 KB` `--jitless` 2k/50k, `69.16 MB` audit) | **`64.87 MB` (`66,424 KB` `--jitless` 2k/50k, `95.47 MB` default)** |
-| Throughput (`req/s`, 16w `taskset 24-31`) | `8,257.6 req/s` (`--jitless` keep-alive) · `28,821.2 req/s` (keep-alive) | `5,114.1 req/s` (`--jitless` keep-alive) · `21,926.4 req/s` (keep-alive) | **`7,257.0 req/s` (`--jitless` keep-alive) · `23,130.6 req/s` (keep-alive) · `1,211.0 req/s` (cold audit)** |
-| Latency (`p50` / `p95`, `taskset 24-31`) | `1.67 ms` / `2.67 ms` (`--jitless`) · `9.22 ms` / `13.97 ms` (audit) | `2.52 ms` / `4.24 ms` (`--jitless`) · `16.53 ms` / `23.45 ms` (audit) | **`1.85 ms` / `3.10 ms` (`--jitless`) · `11.35 ms` / `14.71 ms` (cold audit)** |
-| Simultaneous SSE (`/api/swarm/stream` x5) | `5/5` (`0` drops) | `5/5` (`0` drops) | **`5/5` (`0` drops)** |
-| E2E Gate + Replay + Sloplint | `42/42` + `8/8` + `0 FAIL / 0 REFLEX / 0 WARN` | `43/43` + `8/8` + `0 FAIL / 0 REFLEX / 0 WARN` | **`43/43` + `8/8` + `0 FAIL / 0 REFLEX / 0 WARN`** |
+| Embedded sidecar UI (`/`) | `300,853 B` raw / `93,861 B` gz | `301,440 B` raw / `94,030 B` gz | **`301,836 B` raw (`294.8 KiB`) / `94,150 B` gz (`91.94 KiB`)** |
+| Peak RSS (`VmHWM`, `--jitless` 2k/50k) | `65.55 MB` (`67,128 KB`) | `64.87 MB` (`66,424 KB`) | **`63.05 MB` (`64,564 KB`)** |
+| Peak RSS (`VmHWM`, cold default audit) | `69.16 MB` (`16w`) | `119.63 MB` (`16w`) | **`101.73 MB` (`16w`)** |
+| Throughput (`--jitless` keep-alive) | `5,114.1 req/s` | `7,257.0 req/s` | **`3,872.7 req/s`** (`2k/50k` `#154` `nice -n 19`) |
+| Cold audit HTTP (`16w` close) | `16.53 ms` / `23.45 ms` p95 | `2,315.7 req/s` / `9.30 ms` p95 | **`1,272.3 req/s` / `15.30 ms` p95 (`0` errors)** |
+| Simultaneous SSE (`x5` streams) | `5/5` (`0` drops) | `5/5` (`0` drops) | **`5/5` (`0` drops)** |
+| E2E gate, replay, and Sloplint | `43/43` + `8/8` + `0 FAIL` | `43/43` + `8/8` + `0 FAIL` | **`44/44` + `8/8` + `0 FAIL / 0 REFLEX / 0 WARN`** |
 
 ---
 
-## Quick Start (Antigravity Plugin)
+## Quick start
 
-1. Install into `~/.gemini/config/plugins/fleet/` atomically:
+Install the plugin into `~/.gemini/config/plugins/fleet/`:
 
 ```bash
 ./install.sh
 ```
 
-2. Open Antigravity Customizations (**`customization://fleet`**) to enable **`fleet`**.
-3. Open the auxiliary sidebar via **`sidecar://fleet/fleet_pane/`**, or invoke **`/fleet`** in chat to orchestrate a `plan.json`-tracked swarm with isolated worktrees.
+Open Antigravity Customizations (`customization://fleet`) to enable `fleet`, then open the side pane (`sidecar://fleet/fleet_pane/`) or run `/fleet` in chat to start a tracked swarm.
 
-> **Legacy v0.12.0:** Fleet pivoted cleanly to an Antigravity-native sidecar plugin in `v1.0.0`. The legacy standalone Rust binary remains preserved at git tag `v0.12.0`.
-
----
-
-## Security Model
-
-- Strictly loopback-bound (`127.0.0.1`) with `Host` loopback `403` validation and same-origin `Origin` checks on mutating `POST` routes (`403`).
-- Prompt `413 Payload Too Large` abort before reading oversized request bodies.
-- Strict CWE-22 / CWE-59 confinement on `GET /api/frame` (canonical `realpath` inside `<appData>/brain/` and listed on board/`view.json`) and `git_probe.mjs` worktree file URIs (escaping symlinks return empty `uri`).
-- Confirmation-gated mutating nudges (`confirm: true`), zero external network calls, `frame-src 'none'`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer`.
+> Note: Fleet became an Antigravity sidecar plugin in `v1.0.0`. The older standalone Rust binary remains at git tag `v0.12.0`.
 
 ---
 
-## Development & Verification
+## Security model
+
+The sidecar binds strictly to `127.0.0.1`, validates loopback `Host` headers (`403` otherwise), and checks `Origin` headers on mutating `POST` requests (`403`). Oversized request bodies fail early with `413 Payload Too Large`. `GET /api/frame` resolves paths with `realpath` inside `<appData>/brain/` and checks that each image appears on the board or `view.json`, while `git_probe.mjs` clears `uri` for escaping symlinks inside worktrees. All nudges and broadcasts require explicit user confirmation (`confirm: true`), external network requests are blocked by CSP, and every response carries `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+
+---
+
+## Development and verification
 
 ```bash
 cd sidecars/fleet_pane && npm test
