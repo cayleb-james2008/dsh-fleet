@@ -594,12 +594,16 @@ await runChecks("gate", async (check) => {
     const wtErrors = [];
     const diffModesSeen = [];
     const actionsSeen = [];
+    let expect409 = false;
     wtPage.on("pageerror", (err) => wtErrors.push(err.message));
     wtPage.on("console", (msg) => {
-      if (msg.type() === "error") wtErrors.push(msg.text());
+      if (msg.type() === "error") {
+        if (expect409 && msg.text().includes("status of 409")) return;
+        wtErrors.push(msg.text());
+      }
     });
 
-    await wtPage.route("**/api/worktrees", async (route) => {
+    await wtPage.route(/\/api\/worktrees(\?.*)?$/, async (route) => {
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -813,7 +817,7 @@ await runChecks("gate", async (check) => {
       });
     });
 
-    await wtPage.route("**/api/worktrees/diff*", async (route) => {
+    await wtPage.route(/\/api\/worktrees\/diff(\?.*)?$/, async (route) => {
       const reqUrl = new URL(route.request().url());
       const mode = reqUrl.searchParams.get("mode") || "working";
       diffModesSeen.push(mode);
@@ -834,7 +838,7 @@ await runChecks("gate", async (check) => {
       });
     });
 
-    await wtPage.route("**/api/worktrees/action", async (route) => {
+    await wtPage.route(/\/api\/worktrees\/action(\?.*)?$/, async (route) => {
       const body = JSON.parse(route.request().postData() || "{}");
       actionsSeen.push(body.action);
       if (body.action === "dry_run_merge") {
@@ -865,7 +869,7 @@ await runChecks("gate", async (check) => {
       });
     });
 
-    await wtPage.goto(BASE, { waitUntil: "networkidle" });
+    await wtPage.goto(BASE, { waitUntil: "domcontentloaded" });
     await wtPage.locator("#tab-worktrees").click();
     await wtPage.waitForSelector("#panel-worktrees");
     await wtPage.fill('input[aria-label="Workspace repository path"]', "/mock/repo");
@@ -891,6 +895,7 @@ await runChecks("gate", async (check) => {
 
     // Rebase two-step confirmation & conflict feedback
     await wtPage.locator('[data-testid="wt-action-rebase-feat/beta"]').click();
+    expect409 = true;
     await wtPage.locator('[data-testid="wt-confirm-submit-feat/beta"]').click();
     await wtPage.waitForFunction(
       () => (document.querySelector('[data-testid="wt-action-result-feat/beta"]')?.textContent || "").includes("Rebase aborted"),

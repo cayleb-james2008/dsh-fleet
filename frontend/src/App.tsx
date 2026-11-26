@@ -659,7 +659,7 @@ export function App() {
           <div className="rounded-card bg-board p-3 text-[12px] text-ink-2 space-y-1">
             <div className="f1 font-medium text-ink">
               <CommandIcon />
-              <span>Fleet Antigravity Plugin v1.20.0</span>
+              <span>Fleet Antigravity Plugin v1.21.0</span>
             </div>
             <p>Reads local swarm files over loopback with no telemetry.</p>
           </div>

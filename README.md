@@ -71,7 +71,7 @@ In **Triage**, Fleet pulls unanswered questions, blocked posts, quota pauses, st
 
 Each triage item includes keyboard shortcuts (`j` and `k` to move, `o` or `Enter` to open chat, `p` to pin `#seq`, `r` to reply, `1` to `5` to switch tabs, `?` for help), inline activity peeks showing recent tool calls, unstick presets, `~/`-masked blocker copy buttons, and direct file openers through `window.sidecar.ui.toggleAuxPane`. Press `Ctrl+K` or `Cmd+K` anywhere to search across tabs, `@worker` board filters, worker chats, triage items, recent board posts, worktrees, and active swarms.
 
-In **Board**, Fleet reads `board.jsonl` with quick filters (`All`, `Needs reply`, `[done]`, `[blocked]`, cycled with `f`), pinned posts, `#seq` quote replies, Markdown wave digests, and `.md` or `.json` board exports stripped of local `/home/` paths. In **Roster**, each worker card pairs duration badges, token breakdowns, context saturation, and a 1-line mtime-cached transcript tail `activityPeek` (active tool or command, `~/`-masked paths, and age) with 1-click worker recovery, filtered board jumps, and a confirmation-gated broadcast composer to nudge `@all`, `working`, `waiting`, or custom worker subsets. In **Graph**, a replayable `@mention` graph traces message flow across the swarm. In **Git**, Fleet probes workspace worktrees with `git status --porcelain=v1 -z`, computes ahead/behind divergence against `main` (`Ready to land`, `Needs rebase`, `Uncommitted edits`, or `Landed / clean`) with 1-click copyable merge/rebase/cleanup commands, and shows bounded inline diffs (`GET /api/worktrees/diff`).
+In **Board**, Fleet reads `board.jsonl` with quick filters (`All`, `Needs reply`, `[done]`, `[blocked]`, cycled with `f`), pinned posts, `#seq` quote replies, Markdown wave digests, and `.md` or `.json` board exports stripped of local `/home/` paths. In **Roster**, each worker card pairs duration badges, token breakdowns, context saturation, and a 1-line mtime-cached transcript tail `activityPeek` (active tool or command, `~/`-masked paths, and age) with 1-click worker recovery, filtered board jumps, and a confirmation-gated broadcast composer to nudge `@all`, `working`, `waiting`, or custom worker subsets. In **Graph**, a replayable `@mention` graph traces message flow across the swarm. In **Git**, Fleet probes workspace worktrees with `git status --porcelain=v1 -z` and `git merge-tree --write-tree`, flags overlapping `collisions` across active worktrees, shows recent commits and `Working Changes` vs `Branch Diff` hunks (`GET /api/worktrees/diff?mode=working|branch`), and runs confirmation-gated `Dry-Run Merge`, `FF Merge`, `Rebase` (with automatic `--abort` on conflict), and clean `Remove` actions (`POST /api/worktrees/action`).
 
 Live updates stream over `GET /api/swarm/stream` (`text/event-stream`) with live ping heartbeats in standalone mode and fall back to polling inside Antigravity's `SidecarApp` gateway. On startup, `main.mjs` binds the HTTP listener and answers `/api/health` immediately before lazily loading `server_core.mjs` (`swarm_store.mjs`, `git_probe.mjs`, and gzip caches) and `--jitless` V8 tuning flags after socket bind. When zero SSE clients are connected, `server_core.mjs` enters `idleSleep` and clears background polling timers until the next request or stream connection, serves cached `/api/worktrees` responses synchronously on cache hit, and reads only the trailing 8 KB of each `transcript.jsonl` into a shared buffer for `activityPeek` while tailing full history incrementally in 32 KB chunks without retaining parsed board graphs in memory.
 
@@ -82,9 +82,9 @@ Live updates stream over `GET /api/swarm/stream` (`text/event-stream`) with live
 ```mermaid
 flowchart LR
     Host["Antigravity Host<br/>(Aux Side Pane + /preload.js)"] <-->|"SidecarApp RPC + theme-change<br/>toggleConversation / toggleAuxPane"| Backend["Fleet Sidecar Bootstrap<br/>(sidecars/fleet_pane/main.mjs)"]
-    UI["Embedded Sidebar SPA<br/>(304.2 KiB raw / 94.7 KiB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>Zero-Client Idle Sleep + 304 JSON"| Backend
+    UI["Embedded Sidebar SPA<br/>(328.1 KiB raw / 101.0 KiB gz)"] <-->|"GET /api/swarm/stream (SSE)<br/>Zero-Client Idle Sleep + 304 JSON"| Backend
     Backend -->|"Lazy Route + Store Load"| Core["server_core.mjs + swarm_store.mjs"]
-    Core -->|"Safe-Land Checks + CWE-22/59 Diff Peek"| Git["git_probe.mjs"]
+    Core -->|"Collision, Merge-Tree & Worktree Actions"| Git["git_probe.mjs"]
     Core -.->|"Read-Only 8 KB Tail + Scan"| Brain["~/.gemini/antigravity/brain/&lt;conv&gt;<br/>.system_generated/{swarm,logs}"]
     Git -.->|"git status + rev-list + bounded diff"| WT["Workspace Git Worktrees"]
 ```
@@ -95,14 +95,14 @@ flowchart LR
 
 Measured under `#154` CPU isolation (`taskset -c 24-31`, 16 concurrent polling clients) on a 2,000-board-post and 50,000-transcript-line stress fixture:
 
-| Metric | v1.18.0 | v1.19.0 | **v1.20.0** |
+| Metric | v1.19.0 | v1.20.0 | **v1.21.0** |
 | --- | --- | --- | --- |
-| Embedded sidecar UI (`/`) | `309,310 B` raw / `96,345 B` gz | `311,474 B` raw (`304.2 KiB`) / `97,019 B` gz (`94.7 KiB`) | **`326,845 B` raw (`319.2 KiB`) / `100,977 B` gz (`98.6 KiB`)** |
-| Cold boot & RSS (`16w` audit) | `53.28 ms` / `105.57 MB` | `51.01 ms` / `107.46 MB` (`68.02 MB` `--jitless`) | **`64.59 ms` / `100.02 MB` (`ETag 304`)** |
-| Cold audit HTTP (`16w` close) | `1,839.4 req/s` / `11.90 ms` p95 | `1,833.4 req/s` / `14.11 ms` p95 | **`1,588.3 req/s` / `12.14 ms` p95 (`0/3,979` errors)** |
+| Embedded sidecar UI (`/`) | `311,474 B` raw / `97,019 B` gz | `326,845 B` raw / `100,977 B` gz | **`336,001 B` raw (`328.1 KiB`) / `103,435 B` gz (`101.0 KiB`)** |
+| Cold boot & RSS (`16w` audit) | `51.01 ms` / `107.46 MB` | `64.59 ms` / `100.02 MB` | **`91.09 ms` / `100.22 MB` (`ETag 304`)** |
+| Cold audit HTTP (`16w` close) | `1,833.4 req/s` / `14.11 ms` p95 | `1,588.3 req/s` / `12.14 ms` p95 | **`828.5 req/s` / `22.29 ms` p95 (`0/2,080` errors)** |
 | Simultaneous SSE (`x5` streams) | `5/5` (`0` drops) | `5/5` (`0` drops) | **`5/5` (`0` drops)** |
-| Raw-TCP fuzz & backend tests | `30/30` fuzz + `12/12` unit | `30/30` fuzz + `13/13` unit | **`30/30` fuzz + `16/16` unit (incl. CAS `POST /api/plan`)** |
-| E2E gate, replay, and Sloplint | `51/51` + `8/8` + `0 FAIL` | `52/52` + `8/8` + `0 FAIL` | **`52/52` + `8/8` + `16/16` live-web + `0 FAIL / 0 WARN`** |
+| Raw-TCP fuzz & backend tests | `30/30` fuzz + `13/13` unit | `30/30` fuzz + `16/16` unit | **`30/30` fuzz + `18/18` unit (incl. worktree ops)** |
+| E2E gate, replay, and Sloplint | `52/52` + `8/8` + `0 FAIL` | `52/52` + `8/8` + `16/16` live-web | **`52/52` + `8/8` + `18/18` live-web + `0 FAIL / 0 WARN`** |
 
 ---
 
@@ -122,7 +122,7 @@ Open Antigravity Customizations (`customization://fleet`) to enable `fleet`, the
 
 ## Security model
 
-The sidecar binds strictly to `127.0.0.1`, validates loopback `Host` headers (`403` otherwise), and checks `Origin` headers on mutating `POST` requests (`403`). Oversized request bodies fail early with `413 Payload Too Large`. `GET /api/frame` resolves paths with `realpath` inside `<appData>/brain/` and checks that each image appears on the board or `view.json`, while `git_probe.mjs` clears `uri` for escaping symlinks inside worktrees. All nudges and broadcasts require explicit user confirmation (`confirm: true`), external network requests are blocked by CSP, and every response carries `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+The sidecar binds strictly to `127.0.0.1`, validates loopback `Host` headers (`403` otherwise), and checks `Origin` headers on mutating `POST` requests (`403`). Oversized request bodies fail early with `413 Payload Too Large` (`16 KiB` on worktree actions, `64 KiB` on plan writes). `GET /api/frame` resolves paths with `realpath` inside `<appData>/brain/` and checks that each image appears on the board or `view.json`, while `git_probe.mjs` executes git via `execFile` (zero shell interpolation), confines diffs and `POST /api/worktrees/action` to resolved worktrees inside the repository, refuses dirty/unmerged removals, and clears `uri` for escaping symlinks. All nudges, broadcasts, and destructive worktree actions require explicit user confirmation, external network requests are blocked by CSP, and every response carries `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
 
 ---
 

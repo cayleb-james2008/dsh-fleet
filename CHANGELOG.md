@@ -3,6 +3,13 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as an
 Antigravity plugin archive (`tar.gz` and `zip`) with `SHA256SUMS`.
 
+## 1.21.0 - 2026-11-26
+
+- Added cross-worktree file collision detection (`collisions` across working changes and committed `branchFiles`), `git merge-tree --write-tree` mergeability and `conflictFiles` checks, recent branch commit summaries, and `mode=working|branch` bounded diffs in `sidecars/fleet_pane/git_probe.mjs`.
+- Added `POST /api/worktrees/action` in `sidecars/fleet_pane/server_core.mjs` (`dry_run_merge`, `ff_merge`, `rebase` with automatic `--abort` on conflict, and safe non-force `remove_worktree` restricted to clean merged branches) using `execFile`, `realpath` worktree confinement, Host-403, Origin-403, and a `16 KiB` body limit.
+- Upgraded `frontend/src/components/WorktreesView.tsx`, `frontend/src/sidecar.ts`, `frontend/src/types.ts`, and offline `web-engine.js` with the File collisions banner, mergeability badges, recent commit list, Working Changes vs Branch Diff toggle, and confirmation-gated merge, rebase, and cleanup controls with inline conflict file lists.
+- Refreshed light and dark `docs/screenshots/worktrees-{light,dark}.png`, updated version parity to `1.21.0`, and verified post-final-edit: `18/18` backend unit tests, `52/52` gate, `8/8` replay, `18/18` `test-live-web.mjs`, `SLOP 0/0/0`, `336,001 B` raw (`328.1 KiB`) / `103,435 B` gz (`101.0 KiB`), `91.09 ms` boot, `100.22 MB` RSS, `828.5 req/s` (`22.29 ms` p95, `0/2,080` errors), `5/5` SSE, and `30/30` fuzz.
+
 ## 1.20.0 - 2026-11-26
 
 - Fixed the React 19 white-screen crash on native Antigravity `plan.json` files (`goal.{title,line}`, `tasks`, `threads`) by implementing `normalizePlan` in `sidecars/fleet_pane/swarm_store.mjs` and defensive plan rendering across `frontend/src/{types.ts,ui.tsx,components/TriageView.tsx}` plus narrator `view.json` surfacing (`headline`, `phase`, `running_summary`, `now`, `attention`).
