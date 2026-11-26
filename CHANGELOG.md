@@ -3,6 +3,11 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as an
 Antigravity plugin archive (`tar.gz` and `zip`) with `SHA256SUMS`.
 
+## 1.20.0 - 2026-11-26
+
+- Fixed the React 19 white-screen crash on native Antigravity `plan.json` files (`goal.{title,line}`, `tasks`, `threads`) by implementing `normalizePlan` in `sidecars/fleet_pane/swarm_store.mjs` and defensive plan rendering across `frontend/src/{types.ts,ui.tsx,components/TriageView.tsx}` plus narrator `view.json` surfacing (`headline`, `phase`, `running_summary`, `now`, `attention`).
+- Added atomic two-way plan editing via `POST /api/plan` in `sidecars/fleet_pane/server_core.mjs` (registered in both the standalone router and `runSidecarApp`, with Host-403, Origin-403, 64 KB body cap, `ifMatch` CAS `409 Conflict` detection, native schema preservation, and optional coordinator notification) paired with an inline confirmation-gated Live Plan Editor in `TriageView.tsx` and offline `web-engine.js` parity.
+
 ## 1.19.0 - 2026-11-25
 
 - Added zero-client idle sleep mode in `sidecars/fleet_pane/server_core.mjs` (`idleSleep` + `sseClients` state exposed on `/api/health` and `getSleepState()`): servers boot idle with zero polling timers, clear `sseTimer` and re-enter `idleSleep` immediately when the last SSE client disconnects, and wake immediately on the next API or stream request.
