@@ -3353,7 +3353,11 @@ function correlateTranscriptSteps(revLines, reachedBeginning) {
           targetTc.outputPreview = truncateUtf8Bytes(scrubTranscriptText(combined), TRANSCRIPT_PREVIEW_MAX_BYTES);
 
           const genTs = boardTimeMs(raw.created_at) || 0;
+          const createdIn = extractCreatedAtMs(genContent);
           const completedTs = extractCompletedAtMs(genContent) || genTs;
+          if (!currentPlanner.ts) {
+            currentPlanner.ts = createdIn || genTs;
+          }
           if (currentPlanner.ts > 0 && completedTs >= currentPlanner.ts) {
             const span = completedTs - currentPlanner.ts;
             if (currentPlanner.durationMs === null || span > currentPlanner.durationMs) {

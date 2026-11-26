@@ -1329,6 +1329,8 @@ function fmtStepDuration(ms?: number | null): string {
 function formatTraceArgs(args: unknown): string {
   if (args === undefined || args === null) return "";
   if (typeof args === "string") return maskHome(args);
+  if (Array.isArray(args) && args.length === 0) return "";
+  if (typeof args === "object" && Object.keys(args as Record<string, unknown>).length === 0) return "";
   try {
     return maskHome(JSON.stringify(args, null, 2));
   } catch {
@@ -1372,6 +1374,9 @@ export function StepInspector({
           ? maskHome(step.thinking)
           : "";
 
+  const typeLabel = humanizeStatus(step.type);
+  const badgeLabel = step.status ? humanizeStatus(step.status) : isErr ? "Error" : typeLabel;
+
   return (
     <div
       data-testid={`trace-step-${step.stepIndex}`}
@@ -1387,8 +1392,8 @@ export function StepInspector({
         <div className="row min-w-0">
           <div className="wrap gap-1.5 min-w-0">
             <span className="text-[12px] font-semibold text-ink num">#{step.stepIndex}</span>
-            <Badge tone={tone}>{humanizeStatus(step.status || step.type)}</Badge>
-            <span className="text-[12px] text-ink-2 truncate">{humanizeStatus(step.type)}</span>
+            <Badge tone={tone}>{badgeLabel}</Badge>
+            {badgeLabel !== typeLabel && <span className="text-[12px] text-ink-2 truncate">{typeLabel}</span>}
           </div>
           <div className="f1 shrink-0 text-[12px] text-ink-3">
             {durationLabel && <span className="num">{durationLabel}</span>}

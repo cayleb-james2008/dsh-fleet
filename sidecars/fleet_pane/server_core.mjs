@@ -296,7 +296,7 @@ export function createFleetHandlers({
       healthPacked = pack({
         ok: true,
         name: 'fleet',
-        version: '1.24.0',
+        version: '1.25.0',
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
         sseStream: !isSidecar,
@@ -1383,7 +1383,7 @@ export async function createStandaloneRouter({
     const packed = packJsonPayload({
       ok: true,
       name: 'fleet',
-      version: '1.24.0',
+      version: '1.25.0',
       mode: 'standalone',
       canSendMessage: Boolean(sendMessageFn),
       sseStream: true,

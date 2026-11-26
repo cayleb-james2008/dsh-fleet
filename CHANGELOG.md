@@ -3,6 +3,12 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as an
 Antigravity plugin archive (`tar.gz` and `zip`) with `SHA256SUMS`.
 
+## 1.25.0 - 2026-11-26
+
+- Added `readTranscriptSteps` in `sidecars/fleet_pane/swarm_store.mjs` and `GET /api/transcript` in `sidecars/fleet_pane/server_core.mjs` (both the standalone router and `runSidecarApp`, with `capabilities.transcriptInspector: true` on `/api/health`). The endpoint reads `transcript.jsonl` backwards in bounded `<= 512 KiB` scans, confines paths through `members.json` and `realpathSync` under `<appData>/brain/<memberConv>/.system_generated/logs/transcript.jsonl`, correlates `PLANNER_RESPONSE` tool calls with `GENERIC` tool outputs and errors (inferring missing planner timestamps from paired `GENERIC` steps), masks `/home/` paths and common API tokens (`Bearer`, `sk-`, `ghp_`, `gho_`, `AIza`, `xoxb-`, `AKIA`, PEM private keys, and env secrets), truncates text at `1200` chars and payloads at `2048` bytes, and paginates with `before`, `limit` (`1..50`), and `filter` (`all`, `errors`, `tools`).
+- Added `ForensicTranscriptDrawer` and `StepInspector` in `frontend/src/ui.tsx`, `fetchMemberTranscript` in `frontend/src/sidecar.ts`, transcript types in `frontend/src/types.ts`, `Inspect trace` actions in `RosterView.tsx` and `TriageView.tsx`, and offline `/api/transcript` parity in `frontend/scripts/web-engine.js`. Operators can filter by `All`, `Errors`, or `Tools`, expand tool arguments and stderr tracebacks, copy masked errors, and paginate older steps down to `380px` sidebar width in both Light and Dark themes.
+- Captured light and dark `docs/screenshots/forensic-trace-{light,dark}.png`, bumped all manifests and runtime endpoints to `1.25.0`, and verified post-final-edit: `33/33` backend unit tests, `64/64` gate, `8/8` replay, `24/24` `test-live-web.mjs`, `SLOP 0/0/0` (`frontend/src` and built `dist`), `385,808 B` raw (`376.8 KiB`) / `115,758 B` gz (`113.0 KiB`), `51.54 ms` boot, `105.93 MB` RSS, `1,373.1 req/s` (`16.91 ms` p95, `0/3,439` errors), `5/5` SSE, and `30/30` fuzz.
+
 ## 1.24.0 - 2026-11-26
 
 - Added an incremental `board.jsonl` byte-offset tail cache (`LRU=8`) and `buildSwarmDelta` in `sidecars/fleet_pane/swarm_store.mjs`, paired with `GET /api/swarm/delta` (`fs.watch` coalesced wakeup, `125ms` fallback poll, `<=64` waiters, and `capabilities.deltaStream: true`) in both `createStandaloneRouter` and `runSidecarApp` inside `sidecars/fleet_pane/server_core.mjs`.

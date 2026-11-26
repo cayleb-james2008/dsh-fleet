@@ -77,11 +77,12 @@ async function runCli() {
         bootHealthBuf = Buffer.from(JSON.stringify({
           ok: true,
           name: 'fleet',
-          version: '1.24.0',
+          version: '1.25.0',
           mode: 'standalone',
           canSendMessage: false,
           sseStream: true,
           deltaStream: true,
+          transcriptInspector: true,
           idleSleep: true,
           sseClients: 0,
           appDataDirs: dirs,

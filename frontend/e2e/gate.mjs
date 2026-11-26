@@ -524,6 +524,39 @@ await runChecks("gate", async (check) => {
     return ok;
   });
 
+  await check("roster ForensicTranscriptDrawer fetches real sidecar /api/transcript with correlation, tools filter, and ~/ masking", async () => {
+    await page.locator('#panel-roster [data-testid="inspect-trace-btn"][data-member="builder"]').click();
+    await page.waitForSelector('[data-testid="forensic-trace-drawer"]');
+    await page.waitForSelector('[data-testid="trace-step-2"]');
+    await page.waitForSelector('[data-testid="trace-step-0"]');
+    const s2Text = await page.locator('[data-testid="trace-step-2"]').textContent();
+    await page.locator('[data-testid="trace-filter-tools"]').click();
+    await page.waitForFunction(() => !document.querySelector('[data-testid="trace-step-2"]') && Boolean(document.querySelector('[data-testid="trace-step-0"]')));
+    await page.locator('[data-testid="trace-step-toggle-0"]').click();
+    await page.waitForSelector('[data-testid="trace-step-body-0"]');
+    const builderArgs = await page.locator('[data-testid="trace-tool-args-0-0"]').textContent();
+    await page.locator('[data-testid="trace-close-btn"]').click();
+    await page.waitForFunction(() => !document.querySelector('[data-testid="forensic-trace-drawer"]'));
+
+    await page.locator('#panel-roster [data-testid="inspect-trace-btn"][data-member="verifier"]').click();
+    await page.waitForSelector('[data-testid="forensic-trace-drawer"]');
+    await page.waitForSelector('[data-testid="trace-step-0"]');
+    await page.locator('[data-testid="trace-step-toggle-0"]').click();
+    await page.waitForSelector('[data-testid="trace-step-body-0"]');
+    const verArgs = await page.locator('[data-testid="trace-tool-args-0-0"]').textContent();
+    const traceOv = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    await page.locator('[data-testid="trace-close-btn"]').click();
+    await page.waitForFunction(() => !document.querySelector('[data-testid="forensic-trace-drawer"]'));
+
+    return (
+      Boolean(s2Text?.includes("All 7 backend checks pass")) &&
+      Boolean(builderArgs?.includes("Run sidecar security tests")) &&
+      Boolean(verArgs?.includes("~/main.mjs")) &&
+      !verArgs?.includes("/home/") &&
+      traceOv <= 0
+    );
+  });
+
   await check("zero horizontal overflow on Roster at 380px", async () => {
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
     return overflow <= 0;
