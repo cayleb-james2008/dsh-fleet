@@ -2170,3 +2170,331 @@ test('Closed-loop operator control: async non-blocking dispatch, 409 worker_not_
     rmSync(fx.dir, { recursive: true, force: true });
   }
 });
+
+test('Portfolio, triage ack/snooze, pins, archive, checkpoints HTTP + SidecarApp RPC, and brain/ confinement', async () => {
+  const fx = setupFixtureAppData();
+  const coordB = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const workerB = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  const coordC = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  const swA = join(fx.appData, 'brain', fx.coord, '.system_generated', 'swarm');
+  const swB = join(fx.appData, 'brain', coordB, '.system_generated', 'swarm');
+  const swC = join(fx.appData, 'brain', coordC, '.system_generated', 'swarm');
+  const logsA = join(fx.appData, 'brain', fx.worker, '.system_generated', 'logs');
+  mkdirSync(swB, { recursive: true });
+  mkdirSync(swC, { recursive: true });
+  mkdirSync(logsA, { recursive: true });
+
+  writeFileSync(
+    join(swA, 'plan.json'),
+    JSON.stringify({
+      title: 'Swarm A Plan',
+      goal: 'Initial goal',
+      gate: 'npm test',
+      repo: 'Cayleb/fleet-a',
+      workstreams: [{ id: 'ws-a', title: 'Core', owner: 'worker', status: 'running' }],
+    }),
+  );
+  appendFileSync(join(swA, 'board.jsonl'), JSON.stringify({ seq: 2, agent: 'worker', text: '[blocked] Waiting on token' }) + '\n');
+  writeFileSync(
+    join(logsA, 'transcript.jsonl'),
+    [
+      JSON.stringify({
+        step_index: 0,
+        type: 'PLANNER_RESPONSE',
+        model: 'gemini-3-pro',
+        input_tokens: 500_000,
+        output_tokens: 50_000,
+      }),
+      JSON.stringify({
+        step_index: 1,
+        type: 'ERROR_MESSAGE',
+        model: 'gemini-3-pro',
+        error: 'Model error rate limit',
+      }),
+    ].join('\n') + '\n',
+  );
+
+  writeFileSync(
+    join(swB, 'members.json'),
+    JSON.stringify({
+      title: 'Swarm B',
+      members: {
+        coordinator: { conversation_id: coordB, role: 'coordinator', wake_mode: 'mentions' },
+        qa: { conversation_id: workerB, role: 'worker', wake_mode: 'mentions' },
+      },
+    }),
+  );
+  writeFileSync(join(swB, 'board.jsonl'), JSON.stringify({ seq: 1, agent: 'qa', text: '@coordinator [done] Ready' }) + '\n');
+
+  writeFileSync(
+    join(swC, 'members.json'),
+    JSON.stringify({
+      title: 'Swarm C Archived',
+      members: { coordinator: { conversation_id: coordC, role: 'coordinator', wake_mode: 'mentions' } },
+    }),
+  );
+  writeFileSync(join(swC, 'fleet_state.json'), JSON.stringify({ archived: true }));
+
+  const repoDir = join(fx.dir, 'repo');
+  mkdirSync(repoDir, { recursive: true });
+  const git = (args) => execFileSync('git', ['-C', repoDir, ...args], { encoding: 'utf8' }).trim();
+  git(['init', '-b', 'main']);
+  git(['config', 'user.email', 'test@example.com']);
+  git(['config', 'user.name', 'Test User']);
+  writeFileSync(join(repoDir, 'file.txt'), 'v1\n');
+  git(['add', 'file.txt']);
+  git(['commit', '-m', 'init']);
+  const headSha = git(['rev-parse', 'HEAD']);
+
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+  });
+
+  try {
+    const post = (path, body, headers = {}) =>
+      fetch(`${srv.url}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify(body),
+      });
+
+    // 1. GET /api/portfolio Host-403, gzip, ETag/304, and rollup accuracy
+    const badHostPort = await new Promise((resolve, reject) => {
+      const sock = net.connect(srv.port, '127.0.0.1', () => {
+        sock.write(`GET /api/portfolio HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n`);
+      });
+      const chunks = [];
+      sock.on('data', (c) => chunks.push(c));
+      sock.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      sock.on('error', reject);
+    });
+    assert.ok(badHostPort.startsWith('HTTP/1.1 403'));
+
+    const portRes = await fetch(`${srv.url}/api/portfolio`, { headers: { 'Accept-Encoding': 'gzip' } });
+    assert.equal(portRes.status, 200);
+    const portEtag = portRes.headers.get('etag');
+    assert.ok(portEtag);
+    assert.equal((await fetch(`${srv.url}/api/portfolio`, { headers: { 'If-None-Match': portEtag } })).status, 304);
+
+    const portJson = await portRes.json();
+    assert.equal(portJson.activeSwarms, 2);
+    assert.equal(portJson.swarms.length, 3);
+    assert.equal(portJson.urgentCount, 2);
+    assert.ok(portJson.totalCostUsd > 0);
+    assert.equal(portJson.urgentTriage.every((t) => t.swarmId === fx.coord && t.swarmTitle === 'HTTP Test Swarm'), true);
+    const sumA = portJson.swarms.find((s) => s.id === fx.coord);
+    assert.equal(sumA.repo, 'Cayleb/fleet-a');
+    assert.equal(sumA.gateState, 'blocked');
+    assert.equal(sumA.blockedCount, 1);
+    assert.equal(sumA.failureCount, 1);
+    assert.equal(sumA.archived, false);
+    assert.ok(sumA.topUrgent);
+    assert.equal(portJson.swarms.find((s) => s.id === coordC)?.archived, true);
+
+    // 2. Guards on POST /api/triage/ack, /api/pins, /api/swarm/archive, /api/checkpoints*
+    for (const [path, body] of [
+      ['/api/triage/ack', { confirm: true, conversationId: fx.coord, triageId: 'x', action: 'ack' }],
+      ['/api/pins', { confirm: true, conversationId: fx.coord, seq: 1, pinned: true }],
+      ['/api/swarm/archive', { confirm: true, conversationId: fx.coord, archived: true }],
+      ['/api/checkpoints', { confirm: true, conversationId: fx.coord, label: 'ck' }],
+      ['/api/checkpoints/restore', { confirm: true, conversationId: fx.coord, checkpointId: 'ck-1', mode: 'resume_prompt' }],
+    ]) {
+      assert.equal((await post(path, body, { Origin: 'https://evil.example' })).status, 403);
+      assert.equal((await post(path, { ...body, confirm: false })).status, 400);
+    }
+    assert.equal((await post('/api/triage/ack', { confirm: true, conversationId: fx.coord, triageId: 'x', action: 'bogus' })).status, 400);
+    assert.equal((await post('/api/pins', { confirm: true, conversationId: fx.coord, seq: 0, pinned: true })).status, 400);
+    assert.equal((await post('/api/swarm/archive', { confirm: true, conversationId: fx.coord, archived: 'yes' })).status, 400);
+    assert.equal((await post('/api/checkpoints', { confirm: true, conversationId: fx.coord, label: '   ' })).status, 400);
+    assert.equal((await post('/api/checkpoints/restore', { confirm: true, conversationId: fx.coord, checkpointId: 'missing', mode: 'plan' })).status, 404);
+
+    // 3. Triage ack/snooze/unack + pins + archive lifecycle reflected in /api/swarm, /api/swarm/delta, /api/portfolio
+    const snap0 = await (await fetch(`${srv.url}/api/swarm?conversationId=${fx.coord}`)).json();
+    const delta0 = await (await fetch(`${srv.url}/api/swarm/delta?conversationId=${fx.coord}&since=1`)).json();
+    const blockedTriage = snap0.triage.find((t) => t.kind === 'blocked');
+    const quotaTriage = snap0.triage.find((t) => t.kind === 'quota');
+    assert.ok(blockedTriage && quotaTriage);
+
+    const ackRes = await post('/api/triage/ack', {
+      confirm: true,
+      conversationId: fx.coord,
+      triageId: blockedTriage.id,
+      action: 'ack',
+      note: 'Handled',
+    });
+    assert.equal(ackRes.status, 200);
+
+    const snoozeRes = await post('/api/triage/ack', {
+      confirm: true,
+      conversationId: fx.coord,
+      triageId: quotaTriage.id,
+      action: 'snooze',
+      untilSeq: 10,
+    });
+    assert.equal(snoozeRes.status, 200);
+
+    const pinRes = await post('/api/pins', {
+      confirm: true,
+      conversationId: fx.coord,
+      seq: 2,
+      pinned: true,
+    });
+    assert.equal(pinRes.status, 200);
+    assert.deepEqual((await pinRes.json()).pinnedSeqs, [2]);
+
+    const delta1 = await (
+      await fetch(`${srv.url}/api/swarm/delta?conversationId=${fx.coord}&since=1&etag=${encodeURIComponent(delta0.etag)}`)
+    ).json();
+    assert.equal(delta1.mode, 'delta');
+    assert.deepEqual(delta1.pinnedSeqs, [2]);
+    assert.equal(delta1.triage.find((t) => t.id === blockedTriage.id)?.acked, true);
+    assert.equal(delta1.triage.find((t) => t.id === quotaTriage.id)?.acked, true);
+
+    const portAfterAck = await (await fetch(`${srv.url}/api/portfolio`)).json();
+    assert.equal(portAfterAck.urgentCount, 0);
+
+    await post('/api/triage/ack', { confirm: true, conversationId: fx.coord, triageId: blockedTriage.id, action: 'unack' });
+    assert.equal((await (await fetch(`${srv.url}/api/portfolio`)).json()).urgentCount, 1);
+
+    const archRes = await post('/api/swarm/archive', { confirm: true, conversationId: fx.coord, archived: true });
+    assert.equal(archRes.status, 200);
+    const portArch = await (await fetch(`${srv.url}/api/portfolio`)).json();
+    assert.equal(portArch.activeSwarms, 1);
+    assert.equal(portArch.urgentCount, 0);
+    await post('/api/swarm/archive', { confirm: true, conversationId: fx.coord, archived: false });
+
+    // 4. Checkpoints create / list / CAS plan restore / resume_prompt
+    const ckCreate = await post('/api/checkpoints', {
+      confirm: true,
+      conversationId: fx.coord,
+      label: 'Milestone 1',
+      roots: [repoDir],
+    });
+    assert.equal(ckCreate.status, 200);
+    const ckJson = await ckCreate.json();
+    assert.equal(ckJson.checkpoint.label, 'Milestone 1');
+    assert.equal(ckJson.checkpoint.worktrees[0].head, headSha);
+    assert.equal(ckJson.checkpoint.worktrees[0].clean, true);
+
+    const ckList = await (await fetch(`${srv.url}/api/checkpoints?conversationId=${fx.coord}`)).json();
+    assert.equal(ckList.checkpoints.length, 1);
+
+    const planUpd = await post('/api/plan', {
+      confirm: true,
+      conversationId: fx.coord,
+      ifMatch: snap0.plan.etag,
+      mode: 'replace',
+      patch: { title: 'Changed Plan', goal: 'Temp goal' },
+    });
+    assert.equal(planUpd.status, 200);
+
+    // Stale ifMatch -> 409
+    const restoreConflict = await post('/api/checkpoints/restore', {
+      confirm: true,
+      conversationId: fx.coord,
+      checkpointId: ckJson.checkpoint.id,
+      mode: 'plan',
+      ifMatch: snap0.plan.etag,
+    });
+    assert.equal(restoreConflict.status, 409);
+
+    const restorePlan = await post('/api/checkpoints/restore', {
+      confirm: true,
+      conversationId: fx.coord,
+      checkpointId: ckJson.checkpoint.id,
+      mode: 'plan',
+    });
+    assert.equal(restorePlan.status, 200);
+    assert.equal((await restorePlan.json()).plan.title, 'Swarm A Plan');
+
+    const restorePrompt = await post('/api/checkpoints/restore', {
+      confirm: true,
+      conversationId: fx.coord,
+      checkpointId: ckJson.checkpoint.id,
+      mode: 'resume_prompt',
+    });
+    assert.equal(restorePrompt.status, 200);
+    const promptJson = await restorePrompt.json();
+    assert.ok(promptJson.prompt.includes('Milestone 1'));
+    assert.ok(promptJson.prompt.includes(headSha.slice(0, 8)));
+
+    // 5. SidecarApp RPC parity
+    const mockSidecarUrl = new URL('data:text/javascript,' + encodeURIComponent(`
+      export class Response {
+        constructor(body, init = {}) {
+          this.body = body;
+          this.status = init.status || 200;
+          this.contentType = init.contentType || 'application/json';
+          this.headers = init.headers || {};
+        }
+      }
+      export class SidecarApp {
+        constructor() {
+          this.config = { conversationId: globalThis.__FLEET_TEST_E2_COORD || '' };
+          this.routes = new Map();
+          globalThis.__FLEET_TEST_E2_RPC = this;
+        }
+        page(p, fn) { this.routes.set('PAGE ' + p, fn); }
+        api(p, fn, method = 'GET') { this.routes.set(method + ' ' + p, fn); }
+        async sendMessage() { return { ok: true }; }
+        async run() {}
+      }
+    `));
+    globalThis.__FLEET_TEST_E2_COORD = fx.coord;
+    const hook = registerHooks({
+      resolve(specifier, ctx, next) {
+        if (specifier === 'sidecar_sdk') return { shortCircuit: true, url: mockSidecarUrl.href };
+        return next(specifier, ctx);
+      },
+    });
+    try {
+      await runSidecarApp({ appDataDir: fx.appData });
+      const app = globalThis.__FLEET_TEST_E2_RPC;
+      for (const route of [
+        'GET /api/portfolio',
+        'GET /api/checkpoints',
+        'POST /api/triage/ack',
+        'POST /api/pins',
+        'POST /api/swarm/archive',
+        'POST /api/checkpoints',
+        'POST /api/checkpoints/restore',
+      ]) {
+        assert.equal(typeof app.routes.get(route), 'function', `Missing SidecarApp route ${route}`);
+      }
+      const rpcPort = await app.routes.get('GET /api/portfolio')();
+      assert.equal(rpcPort.status, 200);
+      assert.equal(JSON.parse(Buffer.from(rpcPort.body).toString('utf8')).activeSwarms, 2);
+      const rpcPin = await app.routes.get('POST /api/pins')({
+        confirm: true,
+        conversationId: fx.coord,
+        seq: 1,
+        pinned: true,
+      });
+      assert.equal(rpcPin.status, 200);
+      assert.deepEqual(JSON.parse(rpcPin.body).pinnedSeqs, [1, 2]);
+    } finally {
+      hook?.deregister?.();
+      delete globalThis.__FLEET_TEST_E2_RPC;
+      delete globalThis.__FLEET_TEST_E2_COORD;
+    }
+
+    // 6. CWE-59 symlink escape on fleet_state.json -> 403 across all state & checkpoint routes
+    const statePath = join(swA, 'fleet_state.json');
+    const outsideState = join(fx.dir, 'outside-state.json');
+    writeFileSync(outsideState, '{}');
+    rmSync(statePath, { force: true });
+    symlinkSync(outsideState, statePath);
+    assert.equal((await fetch(`${srv.url}/api/checkpoints?conversationId=${fx.coord}`)).status, 403);
+    assert.equal((await post('/api/triage/ack', { confirm: true, conversationId: fx.coord, triageId: 'x', action: 'ack' })).status, 403);
+    assert.equal((await post('/api/pins', { confirm: true, conversationId: fx.coord, seq: 1, pinned: true })).status, 403);
+    assert.equal((await post('/api/swarm/archive', { confirm: true, conversationId: fx.coord, archived: true })).status, 403);
+    assert.equal((await post('/api/checkpoints', { confirm: true, conversationId: fx.coord, label: 'sym' })).status, 403);
+    assert.equal((await post('/api/checkpoints/restore', { confirm: true, conversationId: fx.coord, checkpointId: ckJson.checkpoint.id, mode: 'plan' })).status, 403);
+  } finally {
+    await srv.close();
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});

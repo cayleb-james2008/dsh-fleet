@@ -7,6 +7,7 @@
  *   older lines and parses JSON objects ONLY for the 32-line sliding tail window.
  * - Does not retain full parsed board message graphs in long-lived JS heap caches.
  */
+import { randomUUID } from 'node:crypto';
 import {
   closeSync,
   existsSync,
@@ -63,6 +64,14 @@ const OPS_RING_LIMIT = 64;
 const OPS_MAX_BYTES = 512 * 1024;
 export const OPS_TIMEOUT_MS = 45_000;
 const OP_STATUSES = new Set(['dispatched', 'verified', 'failed', 'timed_out', 'dismissed']);
+const STATE_FILE = 'fleet_state.json';
+const STATE_MAX_BYTES = 1024 * 1024;
+const SUMMARY_CACHE_LIMIT = 64;
+const INACTIVE_SWARM_MS = 5 * 60 * 1000;
+const CHECKPOINT_CAP = 64;
+const PIN_CAP = 512;
+const ACK_CAP = 512;
+const MAX_SEQ_VAL = 1_000_000_000;
 
 function cleanTok(v) {
   if (typeof v === 'boolean' || v === null || v === undefined || v === '') return 0;
@@ -2058,7 +2067,7 @@ function parseOpsText(text) {
   }
 }
 
-function resolveConfinedOpsPath(appData, swarmId) {
+function resolveConfinedSwarmFile(appData, swarmId, fileName, label = 'Operator file') {
   if (!appData || typeof appData !== 'string' || typeof swarmId !== 'string' || !ID_RE.test(swarmId) || swarmId === '.' || swarmId === '..') {
     return { ok: false, status: 400, error: 'Valid swarmId required' };
   }
@@ -2072,13 +2081,13 @@ function resolveConfinedOpsPath(appData, swarmId) {
   const swarmPath = join(appData, 'brain', swarmId);
   const sysPath = join(swarmPath, '.system_generated');
   const dirPath = join(sysPath, 'swarm');
-  const opsPath = join(dirPath, OPS_FILE);
+  const targetPath = join(dirPath, fileName);
   const membersPath = join(dirPath, 'members.json');
 
   const expectedSwarm = join(brainReal, swarmId);
   const expectedSys = join(expectedSwarm, '.system_generated');
   const expectedDir = join(expectedSys, 'swarm');
-  const expectedOps = join(expectedDir, OPS_FILE);
+  const expectedTarget = join(expectedDir, fileName);
   const expectedMembers = join(expectedDir, 'members.json');
 
   for (const [seg, exp] of [
@@ -2095,19 +2104,27 @@ function resolveConfinedOpsPath(appData, swarmId) {
   if (memSt === 'escape') return { ok: false, status: 403, error: 'Swarm path outside brain root' };
   if (memSt === 'missing') return { ok: false, status: 404, error: 'Swarm not found' };
 
-  const opsSt = checkConfinedSegment(opsPath, expectedOps, brainRoot);
-  if (opsSt === 'escape') return { ok: false, status: 403, error: 'Operator ops path outside brain root' };
-  if (opsSt === 'missing') {
-    return { ok: true, missing: true, realFile: expectedOps, dir: dirPath };
+  const targetSt = checkConfinedSegment(targetPath, expectedTarget, brainRoot);
+  if (targetSt === 'escape') return { ok: false, status: 403, error: `${label} path outside brain root` };
+  if (targetSt === 'missing') {
+    return { ok: true, missing: true, realFile: expectedTarget, dir: dirPath };
   }
   try {
-    if (!statSync(expectedOps).isFile()) {
-      return { ok: false, status: 403, error: 'Invalid operator ops file' };
+    if (!statSync(expectedTarget).isFile()) {
+      return { ok: false, status: 403, error: `Invalid ${label.toLowerCase()} file` };
     }
   } catch {
-    return { ok: false, status: 403, error: 'Invalid operator ops file' };
+    return { ok: false, status: 403, error: `Invalid ${label.toLowerCase()} file` };
   }
-  return { ok: true, missing: false, realFile: expectedOps, dir: dirPath };
+  return { ok: true, missing: false, realFile: expectedTarget, dir: dirPath };
+}
+
+function resolveConfinedOpsPath(appData, swarmId) {
+  return resolveConfinedSwarmFile(appData, swarmId, OPS_FILE, 'Operator ops');
+}
+
+function resolveConfinedStatePath(appData, swarmId) {
+  return resolveConfinedSwarmFile(appData, swarmId, STATE_FILE, 'Operator state');
 }
 
 function readOpsMeta(dir, now = Date.now()) {
@@ -2139,21 +2156,7 @@ function writeOpsFileAtomic(realFile, appData, swarmId, records) {
     version: 1,
     ops: ring.map((r) => (Object.keys(r.meta).length ? { ...r.publicOp, _meta: r.meta } : r.publicOp)),
   };
-  const serialized = JSON.stringify(payload, null, 2) + '\n';
-  const tmpPath = `${realFile}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 10)}`;
-  try {
-    writeFileSync(tmpPath, serialized, 'utf-8');
-    renameSync(tmpPath, realFile);
-  } finally {
-    try {
-      if (existsSync(tmpPath)) unlinkSync(tmpPath);
-    } catch {}
-  }
-  smallFileCache.delete(realFile);
-  smallFileCache.delete(join(swarmDir(appData, swarmId), OPS_FILE));
-  summaryMetaCache.delete(`${appData}\0${swarmId}`);
-  const st = statOf(realFile);
-  return `${st.ino}:${st.mtime}:${st.size}`;
+  return writeSwarmJsonAtomic(realFile, appData, swarmId, OPS_FILE, payload);
 }
 
 /** Read confined operator command ledger for a swarm without mutating disk state. */
@@ -2209,6 +2212,482 @@ export function updateOperatorOp(appData, swarmId, opId, updater) {
   records[idx] = normalized;
   writeOpsFileAtomic(loc.realFile, appData, swarmId, records);
   return { ok: true, op: normalized.publicOp, ops: records.map((r) => r.publicOp) };
+}
+
+function writeSwarmJsonAtomic(realFile, appData, swarmId, fileName, payload) {
+  const serialized = JSON.stringify(payload, null, 2) + '\n';
+  const tmpPath = `${realFile}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 10)}`;
+  try {
+    writeFileSync(tmpPath, serialized, 'utf-8');
+    renameSync(tmpPath, realFile);
+  } finally {
+    try {
+      if (existsSync(tmpPath)) unlinkSync(tmpPath);
+    } catch {}
+  }
+  smallFileCache.delete(realFile);
+  smallFileCache.delete(join(swarmDir(appData, swarmId), fileName));
+  summaryMetaCache.delete(`${appData}\0${swarmId}`);
+  const st = statOf(realFile);
+  return `${st.ino}:${st.mtime}:${st.size}`;
+}
+
+function emptyFleetState() {
+  return { pinnedSeqs: [], ackedTriage: {}, archived: false, checkpoints: [] };
+}
+
+function normalizeAckEntry(raw) {
+  if (!isPlainObj(raw)) return null;
+  const atNum = Number(raw.at);
+  const at = Number.isFinite(atNum) && atNum >= 0 ? Math.round(atNum) : Date.now();
+  const seqNum = Number(raw.untilSeq);
+  const untilSeq = Number.isSafeInteger(seqNum) && seqNum >= 0 && seqNum <= MAX_SEQ_VAL ? seqNum : 0;
+  const note = typeof raw.note === 'string' ? cleanPlanStr(raw.note, false).slice(0, 500) : '';
+  return { at, untilSeq, ...(note ? { note } : {}) };
+}
+
+function normalizeCheckpointWorktree(raw) {
+  if (!isPlainObj(raw)) return null;
+  const path = typeof raw.path === 'string' ? cleanPlanStr(raw.path, true).slice(0, 1024) : '';
+  if (!path) return null;
+  const root = typeof raw.root === 'string' ? cleanPlanStr(raw.root, true).slice(0, 1024) : '';
+  const name = typeof raw.name === 'string' && raw.name ? cleanPlanStr(raw.name, true).slice(0, 256) : basename(path);
+  const branch = typeof raw.branch === 'string' ? cleanPlanStr(raw.branch, true).slice(0, 128) : '';
+  const head = typeof raw.head === 'string' ? cleanPlanStr(raw.head, true).slice(0, 64) : '';
+  const shortHead = typeof raw.shortHead === 'string' && raw.shortHead ? cleanPlanStr(raw.shortHead, true).slice(0, 16) : head.slice(0, 8);
+  return {
+    root,
+    path,
+    name,
+    branch,
+    head,
+    shortHead,
+    clean: raw.clean !== false,
+    isMain: Boolean(raw.isMain),
+    detached: Boolean(raw.detached),
+  };
+}
+
+function normalizeCheckpointMember(raw) {
+  if (!isPlainObj(raw)) return null;
+  const name = typeof raw.name === 'string' ? cleanPlanStr(raw.name, true).slice(0, 128) : '';
+  if (!name || FORBIDDEN_KEYS.has(name)) return null;
+  return {
+    name,
+    conversation_id: typeof raw.conversation_id === 'string' ? cleanPlanStr(raw.conversation_id, true).slice(0, 128) : '',
+    role: typeof raw.role === 'string' ? cleanPlanStr(raw.role, true).slice(0, 64) : '',
+    model: typeof raw.model === 'string' ? cleanPlanStr(raw.model, true).slice(0, 128) : '',
+    status: typeof raw.status === 'string' ? cleanPlanStr(raw.status, true).slice(0, 32) : 'unknown',
+    killed: Boolean(raw.killed),
+    steps: cleanTok(raw.steps),
+    workspace_mode: typeof raw.workspace_mode === 'string' ? cleanPlanStr(raw.workspace_mode, true).slice(0, 32) : 'inherit',
+    workspace: typeof raw.workspace === 'string' ? cleanPlanStr(raw.workspace, true).slice(0, 1024) : '',
+  };
+}
+
+function normalizeCheckpointRecord(raw) {
+  if (!isPlainObj(raw)) return null;
+  const id = typeof raw.id === 'string' ? cleanPlanStr(raw.id, true).slice(0, 128) : '';
+  const label = typeof raw.label === 'string' ? cleanPlanStr(raw.label, true).slice(0, 160) : '';
+  if (!id || !label) return null;
+  const createdAt =
+    typeof raw.createdAt === 'string' && raw.createdAt
+      ? raw.createdAt
+      : typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt)
+        ? new Date(raw.createdAt).toISOString()
+        : new Date().toISOString();
+  const headNum = Number(raw.head);
+  const head = Number.isSafeInteger(headNum) && headNum >= 0 ? headNum : 0;
+  const costUsd = roundUsd(cleanTok(raw.costUsd));
+  const plan = isPlainObj(raw.plan) ? normalizePlan(raw.plan, typeof raw.plan.etag === 'string' ? raw.plan.etag : '') : null;
+  const members = Array.isArray(raw.members) ? raw.members.slice(0, 64).map(normalizeCheckpointMember).filter(Boolean) : [];
+  const worktrees = Array.isArray(raw.worktrees) ? raw.worktrees.slice(0, 64).map(normalizeCheckpointWorktree).filter(Boolean) : [];
+  return { id, label, createdAt, head, costUsd, plan, members, worktrees };
+}
+
+function normalizeFleetState(raw) {
+  if (!isPlainObj(raw)) return emptyFleetState();
+  const pinSet = new Set();
+  if (Array.isArray(raw.pinnedSeqs)) {
+    for (const v of raw.pinnedSeqs) {
+      const s = safeSeq(v);
+      if (s > 0 && s <= MAX_SEQ_VAL) pinSet.add(s);
+    }
+  }
+  const pinnedSeqs = [...pinSet].sort((a, b) => a - b).slice(0, PIN_CAP);
+
+  const ackedTriage = {};
+  if (isPlainObj(raw.ackedTriage)) {
+    let count = 0;
+    for (const [k, v] of Object.entries(raw.ackedTriage)) {
+      if (FORBIDDEN_KEYS.has(k)) continue;
+      const key = cleanPlanStr(k, true).slice(0, 256);
+      if (!key) continue;
+      const entry = normalizeAckEntry(v);
+      if (!entry) continue;
+      ackedTriage[key] = entry;
+      if (++count >= ACK_CAP) break;
+    }
+  }
+
+  const archived = Boolean(raw.archived);
+  const checkpoints = Array.isArray(raw.checkpoints)
+    ? raw.checkpoints.map(normalizeCheckpointRecord).filter(Boolean).slice(0, CHECKPOINT_CAP)
+    : [];
+  return { pinnedSeqs, ackedTriage, archived, checkpoints };
+}
+
+function parseFleetStateText(text) {
+  if (!text) return emptyFleetState();
+  try {
+    return normalizeFleetState(JSON.parse(text));
+  } catch {
+    return emptyFleetState();
+  }
+}
+
+function readFleetStateMeta(dir) {
+  const statePath = join(dir, STATE_FILE);
+  const sf = readSmallCached(statePath, smallFileCache, STATE_MAX_BYTES);
+  if (sf.size < 0 || !sf.isFile) {
+    return { state: emptyFleetState(), stateKey: '0:0:-1', hasFile: false };
+  }
+  return {
+    state: parseFleetStateText(sf.text),
+    stateKey: `${sf.ino}:${sf.mtime}:${sf.size}`,
+    hasFile: true,
+  };
+}
+
+function isTriageAckActive(entry, head = 0) {
+  if (!entry || typeof entry !== 'object') return false;
+  const untilSeq = Number(entry.untilSeq);
+  if (!Number.isSafeInteger(untilSeq) || untilSeq <= 0) return true;
+  return head <= untilSeq;
+}
+
+/** Read confined `fleet_state.json` for a swarm without mutating disk state. */
+export function readFleetState(appData, swarmId) {
+  const loc = resolveConfinedStatePath(appData, swarmId);
+  if (!loc.ok) return loc;
+  if (loc.missing) return { ok: true, state: emptyFleetState(), missing: true };
+  smallFileCache.delete(loc.realFile);
+  try {
+    const text = readFileSync(loc.realFile, 'utf-8');
+    return { ok: true, state: parseFleetStateText(text), missing: false };
+  } catch {
+    return { ok: true, state: emptyFleetState(), missing: false };
+  }
+}
+
+function mutateFleetState(appData, swarmId, mutator) {
+  const loc = resolveConfinedStatePath(appData, swarmId);
+  if (!loc.ok) return loc;
+  let state = emptyFleetState();
+  if (!loc.missing) {
+    try {
+      state = parseFleetStateText(readFileSync(loc.realFile, 'utf-8'));
+    } catch {
+      state = emptyFleetState();
+    }
+  }
+  const res = mutator(state, loc);
+  if (res && res.ok === false) return res;
+  const normalized = normalizeFleetState(res?.state || state);
+  writeSwarmJsonAtomic(loc.realFile, appData, swarmId, STATE_FILE, { version: 1, ...normalized });
+  return { ok: true, state: normalized, ...(res?.extra || {}) };
+}
+
+function readBoardHeadQuick(appData, swarmId) {
+  const dir = swarmDir(appData, swarmId);
+  const boardPath = join(dir, 'board.jsonl');
+  const boardStat = statOf(boardPath);
+  if (!boardStat.isFile || boardStat.size <= 0) return 0;
+  const cached = boardTailCache.get(dir);
+  if (
+    cached &&
+    cached.meta &&
+    cached.meta.ino === boardStat.ino &&
+    cached.meta.size === boardStat.size &&
+    cached.meta.mtime === boardStat.mtime
+  ) {
+    return cached.acc?.head || 0;
+  }
+  let head = 0;
+  let lineCount = 0;
+  streamLinesIncremental(
+    boardPath,
+    null,
+    () => {
+      head = 0;
+      lineCount = 0;
+    },
+    (buf, start, end, preParsed) => {
+      lineCount++;
+      if (preParsed) {
+        const s = safeSeq(preParsed.seq);
+        if (s > head) head = s;
+        return;
+      }
+      const seqIdx = buf.indexOf(Buffer.from('"seq":'), start);
+      if (seqIdx >= 0 && seqIdx < end) {
+        const s = extractIntSpan(buf, start, end, Buffer.from('"seq":'));
+        if (s > head) head = s;
+      }
+    },
+    { rawSpan: true },
+  );
+  return head || lineCount;
+}
+
+/** Persist ack, snooze, or unack state for a triage item in `fleet_state.json`. */
+export function ackTriageItem(appData, swarmId, { triageId, action = 'ack', untilSeq, note } = {}) {
+  const id = typeof triageId === 'string' ? cleanPlanStr(triageId, true).slice(0, 256) : '';
+  if (!id || FORBIDDEN_KEYS.has(id)) {
+    return { ok: false, status: 400, error: 'Valid triageId required' };
+  }
+  if (action !== 'ack' && action !== 'snooze' && action !== 'unack') {
+    return { ok: false, status: 400, error: 'action must be ack, snooze, or unack' };
+  }
+  if (untilSeq !== undefined && untilSeq !== null) {
+    if (typeof untilSeq !== 'number' || !Number.isSafeInteger(untilSeq) || untilSeq < 0 || untilSeq > MAX_SEQ_VAL) {
+      return { ok: false, status: 400, error: 'untilSeq must be a non-negative integer' };
+    }
+  }
+  if (note !== undefined && note !== null && typeof note !== 'string') {
+    return { ok: false, status: 400, error: 'note must be a string' };
+  }
+  if (typeof note === 'string' && PLAN_CTRL_RE.test(note)) {
+    return { ok: false, status: 400, error: 'Control characters are not permitted in note' };
+  }
+  const cleanNote = typeof note === 'string' ? cleanPlanStr(note, false).slice(0, 500) : '';
+  const now = Date.now();
+  const boardHead = action === 'snooze' && !(typeof untilSeq === 'number' && untilSeq > 0) ? readBoardHeadQuick(appData, swarmId) : 0;
+
+  return mutateFleetState(appData, swarmId, (state) => {
+    if (action === 'unack') {
+      delete state.ackedTriage[id];
+    } else if (action === 'snooze') {
+      const targetSeq = typeof untilSeq === 'number' && untilSeq > 0 ? untilSeq : Math.max(0, boardHead) + 5;
+      state.ackedTriage[id] = {
+        at: now,
+        untilSeq: targetSeq,
+        ...(cleanNote ? { note: cleanNote } : {}),
+      };
+    } else {
+      state.ackedTriage[id] = {
+        at: now,
+        untilSeq: typeof untilSeq === 'number' && untilSeq > 0 ? untilSeq : 0,
+        ...(cleanNote ? { note: cleanNote } : {}),
+      };
+    }
+    return { ok: true, state, extra: { triageId: id, action } };
+  });
+}
+
+/** Pin or unpin a board sequence number in `fleet_state.json`. */
+export function setSwarmPin(appData, swarmId, { seq, pinned } = {}) {
+  if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq <= 0 || seq > MAX_SEQ_VAL) {
+    return { ok: false, status: 400, error: 'seq must be a positive integer' };
+  }
+  if (typeof pinned !== 'boolean') {
+    return { ok: false, status: 400, error: 'pinned must be a boolean' };
+  }
+  return mutateFleetState(appData, swarmId, (state) => {
+    const next = new Set(state.pinnedSeqs);
+    if (pinned) next.add(seq);
+    else next.delete(seq);
+    state.pinnedSeqs = [...next].sort((a, b) => a - b);
+    return { ok: true, state, extra: { seq, pinned } };
+  });
+}
+
+/** Persist swarm archive toggle in `fleet_state.json`. */
+export function setSwarmArchived(appData, swarmId, archived) {
+  if (typeof archived !== 'boolean') {
+    return { ok: false, status: 400, error: 'archived must be a boolean' };
+  }
+  return mutateFleetState(appData, swarmId, (state) => {
+    state.archived = archived;
+    return { ok: true, state, extra: { archived } };
+  });
+}
+
+/** List persisted checkpoints for a swarm under `brain/` confinement. */
+export function listCheckpoints(appData, swarmId) {
+  const res = readFleetState(appData, swarmId);
+  if (!res.ok) return res;
+  return { ok: true, checkpoints: res.state.checkpoints };
+}
+
+function checkpointPlanToPatch(plan) {
+  if (!isPlainObj(plan)) return null;
+  const patch = {};
+  if (typeof plan.title === 'string' && plan.title) patch.title = plan.title;
+  const isNative = plan.schema === 'native' || plan.schema === 'hybrid';
+  if (isNative) {
+    patch.goal = {
+      title: typeof plan.goalTitle === 'string' ? plan.goalTitle : '',
+      line: typeof plan.goalLine === 'string' ? plan.goalLine : typeof plan.goal === 'string' ? plan.goal : '',
+    };
+    if (isPlainObj(plan.tasks)) patch.tasks = plan.tasks;
+    if (Array.isArray(plan.threads)) patch.threads = plan.threads;
+  } else if (typeof plan.goal === 'string') {
+    patch.goal = plan.goal;
+  }
+  if (typeof plan.gate === 'string') patch.gate = plan.gate;
+  if (typeof plan.repo === 'string' && plan.repo) patch.repo = plan.repo;
+  if (Array.isArray(plan.workstreams)) patch.workstreams = plan.workstreams;
+  if (Array.isArray(plan.milestones)) patch.milestones = plan.milestones;
+  if (Array.isArray(plan.risks)) patch.risks = plan.risks;
+  return patch;
+}
+
+function buildCheckpointResumePrompt(checkpoint, swarmTitle = '') {
+  const title = cleanPlanStr(swarmTitle || checkpoint.plan?.title || 'Swarm', true);
+  const lines = [
+    `[fleet-checkpoint-resume] id=${checkpoint.id} label=${JSON.stringify(checkpoint.label)} createdAt=${checkpoint.createdAt}`,
+    `Swarm: ${title} | Board head: #${checkpoint.head} | Spend: $${Number(checkpoint.costUsd || 0).toFixed(4)}`,
+  ];
+  if (checkpoint.plan) {
+    if (checkpoint.plan.goal) lines.push(`Goal: ${oneLine(checkpoint.plan.goal, 200)}`);
+    if (checkpoint.plan.gate) lines.push(`Gate: ${oneLine(checkpoint.plan.gate, 160)}`);
+    const openWs = (checkpoint.plan.workstreams || []).filter((w) => w.status !== 'done' && w.status !== 'verified');
+    if (openWs.length) {
+      lines.push(
+        `Open workstreams (${openWs.length}): ${openWs.map((w) => `${w.id || w.title}[${w.status}${w.owner ? ` @${w.owner}` : ''}]`).join(', ')}`,
+      );
+    }
+  }
+  const activeMembers = (checkpoint.members || []).filter((m) => !m.killed);
+  if (activeMembers.length) {
+    lines.push(
+      `Members (${activeMembers.length}): ${activeMembers.map((m) => `${m.name}(${m.status}${m.model ? `, ${m.model}` : ''})`).join(', ')}`,
+    );
+  }
+  if (Array.isArray(checkpoint.worktrees) && checkpoint.worktrees.length) {
+    lines.push(
+      `Worktrees: ${checkpoint.worktrees.map((w) => `${w.name}@${w.branch}(${w.shortHead || w.head.slice(0, 8)}, ${w.clean ? 'clean' : 'dirty'})`).join(', ')}`,
+    );
+  }
+  lines.push(`Resume instructions: Read board from #${checkpoint.head}, verify worktree state above, and continue remaining tasks.`);
+  return lines.join('\n');
+}
+
+/** Capture a durable swarm checkpoint (board head, spend, plan, members, git worktree HEADs/clean flags). */
+export async function createCheckpoint(appData, swarmId, { label, roots = [] } = {}) {
+  const cleanLabel = typeof label === 'string' ? cleanPlanStr(label, true).slice(0, 160) : '';
+  if (!cleanLabel) {
+    return { ok: false, status: 400, error: 'Non-empty checkpoint label required' };
+  }
+  if (typeof label === 'string' && PLAN_SINGLE_CTRL_RE.test(label)) {
+    return { ok: false, status: 400, error: 'Control characters are not permitted in label' };
+  }
+  if (roots !== undefined && !Array.isArray(roots)) {
+    return { ok: false, status: 400, error: 'roots must be an array of paths' };
+  }
+
+  const loc = resolveConfinedStatePath(appData, swarmId);
+  if (!loc.ok) return loc;
+
+  const snap = buildSwarmSnapshot(appData, swarmId);
+  if (!snap) return { ok: false, status: 404, error: 'Swarm not found' };
+
+  const memberPaths = snap.members
+    .map((m) => (typeof m.workspace === 'string' ? m.workspace : ''))
+    .filter(Boolean);
+  const { probeCheckpointWorktrees } = await import('./git_probe.mjs');
+  const wtProbe = await probeCheckpointWorktrees(roots || [], memberPaths);
+
+  const checkpoint = normalizeCheckpointRecord({
+    id: `ckpt-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`,
+    label: cleanLabel,
+    createdAt: new Date().toISOString(),
+    head: snap.head,
+    costUsd: snap.cost?.totalUsd || 0,
+    plan: snap.plan || null,
+    members: snap.members.map((m) => ({
+      name: m.name,
+      conversation_id: m.conversation_id,
+      role: m.role,
+      model: m.model,
+      status: m.status,
+      killed: Boolean(m.killed),
+      steps: m.steps || 0,
+      workspace_mode: m.workspace_mode || 'inherit',
+      workspace: m.workspace || '',
+    })),
+    worktrees: wtProbe.worktrees,
+  });
+
+  const saved = mutateFleetState(appData, swarmId, (state) => {
+    state.checkpoints = [checkpoint, ...state.checkpoints].slice(0, CHECKPOINT_CAP);
+    return { ok: true, state };
+  });
+  if (!saved.ok) return saved;
+  return {
+    ok: true,
+    checkpoint,
+    checkpoints: saved.state.checkpoints,
+    rejectedRoots: wtProbe.rejected,
+  };
+}
+
+/** Restore a checkpoint's `plan.json` (with CAS) or build a structured continuation prompt. */
+export function restoreCheckpoint(appData, swarmId, { checkpointId, mode = 'resume_prompt', ifMatch } = {}) {
+  const ckId = typeof checkpointId === 'string' ? cleanPlanStr(checkpointId, true).slice(0, 128) : '';
+  if (!ckId) {
+    return { ok: false, status: 400, error: 'Valid checkpointId required' };
+  }
+  if (mode !== 'plan' && mode !== 'resume_prompt') {
+    return { ok: false, status: 400, error: 'mode must be "plan" or "resume_prompt"' };
+  }
+  if (ifMatch !== undefined && typeof ifMatch !== 'string') {
+    return { ok: false, status: 400, error: 'ifMatch must be a string' };
+  }
+  if (typeof ifMatch === 'string' && PLAN_SINGLE_CTRL_RE.test(ifMatch)) {
+    return { ok: false, status: 400, error: 'Control characters are not permitted in ifMatch' };
+  }
+
+  const stateRes = readFleetState(appData, swarmId);
+  if (!stateRes.ok) return stateRes;
+  const checkpoint = stateRes.state.checkpoints.find((c) => c.id === ckId);
+  if (!checkpoint) {
+    return { ok: false, status: 404, error: `Checkpoint "${ckId}" not found` };
+  }
+
+  if (mode === 'plan') {
+    if (!checkpoint.plan) {
+      return { ok: false, status: 400, error: 'Checkpoint has no saved plan to restore' };
+    }
+    const patch = checkpointPlanToPatch(checkpoint.plan);
+    const liveEtag = ifMatch !== undefined ? ifMatch.trim() : readPlan(swarmDir(appData, swarmId)).etag;
+    const written = writeSwarmPlan(appData, swarmId, {
+      ifMatch: liveEtag,
+      mode: 'replace',
+      patch,
+    });
+    if (!written.ok) return written;
+    return {
+      ok: true,
+      mode: 'plan',
+      checkpointId: ckId,
+      checkpoint,
+      plan: written.plan,
+      etag: written.etag,
+    };
+  }
+
+  const roster = getSwarmRoster(appData, swarmId);
+  const prompt = buildCheckpointResumePrompt(checkpoint, roster?.title || swarmId);
+  return {
+    ok: true,
+    mode: 'resume_prompt',
+    checkpointId: ckId,
+    checkpoint,
+    prompt,
+    directive: prompt,
+  };
 }
 
 function hasOpIdTag(text, opId) {
@@ -2619,7 +3098,7 @@ function triageDetail(text) {
   return oneLine(cleaned, 160);
 }
 
-function buildTriageItems({ members, messages, sysAttention }) {
+function buildTriageItems({ members, messages, sysAttention, ackedTriage = {}, head = 0 }) {
   const items = [];
   const memberMap = new Map(members.map((m) => [m.name, m]));
 
@@ -2707,20 +3186,45 @@ function buildTriageItems({ members, messages, sysAttention }) {
     }
   }
 
+  const ackMap = isPlainObj(ackedTriage) ? ackedTriage : {};
+  for (const item of items) {
+    const ack = Object.hasOwn(ackMap, item.id) ? ackMap[item.id] : null;
+    if (isTriageAckActive(ack, head)) {
+      item.acked = true;
+      item.ackedAt = ack.at;
+      if (ack.untilSeq > 0) item.ackUntilSeq = ack.untilSeq;
+      if (ack.note) item.ackNote = ack.note;
+    }
+  }
+
   const order = { urgent: 0, attention: 1, verify: 2 };
-  items.sort((a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9) || b.timestamp - a.timestamp);
+  items.sort(
+    (a, b) =>
+      (a.acked ? 1 : 0) - (b.acked ? 1 : 0) ||
+      (order[a.severity] ?? 9) - (order[b.severity] ?? 9) ||
+      b.timestamp - a.timestamp,
+  );
   return items;
 }
 
 // Stores ONLY compact metadata (never 2k+ message arrays or raw file strings).
-const summaryMetaCache = new Map(); // `${appData}\0${id}` -> { checkedAt, membersKey, boardKey, etag, summary }
+const summaryMetaCache = new Map(); // `${appData}\0${id}` -> { checkedAt, membersKey, boardKey, planKey, stateKey, trStatKeys, trKeys, memberConvs, inactive, archived, etag, urgentItems, summary }
 const boardTailCache = new Map(); // swarmDir -> { meta, rosterSig, acc }
 const BOARD_RECENT_CAP = 64;
 const BOARD_TAIL_CACHE_LIMIT = 16;
 const SNAPSHOT_TRANSCRIPT_TTL_MS = 250;
 
-function buildSwarmEtag({ membersKey, boardKey, title, trKeys, viewEtag, planKey, stuckKeys, opsKey }) {
-  return `${membersKey}|${boardKey}|${title}|${trKeys}|${viewEtag}|${planKey}|${stuckKeys}|${opsKey}`;
+/** Return diagnostic size and limit of the LRU summary metadata cache. */
+export function getSummaryCacheStats() {
+  return {
+    size: summaryMetaCache.size,
+    limit: SUMMARY_CACHE_LIMIT,
+    keys: [...summaryMetaCache.keys()],
+  };
+}
+
+function buildSwarmEtag({ membersKey, boardKey, title, trKeys, viewEtag, planKey, stuckKeys, opsKey, stateKey = '' }) {
+  return `${membersKey}|${boardKey}|${title}|${trKeys}|${viewEtag}|${planKey}|${stuckKeys}|${opsKey}|${stateKey}`;
 }
 
 /**
@@ -2732,8 +3236,10 @@ export function computeSwarmFingerprint(appData, id) {
   const membersFile = readSmallCached(join(dir, 'members.json'), smallFileCache, 1024 * 1024);
   if (membersFile.text == null) return null;
   const boardStat = statOf(join(dir, 'board.jsonl'));
+  const stateStat = statOf(join(dir, STATE_FILE));
   const membersKey = `${membersFile.ino}:${membersFile.mtime}:${membersFile.size}`;
   const boardKey = `${boardStat.ino}:${boardStat.mtime}:${boardStat.size}`;
+  const stateKey = `${stateStat.ino}:${stateStat.mtime}:${stateStat.size}`;
   const roster = parseRoster(membersFile.text) || { title: '', members: {} };
   const title = roster.title || id;
   const names = Object.keys(roster.members).filter((n) => roster.members[n] && typeof roster.members[n] === 'object');
@@ -2760,9 +3266,10 @@ export function computeSwarmFingerprint(appData, id) {
     planKey,
     stuckKeys,
     opsKey,
+    stateKey,
   });
   const member = roster.members ? Object.entries(roster.members).find(([, m]) => m?.conversation_id === id)?.[0] || null : null;
-  return { membersKey, boardKey, etag, member };
+  return { membersKey, boardKey, stateKey, etag, member };
 }
 
 export function getSwarmMetaKeys(appData, id) {
@@ -2771,10 +3278,12 @@ export function getSwarmMetaKeys(appData, id) {
   if (m.size < 0) return null;
   const b = statOf(join(dir, 'board.jsonl'));
   const p = statOf(join(dir, 'plan.json'));
+  const s = statOf(join(dir, STATE_FILE));
   return {
     membersKey: `${m.ino}:${m.mtime}:${m.size}`,
     boardKey: `${b.ino}:${b.mtime}:${b.size}`,
     planKey: `${p.mtime}:${p.size}`,
+    stateKey: `${s.ino}:${s.mtime}:${s.size}`,
   };
 }
 
@@ -2812,7 +3321,7 @@ function scanGateTags(messages) {
 export function computeGateReadiness(messages, triage = [], { precomputed = null, members = [], title = '' } = {}) {
   const g = precomputed || scanGateTags(messages);
   const { doneC, doneSeq, verC, verSeq, scaleC, scaleSeq, blkC, blkSeq, blkAgent } = g;
-  const activeBlk = (triage || []).find((x) => (x.kind === 'blocked' || x.severity === 'urgent') && x.seq > 0);
+  const activeBlk = (triage || []).find((x) => !x.acked && (x.kind === 'blocked' || x.severity === 'urgent') && x.seq > 0);
   if (!doneC && !verC && !scaleC && !blkC && !g.shipC && !activeBlk) return null;
   const maxStage = Math.max(doneSeq, verSeq, scaleSeq);
   const pendingSeq = activeBlk ? activeBlk.seq
@@ -3085,6 +3594,7 @@ function readSwarmMeta(appData, id, now = Date.now()) {
     })
     .join(',');
   const opsMeta = readOpsMeta(dir, now);
+  const stateMeta = readFleetStateMeta(dir);
 
   const etag = buildSwarmEtag({
     membersKey,
@@ -3095,6 +3605,7 @@ function readSwarmMeta(appData, id, now = Date.now()) {
     planKey,
     stuckKeys,
     opsKey: opsMeta.opsKey,
+    stateKey: stateMeta.stateKey,
   });
   const member = names.find((n) => roster.members[n]?.conversation_id === id) || null;
   return {
@@ -3116,6 +3627,7 @@ function readSwarmMeta(appData, id, now = Date.now()) {
     planMtime,
     stuckKeys,
     opsMeta,
+    stateMeta,
     failures,
     etag,
     member,
@@ -3474,8 +3986,15 @@ function buildMembersAndTelemetry(appData, id, meta, acc, now) {
   for (const msg of acc.latestDoneByAgent.values()) triageMsgs.push(msg);
   for (const msg of acc.latestBlockedByAgent.values()) triageMsgs.push(msg);
 
+  const fleetState = meta.stateMeta?.state || emptyFleetState();
   const sysAttention = systemAttention(members, now);
-  const triage = buildTriageItems({ members, messages: triageMsgs, sysAttention });
+  const triage = buildTriageItems({
+    members,
+    messages: triageMsgs,
+    sysAttention,
+    ackedTriage: fleetState.ackedTriage,
+    head,
+  });
   const totalTokens = totalInputTokens + totalCacheReadTokens + totalOutputTokens;
   const burnSummary = computeBurnSummary(members, totalTokens);
   const gateReadiness = computeGateReadiness(triageMsgs, triage, { precomputed: acc.gateAcc, members, title });
@@ -3497,40 +4016,42 @@ function buildMembersAndTelemetry(appData, id, meta, acc, now) {
     contextPct = peak.contextPct;
   }
 
-  const activeCount = members.filter((m) => !m.killed && m.status === 'working').length;
-  const waitingCount = members.filter((m) => !m.killed && m.status === 'waiting').length;
-  const killedCount = members.filter((m) => m.killed).length;
   const lastActivityTs = Math.max(boardStat.mtime || 0, membersFile.mtime || 0, ...members.map((m) => m.transcriptMtime || 0));
+  const memberConvs = members.map((m) => m.conversation_id).filter(Boolean);
+  const trStatKeys = computeTranscriptStatKeys(appData, memberConvs);
 
-  lruSet(summaryMetaCache, `${appData}\0${id}`, {
-    checkedAt: now,
+  cacheSwarmSummary({
+    appData,
+    id,
+    now,
     membersKey: meta.membersKey,
     boardKey: meta.boardKey,
     planKey: meta.planKey,
+    stateKey: meta.stateMeta?.stateKey || '0:0:-1',
     trKeys: meta.trKeys,
+    trStatKeys,
+    memberConvs,
     etag: meta.etag,
-    summary: {
-      id,
-      title,
-      appData,
-      head,
-      memberCount: members.length,
-      activeCount,
-      waitingCount,
-      killedCount,
-      triageCount: triage.length,
-      totalTokens,
-      costUsd: cost.totalUsd,
-      hasPlan: Boolean(plan),
-      lastActivityTs,
-    },
-  }, 8);
+    title,
+    head,
+    members,
+    triage,
+    totalTokens,
+    cost,
+    gateReadiness,
+    plan,
+    fleetState,
+    lastActivityTs,
+  });
 
   return {
     members,
     channels,
     sysAttention,
     triage,
+    pinnedSeqs: fleetState.pinnedSeqs,
+    ackedTriage: fleetState.ackedTriage,
+    archived: fleetState.archived,
     burnSummary,
     gateReadiness,
     contextLimit,
@@ -3546,6 +4067,321 @@ function buildMembersAndTelemetry(appData, id, meta, acc, now) {
     view: vf.view,
     plan,
   };
+}
+
+function computeTranscriptStatKeys(appData, memberConvs) {
+  return memberConvs
+    .map((cid) => {
+      const s = statOf(transcriptPath(appData, cid));
+      return `${cid}:${s.ino}:${s.mtime}:${s.size}`;
+    })
+    .join(',');
+}
+
+function buildSwarmSummaryRecord({
+  appData,
+  id,
+  title,
+  head,
+  members,
+  triage,
+  totalTokens,
+  cost,
+  gateReadiness,
+  plan,
+  fleetState,
+  lastActivityTs,
+}) {
+  const activeCount = members.filter((m) => !m.killed && m.status === 'working').length;
+  const waitingCount = members.filter((m) => !m.killed && m.status === 'waiting').length;
+  const killedCount = members.filter((m) => m.killed).length;
+  const unackedTriage = triage.filter((t) => !t.acked);
+  const urgentItems = unackedTriage.filter((t) => t.severity === 'urgent');
+  const blockedCount = unackedTriage.filter((t) => t.kind === 'blocked').length;
+  const failureCount = unackedTriage.filter((t) => t.kind === 'quota' || t.kind === 'error').length;
+  const archived = Boolean(fleetState?.archived);
+
+  return {
+    summary: {
+      id,
+      title,
+      appData,
+      head,
+      memberCount: members.length,
+      activeCount,
+      waitingCount,
+      killedCount,
+      triageCount: unackedTriage.length,
+      urgentCount: urgentItems.length,
+      blockedCount,
+      failureCount,
+      totalTokens,
+      costUsd: roundUsd(cleanTok(cost?.totalUsd)),
+      gateState: gateReadiness?.state || null,
+      repo: plan?.repo || '',
+      archived,
+      topUrgent: urgentItems[0] || null,
+      hasPlan: Boolean(plan),
+      lastActivityTs,
+    },
+    urgentItems,
+    activeCount,
+    archived,
+  };
+}
+
+function cacheSwarmSummary(opts) {
+  const rec = buildSwarmSummaryRecord(opts);
+  const inactive = rec.archived || (rec.activeCount === 0 && opts.now - opts.lastActivityTs > INACTIVE_SWARM_MS);
+  const entry = {
+    checkedAt: opts.now,
+    membersKey: opts.membersKey,
+    boardKey: opts.boardKey,
+    planKey: opts.planKey,
+    stateKey: opts.stateKey,
+    trKeys: opts.trKeys,
+    trStatKeys: opts.trStatKeys,
+    memberConvs: opts.memberConvs,
+    inactive,
+    archived: rec.archived,
+    etag: opts.etag || '',
+    urgentItems: rec.urgentItems,
+    summary: rec.summary,
+  };
+  lruSet(summaryMetaCache, `${opts.appData}\0${opts.id}`, entry, SUMMARY_CACHE_LIMIT);
+  return entry;
+}
+
+function buildSwarmSummaryOnly(appData, id, now = Date.now()) {
+  const dir = swarmDir(appData, id);
+  const membersFile = readSmallCached(join(dir, 'members.json'), smallFileCache, 1024 * 1024);
+  if (membersFile.text == null) return null;
+  const boardPath = join(dir, 'board.jsonl');
+  const boardStat = statOf(boardPath);
+  const membersKey = `${membersFile.ino}:${membersFile.mtime}:${membersFile.size}`;
+  const boardKey = `${boardStat.ino}:${boardStat.mtime}:${boardStat.size}`;
+  const roster = parseRoster(membersFile.text) || { title: '', members: {} };
+  const title = roster.title || id;
+  const names = Object.keys(roster.members).filter((n) => roster.members[n] && typeof roster.members[n] === 'object');
+  const { plan, key: planKey } = readPlan(dir);
+  const stateMeta = readFleetStateMeta(dir);
+  const fleetState = stateMeta.state;
+
+  let head = 0;
+  let lineCount = 0;
+  let lastVerifiedSeq = 0;
+  const posts = new Map();
+  const latestBlockedByAgent = new Map();
+  const latestDoneByAgent = new Map();
+  const gateAcc = {
+    doneC: 0,
+    doneSeq: 0,
+    doneText: '',
+    verC: 0,
+    verSeq: 0,
+    verText: '',
+    scaleC: 0,
+    scaleSeq: 0,
+    scaleText: '',
+    blkC: 0,
+    blkSeq: 0,
+    blkAgent: '',
+    shipC: 0,
+    shipSeq: 0,
+    firstTs: 0,
+    lastTs: 0,
+  };
+
+  if (boardStat.isFile && boardStat.size > 0) {
+    streamLinesIncremental(
+      boardPath,
+      null,
+      () => {
+        head = 0;
+        lineCount = 0;
+        lastVerifiedSeq = 0;
+        posts.clear();
+        latestBlockedByAgent.clear();
+        latestDoneByAgent.clear();
+      },
+      (line, preParsed) => {
+        let m = preParsed;
+        if (!m) {
+          try {
+            m = JSON.parse(line);
+          } catch {
+            return;
+          }
+        }
+        if (!m || typeof m !== 'object' || Array.isArray(m)) return;
+        lineCount++;
+        const seq = safeSeq(m.seq);
+        if (seq > head) head = seq;
+        if (controlOf(m)) return;
+        const agent = safeStr(m.agent);
+        const text = safeStr(m.text);
+        const ts = boardTimeMs(safeStr(m.time));
+
+        if (agent) {
+          let p = posts.get(agent);
+          if (!p) {
+            p = { lastPostSeq: 0, lastPostTs: null };
+            posts.set(agent, p);
+          }
+          p.lastPostSeq = seq;
+          p.lastPostTs = ts;
+        }
+
+        const hasBrk = text.indexOf('[') >= 0;
+        const hasShip = text.indexOf('shipped') >= 0 || text.indexOf('Shipped') >= 0 || text.indexOf('SHIPPED') >= 0;
+        if (hasBrk || hasShip) {
+          let hit = false;
+          if (hasBrk) {
+            if (/\[scale-verified\]/i.test(text)) { gateAcc.scaleC++; if (seq >= gateAcc.scaleSeq) { gateAcc.scaleSeq = seq; gateAcc.scaleText = text; } hit = true; }
+            else if (/\[verified\]/i.test(text)) { gateAcc.verC++; if (seq >= gateAcc.verSeq) { gateAcc.verSeq = seq; gateAcc.verText = text; } hit = true; }
+            else if (/\[done\]/i.test(text)) { gateAcc.doneC++; if (seq >= gateAcc.doneSeq) { gateAcc.doneSeq = seq; gateAcc.doneText = text; } hit = true; }
+            if (/\[blocked\]/i.test(text)) { gateAcc.blkC++; if (seq >= gateAcc.blkSeq) { gateAcc.blkSeq = seq; gateAcc.blkAgent = agent; } hit = true; }
+          }
+          if (hasShip && /\bshipped\b/i.test(text)) {
+            gateAcc.shipC++;
+            if (seq >= gateAcc.shipSeq) gateAcc.shipSeq = seq;
+            hit = true;
+          }
+          if (hit && ts > 0) {
+            if (!gateAcc.firstTs || ts < gateAcc.firstTs) gateAcc.firstTs = ts;
+            if (ts > gateAcc.lastTs) gateAcc.lastTs = ts;
+          }
+        }
+
+        const trimmed = text.trim();
+        if (trimmed.toLowerCase().includes('[verified]')) {
+          lastVerifiedSeq = Math.max(lastVerifiedSeq, seq);
+        }
+        if (/\[blocked\]/i.test(trimmed)) {
+          latestBlockedByAgent.set(agent, { seq, agent, text: trimmed, ts, control: null });
+        } else if (/^@\S+\s+\[done\]|\[done\]/i.test(trimmed)) {
+          latestDoneByAgent.set(agent, { seq, agent, text: trimmed, ts, control: null });
+        }
+      },
+    );
+    if (head === 0 && lineCount > 0) head = lineCount;
+  }
+
+  let totalInputTokens = 0;
+  let totalCacheReadTokens = 0;
+  let totalOutputTokens = 0;
+  const swarmByModel = {};
+  const trKeysArr = [];
+  const memberConvs = [];
+
+  const members = names.map((name) => {
+    const m = roster.members[name];
+    const convId = typeof m.conversation_id === 'string' ? m.conversation_id : '';
+    if (convId) memberConvs.push(convId);
+    const trRes = summarizeTranscript(appData, convId);
+    trKeysArr.push(`${name}:${trRes.key}`);
+    const tr = trRes.summary;
+    const role = roleOf(name, m);
+    const status = statusOf(m, tr);
+    const failure = stepFailure(tr, now);
+    const usage = tr?.usage || { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, totalTokens: 0 };
+    totalInputTokens += usage.inputTokens;
+    totalCacheReadTokens += usage.cacheReadTokens;
+    totalOutputTokens += usage.outputTokens;
+
+    const memberModel = m.model || tr?.model || '';
+    const byModel = cloneByModel(tr?.byModel);
+    if (Object.hasOwn(byModel, 'unknown') && !tr?.model && m.model) {
+      const moved = byModel.unknown;
+      delete byModel.unknown;
+      const targetKey = sanitizeModelKey(m.model);
+      if (byModel[targetKey]) {
+        byModel[targetKey].inputTokens += moved.inputTokens;
+        byModel[targetKey].cacheReadTokens += moved.cacheReadTokens;
+        byModel[targetKey].outputTokens += moved.outputTokens;
+        byModel[targetKey].steps += moved.steps;
+      } else {
+        byModel[targetKey] = moved;
+      }
+    }
+    for (const [mk, mv] of Object.entries(byModel)) {
+      if (!swarmByModel[mk]) {
+        swarmByModel[mk] = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
+      }
+      swarmByModel[mk].inputTokens += mv.inputTokens;
+      swarmByModel[mk].cacheReadTokens += mv.cacheReadTokens;
+      swarmByModel[mk].outputTokens += mv.outputTokens;
+      swarmByModel[mk].steps += mv.steps;
+    }
+
+    const cost = computeCostFromByModel(byModel, memberModel);
+    return {
+      name,
+      conversation_id: convId,
+      model: memberModel,
+      role,
+      status,
+      killed: !!m.killed,
+      steps: tr?.steps || 0,
+      replyAsk: tr?.replyAsk || '',
+      narrator: narratorRank(name, m) >= 0,
+      roleWorker: isRoleWorker(name, m),
+      failure,
+      transcriptMtime: tr?.mtime || 0,
+      cost,
+      ...(posts.get(name) || { lastPostSeq: 0, lastPostTs: null }),
+    };
+  });
+  members.sort(
+    (a, b) => (a.role === 'coordinator' ? 0 : 1) - (b.role === 'coordinator' ? 0 : 1) || a.name.localeCompare(b.name),
+  );
+
+  const triageMsgs = [];
+  if (lastVerifiedSeq > 0) {
+    triageMsgs.push({ seq: lastVerifiedSeq, agent: '', text: '[verified]', ts: 0, control: null });
+  }
+  for (const msg of latestDoneByAgent.values()) triageMsgs.push(msg);
+  for (const msg of latestBlockedByAgent.values()) triageMsgs.push(msg);
+
+  const sysAttention = systemAttention(members, now);
+  const triage = buildTriageItems({
+    members,
+    messages: triageMsgs,
+    sysAttention,
+    ackedTriage: fleetState.ackedTriage,
+    head,
+  });
+  const totalTokens = totalInputTokens + totalCacheReadTokens + totalOutputTokens;
+  const gateReadiness = computeGateReadiness(triageMsgs, triage, { precomputed: gateAcc, members, title });
+  const cost = computeCostFromByModel(swarmByModel);
+  if (!Object.keys(swarmByModel).length && members.some((m) => m.cost?.pricingKnown)) {
+    cost.pricingKnown = true;
+  }
+  const lastActivityTs = Math.max(boardStat.mtime || 0, membersFile.mtime || 0, ...members.map((m) => m.transcriptMtime || 0));
+
+  return cacheSwarmSummary({
+    appData,
+    id,
+    now,
+    membersKey,
+    boardKey,
+    planKey,
+    stateKey: stateMeta.stateKey,
+    trKeys: trKeysArr.join(','),
+    trStatKeys: computeTranscriptStatKeys(appData, memberConvs),
+    memberConvs,
+    etag: '',
+    title,
+    head,
+    members,
+    triage,
+    totalTokens,
+    cost,
+    gateReadiness,
+    plan,
+    fleetState,
+    lastActivityTs,
+  });
 }
 
 function streamBoardLines(boardPath, prevMeta) {
@@ -3606,6 +4442,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     planKey: meta.planKey,
     stuckKeys: meta.stuckKeys,
     opsKey,
+    stateKey: meta.stateMeta?.stateKey || '',
   });
   meta.etag = etag;
 
@@ -3641,6 +4478,9 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     allowedFiles,
     systemAttention: telemetry.sysAttention,
     triage: telemetry.triage,
+    pinnedSeqs: telemetry.pinnedSeqs,
+    ackedTriage: telemetry.ackedTriage,
+    archived: telemetry.archived,
     burnSummary: telemetry.burnSummary,
     gateReadiness: telemetry.gateReadiness,
     contextLimit: telemetry.contextLimit,
@@ -3881,6 +4721,7 @@ export function buildSwarmDelta({ appData, conversationId, since = 0, prevEtag =
     planKey: meta.planKey,
     stuckKeys: meta.stuckKeys,
     opsKey,
+    stateKey: meta.stateMeta?.stateKey || '',
   });
   meta.etag = finalEtag;
 
@@ -3905,6 +4746,9 @@ export function buildSwarmDelta({ appData, conversationId, since = 0, prevEtag =
     ops,
     view: telemetry.view,
     triage: telemetry.triage,
+    pinnedSeqs: telemetry.pinnedSeqs,
+    ackedTriage: telemetry.ackedTriage,
+    archived: telemetry.archived,
     burnSummary: telemetry.burnSummary,
     gateReadiness: telemetry.gateReadiness,
     contextLimit: telemetry.contextLimit,
@@ -3959,7 +4803,7 @@ export function resolveConversationSwarm(appDataDirs, conv) {
   return { appData: null, swarm: null, member: null };
 }
 
-/** Scan all available local swarms using cached lightweight summary metadata (no AST retention). */
+/** Scan all available local swarms using LRU=64 cached lightweight summary metadata (stat-only on warm hits). */
 export function listSwarms(appDataDirs, onSnapshot = null) {
   const list = [];
   const now = Date.now();
@@ -3971,30 +4815,83 @@ export function listSwarms(appDataDirs, onSnapshot = null) {
       continue;
     }
     const hit = summaryMetaCache.get(cacheKey);
-    if (hit && hit.membersKey === keys.membersKey && hit.boardKey === keys.boardKey && hit.planKey === keys.planKey) {
+    if (
+      hit &&
+      hit.membersKey === keys.membersKey &&
+      hit.boardKey === keys.boardKey &&
+      hit.planKey === keys.planKey &&
+      hit.stateKey === keys.stateKey
+    ) {
+      lruSet(summaryMetaCache, cacheKey, hit, SUMMARY_CACHE_LIMIT);
       if (now - hit.checkedAt < SNAPSHOT_TRANSCRIPT_TTL_MS) {
         list.push(hit.summary);
         continue;
       }
-      // Check if any member transcript changed before re-reading board.jsonl
-      const mf = readSmallCached(join(swarmDir(appData, id), 'members.json'), smallFileCache, 1024 * 1024);
-      const roster = parseRoster(mf.text || '');
-      const names = Object.keys(roster?.members || {}).filter((n) => roster.members[n] && typeof roster.members[n] === 'object');
-      const curTrKeys = names.map((n) => `${n}:${summarizeTranscript(appData, roster.members[n].conversation_id).key}`).join(',');
-      if (curTrKeys === hit.trKeys) {
+      if ((hit.archived || hit.inactive) && now - hit.checkedAt < 10_000) {
+        list.push(hit.summary);
+        continue;
+      }
+      const curTrStatKeys = computeTranscriptStatKeys(appData, hit.memberConvs || []);
+      if (curTrStatKeys === hit.trStatKeys) {
         hit.checkedAt = now;
         list.push(hit.summary);
         continue;
       }
     }
-    const snap = buildSwarmSnapshot(appData, id);
-    if (!snap) continue;
-    if (onSnapshot) onSnapshot(appData, id, snap, keys);
-    const entry = summaryMetaCache.get(cacheKey);
+
+    if (onSnapshot) {
+      const stateMeta = readFleetStateMeta(swarmDir(appData, id));
+      if (!stateMeta.state.archived) {
+        const snap = buildSwarmSnapshot(appData, id);
+        if (!snap) continue;
+        onSnapshot(appData, id, snap, keys);
+        const entry = summaryMetaCache.get(cacheKey);
+        if (entry) list.push(entry.summary);
+        continue;
+      }
+    }
+
+    const entry = buildSwarmSummaryOnly(appData, id, now);
     if (entry) list.push(entry.summary);
   }
-  list.sort((a, b) => b.activeCount - a.activeCount || b.lastActivityTs - a.lastActivityTs);
+  list.sort((a, b) => (a.archived ? 1 : 0) - (b.archived ? 1 : 0) || b.activeCount - a.activeCount || b.lastActivityTs - a.lastActivityTs);
   return list;
+}
+
+/** Build multi-swarm portfolio rollup with aggregated cost, tokens, active count, and urgent triage queue. */
+export function getPortfolio(appDataDirs) {
+  const swarms = listSwarms(appDataDirs);
+  let totalCostUsd = 0;
+  let totalTokens = 0;
+  let activeSwarms = 0;
+  const urgentTriage = [];
+
+  for (const s of swarms) {
+    if (s.archived) continue;
+    activeSwarms++;
+    totalCostUsd += cleanTok(s.costUsd);
+    totalTokens += cleanTok(s.totalTokens);
+    const cacheKey = `${s.appData}\0${s.id}`;
+    const entry = summaryMetaCache.get(cacheKey);
+    const urgents = entry?.urgentItems || (s.topUrgent ? [s.topUrgent] : []);
+    for (const item of urgents) {
+      urgentTriage.push({
+        ...item,
+        swarmId: s.id,
+        swarmTitle: s.title,
+      });
+    }
+  }
+
+  urgentTriage.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+  return {
+    totalCostUsd: roundUsd(totalCostUsd),
+    totalTokens,
+    activeSwarms,
+    urgentCount: urgentTriage.length,
+    urgentTriage,
+    swarms,
+  };
 }
 
 /** Validate and resolve a screenshot frame path listed on the board/view under `<appData>/brain/`. */

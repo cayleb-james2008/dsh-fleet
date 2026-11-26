@@ -237,15 +237,19 @@ export function createFleetHandlers({
 } = {}) {
   const {
     ID_RE = SIDE_ID_RE,
+    ackTriageItem,
     buildSwarmDelta,
     buildSwarmSnapshot,
     computeSwarmFingerprint,
+    createCheckpoint,
     findAppDataDirs,
     findCoordinatorConvId,
     getMemberLiveState,
+    getPortfolio,
     getSwarmMetaKeys,
     getSwarmOpContext,
     getSwarmRoster,
+    listCheckpoints,
     listSwarms,
     oneLine,
     readOperatorOps,
@@ -254,7 +258,10 @@ export function createFleetHandlers({
     recordOperatorOp,
     resolveAllowedFrame,
     resolveConversationSwarm,
+    restoreCheckpoint,
     roleOf,
+    setSwarmArchived,
+    setSwarmPin,
     unseenBy,
     updateOperatorOp,
     validatePlanPatch,
@@ -367,7 +374,12 @@ export function createFleetHandlers({
         unchangedPacked,
       });
     });
-    const sig = swarms.map((s) => `${s.id}:${s.head}:${s.triageCount}:${s.totalTokens}:${s.activeCount}`).join(',');
+    const sig = swarms
+      .map(
+        (s) =>
+          `${s.id}:${s.head}:${s.triageCount}:${s.blockedCount || 0}:${s.failureCount || 0}:${s.gateState || ''}:${s.archived ? 1 : 0}:${s.totalTokens}:${s.costUsd || 0}:${s.activeCount}:${s.topUrgent?.id || ''}`,
+      )
+      .join(',');
     if (swarmsListCache.packed && swarmsListCache.sig === sig && swarmsListCache.key === key) {
       swarmsListCache.at = now;
       return swarmsListCache;
@@ -556,7 +568,7 @@ export function createFleetHandlers({
     const swDir = join(appData, 'brain', swarmId, '.system_generated', 'swarm');
     const paths = [];
     if (existsSync(swDir)) paths.push(swDir);
-    for (const f of ['board.jsonl', 'members.json', 'plan.json', 'view.json', 'fleet_ops.json']) {
+    for (const f of ['board.jsonl', 'members.json', 'plan.json', 'view.json', 'fleet_ops.json', 'fleet_state.json']) {
       const p = join(swDir, f);
       if (existsSync(p)) paths.push(p);
     }
@@ -1788,11 +1800,218 @@ export function createFleetHandlers({
     };
   }
 
+  function resolveConfirmedBodySwarm(body) {
+    if (!body || typeof body !== 'object' || Array.isArray(body) || body.confirm !== true) {
+      return { ok: false, status: 400, json: { error: 'Confirmation required (confirm: true)' } };
+    }
+    const convChk = checkControlString(body.conversationId, 'conversationId', { required: true, maxLen: 128, singleLine: true });
+    if (!convChk.ok || !ID_RE.test(convChk.value)) {
+      return { ok: false, status: 400, json: { error: 'Valid conversationId required' } };
+    }
+    const res = resolveConversationSwarm(getAppDirs(), convChk.value);
+    if (!res.swarm || !res.appData) {
+      return { ok: false, status: 404, json: { error: 'Swarm not found' } };
+    }
+    return { ok: true, conv: convChk.value, res };
+  }
+
+  function resolveQuerySwarm(query = {}) {
+    const q = query && typeof query === 'object' && !Array.isArray(query) ? query : {};
+    let requestedConv = '';
+    if (q.conversationId !== undefined) {
+      if (typeof q.conversationId !== 'string') {
+        return { ok: false, status: 400, error: 'Valid conversationId required' };
+      }
+      requestedConv = q.conversationId.trim();
+      if (!requestedConv || !ID_RE.test(requestedConv)) {
+        return { ok: false, status: 400, error: 'Valid conversationId required' };
+      }
+    }
+    const appDataDirs = getAppDirs();
+    let conv = requestedConv || defaultConversationId;
+    if (!conv) {
+      const swarmsData = getSwarmsEntry().swarms;
+      if (swarmsData.length) conv = swarmsData[0].id;
+    }
+    if (!conv || !ID_RE.test(conv)) {
+      return { ok: false, status: 404, error: 'Swarm not found' };
+    }
+    const res = resolveConversationSwarm(appDataDirs, conv);
+    if (!res.swarm || !res.appData) {
+      return { ok: false, status: 404, error: 'Swarm not found' };
+    }
+    return { ok: true, conv, res };
+  }
+
+  function getPortfolioPacked() {
+    const appDataDirs = getAppDirs();
+    const portfolio = getPortfolio(appDataDirs);
+    return pack(portfolio);
+  }
+
+  function postTriageAck(body = {}) {
+    const target = resolveConfirmedBodySwarm(body);
+    if (!target.ok) return { status: target.status, json: target.json };
+    const { conv, res } = target;
+    const out = ackTriageItem(res.appData, res.swarm, {
+      triageId: body.triageId,
+      action: body.action,
+      untilSeq: body.untilSeq,
+      note: body.note,
+    });
+    if (!out.ok) {
+      return { status: out.status || 400, json: { error: out.error || 'Failed to update triage ack' } };
+    }
+    invalidateSwarmPayloadCache(res.swarm);
+    return {
+      status: 200,
+      json: {
+        ok: true,
+        conversationId: conv,
+        swarm: res.swarm,
+        triageId: out.triageId,
+        action: out.action,
+        ackedTriage: out.state.ackedTriage,
+      },
+    };
+  }
+
+  function postPins(body = {}) {
+    const target = resolveConfirmedBodySwarm(body);
+    if (!target.ok) return { status: target.status, json: target.json };
+    const { conv, res } = target;
+    const out = setSwarmPin(res.appData, res.swarm, {
+      seq: body.seq,
+      pinned: body.pinned,
+    });
+    if (!out.ok) {
+      return { status: out.status || 400, json: { error: out.error || 'Failed to update pin' } };
+    }
+    invalidateSwarmPayloadCache(res.swarm);
+    return {
+      status: 200,
+      json: {
+        ok: true,
+        conversationId: conv,
+        swarm: res.swarm,
+        seq: out.seq,
+        pinned: out.pinned,
+        pinnedSeqs: out.state.pinnedSeqs,
+      },
+    };
+  }
+
+  function postSwarmArchive(body = {}) {
+    const target = resolveConfirmedBodySwarm(body);
+    if (!target.ok) return { status: target.status, json: target.json };
+    const { conv, res } = target;
+    const out = setSwarmArchived(res.appData, res.swarm, body.archived);
+    if (!out.ok) {
+      return { status: out.status || 400, json: { error: out.error || 'Failed to update archive state' } };
+    }
+    invalidateSwarmPayloadCache(res.swarm);
+    return {
+      status: 200,
+      json: {
+        ok: true,
+        conversationId: conv,
+        swarm: res.swarm,
+        archived: out.state.archived,
+      },
+    };
+  }
+
+  function getCheckpoints(query = {}) {
+    const resolved = resolveQuerySwarm(query);
+    if (!resolved.ok) {
+      return { status: resolved.status, packed: pack({ ok: false, error: resolved.error }) };
+    }
+    const { conv, res } = resolved;
+    const out = listCheckpoints(res.appData, res.swarm);
+    if (!out.ok) {
+      return { status: out.status || 403, packed: pack({ ok: false, error: out.error || 'Checkpoints not accessible' }) };
+    }
+    return {
+      status: 200,
+      packed: pack({
+        ok: true,
+        conversationId: conv,
+        swarm: res.swarm,
+        checkpoints: out.checkpoints,
+      }),
+    };
+  }
+
+  async function postCheckpoint(body = {}) {
+    const target = resolveConfirmedBodySwarm(body);
+    if (!target.ok) return { status: target.status, json: target.json };
+    const { conv, res } = target;
+    const out = await createCheckpoint(res.appData, res.swarm, {
+      label: body.label,
+      roots: body.roots,
+    });
+    if (!out.ok) {
+      return { status: out.status || 400, json: { error: out.error || 'Failed to create checkpoint' } };
+    }
+    invalidateSwarmPayloadCache(res.swarm);
+    return {
+      status: 200,
+      json: {
+        ok: true,
+        conversationId: conv,
+        swarm: res.swarm,
+        checkpoint: out.checkpoint,
+        checkpoints: out.checkpoints,
+        ...(out.rejectedRoots?.length ? { rejectedRoots: out.rejectedRoots } : {}),
+      },
+    };
+  }
+
+  function postCheckpointRestore(body = {}) {
+    const target = resolveConfirmedBodySwarm(body);
+    if (!target.ok) return { status: target.status, json: target.json };
+    const { conv, res } = target;
+    const out = restoreCheckpoint(res.appData, res.swarm, {
+      checkpointId: body.checkpointId,
+      mode: body.mode,
+      ifMatch: body.ifMatch,
+    });
+    if (!out.ok) {
+      if (out.status === 409) {
+        invalidateSwarmPayloadCache(res.swarm);
+        return {
+          status: 409,
+          json: {
+            error: out.error || 'plan changed on disk',
+            plan: out.plan || null,
+            etag: out.etag || out.plan?.etag || '',
+          },
+        };
+      }
+      return { status: out.status || 400, json: { error: out.error || 'Failed to restore checkpoint' } };
+    }
+    if (out.mode === 'plan') {
+      invalidateSwarmPayloadCache(res.swarm);
+    }
+    return {
+      status: 200,
+      json: {
+        ok: true,
+        conversationId: conv,
+        swarm: res.swarm,
+        mode: out.mode,
+        checkpointId: out.checkpointId,
+        ...(out.mode === 'plan' ? { plan: out.plan, etag: out.etag } : { prompt: out.prompt, directive: out.directive, checkpoint: out.checkpoint }),
+      },
+    };
+  }
+
   return {
     assets,
     computeSwarmFingerprint,
     getHealthPacked,
     getSwarmsPacked,
+    getPortfolioPacked,
     getSwarmPacked,
     getSwarmDelta,
     getDeltaStats,
@@ -1803,11 +2022,17 @@ export function createFleetHandlers({
     getTranscript,
     getFrame,
     getOps,
+    getCheckpoints,
     postNudge,
     postPlan,
     postControl,
     postOpsAction,
     postWorktreeAction,
+    postTriageAck,
+    postPins,
+    postSwarmArchive,
+    postCheckpoint,
+    postCheckpointRestore,
     resolveStreamTarget,
   };
 }
@@ -2076,6 +2301,9 @@ export async function createStandaloneRouter({
     if (req.method === 'GET' && pathname === '/api/swarms') {
       return withHandlers((h) => sendPacked(req, res, 200, h.getSwarmsPacked()));
     }
+    if (req.method === 'GET' && pathname === '/api/portfolio') {
+      return withHandlers((h) => sendPacked(req, res, 200, h.getPortfolioPacked()));
+    }
     if (req.method === 'GET' && pathname === '/api/swarm') {
       const q = parseQueryFast(search);
       return withHandlers((h) => sendPacked(req, res, 200, h.getSwarmPacked(q)));
@@ -2196,6 +2424,13 @@ export async function createStandaloneRouter({
         sendPacked(req, res, out.status, out.packed);
       });
     }
+    if (req.method === 'GET' && pathname === '/api/checkpoints') {
+      const q = parseQueryFast(search);
+      return withHandlers((h) => {
+        const out = h.getCheckpoints(q);
+        sendPacked(req, res, out.status, out.packed);
+      });
+    }
     if (req.method === 'GET' && pathname === '/api/frame') {
       const q = parseQueryFast(search);
       return withHandlers((h) => {
@@ -2270,6 +2505,21 @@ export async function createStandaloneRouter({
     }
     if (req.method === 'POST' && pathname === '/api/worktrees/action') {
       return handleJsonPost(req, res, (h, body) => h.postWorktreeAction(body), MAX_WORKTREE_ACTION_BYTES);
+    }
+    if (req.method === 'POST' && pathname === '/api/triage/ack') {
+      return handleJsonPost(req, res, (h, body) => h.postTriageAck(body));
+    }
+    if (req.method === 'POST' && pathname === '/api/pins') {
+      return handleJsonPost(req, res, (h, body) => h.postPins(body));
+    }
+    if (req.method === 'POST' && pathname === '/api/swarm/archive') {
+      return handleJsonPost(req, res, (h, body) => h.postSwarmArchive(body));
+    }
+    if (req.method === 'POST' && pathname === '/api/checkpoints') {
+      return handleJsonPost(req, res, (h, body) => h.postCheckpoint(body));
+    }
+    if (req.method === 'POST' && pathname === '/api/checkpoints/restore') {
+      return handleJsonPost(req, res, (h, body) => h.postCheckpointRestore(body));
     }
 
     res.writeHead(404, { 'Content-Type': 'text/plain', ...SECURITY_HEADERS });
@@ -2362,6 +2612,7 @@ export async function runSidecarApp({ appDataDir = '' } = {}) {
 
   app.api('/api/health', () => new Response(handlers.getHealthPacked().raw, { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
   app.api('/api/swarms', () => new Response(handlers.getSwarmsPacked().raw, { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
+  app.api('/api/portfolio', () => new Response(handlers.getPortfolioPacked().raw, { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
   app.api('/api/swarm', (data) => new Response(handlers.getSwarmPacked(data).raw, { contentType: 'application/json', headers: SECURITY_HEADERS }), 'GET');
   app.api('/api/swarm/delta', async (data) => {
     const out = await handlers.getSwarmDelta(data);
@@ -2378,6 +2629,10 @@ export async function runSidecarApp({ appDataDir = '' } = {}) {
   }, 'GET');
   app.api('/api/ops', (data) => {
     const out = handlers.getOps(data);
+    return new Response(out.packed.raw, { status: out.status, contentType: 'application/json', headers: SECURITY_HEADERS });
+  }, 'GET');
+  app.api('/api/checkpoints', (data) => {
+    const out = handlers.getCheckpoints(data);
     return new Response(out.packed.raw, { status: out.status, contentType: 'application/json', headers: SECURITY_HEADERS });
   }, 'GET');
   app.api('/api/frame', (data) => {
@@ -2428,6 +2683,11 @@ export async function runSidecarApp({ appDataDir = '' } = {}) {
   registerJsonPost('/api/control', (payload) => handlers.postControl(payload));
   registerJsonPost('/api/ops/action', (payload) => handlers.postOpsAction(payload));
   registerJsonPost('/api/worktrees/action', (payload) => handlers.postWorktreeAction(payload), MAX_WORKTREE_ACTION_BYTES);
+  registerJsonPost('/api/triage/ack', (payload) => handlers.postTriageAck(payload));
+  registerJsonPost('/api/pins', (payload) => handlers.postPins(payload));
+  registerJsonPost('/api/swarm/archive', (payload) => handlers.postSwarmArchive(payload));
+  registerJsonPost('/api/checkpoints', (payload) => handlers.postCheckpoint(payload));
+  registerJsonPost('/api/checkpoints/restore', (payload) => handlers.postCheckpointRestore(payload));
 
   await app.run();
 }

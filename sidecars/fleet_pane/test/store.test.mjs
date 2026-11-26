@@ -7,27 +7,37 @@ import { fileURLToPath } from 'node:url';
 import {
   executeWorktreeAction,
   parsePorcelainWorktrees,
+  probeCheckpointWorktrees,
   probeMemberWorktree,
   probeWorktreeDiff,
   probeWorktrees,
 } from '../git_probe.mjs';
 import {
   OPS_TIMEOUT_MS,
+  ackTriageItem,
   buildSwarmDelta,
   buildSwarmSnapshot,
   computeBurnSummary,
   computeGateReadiness,
+  createCheckpoint,
   findCoordinatorConvId,
   getBoardTailStats,
   getModelSpec,
+  getPortfolio,
+  getSummaryCacheStats,
   getSwarmOpContext,
+  listCheckpoints,
   listSwarms,
   normalizePlan,
+  readFleetState,
   readOperatorOps,
   readTranscriptActivityTail,
   readTranscriptSteps,
   reconcileOperatorOps,
   recordOperatorOp,
+  restoreCheckpoint,
+  setSwarmArchived,
+  setSwarmPin,
   summarizeTranscript,
   writeSwarmPlan,
 } from '../swarm_store.mjs';
@@ -2303,6 +2313,336 @@ test('reconcileOperatorOps verifies via board/members/plan, handles ERROR_MESSAG
     assert.equal(failedOp.status, 'failed');
     assert.ok(failedOp.error.includes('Rate limit'));
     assert.ok(!failedOp.error.includes('sk-secret123456'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('summaryMetaCache maintains LRU=64 index, lightweight summary path, and extended SwarmSummary fields', () => {
+  const dir = makeScratchDir('lru64-');
+  try {
+    const ids = [];
+    for (let i = 1; i <= 66; i++) {
+      const hex = i.toString(16).padStart(4, '0');
+      const cid = `11111111-1111-4111-8111-${hex}00000000`;
+      const wid = `22222222-2222-4222-8222-${hex}00000000`;
+      ids.push(cid);
+      const swDir = join(dir, 'brain', cid, '.system_generated', 'swarm');
+      const wLogs = join(dir, 'brain', wid, '.system_generated', 'logs');
+      mkdirSync(swDir, { recursive: true });
+      mkdirSync(wLogs, { recursive: true });
+      writeFileSync(
+        join(swDir, 'members.json'),
+        JSON.stringify({
+          title: `Swarm ${i}`,
+          members: {
+            coordinator: { conversation_id: cid, role: 'coordinator', wake_mode: 'mentions' },
+            worker: { conversation_id: wid, role: 'worker', model: 'gemini-3-pro', wake_mode: 'mentions', killed: i === 66 },
+          },
+        }),
+      );
+      if (i === 65) {
+        writeFileSync(
+          join(swDir, 'plan.json'),
+          JSON.stringify({ title: 'Repo Plan', repo: 'Cayleb/fleet-test', gate: 'npm test' }),
+        );
+        writeFileSync(
+          join(swDir, 'board.jsonl'),
+          JSON.stringify({ seq: 1, agent: 'worker', text: '[blocked] Needs API key' }) + '\n',
+        );
+        writeFileSync(
+          join(wLogs, 'transcript.jsonl'),
+          JSON.stringify({ step_index: 0, type: 'ERROR_MESSAGE', error: 'Quota limit hit' }) + '\n',
+        );
+      } else if (i === 66) {
+        writeFileSync(join(swDir, 'fleet_state.json'), JSON.stringify({ archived: true }));
+        writeFileSync(
+          join(swDir, 'board.jsonl'),
+          JSON.stringify({ seq: 1, agent: 'worker', text: '@coordinator [done] Finished' }) + '\n',
+        );
+      } else {
+        writeFileSync(
+          join(swDir, 'board.jsonl'),
+          JSON.stringify({ seq: 1, agent: 'coordinator', text: 'Init' }) + '\n',
+        );
+      }
+    }
+
+    const swarms = listSwarms([dir]);
+    assert.equal(swarms.length, 66);
+
+    const cacheStats = getSummaryCacheStats();
+    assert.equal(cacheStats.limit, 64);
+    assert.equal(cacheStats.size, 64);
+    // Earliest 2 swarms were evicted, newest 64 remain
+    assert.equal(cacheStats.keys.includes(`${dir}\0${ids[0]}`), false);
+    assert.equal(cacheStats.keys.includes(`${dir}\0${ids[1]}`), false);
+    assert.equal(cacheStats.keys.includes(`${dir}\0${ids[64]}`), true);
+    assert.equal(cacheStats.keys.includes(`${dir}\0${ids[65]}`), true);
+
+    // Lightweight summary path does not populate or thrash boardTailCache
+    assert.equal(getBoardTailStats(dir, ids[64]), null);
+    assert.equal(getBoardTailStats(dir, ids[65]), null);
+
+    const s65 = swarms.find((s) => s.id === ids[64]);
+    assert.equal(s65.repo, 'Cayleb/fleet-test');
+    assert.equal(s65.gateState, 'blocked');
+    assert.equal(s65.blockedCount, 1);
+    assert.equal(s65.failureCount, 1);
+    assert.equal(s65.archived, false);
+    assert.ok(s65.topUrgent);
+    assert.equal(s65.topUrgent.severity, 'urgent');
+
+    const s66 = swarms.find((s) => s.id === ids[65]);
+    assert.equal(s66.archived, true);
+    assert.equal(swarms[swarms.length - 1].id, ids[65]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('fleet_state.json persists ack/snooze/pins/archive, merges into snapshots/deltas/portfolio, and enforces brain/ confinement', () => {
+  const dir = makeScratchDir('fleet-state-');
+  try {
+    const coordA = '11111111-1111-4111-8111-aaaaaaaaaaaa';
+    const workerA = '22222222-2222-4222-8222-aaaaaaaaaaaa';
+    const coordB = '33333333-3333-4333-8333-bbbbbbbbbbbb';
+    const swA = join(dir, 'brain', coordA, '.system_generated', 'swarm');
+    const swB = join(dir, 'brain', coordB, '.system_generated', 'swarm');
+    const wLogsA = join(dir, 'brain', workerA, '.system_generated', 'logs');
+    mkdirSync(swA, { recursive: true });
+    mkdirSync(swB, { recursive: true });
+    mkdirSync(wLogsA, { recursive: true });
+
+    writeFileSync(
+      join(swA, 'members.json'),
+      JSON.stringify({
+        title: 'Alpha Swarm',
+        members: {
+          coordinator: { conversation_id: coordA, role: 'coordinator', wake_mode: 'mentions' },
+          builder: { conversation_id: workerA, role: 'worker', model: 'gemini-3-pro', wake_mode: 'mentions' },
+        },
+      }),
+    );
+    writeFileSync(
+      join(swA, 'board.jsonl'),
+      [
+        JSON.stringify({ seq: 1, agent: 'coordinator', text: 'Start' }),
+        JSON.stringify({ seq: 2, agent: 'builder', text: '[blocked] Waiting on credentials' }),
+      ].join('\n') + '\n',
+    );
+    writeFileSync(
+      join(wLogsA, 'transcript.jsonl'),
+      [
+        JSON.stringify({
+          step_index: 0,
+          type: 'PLANNER_RESPONSE',
+          model: 'gemini-3-pro',
+          input_tokens: 1_000_000,
+          output_tokens: 100_000,
+        }),
+        JSON.stringify({
+          step_index: 1,
+          type: 'ERROR_MESSAGE',
+          model: 'gemini-3-pro',
+          error: 'RESOURCE_EXHAUSTED quota exceeded',
+        }),
+      ].join('\n') + '\n',
+    );
+
+    writeFileSync(
+      join(swB, 'members.json'),
+      JSON.stringify({
+        title: 'Beta Swarm',
+        members: { coordinator: { conversation_id: coordB, role: 'coordinator', wake_mode: 'mentions' } },
+      }),
+    );
+    writeFileSync(join(swB, 'board.jsonl'), JSON.stringify({ seq: 1, agent: 'coordinator', text: 'Idle' }) + '\n');
+
+    // Initial portfolio before ack/archive
+    const p0 = getPortfolio([dir]);
+    assert.equal(p0.activeSwarms, 2);
+    assert.equal(p0.urgentCount, 2);
+    assert.ok(p0.totalCostUsd > 0);
+    assert.equal(p0.urgentTriage.every((t) => t.swarmId === coordA && t.swarmTitle === 'Alpha Swarm'), true);
+
+    // Pin seq 2, ack error item, snooze blocked item until seq 3
+    assert.equal(setSwarmPin(dir, coordA, { seq: 2, pinned: true }).ok, true);
+    assert.equal(setSwarmPin(dir, coordA, { seq: 1, pinned: true }).ok, true);
+    assert.equal(setSwarmPin(dir, coordA, { seq: 1, pinned: false }).ok, true);
+
+    const snap0 = buildSwarmSnapshot(dir, coordA);
+    const errItem = snap0.triage.find((t) => t.kind === 'quota');
+    const blkItem = snap0.triage.find((t) => t.kind === 'blocked');
+    assert.ok(errItem && blkItem);
+
+    assert.equal(ackTriageItem(dir, coordA, { triageId: errItem.id, action: 'ack', note: 'Switched key' }).ok, true);
+    assert.equal(ackTriageItem(dir, coordA, { triageId: blkItem.id, action: 'snooze', untilSeq: 3 }).ok, true);
+
+    const snap1 = buildSwarmSnapshot(dir, coordA);
+    assert.deepEqual(snap1.pinnedSeqs, [2]);
+    assert.equal(snap1.triage.find((t) => t.id === errItem.id)?.acked, true);
+    assert.equal(snap1.triage.find((t) => t.id === errItem.id)?.ackNote, 'Switched key');
+    assert.equal(snap1.triage.find((t) => t.id === blkItem.id)?.acked, true);
+    assert.equal(snap1.triage.find((t) => t.id === blkItem.id)?.ackUntilSeq, 3);
+
+    const p1 = getPortfolio([dir]);
+    assert.equal(p1.urgentCount, 0);
+    assert.equal(p1.swarms.find((s) => s.id === coordA)?.triageCount, 0);
+
+    // Advancing board past snooze untilSeq (seq 4 > 3) wakes snoozed item while keeping permanent ack
+    const deltaBefore = buildSwarmDelta({ appData: dir, conversationId: coordA, since: 2 });
+    appendFileSync(join(swA, 'board.jsonl'), JSON.stringify({ seq: 4, agent: 'coordinator', text: 'Ping #4' }) + '\n');
+    const deltaAfter = buildSwarmDelta({ appData: dir, conversationId: coordA, since: 2, prevEtag: deltaBefore.etag });
+    assert.equal(deltaAfter.mode, 'delta');
+    assert.deepEqual(deltaAfter.pinnedSeqs, [2]);
+    assert.equal(deltaAfter.triage.find((t) => t.id === blkItem.id)?.acked, undefined);
+    assert.equal(deltaAfter.triage.find((t) => t.id === errItem.id)?.acked, true);
+    assert.equal(getPortfolio([dir]).urgentCount, 1);
+
+    // Unack restores error item
+    assert.equal(ackTriageItem(dir, coordA, { triageId: errItem.id, action: 'unack' }).ok, true);
+    assert.equal(getPortfolio([dir]).urgentCount, 2);
+
+    // Archive excludes swarm from activeSwarms & urgentTriage while keeping it in swarms[]
+    assert.equal(setSwarmArchived(dir, coordA, true).ok, true);
+    const pArch = getPortfolio([dir]);
+    assert.equal(pArch.activeSwarms, 1);
+    assert.equal(pArch.urgentCount, 0);
+    assert.equal(pArch.swarms.find((s) => s.id === coordA)?.archived, true);
+
+    // Corrupt JSON & prototype pollution recover safely
+    const statePath = join(swA, 'fleet_state.json');
+    writeFileSync(statePath, '{broken json');
+    assert.deepEqual(readFleetState(dir, coordA).state, { pinnedSeqs: [], ackedTriage: {}, archived: false, checkpoints: [] });
+    writeFileSync(statePath, '{"__proto__":{"polluted":true},"pinnedSeqs":["bad",-1,5,5],"archived":1}');
+    const sanitized = readFleetState(dir, coordA).state;
+    assert.deepEqual(sanitized.pinnedSeqs, [5]);
+    assert.equal(sanitized.archived, true);
+    assert.equal(({}).polluted, undefined);
+
+    // CWE-22 & CWE-59 confinement
+    assert.equal(readFleetState(dir, '../escape').ok, false);
+    const outsideState = join(dir, 'outside-state.json');
+    writeFileSync(outsideState, '{}');
+    rmSync(statePath, { force: true });
+    symlinkSync(outsideState, statePath);
+    const symRead = readFleetState(dir, coordA);
+    assert.equal(symRead.ok, false);
+    assert.equal(symRead.status, 403);
+    assert.equal(setSwarmPin(dir, coordA, { seq: 1, pinned: true }).status, 403);
+    assert.equal(ackTriageItem(dir, coordA, { triageId: 'x', action: 'ack' }).status, 403);
+    assert.equal(setSwarmArchived(dir, coordA, false).status, 403);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('swarm checkpoints capture git worktree HEADs/clean flags and support CAS plan restore & resume_prompt', async () => {
+  const dir = makeScratchDir('checkpoints-');
+  try {
+    const repoDir = join(dir, 'repo');
+    const wtDir = join(dir, 'wt-worker');
+    mkdirSync(repoDir, { recursive: true });
+    const git = (cwd, args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }).trim();
+    git(repoDir, ['init', '-b', 'main']);
+    git(repoDir, ['config', 'user.email', 'test@example.com']);
+    git(repoDir, ['config', 'user.name', 'Test User']);
+    writeFileSync(join(repoDir, 'README.md'), 'init\n');
+    git(repoDir, ['add', 'README.md']);
+    git(repoDir, ['commit', '-m', 'init']);
+    const mainHead = git(repoDir, ['rev-parse', 'HEAD']);
+    git(repoDir, ['worktree', 'add', '-b', 'feat/work', wtDir]);
+    writeFileSync(join(wtDir, 'dirty.txt'), 'uncommitted\n');
+
+    const coordId = '44444444-4444-4444-8444-444444444444';
+    const workerId = '55555555-5555-4555-8555-555555555555';
+    const swDir = join(dir, 'brain', coordId, '.system_generated', 'swarm');
+    mkdirSync(swDir, { recursive: true });
+
+    writeFileSync(
+      join(swDir, 'members.json'),
+      JSON.stringify({
+        title: 'Checkpoint Swarm',
+        members: {
+          coordinator: { conversation_id: coordId, role: 'coordinator', wake_mode: 'mentions' },
+          builder: { conversation_id: workerId, role: 'worker', model: 'gemini-3-pro', workspace_mode: 'branch', workspace: wtDir },
+        },
+      }),
+    );
+    writeFileSync(join(swDir, 'board.jsonl'), JSON.stringify({ seq: 3, agent: 'builder', text: 'Working' }) + '\n');
+    writeFileSync(
+      join(swDir, 'plan.json'),
+      JSON.stringify({
+        title: 'Original Plan',
+        goal: 'Ship checkpointing',
+        gate: 'npm test',
+        workstreams: [{ id: 'ws-1', title: 'Backend', owner: 'builder', status: 'running' }],
+      }),
+    );
+
+    const probeDirect = await probeCheckpointWorktrees([repoDir, '../escape'], [wtDir]);
+    assert.equal(probeDirect.worktrees.length, 2);
+    assert.equal(probeDirect.rejected.length, 1);
+
+    const created = await createCheckpoint(dir, coordId, { label: 'Before refactor', roots: [repoDir] });
+    assert.equal(created.ok, true);
+    assert.equal(created.checkpoint.label, 'Before refactor');
+    assert.equal(created.checkpoint.head, 3);
+    assert.equal(created.checkpoint.plan.title, 'Original Plan');
+    assert.equal(created.checkpoint.members.length, 2);
+    assert.equal(created.checkpoint.worktrees.length, 2);
+
+    const mainWt = created.checkpoint.worktrees.find((w) => w.isMain);
+    const featWt = created.checkpoint.worktrees.find((w) => !w.isMain);
+    assert.equal(mainWt.head, mainHead);
+    assert.equal(mainWt.clean, true);
+    assert.equal(featWt.branch, 'feat/work');
+    assert.equal(featWt.clean, false);
+
+    const listed = listCheckpoints(dir, coordId);
+    assert.equal(listed.ok, true);
+    assert.equal(listed.checkpoints.length, 1);
+    assert.equal(listed.checkpoints[0].id, created.checkpoint.id);
+
+    // Mutate plan.json externally
+    const snapBeforeMutate = buildSwarmSnapshot(dir, coordId);
+    const upd = writeSwarmPlan(dir, coordId, {
+      ifMatch: snapBeforeMutate.plan.etag,
+      mode: 'replace',
+      patch: { title: 'Mutated Plan', goal: 'Changed' },
+    });
+    assert.equal(upd.ok, true);
+
+    // Stale ifMatch -> 409 CAS conflict
+    const conflict = restoreCheckpoint(dir, coordId, {
+      checkpointId: created.checkpoint.id,
+      mode: 'plan',
+      ifMatch: snapBeforeMutate.plan.etag,
+    });
+    assert.equal(conflict.ok, false);
+    assert.equal(conflict.status, 409);
+
+    // Valid restore -> restores Original Plan
+    const restored = restoreCheckpoint(dir, coordId, {
+      checkpointId: created.checkpoint.id,
+      mode: 'plan',
+    });
+    assert.equal(restored.ok, true);
+    assert.equal(restored.plan.title, 'Original Plan');
+    assert.equal(restored.plan.workstreams[0].status, 'running');
+
+    // resume_prompt mode returns structured directive
+    const resumed = restoreCheckpoint(dir, coordId, {
+      checkpointId: created.checkpoint.id,
+      mode: 'resume_prompt',
+    });
+    assert.equal(resumed.ok, true);
+    assert.ok(resumed.prompt.includes('Before refactor'));
+    assert.ok(resumed.prompt.includes('#3'));
+    assert.ok(resumed.prompt.includes('ws-1[running @builder]'));
+    assert.ok(resumed.prompt.includes('feat/work'));
+    assert.equal(resumed.directive, resumed.prompt);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

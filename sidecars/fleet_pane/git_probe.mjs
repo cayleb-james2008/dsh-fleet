@@ -1087,3 +1087,68 @@ export async function probeMemberWorktree(workspacePath) {
     ahead,
   };
 }
+
+async function inspectCheckpointWorktree(rootPath, wt, index) {
+  let wtReal = wt.path;
+  try {
+    if (isSymlinkPath(wt.path) || isSymlinkPath(join(wt.path, '.git'))) return null;
+    wtReal = realpathSync(wt.path);
+    if (!statSync(wtReal).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+
+  let head = typeof wt.head === 'string' ? wt.head.trim() : '';
+  if (!head && !wt.bare) {
+    const headRes = await execGit(wtReal, ['rev-parse', 'HEAD']);
+    if (headRes.ok) head = headRes.stdout.trim();
+  }
+  const clean = wt.bare ? true : await isWorktreeClean(wtReal);
+  const branch = wt.branch || (wt.detached ? 'detached' : 'unknown');
+  const isMain = index === 0 || wtReal === rootPath;
+
+  return {
+    root: rootPath,
+    path: wtReal,
+    name: basename(wtReal) || wtReal,
+    branch,
+    head,
+    shortHead: head.slice(0, 8),
+    clean,
+    isMain,
+    detached: Boolean(wt.detached),
+  };
+}
+
+/** Probe worktree HEAD SHAs and clean flags across workspace roots and member paths for checkpoints. */
+export async function probeCheckpointWorktrees(rawRoots = [], extraWorktreePaths = []) {
+  const { roots, rejected } = parseRootsInput(rawRoots);
+  const byPath = new Map();
+
+  for (const r of roots) {
+    const res = await execGit(r.path, ['worktree', 'list', '--porcelain']);
+    if (!res.ok) continue;
+    const parsed = parsePorcelainWorktrees(res.stdout).slice(0, MAX_WORKTREES_PER_ROOT);
+    const entries = await Promise.all(parsed.map((wt, idx) => inspectCheckpointWorktree(r.path, wt, idx)));
+    for (const item of entries) {
+      if (item && !byPath.has(item.path)) byPath.set(item.path, item);
+    }
+  }
+
+  if (Array.isArray(extraWorktreePaths)) {
+    const seenExtra = new Set();
+    for (const rawPath of extraWorktreePaths.slice(0, MAX_ROOTS)) {
+      if (typeof rawPath !== 'string' || !rawPath.trim()) continue;
+      const confined = await resolveConfinedWorktree({ worktree: rawPath });
+      if (!confined.ok || byPath.has(confined.wtPath) || seenExtra.has(confined.wtPath)) continue;
+      seenExtra.add(confined.wtPath);
+      const item = await inspectCheckpointWorktree(confined.rootPath, confined.wtEntry, confined.isMain ? 0 : 1);
+      if (item && !byPath.has(item.path)) byPath.set(item.path, item);
+    }
+  }
+
+  return {
+    worktrees: [...byPath.values()],
+    rejected,
+  };
+}
