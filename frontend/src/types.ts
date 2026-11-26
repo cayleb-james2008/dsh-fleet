@@ -506,3 +506,45 @@ export interface WorktreeActionPayload {
   stderr?: string;
   error?: string;
 }
+
+export type TranscriptFilter = "all" | "errors" | "tools";
+
+export interface TranscriptToolCall {
+  name: string;
+  summary?: string;
+  args?: unknown;
+  status?: string;
+  outputPreview?: string;
+}
+
+export interface TranscriptStepUsage {
+  inputTokens: number;
+  cacheReadTokens: number;
+  outputTokens: number;
+  totalTokens?: number;
+}
+
+export interface TranscriptStep {
+  stepIndex: number;
+  type: string;
+  status: string;
+  ts: number | string;
+  durationMs?: number | null;
+  model?: string;
+  thinking?: string;
+  content?: string;
+  error?: string | null;
+  toolCalls?: TranscriptToolCall[];
+  usage?: TranscriptStepUsage | null;
+}
+
+export interface TranscriptResponse {
+  ok: boolean;
+  member: string;
+  conversationId: string;
+  totalSteps: number;
+  nextBefore: number | null;
+  hasMore: boolean;
+  steps: TranscriptStep[];
+  error?: string;
+}

@@ -1367,6 +1367,70 @@ await runChecks("gate", async (check) => {
       capabilities: { canSendMessage: true, isSidecar: false, sseStream: false },
     };
 
+    const traceRequests = [];
+    const mockTraceSteps = Array.from({ length: 24 }, (_, idx) => {
+      const isErr = idx === 21;
+      const hasTool = idx % 2 === 0 || isErr;
+      return {
+        stepIndex: idx,
+        type: "PLANNER_RESPONSE",
+        status: isErr ? "ERROR" : "DONE",
+        ts: Date.now() - (24 - idx) * 15_000,
+        durationMs: isErr ? 1450 : 320 + idx * 10,
+        model: "gemini-3-pro",
+        thinking: idx === 0 ? "Bootstrap trace context" : `Evaluating step #${idx}`,
+        content: idx === 0 ? "Initial bootstrap step." : idx === 23 ? "Final check complete." : "",
+        error: isErr ? "QuotaError: 429 RESOURCE_EXHAUSTED\n  at callModel (~/sidecars/fleet_pane/runtime.mjs:88:5)" : null,
+        toolCalls: hasTool
+          ? [
+              {
+                name: isErr ? "run_command" : "read_file",
+                summary: isErr ? "Run model probe command" : `Inspect step #${idx} target`,
+                args: isErr
+                  ? { CommandLine: "node scripts/probe-quota.mjs --check", WaitMsBeforeAsync: 5000 }
+                  : { Path: "~/frontend/src/sidecar.ts", StartLine: 1, EndLine: 50 },
+                status: isErr ? "ERROR" : "DONE",
+                outputPreview: isErr
+                  ? "stdout: probing quota...\nstderr: 429 RESOURCE_EXHAUSTED (exit 1)"
+                  : "ok: read 50 lines",
+              },
+            ]
+          : [],
+        usage: { inputTokens: 800 + idx * 20, cacheReadTokens: 200, outputTokens: 110 },
+      };
+    });
+
+    await rosterPage.route("**/api/transcript*", async (route) => {
+      const u = new URL(route.request().url());
+      const filter = u.searchParams.get("filter") || "all";
+      const rawBefore = u.searchParams.get("before");
+      const before = rawBefore !== null && rawBefore !== "" ? Number(rawBefore) : null;
+      const limit = Math.max(1, Math.min(50, Number(u.searchParams.get("limit") || 20)));
+      traceRequests.push({ filter, before, limit, member: u.searchParams.get("member") });
+      const filtered = mockTraceSteps.filter((st) => {
+        if (filter === "errors") return Boolean(st.error) || st.status === "ERROR";
+        if (filter === "tools") return st.toolCalls.length > 0;
+        return true;
+      });
+      const scoped = before !== null ? filtered.filter((st) => st.stepIndex < before) : filtered;
+      const pageSteps = scoped.slice(-limit).reverse();
+      const nextBefore = pageSteps.length > 0 ? pageSteps[pageSteps.length - 1].stepIndex : null;
+      const hasMore = pageSteps.length > 0 && scoped.some((st) => st.stepIndex < nextBefore);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ok: true,
+          member: u.searchParams.get("member") || "scout",
+          conversationId: u.searchParams.get("conversationId") || "ctrl-coord-1",
+          totalSteps: mockTraceSteps.length,
+          nextBefore,
+          hasMore,
+          steps: pageSteps,
+        }),
+      });
+    });
+
     await rosterPage.route("**/api/swarm*", async (route) => {
       await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(mockSnap) });
     });
@@ -1389,12 +1453,49 @@ await runChecks("gate", async (check) => {
     });
 
     await rosterPage.goto(BASE, { waitUntil: "domcontentloaded" });
+    await rosterPage.setViewportSize({ width: 380, height: 900 });
+    await rosterPage.waitForSelector('[data-testid="inspect-trace-btn"][data-member="scout"]');
+    await rosterPage.locator('[data-testid="inspect-trace-btn"][data-member="scout"]').click();
+    await rosterPage.waitForSelector('[data-testid="forensic-trace-drawer"]');
+    await rosterPage.waitForSelector('[data-testid="trace-step-23"]');
+    const triageTraceOv = await rosterPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    await rosterPage.keyboard.press("Escape");
+    await rosterPage.waitForFunction(() => !document.querySelector('[data-testid="forensic-trace-drawer"]'));
+
     await rosterPage.locator('[data-testid="gate-verdict-toggle"]').click();
     await rosterPage.locator('[data-testid="gate-verdict-submit"]').click();
     await rosterPage.waitForFunction(() => !document.querySelector('[data-testid="gate-verdict-drawer"]'));
 
     await rosterPage.locator("#tab-roster").click();
     await rosterPage.waitForSelector("#panel-roster");
+
+    await rosterPage.locator('[data-testid="inspect-trace-btn"][data-member="scout"]').click();
+    await rosterPage.waitForSelector('[data-testid="forensic-trace-drawer"]');
+    await rosterPage.locator('[data-testid="trace-load-older"]').click();
+    await rosterPage.waitForSelector('[data-testid="trace-step-0"]');
+    await rosterPage.locator('[data-testid="trace-filter-errors"]').click();
+    await rosterPage.waitForSelector('[data-testid="trace-step-21"]');
+    await rosterPage.locator('[data-testid="trace-step-toggle-21"]').click();
+    await rosterPage.waitForSelector('[data-testid="trace-step-body-21"]');
+    const traceErrTxt = await rosterPage.locator('[data-testid="trace-step-error-21"]').textContent();
+    const traceArgsTxt = await rosterPage.locator('[data-testid="trace-tool-args-21-0"]').textContent();
+    const traceOutTxt = await rosterPage.locator('[data-testid="trace-tool-output-21-0"]').textContent();
+    const lightTraceOv = await rosterPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    await rosterPage.locator('[data-testid="trace-close-btn"]').click();
+    await rosterPage.waitForFunction(() => !document.querySelector('[data-testid="forensic-trace-drawer"]'));
+
+    await rosterPage.locator('button[aria-label="Open settings"]').click();
+    await rosterPage.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();
+    await rosterPage.locator('button[aria-label="Close dialog"]').click();
+    await rosterPage.locator('[data-testid="inspect-trace-btn"][data-member="scout"]').click();
+    await rosterPage.waitForSelector('[data-testid="forensic-trace-drawer"]');
+    const darkTraceOv = await rosterPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    await rosterPage.locator('[data-testid="trace-close-btn"]').click();
+    await rosterPage.waitForFunction(() => !document.querySelector('[data-testid="forensic-trace-drawer"]'));
+    await rosterPage.locator('button[aria-label="Open settings"]').click();
+    await rosterPage.locator('div[role="dialog"] button[role="radio"]:has-text("Light")').click();
+    await rosterPage.locator('button[aria-label="Close dialog"]').click();
+    await rosterPage.setViewportSize({ width: 360, height: 900 });
 
     await rosterPage.locator('[data-testid="toggle-spawn-worker"]').click();
     await rosterPage.fill('[data-testid="spawn-worker-name"]', "qa-bot");
@@ -1431,6 +1532,13 @@ await runChecks("gate", async (check) => {
       Boolean(switchCall?.member === "scout" && switchCall.model === "gemini-3-flash") &&
       Boolean(warnTxt?.includes("2 dirty files, 1 commits ahead")) &&
       Boolean(forceKillCall?.member === "scout") &&
+      triageTraceOv <= 0 &&
+      lightTraceOv <= 0 &&
+      darkTraceOv <= 0 &&
+      traceRequests.some((r) => r.before !== null) &&
+      Boolean(traceErrTxt?.includes("429 RESOURCE_EXHAUSTED")) &&
+      Boolean(traceArgsTxt?.includes("probe-quota.mjs")) &&
+      Boolean(traceOutTxt?.includes("stderr: 429 RESOURCE_EXHAUSTED")) &&
       ov360 <= 0 &&
       rosterErrors.length === 0
     );

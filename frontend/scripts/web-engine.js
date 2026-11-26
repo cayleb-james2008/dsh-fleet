@@ -1617,6 +1617,131 @@
       }
       return jsonResp({ error: "Unsupported action" }, 400);
     }
+    if (url.pathname === "/api/transcript") {
+      var tConv = url.searchParams.get("conversationId") || COORD_ID;
+      var tMember = String(url.searchParams.get("member") || "").trim();
+      var tFilter = String(url.searchParams.get("filter") || "all").toLowerCase();
+      if (tFilter !== "errors" && tFilter !== "tools") tFilter = "all";
+      var rawLimit = Number(url.searchParams.get("limit") || 20);
+      var tLimit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(50, Math.floor(rawLimit))) : 20;
+      var rawBefore = url.searchParams.get("before");
+      var hasBefore = rawBefore !== null && rawBefore !== "";
+      var beforeNum = hasBefore ? Number(rawBefore) : null;
+      if (hasBefore && (!Number.isInteger(beforeNum) || beforeNum < 0)) {
+        return jsonResp({ ok: false, error: "Invalid before parameter" }, 400);
+      }
+      var tSw = state.swarms[tConv] || Object.values(state.swarms).find(function (s) {
+        return (s.members || []).some(function (m) { return m.conversation_id === tConv; });
+      });
+      if (!tSw) return jsonResp({ ok: false, error: "Unknown swarm" }, 404);
+      var tMemObj = (tSw.members || []).find(function (m) {
+        return tMember ? m.name === tMember : m.conversation_id === tConv;
+      }) || (tSw.members || [])[0];
+      if (!tMemObj) return jsonResp({ ok: false, error: "Unknown member" }, 404);
+
+      var mName = tMemObj.name;
+      var mModel = tMemObj.model || "gemini-3-pro";
+      var stepsAll = [];
+      for (var si = 0; si < 24; si++) {
+        var stepTs = t(900 - si * 35);
+        var isBoot = si === 0;
+        var isErrStep = si === 21 || (mName === "scanner" && si === 22);
+        var isToolStep = si % 2 === 0 || isErrStep || si === 3;
+        var toolCalls = [];
+        if (isBoot) {
+          toolCalls.push({
+            name: "read_file",
+            summary: "Inspect ~/workspace/fleet-ui/package.json",
+            args: { Path: "~/workspace/fleet-ui/package.json", StartLine: 1, EndLine: 40 },
+            status: "DONE",
+            outputPreview: "{\"name\": \"fleet-frontend\", \"version\": \"1.24.0\"}",
+          });
+        } else if (isErrStep) {
+          toolCalls.push({
+            name: "run_command",
+            summary: mName === "scanner" ? "Probe model endpoint capacity" : "Run Host-403 and CWE-59 security suite",
+            args: {
+              CommandLine: mName === "scanner" ? "node scripts/scan-endpoints.mjs --strict" : "node --test test/security.test.mjs",
+              WaitMsBeforeAsync: 5000,
+            },
+            status: "ERROR",
+            outputPreview: mName === "scanner"
+              ? "stdout: scanning 12 routes...\nstderr: 429 RESOURCE_EXHAUSTED: model quota exceeded on endpoint"
+              : "stdout: running 7 security tests...\nstderr: FAIL test/security.test.mjs:48 expected 403 for non-loopback Host, got 200 (exit 1)",
+          });
+        } else if (isToolStep) {
+          toolCalls.push({
+            name: si % 4 === 0 ? "run_command" : "edit_file",
+            summary: si === 2
+              ? "Verify initial test harness baseline"
+              : si % 4 === 0
+                ? "Run unit and frame confinement tests"
+                : "Update ~/workspace/fleet-ui/swarm_store.mjs",
+            args: si % 4 === 0
+              ? { CommandLine: "node --test test/store.test.mjs", WaitMsBeforeAsync: 5000 }
+              : { Path: "~/workspace/fleet-ui/swarm_store.mjs", StartLine: 120, EndLine: 165 },
+            status: "DONE",
+            outputPreview: si % 4 === 0
+              ? "stdout: 7/7 tests passed (142ms)"
+              : "Updated 1 block in ~/workspace/fleet-ui/swarm_store.mjs",
+          });
+        }
+        stepsAll.push({
+          stepIndex: si,
+          type: "PLANNER_RESPONSE",
+          status: isErrStep ? "ERROR" : "DONE",
+          ts: stepTs,
+          durationMs: isErrStep ? 1840 : 420 + (si % 5) * 190,
+          model: mModel,
+          thinking: isErrStep
+            ? "Investigating failure in " + mName + " execution trace"
+            : isBoot
+              ? "Bootstrapping workspace context for @" + mName
+              : "Step #" + si + " verification for @" + mName,
+          content: isBoot
+            ? "Initial workspace bootstrap complete (#0)."
+            : si === 23
+              ? "All checks pass after remediation."
+              : "",
+          error: isErrStep
+            ? (mName === "scanner"
+              ? "QuotaError: 429 RESOURCE_EXHAUSTED: model quota exceeded\n  at callModel (~/sidecars/fleet_pane/runtime.mjs:112:9)"
+              : "AssertionError: Expected 403 for non-loopback Host header\n  at Object.<anonymous> (~/sidecars/fleet_pane/test/security.test.mjs:48:12)")
+            : null,
+          toolCalls: toolCalls,
+          usage: {
+            inputTokens: 1100 + si * 90,
+            cacheReadTokens: 450 + si * 40,
+            outputTokens: 120 + (si % 4) * 45,
+          },
+        });
+      }
+
+      var filteredSteps = stepsAll.filter(function (st) {
+        if (tFilter === "errors") {
+          return Boolean(st.error) || st.status === "ERROR" || st.toolCalls.some(function (tc) { return tc.status === "ERROR"; });
+        }
+        if (tFilter === "tools") {
+          return st.toolCalls && st.toolCalls.length > 0;
+        }
+        return true;
+      });
+      var beforeFiltered = hasBefore
+        ? filteredSteps.filter(function (st) { return st.stepIndex < beforeNum; })
+        : filteredSteps;
+      var pageSlice = beforeFiltered.slice(-tLimit).reverse();
+      var nextBefore = pageSlice.length > 0 ? pageSlice[pageSlice.length - 1].stepIndex : null;
+      var hasMore = pageSlice.length > 0 && beforeFiltered.some(function (st) { return st.stepIndex < nextBefore; });
+      return jsonResp({
+        ok: true,
+        member: mName,
+        conversationId: tMemObj.conversation_id || tSw.id,
+        totalSteps: stepsAll.length,
+        nextBefore: nextBefore,
+        hasMore: hasMore,
+        steps: pageSlice,
+      });
+    }
     return origFetch(input, init);
   };
 })();

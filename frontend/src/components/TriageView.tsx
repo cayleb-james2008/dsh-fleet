@@ -8,6 +8,7 @@ import {
   ChevronUp,
   ClipboardCopy,
   ExternalLink,
+  FileCode2,
   Image as ImageIcon,
   Layers,
   MessageSquare,
@@ -40,6 +41,7 @@ import {
   Badge,
   Button,
   Card,
+  ForensicTranscriptDrawer,
   GateReadinessCard,
   InlineComposer,
   Input,
@@ -66,6 +68,7 @@ import {
   safePlanText,
   submitNudge,
   toast,
+  type TraceTarget,
   useNowMs,
 } from "../ui";
 
@@ -829,6 +832,7 @@ export function TriageView({
   const [nudgeDraft, setNudgeDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [peekId, setPeekId] = useState<string | null>(null);
+  const [traceTarget, setTraceTarget] = useState<TraceTarget | null>(null);
   const nudgeLockRef = useRef(false);
   const nowMs = useNowMs();
   const cardRefs = useRef<Array<HTMLDivElement | null>>([]);
@@ -1011,7 +1015,7 @@ export function TriageView({
                 const issue = m.failure ? m.failure.kind : isStalled ? "stalled" : `${m.unread} unread`;
                 return (
                   <div key={m.name} className="space-y-1">
-                    <div className="f1">
+                    <div className="wrap gap-1">
                       <Button
                         variant={m.failure || isStalled ? "danger" : "info"}
                         data-testid={`recover-worker-${m.name}`}
@@ -1020,6 +1024,18 @@ export function TriageView({
                         {canNudge && m.conversation_id ? <Wrench /> : <ClipboardCopy />}
                         Recover @{m.name} · {issue}
                       </Button>
+                      {(isStalled || Boolean(m.failure)) && m.conversation_id && (
+                        <Button
+                          variant="outline"
+                          data-testid="inspect-trace-btn"
+                          data-member={m.name}
+                          aria-label={`Inspect trace for ${m.name}`}
+                          onClick={() => setTraceTarget({ member: m.name, conversationId: m.conversation_id, model: m.model, status: m.status })}
+                        >
+                          <FileCode2 />
+                          Inspect trace
+                        </Button>
+                      )}
                       <Button
                         variant="ghost"
                         data-testid={`jump-worker-${m.name}`}
@@ -1096,6 +1112,8 @@ export function TriageView({
                   {(() => {
                     const live = Boolean(canNudge && item.conversationId);
                     const urgent = item.severity === "urgent";
+                    const isForensicItem = urgent || item.kind === "blocked" || item.kind === "stuck" || item.kind === "error" || item.kind === "quota" || isStalled;
+                    const traceConvId = item.conversationId || worker?.conversation_id || "";
                     return (
                   <div className="wrap pt-1">
                     {item.conversationId && window.sidecar?.ui?.toggleConversation && (
@@ -1111,6 +1129,18 @@ export function TriageView({
                     <Button variant="ghost" onClick={() => live ? openNudge(item, askStatusPrompt) : handleCopy(askStatusPrompt, "Status prompt copied")}>
                       Ask status
                     </Button>
+                    {isForensicItem && traceConvId && (
+                      <Button
+                        variant="outline"
+                        data-testid="inspect-trace-btn"
+                        data-member={item.member}
+                        aria-label={`Inspect trace for ${item.member}`}
+                        onClick={() => setTraceTarget({ member: item.member, conversationId: traceConvId, model: worker?.model, status: worker?.status })}
+                      >
+                        <FileCode2 />
+                        Inspect trace
+                      </Button>
+                    )}
                     {item.kind !== "question" && (
                       <Button variant="ghost" data-testid={`copy-blocker-${item.id}`} onClick={() => handleCopy(formatBlockerContext(item, worker, snap), "Blocker context copied")}>
                         <ClipboardCopy />
@@ -1206,6 +1236,13 @@ export function TriageView({
           </div>
         </section>
       )}
+
+      <ForensicTranscriptDrawer
+        open={Boolean(traceTarget)}
+        swarmConversationId={snap.swarm || snap.conversationId || ""}
+        target={traceTarget}
+        onClose={() => setTraceTarget(null)}
+      />
     </div>
   );
 }

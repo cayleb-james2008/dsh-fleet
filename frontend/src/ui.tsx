@@ -11,9 +11,9 @@ import type {
   Ref,
   TextareaHTMLAttributes,
 } from "react";
-import { ArrowUpRight, CheckCircle2, ClipboardCopy, FileCode2, Image as ImageIcon, Pin, PinOff, Send, X } from "./icons";
+import { AlertTriangle, ArrowUpRight, CheckCircle2, ChevronDown, ChevronUp, ClipboardCopy, FileCode2, Image as ImageIcon, Pin, PinOff, RefreshCw, Send, X } from "./icons";
 import { animatePanelEnter } from "./motion";
-import { openFileInAuxPane, parseScreenshotLines, sendConfirmedNudge, sendSwarmControl } from "./sidecar";
+import { fetchMemberTranscript, openFileInAuxPane, parseScreenshotLines, sendConfirmedNudge, sendSwarmControl } from "./sidecar";
 import type {
   BoardMessage,
   NormalizedPlan,
@@ -25,6 +25,8 @@ import type {
   SwarmMember,
   SwarmPlan,
   SwarmSnapshot,
+  TranscriptFilter,
+  TranscriptStep,
   TriageItem,
   WorktreesPayload,
 } from "./types";
@@ -1308,5 +1310,458 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
         </div>
       )}
     </Card>
+  );
+}
+
+export interface TraceTarget {
+  member: string;
+  conversationId: string;
+  model?: string;
+  status?: string;
+}
+
+function fmtStepDuration(ms?: number | null): string {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) return "";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function formatTraceArgs(args: unknown): string {
+  if (args === undefined || args === null) return "";
+  if (typeof args === "string") return maskHome(args);
+  try {
+    return maskHome(JSON.stringify(args, null, 2));
+  } catch {
+    return maskHome(String(args));
+  }
+}
+
+/** Expandable forensic step inspector inside ForensicTranscriptDrawer. */
+export function StepInspector({
+  step,
+  expanded,
+  onToggle,
+}: {
+  step: TranscriptStep;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const toolCalls = step.toolCalls || [];
+  const stepStatusUpper = String(step.status || "").toUpperCase();
+  const hasToolErr = toolCalls.some((tc) => {
+    const st = String(tc.status || "").toUpperCase();
+    return st === "ERROR" || st === "FAILED";
+  });
+  const isErr = Boolean(step.error) || stepStatusUpper === "ERROR" || stepStatusUpper === "FAILED" || hasToolErr;
+  const tone: BadgeTone = isErr
+    ? "danger"
+    : stepStatusUpper === "DONE" || stepStatusUpper === "OK"
+      ? "success"
+      : "neutral";
+  const durationLabel = fmtStepDuration(step.durationMs);
+  const tsNum = typeof step.ts === "number" ? step.ts : step.ts ? Date.parse(String(step.ts)) : 0;
+  const tsLabel = Number.isFinite(tsNum) && tsNum > 0 ? fmtClockTime(tsNum) : "";
+  const firstTool = toolCalls[0];
+  const previewText = step.error
+    ? maskHome(step.error)
+    : firstTool
+      ? `${firstTool.name}${firstTool.summary ? `: ${maskHome(firstTool.summary)}` : ""}`
+      : step.content
+        ? maskHome(step.content)
+        : step.thinking
+          ? maskHome(step.thinking)
+          : "";
+
+  return (
+    <div
+      data-testid={`trace-step-${step.stepIndex}`}
+      className={cn("rounded-chip border bg-board min-w-0", isErr ? "border-danger" : "border-hairline")}
+    >
+      <button
+        type="button"
+        aria-expanded={expanded}
+        data-testid={`trace-step-toggle-${step.stepIndex}`}
+        onClick={onToggle}
+        className="w-full text-left p-2.5 space-y-1 cursor-pointer hover:bg-track transition rounded-chip min-w-0"
+      >
+        <div className="row min-w-0">
+          <div className="wrap gap-1.5 min-w-0">
+            <span className="text-[12px] font-semibold text-ink num">#{step.stepIndex}</span>
+            <Badge tone={tone}>{humanizeStatus(step.status || step.type)}</Badge>
+            <span className="text-[12px] text-ink-2 truncate">{humanizeStatus(step.type)}</span>
+          </div>
+          <div className="f1 shrink-0 text-[12px] text-ink-3">
+            {durationLabel && <span className="num">{durationLabel}</span>}
+            {tsLabel && <span className="num">{tsLabel}</span>}
+            {expanded ? <ChevronUp /> : <ChevronDown />}
+          </div>
+        </div>
+
+        {(step.model || step.usage || toolCalls.length > 0) && (
+          <div className="wrap gap-2 text-[12px] text-ink-3">
+            {step.model && <span>{step.model}</span>}
+            {toolCalls.length > 0 && <span className="num">{toolCalls.length} tools</span>}
+            {step.usage && (
+              <span className="inline-flex items-center gap-2 num">
+                <span>in {fmtTokens(step.usage.inputTokens)}</span>
+                <span>cache {fmtTokens(step.usage.cacheReadTokens)}</span>
+                <span>out {fmtTokens(step.usage.outputTokens)}</span>
+              </span>
+            )}
+          </div>
+        )}
+
+        {previewText && !expanded && (
+          <p className={cn("text-[12px] truncate min-w-0", isErr ? "text-danger" : "text-ink-2")}>
+            {previewText}
+          </p>
+        )}
+      </button>
+
+      {expanded && (
+        <div
+          data-testid={`trace-step-body-${step.stepIndex}`}
+          className="px-2.5 pb-2.5 pt-2 border-t border-hairline space-y-2 min-w-0"
+        >
+          {step.error && (
+            <div className="space-y-1 min-w-0">
+              <div className="row">
+                <span className="text-[12px] font-medium text-danger">Error traceback</span>
+                <Button
+                  variant="ghost"
+                  onClick={() => void copyText(maskHome(step.error), "Copied error")}
+                  className="h-7 px-2"
+                >
+                  <ClipboardCopy />
+                  Copy
+                </Button>
+              </div>
+              <pre
+                data-testid={`trace-step-error-${step.stepIndex}`}
+                className="max-h-48 w-full max-w-full overflow-auto rounded-chip border border-danger bg-bad-soft p-2 text-[12px] leading-snug text-danger whitespace-pre-wrap break-words"
+              >
+                {maskHome(step.error)}
+              </pre>
+            </div>
+          )}
+
+          {step.thinking && (
+            <div className="space-y-1 min-w-0">
+              <span className="text-[12px] font-medium text-ink-2">Thinking</span>
+              <p className="rounded-chip bg-surface px-2 py-1.5 text-[12px] text-ink-2 whitespace-pre-wrap break-words">
+                {maskHome(step.thinking)}
+              </p>
+            </div>
+          )}
+
+          {step.content && (
+            <div className="space-y-1 min-w-0">
+              <span className="text-[12px] font-medium text-ink-2">Response</span>
+              <p className="rounded-chip bg-surface px-2 py-1.5 text-[12px] text-ink whitespace-pre-wrap break-words">
+                {maskHome(step.content)}
+              </p>
+            </div>
+          )}
+
+          {toolCalls.length > 0 && (
+            <div className="space-y-2 min-w-0" data-testid={`trace-step-tools-${step.stepIndex}`}>
+              <span className="text-[12px] font-medium text-ink-2">Tool calls ({toolCalls.length})</span>
+              {toolCalls.map((tc, tcIdx) => {
+                const tcStatus = String(tc.status || "").toUpperCase();
+                const tcErr = tcStatus === "ERROR" || tcStatus === "FAILED";
+                const argsText = formatTraceArgs(tc.args);
+                const outText = tc.outputPreview ? maskHome(tc.outputPreview) : "";
+                return (
+                  <div
+                    key={`${tc.name}-${tcIdx}`}
+                    className="rounded-chip border border-hairline bg-surface p-2 space-y-1.5 min-w-0"
+                  >
+                    <div className="wrap gap-1.5 min-w-0">
+                      <code className="text-[12px] font-medium text-ink">{tc.name}</code>
+                      {tc.status && (
+                        <Badge tone={tcErr ? "danger" : tcStatus === "DONE" || tcStatus === "OK" ? "success" : "neutral"}>
+                          {humanizeStatus(tc.status)}
+                        </Badge>
+                      )}
+                    </div>
+                    {tc.summary && (
+                      <p className="text-[12px] text-ink-2 break-words">{maskHome(tc.summary)}</p>
+                    )}
+                    {argsText && (
+                      <div className="space-y-1 min-w-0">
+                        <span className="text-[12px] font-medium text-ink-3">Arguments</span>
+                        <pre
+                          data-testid={`trace-tool-args-${step.stepIndex}-${tcIdx}`}
+                          className="max-h-40 w-full max-w-full overflow-auto rounded-chip border border-hairline bg-canvas p-2 text-[12px] leading-snug text-ink whitespace-pre-wrap break-words"
+                        >
+                          {argsText}
+                        </pre>
+                      </div>
+                    )}
+                    {outText && (
+                      <div className="space-y-1 min-w-0">
+                        <span className="text-[12px] font-medium text-ink-3">Output / stderr</span>
+                        <pre
+                          data-testid={`trace-tool-output-${step.stepIndex}-${tcIdx}`}
+                          className={cn(
+                            "max-h-48 w-full max-w-full overflow-auto rounded-chip border p-2 text-[12px] leading-snug whitespace-pre-wrap break-words",
+                            tcErr ? "border-danger bg-bad-soft text-danger" : "border-hairline bg-canvas text-ink-2",
+                          )}
+                        >
+                          {outText}
+                        </pre>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const TRACE_FILTERS: Array<{ value: TranscriptFilter; label: string }> = [
+  { value: "all", label: "All" },
+  { value: "errors", label: "Errors" },
+  { value: "tools", label: "Tools" },
+];
+
+function mergeTraceSteps(prev: TranscriptStep[], incoming: TranscriptStep[]): TranscriptStep[] {
+  const byIdx = new Map<number, TranscriptStep>();
+  for (const s of prev) byIdx.set(s.stepIndex, s);
+  for (const s of incoming) byIdx.set(s.stepIndex, s);
+  return [...byIdx.values()].sort((a, b) => b.stepIndex - a.stepIndex);
+}
+
+/** Responsive slide-over forensic transcript inspector (380px sidebar + desktop). */
+export function ForensicTranscriptDrawer({
+  open,
+  swarmConversationId,
+  target,
+  onClose,
+}: {
+  open: boolean;
+  swarmConversationId: string;
+  target: TraceTarget | null;
+  onClose: () => void;
+}) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [filter, setFilter] = useState<TranscriptFilter>("all");
+  const [steps, setSteps] = useState<TranscriptStep[]>([]);
+  const [totalSteps, setTotalSteps] = useState(0);
+  const [nextBefore, setNextBefore] = useState<number | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [error, setError] = useState("");
+  const [expanded, setExpanded] = useState<Record<number, boolean>>({});
+  const [reloadNonce, setReloadNonce] = useState(0);
+
+  useEffect(() => {
+    setFilter("all");
+  }, [target?.member, target?.conversationId]);
+
+  useEffect(() => {
+    if (!open) return;
+    animatePanelEnter(panelRef.current);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  useEffect(() => {
+    if (!open || !target) return;
+    const convId = swarmConversationId || target.conversationId;
+    if (!convId || !target.member) return;
+    const ac = new AbortController();
+    setLoading(true);
+    setError("");
+    setSteps([]);
+    setNextBefore(null);
+    setHasMore(false);
+    setExpanded({});
+    fetchMemberTranscript("", {
+      conversationId: convId,
+      member: target.member,
+      limit: 20,
+      filter,
+      signal: ac.signal,
+    })
+      .then((res) => {
+        if (ac.signal.aborted) return;
+        setSteps(mergeTraceSteps([], res.steps || []));
+        setTotalSteps(typeof res.totalSteps === "number" ? res.totalSteps : (res.steps || []).length);
+        setNextBefore(typeof res.nextBefore === "number" ? res.nextBefore : null);
+        setHasMore(Boolean(res.hasMore));
+      })
+      .catch((err) => {
+        if (ac.signal.aborted) return;
+        setError(err instanceof Error ? err.message : "Failed to load transcript");
+      })
+      .finally(() => {
+        if (!ac.signal.aborted) setLoading(false);
+      });
+    return () => ac.abort();
+  }, [open, target?.member, target?.conversationId, swarmConversationId, filter, reloadNonce]);
+
+  const handleLoadOlder = async () => {
+    if (!target || loadingMore || !hasMore || nextBefore === null) return;
+    const convId = swarmConversationId || target.conversationId;
+    if (!convId) return;
+    setLoadingMore(true);
+    setError("");
+    try {
+      const res = await fetchMemberTranscript("", {
+        conversationId: convId,
+        member: target.member,
+        before: nextBefore,
+        limit: 20,
+        filter,
+      });
+      setSteps((prev) => mergeTraceSteps(prev, res.steps || []));
+      if (typeof res.totalSteps === "number") setTotalSteps(res.totalSteps);
+      setNextBefore(typeof res.nextBefore === "number" ? res.nextBefore : null);
+      setHasMore(Boolean(res.hasMore));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load older steps");
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  if (!open || !target) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex justify-end bg-[var(--scrim)]"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="forensic-trace-title"
+        data-testid="forensic-trace-drawer"
+        className="flex h-full w-full max-w-[380px] sm:max-w-[560px] lg:max-w-[680px] flex-col border-l border-hairline bg-surface shadow-[var(--elev-lift)] min-w-0"
+      >
+        <div className="p-3 border-b border-hairline space-y-2 shrink-0 min-w-0">
+          <div className="row min-w-0">
+            <div className="min-w-0 flex-1 space-y-0.5">
+              <div className="wrap gap-1.5 min-w-0">
+                <h2 id="forensic-trace-title" className="h2 truncate">
+                  Trace: @{target.member}
+                </h2>
+                {totalSteps > 0 && <Badge tone="neutral">{totalSteps} steps</Badge>}
+              </div>
+              {(target.model || target.status) && (
+                <div className="wrap gap-2 t3">
+                  {target.status && <span>{humanizeStatus(target.status)}</span>}
+                  {target.model && <span>{target.model}</span>}
+                </div>
+              )}
+            </div>
+            <div className="f1 shrink-0">
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label="Refresh trace"
+                data-testid="trace-refresh-btn"
+                onClick={() => setReloadNonce((n) => n + 1)}
+              >
+                <RefreshCw />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label="Close trace inspector"
+                data-testid="trace-close-btn"
+                onClick={onClose}
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+          </div>
+
+          <div role="tablist" aria-label="Transcript step filter" className="wrap gap-1.5">
+            {TRACE_FILTERS.map((f) => (
+              <Pill
+                key={f.value}
+                role="tab"
+                aria-selected={filter === f.value}
+                active={filter === f.value}
+                data-testid={`trace-filter-${f.value}`}
+                onClick={() => setFilter(f.value)}
+              >
+                {f.label}
+              </Pill>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto overflow-x-hidden p-3 space-y-2 min-w-0">
+          {error && (
+            <div
+              role="alert"
+              data-testid="trace-error-banner"
+              className="rounded-chip border border-danger bg-bad-soft p-2.5 space-y-2 text-[12px] text-danger min-w-0"
+            >
+              <div className="flex items-start gap-1.5 min-w-0">
+                <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                <span className="break-words min-w-0">{maskHome(error)}</span>
+              </div>
+              <Button variant="outline" onClick={() => setReloadNonce((n) => n + 1)}>
+                <RefreshCw />
+                Retry
+              </Button>
+            </div>
+          )}
+
+          {loading ? (
+            <div className="rounded-chip border border-hairline bg-board p-3 text-[13px] text-ink-2" data-testid="trace-loading">
+              Loading transcript steps…
+            </div>
+          ) : steps.length === 0 && !error ? (
+            <div className="rounded-chip border border-hairline bg-board p-3 space-y-2 text-[13px] text-ink-2" data-testid="trace-empty">
+              <p>No transcript steps match this filter.</p>
+              {filter !== "all" && (
+                <Button variant="outline" onClick={() => setFilter("all")}>
+                  Show all steps
+                </Button>
+              )}
+            </div>
+          ) : (
+            <div className="space-y-2 min-w-0" data-testid="trace-steps-list">
+              {steps.map((step) => (
+                <StepInspector
+                  key={step.stepIndex}
+                  step={step}
+                  expanded={Boolean(expanded[step.stepIndex])}
+                  onToggle={() => setExpanded((prev) => ({ ...prev, [step.stepIndex]: !prev[step.stepIndex] }))}
+                />
+              ))}
+            </div>
+          )}
+
+          {hasMore && nextBefore !== null && (
+            <Button
+              variant="outline"
+              data-testid="trace-load-older"
+              disabled={loadingMore}
+              onClick={handleLoadOlder}
+              className="w-full"
+            >
+              {loadingMore ? "Loading older steps…" : "Load older steps"}
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
   );
 }

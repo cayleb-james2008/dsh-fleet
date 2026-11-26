@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "../hooks";
-import { AlertTriangle, ChevronDown, ChevronUp, ClipboardCopy, Cpu, Eye, EyeOff, MessageSquare, Plus, Radio, Send, Trash2, X } from "../icons";
+import { AlertTriangle, ChevronDown, ChevronUp, ClipboardCopy, Cpu, Eye, EyeOff, FileCode2, MessageSquare, Plus, Radio, Send, Trash2, X } from "../icons";
 import { SwarmControlError, openWorkerConversation, sendSwarmControl } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot, SwarmWorkspaceMode } from "../types";
-import { ActivityPeek, Badge, Button, Card, InlineComposer, Input, MemberActivityLine, Pill, StatusDot, Textarea, TokenBurnStrip, buildRecoverPrompt, canLiveNudge, cn, copyText, fmtTokens, hasControlChars, memberMeta, submitNudge, toast, useNowMs } from "../ui";
+import { ActivityPeek, Badge, Button, Card, ForensicTranscriptDrawer, InlineComposer, Input, MemberActivityLine, Pill, StatusDot, Textarea, TokenBurnStrip, type TraceTarget, buildRecoverPrompt, canLiveNudge, cn, copyText, fmtTokens, hasControlChars, memberMeta, submitNudge, toast, useNowMs } from "../ui";
 
 const ORDER: Record<SwarmMember["status"], number> = { working: 0, waiting: 1, killed: 2 };
 const CONTEXT_BUDGET_TOKENS = 200_000;
@@ -72,6 +72,7 @@ export function RosterView({
   const [killing, setKilling] = useState(false);
   const [killError, setKillError] = useState("");
   const [kill409, setKill409] = useState<{ member: string; dirtyFiles: number; ahead: number; message: string } | null>(null);
+  const [traceTarget, setTraceTarget] = useState<TraceTarget | null>(null);
 
   const spawnLockRef = useRef(false);
   const switchLockRef = useRef(false);
@@ -596,6 +597,16 @@ export function RosterView({
                         Board ({m.posts})
                       </Button>
                     )}
+                    <Button
+                      variant="outline"
+                      data-testid="inspect-trace-btn"
+                      data-member={m.name}
+                      aria-label={`Inspect trace for ${m.name}`}
+                      onClick={() => setTraceTarget({ member: m.name, conversationId: m.conversation_id, model: m.model, status: m.status })}
+                    >
+                      <FileCode2 />
+                      Inspect trace
+                    </Button>
                     {canKill && (
                       <Button
                         variant="ghost"
@@ -610,6 +621,21 @@ export function RosterView({
                   </div>
                   );
                 })()}
+
+                {m.killed && m.conversation_id && (
+                  <div className="wrap gap-1">
+                    <Button
+                      variant="outline"
+                      data-testid="inspect-trace-btn"
+                      data-member={m.name}
+                      aria-label={`Inspect trace for ${m.name}`}
+                      onClick={() => setTraceTarget({ member: m.name, conversationId: m.conversation_id, model: m.model, status: m.status })}
+                    >
+                      <FileCode2 />
+                      Inspect trace
+                    </Button>
+                  </div>
+                )}
 
                 {/* Line 3: Token telemetry & Context saturation bar */}
                 <div className="rounded-chip bg-board px-2 py-1 space-y-1">
@@ -795,6 +821,13 @@ export function RosterView({
           })}
         </div>
       )}
+
+      <ForensicTranscriptDrawer
+        open={Boolean(traceTarget)}
+        swarmConversationId={swarmConvId}
+        target={traceTarget}
+        onClose={() => setTraceTarget(null)}
+      />
     </div>
   );
 }
