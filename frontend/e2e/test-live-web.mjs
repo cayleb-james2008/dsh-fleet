@@ -131,10 +131,65 @@ await check("Graph renders nodes/edges and toggles", async () => {
   return (await page.locator("#panel-graph svg g").count()) >= 4;
 });
 
-await check("Worktrees shows simulated branch dirtiness and safe-land readiness", async () => {
+await check("Worktrees shows simulated branch dirtiness, collisions banner, mergeability, and commits", async () => {
   await page.locator("#tab-worktrees").click();
+  await page.waitForSelector('[data-testid="worktree-collisions-banner"]');
   const txt = await page.locator("#panel-worktrees").textContent();
-  return txt.includes("lane/sidebar-ui") && txt.includes("4 changed") && txt.includes("Ready to land") && txt.includes("Uncommitted edits");
+  const bannerTxt = await page.locator('[data-testid="worktree-collisions-banner"]').textContent();
+  return (
+    txt.includes("lane/sidebar-ui") &&
+    txt.includes("4 changed") &&
+    txt.includes("Ready to land") &&
+    txt.includes("Uncommitted edits") &&
+    txt.includes("Merge clean") &&
+    txt.includes("Dirty tree") &&
+    txt.includes("@builder") &&
+    txt.includes("@ui-dev") &&
+    txt.includes("ui: wire worktree operator controls") &&
+    Boolean(bannerTxt?.includes("frontend/src/sidecar.ts")) &&
+    Boolean(bannerTxt?.includes("lane/sidecar-backend")) &&
+    Boolean(bannerTxt?.includes("lane/sidebar-ui"))
+  );
+});
+
+await check("Worktrees toggles Working Changes vs Branch Diff and loads branch diff", async () => {
+  await page.locator('[data-testid="wt-diff-mode-branch-lane/sidebar-ui"]').click();
+  await page.locator('[data-testid="wt-card-lane/sidebar-ui"] button[aria-label="Diff peek frontend/src/types.ts"]').click();
+  await page.waitForSelector('[data-testid="wt-card-lane/sidebar-ui"] pre');
+  const cardTxt = await page.locator('[data-testid="wt-card-lane/sidebar-ui"]').textContent();
+  await page.locator('[data-testid="wt-diff-mode-working-lane/sidebar-ui"]').click();
+  const workingTxt = await page.locator('[data-testid="wt-card-lane/sidebar-ui"]').textContent();
+  return Boolean(cardTxt?.includes("committed on branch")) && Boolean(workingTxt?.includes("WorktreesView.tsx"));
+});
+
+await check("Worktrees Dry-Run Merge & Rebase surface conflicts and FF Merge + Remove Clean work", async () => {
+  await page.locator('[data-testid="wt-action-dry-run-lane/sidebar-ui"]').click();
+  await page.waitForSelector('[data-testid="wt-action-conflicts-lane/sidebar-ui"]');
+  const dryTxt = await page.locator('[data-testid="wt-action-result-lane/sidebar-ui"]').textContent();
+
+  await page.locator('[data-testid="wt-action-rebase-lane/sidebar-ui"]').click();
+  await page.locator('[data-testid="wt-confirm-submit-lane/sidebar-ui"]').click();
+  await page.waitForFunction(
+    () => (document.querySelector('[data-testid="wt-action-result-lane/sidebar-ui"]')?.textContent || "").includes("Rebase hit conflict"),
+  );
+  const rebaseTxt = await page.locator('[data-testid="wt-action-result-lane/sidebar-ui"]').textContent();
+
+  await page.locator('[data-testid="wt-action-ff-merge-lane/sidecar-backend"]').click();
+  await page.locator('[data-testid="wt-confirm-submit-lane/sidecar-backend"]').click();
+  await page.waitForFunction(
+    () => (document.querySelector('[data-testid="wt-action-result-lane/sidecar-backend"]')?.textContent || "").includes("Fast-forward merged"),
+  );
+
+  await page.locator('[data-testid="wt-action-remove-lane/sidecar-backend"]').click();
+  await page.locator('[data-testid="wt-confirm-submit-lane/sidecar-backend"]').click();
+  await page.waitForFunction(() => !document.querySelector('[data-testid="wt-card-lane/sidecar-backend"]'));
+
+  const overflow380 = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  return (
+    Boolean(dryTxt?.includes("Dry-run merge detected conflicting changes") && dryTxt.includes("frontend/src/sidecar.ts")) &&
+    Boolean(rebaseTxt?.includes("Rebase hit conflict and was aborted cleanly") && rebaseTxt.includes("frontend/src/sidecar.ts")) &&
+    overflow380 <= 0
+  );
 });
 
 await check("Multi-Swarm Switcher switches to secondary audit swarm", async () => {

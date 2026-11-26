@@ -522,6 +522,7 @@ export function App() {
               payload={worktrees}
               loading={wtLoading}
               manualRoots={manualRoots}
+              members={members}
               onAddManualRoot={(r) => setManualRoots((prev) => (prev.includes(r) ? prev : [...prev, r]))}
               onRefresh={refreshWorktrees}
             />

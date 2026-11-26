@@ -97,6 +97,7 @@
             ],
             usage: { inputTokens: 24200, cacheReadTokens: 19400, outputTokens: 2850, totalTokens: 46450 },
             workspace_mode: "share",
+            workspace: "/workspace/scratch/fleet-builder",
             posts: 2,
             lastPostSeq: 4,
             lastPostTime: "13:44:05",
@@ -126,6 +127,7 @@
             lastStepAt: new Date(t(4)).toISOString(),
             usage: { inputTokens: 16800, cacheReadTokens: 9100, outputTokens: 1950, totalTokens: 27850 },
             workspace_mode: "share",
+            workspace: "/workspace/scratch/fleet-ui",
             posts: 1,
             lastPostSeq: 5,
             lastPostTime: "13:45:01",
@@ -440,9 +442,13 @@
         ahead: 0,
         behind: 0,
         landStatus: "main",
+        mergeability: "main",
         dirtyFiles: 0,
         untrackedFiles: 0,
         stagedFiles: 0,
+        commits: [
+          { sha: "8c54f0ec", subject: "feat(v1.0.0): Antigravity-native Fleet sidecar plugin", authorTime: "5m ago" },
+        ],
         lastCommitSha: "8c54f0ec",
         lastCommitSubject: "feat(v1.0.0): Antigravity-native Fleet sidecar plugin",
         lastCommitAt: t(320),
@@ -466,9 +472,18 @@
         ahead: 1,
         behind: 0,
         landStatus: "ready",
+        mergeability: "clean",
         dirtyFiles: 0,
         untrackedFiles: 0,
         stagedFiles: 0,
+        branchFiles: [
+          "sidecars/fleet_pane/git_probe.mjs",
+          "sidecars/fleet_pane/server_core.mjs",
+          "frontend/src/sidecar.ts",
+        ],
+        commits: [
+          { sha: "9a31d4b0", subject: "test: add CWE-22/59 frame confinement & 413 tests", authorTime: "2m ago" },
+        ],
         lastCommitSha: "9a31d4b0",
         lastCommitSubject: "test: add CWE-22/59 frame confinement & 413 tests",
         lastCommitAt: t(95),
@@ -492,15 +507,73 @@
         ahead: 2,
         behind: 0,
         landStatus: "dirty",
+        mergeability: "dirty",
         dirtyFiles: 3,
         untrackedFiles: 1,
         stagedFiles: 0,
+        files: [
+          {
+            path: "frontend/src/components/WorktreesView.tsx",
+            state: "M",
+            uri: "file:///workspace/scratch/fleet-ui/frontend/src/components/WorktreesView.tsx",
+          },
+          {
+            path: "frontend/src/sidecar.ts",
+            state: "M",
+            uri: "file:///workspace/scratch/fleet-ui/frontend/src/sidecar.ts",
+          },
+        ],
+        branchFiles: [
+          "frontend/src/types.ts",
+          "frontend/src/sidecar.ts",
+        ],
+        commits: [
+          { sha: "c42e81f2", subject: "ui: refine 380px Needs-You triage cards", authorTime: "1m ago" },
+          { sha: "b102f8a1", subject: "ui: wire worktree operator controls", authorTime: "4m ago" },
+        ],
         lastCommitSha: "c42e81f2",
         lastCommitSubject: "ui: refine 380px Needs-You triage cards",
         lastCommitAt: t(25),
       },
     ],
   };
+
+  function computeWorktreeCollisions(worktrees) {
+    var byFile = {};
+    (worktrees || []).forEach(function (wt) {
+      if (wt.isMain) return;
+      (wt.files || []).forEach(function (f) {
+        var fp = typeof f === "string" ? f : f.path;
+        if (!fp) return;
+        byFile[fp] = byFile[fp] || { working: {}, branch: {} };
+        byFile[fp].working[wt.path] = wt.branch;
+      });
+      (wt.branchFiles || []).forEach(function (f) {
+        var fp = typeof f === "string" ? f : f.path;
+        if (!fp) return;
+        byFile[fp] = byFile[fp] || { working: {}, branch: {} };
+        byFile[fp].branch[wt.path] = wt.branch;
+      });
+    });
+    var out = [];
+    Object.keys(byFile).sort().forEach(function (file) {
+      var entry = byFile[file];
+      var allPaths = {};
+      Object.keys(entry.working).forEach(function (p) { allPaths[p] = entry.working[p]; });
+      Object.keys(entry.branch).forEach(function (p) { allPaths[p] = entry.branch[p]; });
+      var paths = Object.keys(allPaths);
+      if (paths.length < 2) return;
+      var hasWorking = Object.keys(entry.working).length > 0;
+      var hasBranch = Object.keys(entry.branch).length > 0;
+      out.push({
+        file: file,
+        worktrees: paths,
+        branches: paths.map(function (p) { return allPaths[p]; }),
+        kind: hasWorking && hasBranch ? "mixed" : hasBranch ? "branch" : "working",
+      });
+    });
+    return out;
+  }
 
   function planEtagOf(sw) {
     return sw && sw.plan ? "plan-v" + (sw.planVersion || 1) : "";
@@ -948,21 +1021,118 @@
       return jsonResp(snap);
     }
     if (url.pathname === "/api/worktrees") {
-      return jsonResp({ roots: [{ path: "/workspace/fleet", uri: "file:///workspace/fleet", isGit: true, count: state.worktrees.length, error: "" }], worktrees: state.worktrees, rejected: [] });
+      return jsonResp({
+        roots: [{ path: "/workspace/fleet", uri: "file:///workspace/fleet", isGit: true, count: state.worktrees.length, error: "" }],
+        worktrees: state.worktrees,
+        collisions: computeWorktreeCollisions(state.worktrees),
+        rejected: [],
+      });
     }
     if (url.pathname === "/api/worktrees/diff") {
-      var wtPath = url.searchParams.get("worktree") || "/workspace/fleet";
+      var wtPath = url.searchParams.get("worktree") || url.searchParams.get("path") || "/workspace/fleet";
       var relFile = url.searchParams.get("file") || "README.md";
+      var diffMode = url.searchParams.get("mode") === "branch" ? "branch" : "working";
+      var diffBody = diffMode === "branch"
+        ? "@@ -1,3 +1,5 @@\n export interface WorktreeChange {}\n+export type WorktreeDiffMode = \"working\" | \"branch\";\n+// committed on branch"
+        : "@@ -12,4 +12,6 @@\n-  const cached = probeCache.get(key);\n+  const realTarget = realpathSync(abs);\n+  if (!realTarget.startsWith(wtPrefix)) return { ok: false, status: 404 };\n   return capDiff(stdout, 8192);";
       return jsonResp({
         ok: true,
         worktree: wtPath,
         file: relFile,
-        diff: "@@ -12,4 +12,6 @@\n-  const cached = probeCache.get(key);\n+  const realTarget = realpathSync(abs);\n+  if (!realTarget.startsWith(wtPrefix)) return { ok: false, status: 404 };\n   return capDiff(stdout, 8192);",
+        mode: diffMode,
+        diff: diffBody,
         truncated: false,
         untracked: false,
         added: 2,
         removed: 1,
       });
+    }
+    if (url.pathname === "/api/worktrees/action" && init && String(init.method || "").toUpperCase() === "POST") {
+      var actBody = {};
+      try { actBody = JSON.parse(String(init.body || "{}")); } catch { return jsonResp({ error: "Invalid JSON" }, 400); }
+      var actName = String(actBody.action || "");
+      var targetPath = String(actBody.path || actBody.worktree || "");
+      var targetWt = state.worktrees.find(function (w) { return w.path === targetPath; });
+      if (!targetWt) return jsonResp({ error: "Unknown worktree" }, 404);
+      var collisionsNow = computeWorktreeCollisions(state.worktrees);
+      var collidingFiles = collisionsNow
+        .filter(function (c) { return c.worktrees.indexOf(targetWt.path) >= 0; })
+        .map(function (c) { return c.file; });
+
+      if (actName === "dry_run_merge") {
+        if (targetWt.branch === "lane/sidebar-ui" && collidingFiles.length > 0) {
+          return jsonResp({
+            ok: false,
+            action: actName,
+            status: "conflict",
+            conflicts: collidingFiles,
+            message: "Dry-run merge detected conflicting changes against main.",
+          });
+        }
+        return jsonResp({
+          ok: true,
+          action: actName,
+          status: "clean",
+          conflicts: [],
+          message: "Dry-run merge with " + (targetWt.baseBranch || "main") + " is clean.",
+        });
+      }
+      if (actName === "rebase") {
+        if (targetWt.isMain) return jsonResp({ error: "Cannot rebase primary worktree" }, 400);
+        if (targetWt.branch === "lane/sidebar-ui" && collidingFiles.length > 0) {
+          return jsonResp({
+            ok: false,
+            action: actName,
+            status: "conflict",
+            aborted: true,
+            conflicts: collidingFiles,
+            message: "Rebase hit conflict and was aborted cleanly.",
+          }, 409);
+        }
+        targetWt.behind = 0;
+        targetWt.mergeability = "clean";
+        return jsonResp({
+          ok: true,
+          action: actName,
+          status: "rebased",
+          conflicts: [],
+          message: "Rebased " + targetWt.branch + " onto " + (targetWt.baseBranch || "main") + ".",
+        });
+      }
+      if (actName === "ff_merge") {
+        if (targetWt.isMain) return jsonResp({ error: "Cannot FF merge primary worktree" }, 400);
+        if (!targetWt.clean) {
+          return jsonResp({ ok: false, action: actName, status: "dirty", message: "Worktree has uncommitted changes." }, 409);
+        }
+        targetWt.ahead = 0;
+        targetWt.landStatus = "merged";
+        targetWt.mergeability = "clean";
+        return jsonResp({
+          ok: true,
+          action: actName,
+          status: "merged",
+          message: "Fast-forward merged " + targetWt.branch + " into " + (targetWt.baseBranch || "main") + ".",
+        });
+      }
+      if (actName === "remove_worktree") {
+        if (targetWt.isMain) return jsonResp({ error: "Cannot remove primary worktree" }, 400);
+        if (!targetWt.clean || (targetWt.ahead || 0) > 0) {
+          return jsonResp({
+            ok: false,
+            action: actName,
+            status: "unmerged",
+            message: "Worktree must be clean and merged before removal.",
+          }, 409);
+        }
+        state.worktrees = state.worktrees.filter(function (w) { return w.path !== targetWt.path; });
+        return jsonResp({
+          ok: true,
+          action: actName,
+          status: "removed",
+          message: "Removed clean worktree " + targetWt.branch + ".",
+        });
+      }
+      return jsonResp({ error: "Unsupported action" }, 400);
     }
     return origFetch(input, init);
   };

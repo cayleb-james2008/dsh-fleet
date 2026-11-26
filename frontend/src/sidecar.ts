@@ -8,6 +8,9 @@ import type {
   SwarmSnapshot,
   SwarmSummary,
   ThemeMode,
+  WorktreeActionName,
+  WorktreeActionPayload,
+  WorktreeDiffMode,
   WorktreeDiffPayload,
   WorktreesPayload,
 } from "./types";
@@ -70,11 +73,65 @@ export const fetchSwarmSnapshot = (conversationId?: string | null, etag?: string
 export const fetchWorktrees = (roots: string[]): Promise<WorktreesPayload> =>
   apiJson(qs("/api/worktrees", { roots: roots.join(",") }), "Worktrees failed");
 
-export async function fetchWorktreeDiff(root: string, worktree: string, file: string): Promise<WorktreeDiffPayload> {
-  const res = await sidecarFetch(qs("/api/worktrees/diff", { root, worktree, file }));
+export async function fetchWorktreeDiff(
+  root: string,
+  worktree: string,
+  file: string,
+  mode: WorktreeDiffMode = "working",
+): Promise<WorktreeDiffPayload> {
+  const res = await sidecarFetch(qs("/api/worktrees/diff", { root, worktree, path: worktree, file, mode }));
   const data = (await res.json().catch(() => ({}))) as Partial<WorktreeDiffPayload>;
   if (!res.ok) throw new Error(data.error || `Diff peek failed (${res.status})`);
   return data as WorktreeDiffPayload;
+}
+
+export const getWorktreeDiff = (
+  path: string,
+  file: string,
+  mode: WorktreeDiffMode = "working",
+  root?: string,
+): Promise<WorktreeDiffPayload> => fetchWorktreeDiff(root || path, path, file, mode);
+
+export async function runWorktreeAction(
+  action: WorktreeActionName,
+  path: string,
+  targetBranch?: string,
+  root?: string,
+): Promise<WorktreeActionPayload> {
+  const res = await sidecarFetch("/api/worktrees/action", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      confirm: true,
+      action,
+      path,
+      worktree: path,
+      ...(root ? { root } : {}),
+      ...(targetBranch ? { targetBranch } : {}),
+    }),
+  });
+  const data = (await res.json().catch(() => ({}))) as Partial<WorktreeActionPayload>;
+  if (
+    res.status === 409 ||
+    (data && (Array.isArray(data.conflicts) || Array.isArray(data.conflictFiles) || data.aborted))
+  ) {
+    const conflicts = data.conflicts || data.conflictFiles || [];
+    return {
+      ok: Boolean(res.ok && data.ok),
+      action: data.action || action,
+      status: data.status || (res.status === 409 ? "conflict" : undefined),
+      result: data.result,
+      aborted: data.aborted,
+      conflicts,
+      conflictFiles: conflicts,
+      message: data.message || data.error || data.stderr || data.stdout || `Action ${action} blocked (${res.status})`,
+      error: data.error,
+    };
+  }
+  if (!res.ok) {
+    throw new Error(data.error || data.message || `Worktree action failed (${res.status})`);
+  }
+  return data as WorktreeActionPayload;
 }
 
 export async function sendConfirmedNudge(target: string | string[], message: string): Promise<void> {

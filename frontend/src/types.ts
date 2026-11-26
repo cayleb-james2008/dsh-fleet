@@ -288,10 +288,46 @@ export interface SwarmSnapshot {
   };
 }
 
+export type WorktreeMergeability =
+  | "clean"
+  | "conflict"
+  | "dirty"
+  | "detached"
+  | "main"
+  | "ff"
+  | "clean_merge"
+  | "up_to_date"
+  | "unknown";
+
+export type WorktreeDiffMode = "working" | "branch";
+
+export type WorktreeActionName =
+  | "dry_run_merge"
+  | "ff_merge"
+  | "rebase"
+  | "remove_worktree";
+
 export interface WorktreeChangedFile {
   path: string;
   state: string;
   uri: string;
+  added?: number;
+  removed?: number;
+}
+
+export interface WorktreeCommitInfo {
+  sha: string;
+  subject: string;
+  authorTime?: string;
+  at?: number;
+}
+
+export interface WorktreeCollision {
+  file: string;
+  worktrees: Array<string | { id?: string; branch?: string; path?: string; source?: string }>;
+  branches?: string[];
+  kind?: "working" | "branch" | "mixed";
+  root?: string;
 }
 
 export interface WorktreeInfo {
@@ -313,11 +349,16 @@ export interface WorktreeInfo {
   ahead?: number;
   behind?: number;
   landStatus?: "main" | "ready" | "rebase" | "dirty" | "merged";
+  mergeability?: WorktreeMergeability;
+  conflictFiles?: string[];
   dirtyFiles: number;
   untrackedFiles: number;
   stagedFiles: number;
   files?: WorktreeChangedFile[];
   filesTruncated?: boolean;
+  branchFiles?: Array<string | WorktreeChangedFile>;
+  branchFilesTruncated?: boolean;
+  commits?: WorktreeCommitInfo[];
   lastCommitSha: string;
   lastCommitSubject: string;
   lastCommitAt: number;
@@ -326,6 +367,7 @@ export interface WorktreeInfo {
 export interface WorktreesPayload {
   roots: Array<{ path: string; uri: string; isGit: boolean; count: number; error: string }>;
   worktrees: WorktreeInfo[];
+  collisions?: WorktreeCollision[];
   rejected: string[];
 }
 
@@ -333,10 +375,26 @@ export interface WorktreeDiffPayload {
   ok: boolean;
   worktree: string;
   file: string;
+  mode?: WorktreeDiffMode;
   diff: string;
   truncated: boolean;
   untracked: boolean;
   added: number;
   removed: number;
+  error?: string;
+}
+
+export interface WorktreeActionPayload {
+  ok: boolean;
+  action: WorktreeActionName | string;
+  status?: string;
+  result?: string;
+  clean?: boolean;
+  aborted?: boolean;
+  conflicts?: string[];
+  conflictFiles?: string[];
+  message?: string;
+  stdout?: string;
+  stderr?: string;
   error?: string;
 }

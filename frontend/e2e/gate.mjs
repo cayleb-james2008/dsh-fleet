@@ -587,7 +587,333 @@ await runChecks("gate", async (check) => {
     await page.locator('button[aria-label="Diff peek untracked.txt"]').click();
     await page.waitForSelector('#panel-worktrees pre');
     const preTxt = await page.locator("#panel-worktrees pre").textContent();
-    return preTxt.includes("(untracked)") && preTxt.includes("+");
+    if (!preTxt.includes("(untracked)") || !preTxt.includes("+")) return false;
+
+    // E2 Gap #2 verification: collisions banner, branchFiles/working toggle, dry_run_merge & rebase conflict feedback
+    const wtPage = await ctx.newPage();
+    const wtErrors = [];
+    const diffModesSeen = [];
+    const actionsSeen = [];
+    wtPage.on("pageerror", (err) => wtErrors.push(err.message));
+    wtPage.on("console", (msg) => {
+      if (msg.type() === "error") wtErrors.push(msg.text());
+    });
+
+    await wtPage.route("**/api/worktrees", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          roots: [{ path: "/mock/repo", uri: "file:///mock/repo", isGit: true, count: 3, error: "" }],
+          collisions: [
+            {
+              file: "src/shared.ts",
+              worktrees: ["/mock/alpha", "/mock/beta"],
+              branches: ["feat/alpha", "feat/beta"],
+              kind: "mixed",
+            },
+          ],
+          worktrees: [
+            {
+              id: "m-main",
+              root: "/mock/repo",
+              name: "repo",
+              path: "/mock/repo",
+              uri: "file:///mock/repo",
+              isMain: true,
+              exists: true,
+              bare: false,
+              detached: false,
+              locked: false,
+              prunable: false,
+              branch: "main",
+              head: "1111aaa",
+              clean: true,
+              landStatus: "main",
+              mergeability: "main",
+              dirtyFiles: 0,
+              untrackedFiles: 0,
+              stagedFiles: 0,
+              commits: [{ sha: "1111aaa", subject: "chore: root commit", authorTime: "10m ago" }],
+              lastCommitSha: "1111aaa",
+              lastCommitSubject: "chore: root commit",
+              lastCommitAt: Date.now(),
+            },
+            {
+              id: "m-alpha",
+              root: "/mock/repo",
+              name: "alpha",
+              path: "/mock/alpha",
+              uri: "file:///mock/alpha",
+              isMain: false,
+              exists: true,
+              bare: false,
+              detached: false,
+              locked: false,
+              prunable: false,
+              branch: "feat/alpha",
+              head: "2222bbb",
+              clean: true,
+              baseBranch: "main",
+              ahead: 1,
+              behind: 0,
+              landStatus: "ready",
+              mergeability: "clean",
+              dirtyFiles: 0,
+              untrackedFiles: 0,
+              stagedFiles: 0,
+              files: [],
+              branchFiles: ["src/shared.ts", "src/alpha.ts"],
+              commits: [{ sha: "2222bbb", subject: "feat: alpha lane", authorTime: "2m ago" }],
+              lastCommitSha: "2222bbb",
+              lastCommitSubject: "feat: alpha lane",
+              lastCommitAt: Date.now(),
+            },
+            {
+              id: "m-beta",
+              root: "/mock/repo",
+              name: "beta",
+              path: "/mock/beta",
+              uri: "file:///mock/beta",
+              isMain: false,
+              exists: true,
+              bare: false,
+              detached: false,
+              locked: false,
+              prunable: false,
+              branch: "feat/beta",
+              head: "3333ccc",
+              clean: false,
+              baseBranch: "main",
+              ahead: 1,
+              behind: 1,
+              landStatus: "dirty",
+              mergeability: "conflict",
+              conflictFiles: ["src/shared.ts"],
+              dirtyFiles: 1,
+              untrackedFiles: 0,
+              stagedFiles: 0,
+              files: [{ path: "src/shared.ts", state: "M", uri: "file:///mock/beta/src/shared.ts" }],
+              branchFiles: ["src/shared.ts"],
+              commits: [{ sha: "3333ccc", subject: "feat: beta lane", authorTime: "1m ago" }],
+              lastCommitSha: "3333ccc",
+              lastCommitSubject: "feat: beta lane",
+              lastCommitAt: Date.now(),
+            },
+          ],
+          rejected: [],
+        }),
+      });
+    });
+
+    await wtPage.route("**/api/worktrees?*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          roots: [{ path: "/mock/repo", uri: "file:///mock/repo", isGit: true, count: 3, error: "" }],
+          collisions: [
+            {
+              file: "src/shared.ts",
+              worktrees: ["/mock/alpha", "/mock/beta"],
+              branches: ["feat/alpha", "feat/beta"],
+              kind: "mixed",
+            },
+          ],
+          worktrees: [
+            {
+              id: "m-main",
+              root: "/mock/repo",
+              name: "repo",
+              path: "/mock/repo",
+              uri: "file:///mock/repo",
+              isMain: true,
+              exists: true,
+              bare: false,
+              detached: false,
+              locked: false,
+              prunable: false,
+              branch: "main",
+              head: "1111aaa",
+              clean: true,
+              landStatus: "main",
+              mergeability: "main",
+              dirtyFiles: 0,
+              untrackedFiles: 0,
+              stagedFiles: 0,
+              commits: [{ sha: "1111aaa", subject: "chore: root commit", authorTime: "10m ago" }],
+              lastCommitSha: "1111aaa",
+              lastCommitSubject: "chore: root commit",
+              lastCommitAt: Date.now(),
+            },
+            {
+              id: "m-alpha",
+              root: "/mock/repo",
+              name: "alpha",
+              path: "/mock/alpha",
+              uri: "file:///mock/alpha",
+              isMain: false,
+              exists: true,
+              bare: false,
+              detached: false,
+              locked: false,
+              prunable: false,
+              branch: "feat/alpha",
+              head: "2222bbb",
+              clean: true,
+              baseBranch: "main",
+              ahead: 1,
+              behind: 0,
+              landStatus: "ready",
+              mergeability: "clean",
+              dirtyFiles: 0,
+              untrackedFiles: 0,
+              stagedFiles: 0,
+              files: [],
+              branchFiles: ["src/shared.ts", "src/alpha.ts"],
+              commits: [{ sha: "2222bbb", subject: "feat: alpha lane", authorTime: "2m ago" }],
+              lastCommitSha: "2222bbb",
+              lastCommitSubject: "feat: alpha lane",
+              lastCommitAt: Date.now(),
+            },
+            {
+              id: "m-beta",
+              root: "/mock/repo",
+              name: "beta",
+              path: "/mock/beta",
+              uri: "file:///mock/beta",
+              isMain: false,
+              exists: true,
+              bare: false,
+              detached: false,
+              locked: false,
+              prunable: false,
+              branch: "feat/beta",
+              head: "3333ccc",
+              clean: false,
+              baseBranch: "main",
+              ahead: 1,
+              behind: 1,
+              landStatus: "dirty",
+              mergeability: "conflict",
+              conflictFiles: ["src/shared.ts"],
+              dirtyFiles: 1,
+              untrackedFiles: 0,
+              stagedFiles: 0,
+              files: [{ path: "src/shared.ts", state: "M", uri: "file:///mock/beta/src/shared.ts" }],
+              branchFiles: ["src/shared.ts"],
+              commits: [{ sha: "3333ccc", subject: "feat: beta lane", authorTime: "1m ago" }],
+              lastCommitSha: "3333ccc",
+              lastCommitSubject: "feat: beta lane",
+              lastCommitAt: Date.now(),
+            },
+          ],
+          rejected: [],
+        }),
+      });
+    });
+
+    await wtPage.route("**/api/worktrees/diff*", async (route) => {
+      const reqUrl = new URL(route.request().url());
+      const mode = reqUrl.searchParams.get("mode") || "working";
+      diffModesSeen.push(mode);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ok: true,
+          worktree: reqUrl.searchParams.get("worktree") || "/mock/beta",
+          file: reqUrl.searchParams.get("file") || "src/shared.ts",
+          mode,
+          diff: mode === "branch" ? "@@ -1 +1 @@\n+export const committed = true;" : "@@ -1 +1 @@\n+export const dirty = true;",
+          truncated: false,
+          untracked: false,
+          added: 1,
+          removed: 0,
+        }),
+      });
+    });
+
+    await wtPage.route("**/api/worktrees/action", async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      actionsSeen.push(body.action);
+      if (body.action === "dry_run_merge") {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            ok: false,
+            action: "dry_run_merge",
+            status: "conflict",
+            conflicts: ["src/shared.ts"],
+            message: "Dry-run merge conflict in src/shared.ts",
+          }),
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ok: false,
+          action: body.action,
+          status: "conflict",
+          aborted: true,
+          conflicts: ["src/shared.ts"],
+          message: "Rebase aborted on src/shared.ts conflict",
+        }),
+      });
+    });
+
+    await wtPage.goto(BASE, { waitUntil: "networkidle" });
+    await wtPage.locator("#tab-worktrees").click();
+    await wtPage.waitForSelector("#panel-worktrees");
+    await wtPage.fill('input[aria-label="Workspace repository path"]', "/mock/repo");
+    await wtPage.locator('#panel-worktrees button:has-text("Inspect")').click();
+    await wtPage.waitForSelector('[data-testid="worktree-collisions-banner"]');
+
+    const bannerTxt = await wtPage.locator('[data-testid="worktree-collisions-banner"]').textContent();
+    const alphaMerge = await wtPage.locator('[data-testid="wt-mergeability-feat/alpha"]').textContent();
+    const betaMerge = await wtPage.locator('[data-testid="wt-mergeability-feat/beta"]').textContent();
+    const alphaBranchCount = await wtPage.locator('[data-testid="wt-branch-files-count-feat/alpha"]').textContent();
+    const alphaCommits = await wtPage.locator('[data-testid="wt-commits-feat/alpha"]').textContent();
+
+    // Switch feat/beta to Branch Diff and open diff peek
+    await wtPage.locator('[data-testid="wt-diff-mode-branch-feat/beta"]').click();
+    await wtPage.locator('[data-testid="wt-card-feat/beta"] button[aria-label="Diff peek src/shared.ts"]').click();
+    await wtPage.waitForSelector('[data-testid="wt-card-feat/beta"] pre');
+    const branchPre = await wtPage.locator('[data-testid="wt-card-feat/beta"] pre').textContent();
+
+    // Dry-Run Merge conflict feedback
+    await wtPage.locator('[data-testid="wt-action-dry-run-feat/beta"]').click();
+    await wtPage.waitForSelector('[data-testid="wt-action-conflicts-feat/beta"]');
+    const dryRunTxt = await wtPage.locator('[data-testid="wt-action-result-feat/beta"]').textContent();
+
+    // Rebase two-step confirmation & conflict feedback
+    await wtPage.locator('[data-testid="wt-action-rebase-feat/beta"]').click();
+    await wtPage.locator('[data-testid="wt-confirm-submit-feat/beta"]').click();
+    await wtPage.waitForFunction(
+      () => (document.querySelector('[data-testid="wt-action-result-feat/beta"]')?.textContent || "").includes("Rebase aborted"),
+    );
+    const rebaseTxt = await wtPage.locator('[data-testid="wt-action-result-feat/beta"]').textContent();
+    const wtOverflow = await wtPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    await wtPage.close();
+
+    return (
+      Boolean(bannerTxt?.includes("src/shared.ts") && bannerTxt.includes("feat/alpha") && bannerTxt.includes("feat/beta")) &&
+      alphaMerge === "Merge clean" &&
+      betaMerge === "Merge conflict" &&
+      Boolean(alphaBranchCount?.includes("2 branch files")) &&
+      Boolean(alphaCommits?.includes("feat: alpha lane")) &&
+      diffModesSeen.includes("branch") &&
+      Boolean(branchPre?.includes("committed = true")) &&
+      Boolean(dryRunTxt?.includes("Dry-run merge conflict") && dryRunTxt.includes("src/shared.ts")) &&
+      Boolean(rebaseTxt?.includes("Rebase aborted on src/shared.ts conflict")) &&
+      actionsSeen.includes("dry_run_merge") &&
+      actionsSeen.includes("rebase") &&
+      wtOverflow <= 0 &&
+      wtErrors.length === 0
+    );
   });
 
   await check("worktrees Open file calls toggleAuxPane with fileView uri", async () => {
