@@ -442,7 +442,7 @@ export function App() {
               <span aria-hidden="true" className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-chip bg-[var(--ink-button)] text-[var(--ink-button-fg)]">
                 <Rocket className="h-4 w-4" />
               </span>
-              <div className="min-w-0">
+              <div className="min-w-0 flex-1">
                 {swarms.length > 1 ? (
                   <>
                     <h1 className="sr-only">{snap?.title || "Fleet"}</h1>
@@ -450,7 +450,7 @@ export function App() {
                       aria-label="Active swarm"
                       value={snap?.swarm || selectedSwarmId || ""}
                       onChange={(e) => handleSelectSwarm(e.target.value)}
-                      className="h-7 max-w-[128px] min-[380px]:max-w-[164px] sm:max-w-[320px] truncate rounded-chip border border-[var(--edge)] bg-board px-2 h2 cursor-pointer"
+                      className="h-7 w-full max-w-[320px] truncate rounded-chip border border-[var(--edge)] bg-board px-2 h2 cursor-pointer"
                     >
                       {swarms.map((sw) => (
                         <option key={sw.id} value={sw.id}>{sw.title || sw.id} ({sw.activeCount}/{sw.memberCount})</option>

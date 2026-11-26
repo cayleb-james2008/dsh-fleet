@@ -3,6 +3,14 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as an
 Antigravity plugin archive (`tar.gz` and `zip`) with `SHA256SUMS`.
 
+## 1.22.0 - 2026-11-26
+
+- Added `POST /api/control` in `sidecars/fleet_pane/server_core.mjs` (both the standalone router and `runSidecarApp`) supporting `board_post`, `spawn_worker`, `switch_model`, `kill_worker`, `channel_op`, and `gate_verdict`, with Host-403, Origin-403, 64 KB `413` checks, `confirm: true` validation, `404` coordinator resolution, `501` non-sidecar guard, `409` unmerged worktree protection via `probeMemberWorktree` in `sidecars/fleet_pane/git_probe.mjs`, and `[fleet-operator:<op>]` directive formatting documented in `skills/fleet/SKILL.md` and `rules/AGENTS.md`.
+- Added `replyRefs` thread backlink indexing and `findCoordinatorConvId` in `sidecars/fleet_pane/swarm_store.mjs`.
+- Upgraded `frontend/src/{types.ts,sidecar.ts,App.tsx,ui.tsx}` and `frontend/src/components/{BoardView,RosterView,CommandPalette}.tsx` with the New Swarm launcher modal, Command Palette Spawn Worker and Board Post actions, Board channel filter tabs, Channel Manager drawer, sticky confirmation-gated Board/Channel Composer, clickable `#seq` `replyRefs` backlink chips, Roster Spawn Worker and Switch Model drawers, confirmation-gated Kill Worker `409` warning and Force kill flow, Gate Readiness verdict controls, `addArtifactComment` host bridge, and matching offline parity in `frontend/scripts/web-engine.js`.
+- Fixed header swarm selector flex width in `frontend/src/App.tsx` so the `<select>` shrinks cleanly beside the 5 header icon buttons at 380px.
+- Captured light and dark `docs/screenshots/control-{light,dark}.png`, updated version parity to `1.22.0`, and verified post-final-edit: `21/21` backend unit tests (`654.05 ms`), `57/57` gate, `8/8` replay, `21/21` `test-live-web.mjs`, `SLOP 0/0/0`, `357,566 B` raw (`349.2 KiB`) / `108,730 B` gz (`106.2 KiB`), `50.03 ms` boot, `113.51 MB` RSS, `2,350.6 req/s` (`11.24 ms` p95, `0/5,897` errors), `5/5` SSE, and `30/30` fuzz.
+
 ## 1.21.0 - 2026-11-26
 
 - Added cross-worktree file collision detection (`collisions` across working changes and committed `branchFiles`), `git merge-tree --write-tree` mergeability and `conflictFiles` checks, recent branch commit summaries, and `mode=working|branch` bounded diffs in `sidecars/fleet_pane/git_probe.mjs`.
