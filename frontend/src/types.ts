@@ -13,6 +13,13 @@ export interface MemberFailure {
   text: string;
 }
 
+export interface ActivityPeek {
+  status: "working" | "waiting";
+  label: string;
+  tool?: string;
+  ts: number;
+}
+
 export interface SwarmMember {
   name: string;
   conversation_id: string;
@@ -27,6 +34,7 @@ export interface SwarmMember {
   steps: number;
   activity: string;
   activityKind: "tool" | "thinking" | "";
+  activityPeek?: ActivityPeek | null;
   replied: boolean;
   replyAsk: string;
   narrator: boolean;

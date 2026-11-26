@@ -2,7 +2,7 @@ import { useMemo, useState } from "../hooks";
 import { ChevronDown, ChevronUp, ClipboardCopy, Cpu, Eye, EyeOff, MessageSquare, Radio, Send } from "../icons";
 import { openWorkerConversation } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot } from "../types";
-import { ActivityPeek, Badge, Button, Card, InlineComposer, Pill, StatusDot, TokenBurnStrip, buildRecoverPrompt, canLiveNudge, cn, copyText, fmtTokens, hasControlChars, memberMeta, submitNudge, useNowMs } from "../ui";
+import { ActivityPeek, Badge, Button, Card, InlineComposer, MemberActivityLine, Pill, StatusDot, TokenBurnStrip, buildRecoverPrompt, canLiveNudge, cn, copyText, fmtTokens, hasControlChars, memberMeta, submitNudge, useNowMs } from "../ui";
 
 const ORDER: Record<SwarmMember["status"], number> = { working: 0, waiting: 1, killed: 2 };
 const CONTEXT_BUDGET_TOKENS = 200_000;
@@ -294,12 +294,8 @@ export function RosterView({
                   )}
                 </div>
 
-                {/* Line 4: Shimmering live activity or error detail */}
-                {!m.killed && m.status === "working" && m.activity && (
-                  <p className="text-[13px] text-info fleet-live-shimmer truncate">
-                    {m.activityKind === "thinking" ? `Thinking: ${m.activity}` : m.activity}
-                  </p>
-                )}
+                {/* Line 4: Bounded 1-line transcript activity peek or error detail */}
+                <MemberActivityLine member={m} testId={`roster-activity-peek-${m.name}`} />
                 {m.failure && (
                   <p className="text-[12px] text-danger break-words">{m.failure.text}</p>
                 )}

@@ -270,7 +270,7 @@ export function createFleetHandlers({
       healthPacked = pack({
         ok: true,
         name: 'fleet',
-        version: '1.17.0',
+        version: '1.18.0',
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
         sseStream: !isSidecar,
@@ -653,7 +653,7 @@ export async function createStandaloneRouter({
     (quickHealthPacked ||= packJsonPayload({
       ok: true,
       name: 'fleet',
-      version: '1.17.0',
+      version: '1.18.0',
       mode: 'standalone',
       canSendMessage: Boolean(sendMessageFn),
       sseStream: true,

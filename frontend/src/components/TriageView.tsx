@@ -22,7 +22,7 @@ import {
   parseScreenshotLines,
 } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot, TriageItem } from "../types";
-import { ActivityPeek, Badge, Button, Card, GateReadinessCard, InlineComposer, MediaPathChips, Pill, PinnedList, SegBar, StatusDot, TokenBurnStrip, buildRecoverPrompt, canLiveNudge, cn, copyText, fmtTimeAgo, fmtTokens, formatBlockerContext, humanizeStatus, memberMeta, openOrCopyPath, submitNudge, useNowMs } from "../ui";
+import { ActivityPeek, Badge, Button, Card, GateReadinessCard, InlineComposer, MediaPathChips, MemberActivityLine, Pill, PinnedList, SegBar, StatusDot, TokenBurnStrip, buildRecoverPrompt, canLiveNudge, cn, copyText, fmtTimeAgo, fmtTokens, formatBlockerContext, humanizeStatus, memberMeta, openOrCopyPath, submitNudge, useNowMs } from "../ui";
 
 const SEVERITY_BADGE: Record<TriageItem["severity"], { tone: "danger" | "warning" | "info"; label: string; Icon: typeof AlertTriangle }> = {
   urgent: { tone: "danger", label: "Urgent", Icon: ShieldAlert },
@@ -230,29 +230,32 @@ export function TriageView({
               <span className="font-semibold text-ink">Worker attention ({recoveryMembers.length})</span>
               <span className="t3">Idle, unread, or stalled</span>
             </div>
-            <div className="wrap gap-1">
+            <div className="space-y-1">
               {recoveryMembers.slice(0, 4).map((m) => {
                 const { isStalled } = memberMeta(m, nowMs);
                 const issue = m.failure ? m.failure.kind : isStalled ? "stalled" : `${m.unread} unread`;
                 return (
-                  <div key={m.name} className="f1">
-                    <Button
-                      variant={m.failure || isStalled ? "danger" : "info"}
-                      data-testid={`recover-worker-${m.name}`}
-                      onClick={() => triggerMemberRecover(m)}
-                    >
-                      {canNudge && m.conversation_id ? <Wrench /> : <ClipboardCopy />}
-                      Recover @{m.name} · {issue}
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      data-testid={`jump-worker-${m.name}`}
-                      onClick={() => onJumpToBoardSeq(m.lastPostSeq || 0, m.name)}
-                      className="bg-board num"
-                    >
-                      {m.lastPostSeq > 0 ? `#${m.lastPostSeq}` : `@${m.name}`}
-                      <ArrowUpRight />
-                    </Button>
+                  <div key={m.name} className="space-y-1">
+                    <div className="f1">
+                      <Button
+                        variant={m.failure || isStalled ? "danger" : "info"}
+                        data-testid={`recover-worker-${m.name}`}
+                        onClick={() => triggerMemberRecover(m)}
+                      >
+                        {canNudge && m.conversation_id ? <Wrench /> : <ClipboardCopy />}
+                        Recover @{m.name} · {issue}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        data-testid={`jump-worker-${m.name}`}
+                        onClick={() => onJumpToBoardSeq(m.lastPostSeq || 0, m.name)}
+                        className="bg-board num"
+                      >
+                        {m.lastPostSeq > 0 ? `#${m.lastPostSeq}` : `@${m.name}`}
+                        <ArrowUpRight />
+                      </Button>
+                    </div>
+                    <MemberActivityLine member={m} testId={`triage-activity-peek-${m.name}`} />
                   </div>
                 );
               })}

@@ -77,7 +77,7 @@ async function runCli() {
         bootHealthBuf = Buffer.from(JSON.stringify({
           ok: true,
           name: 'fleet',
-          version: '1.17.0',
+          version: '1.18.0',
           mode: 'standalone',
           canSendMessage: false,
           sseStream: true,
@@ -110,14 +110,17 @@ async function runCli() {
   const addr = server.address();
   console.log(`[fleet_pane] standalone server listening on http://127.0.0.1:${addr.port}`);
 
-  if (process.execArgv.includes('--jitless')) {
-    import('node:v8').then(({ setFlagsFromString }) => {
-      try {
-        setFlagsFromString('--max-semi-space-size=1 --optimize-for-size --memory-reducer');
-      } catch {}
-    }).catch(() => {});
-  }
-  void ensureRouter().then((r) => r.ensureHandlers());
+  const warmTimer = setTimeout(() => {
+    if (process.execArgv.includes('--jitless')) {
+      import('node:v8').then(({ setFlagsFromString }) => {
+        try {
+          setFlagsFromString('--max-semi-space-size=1 --optimize-for-size --memory-reducer');
+        } catch {}
+      }).catch(() => {});
+    }
+    void ensureRouter().then((r) => r.ensureHandlers());
+  }, 25);
+  warmTimer.unref();
 }
 
 const isEntry =

@@ -142,8 +142,8 @@
             killed: false,
             status: "waiting",
             steps: 6,
-            activity: "",
-            activityKind: "",
+            activity: "Inspecting ~/workspace/fleet-ui diff",
+            activityKind: "tool",
             replied: false,
             replyAsk: "",
             narrator: false,
@@ -548,7 +548,21 @@
       id: sw.id,
       title: sw.title,
       head: sw.head,
-      members: sw.members,
+      members: sw.members.map(function (m) {
+        if (m.killed || m.activityPeek) return m;
+        var label = (m.activity || (m.recentTools && m.recentTools[0] && m.recentTools[0].summary) || m.thinkingHeading || (m.status === "waiting" ? "Waiting on board" : ""))
+          .replace(/\/(?:home|Users)\/[^/\s]+(\/|$)/g, function (_m, sep) { return "~" + sep; });
+        return Object.assign({}, m, {
+          activityPeek: label
+            ? {
+                status: m.status === "working" ? "working" : "waiting",
+                label: label,
+                tool: m.activityKind || (m.recentTools && m.recentTools[0] && m.recentTools[0].name) || "tool",
+                ts: m.transcriptMtime || 0,
+              }
+            : null,
+        });
+      }),
       messages: sw.messages,
       edges: [],
       plan: sw.plan,
@@ -664,7 +678,7 @@
       return jsonResp({ ok: true, delivered: targets.length });
     }
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.17.0", mode: "live-web", canSendMessage: true, sseStream: false });
+      return jsonResp({ ok: true, name: "fleet", version: "1.18.0", mode: "live-web", canSendMessage: true, sseStream: false });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });

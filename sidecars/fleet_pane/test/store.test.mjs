@@ -1,11 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parsePorcelainWorktrees, probeWorktreeDiff, probeWorktrees } from '../git_probe.mjs';
-import { buildSwarmSnapshot, computeBurnSummary, computeGateReadiness, listSwarms, summarizeTranscript } from '../swarm_store.mjs';
+import {
+  buildSwarmSnapshot,
+  computeBurnSummary,
+  computeGateReadiness,
+  listSwarms,
+  readTranscriptActivityTail,
+  summarizeTranscript,
+} from '../swarm_store.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -376,4 +383,61 @@ test('computeGateReadiness tracks release gate progression, pending #seq jumps, 
   assert.equal(ready?.velocity?.exactShipped, true);
   assert.equal(ready?.nextAction?.kind, 'ship');
   assert.equal(ready?.nextAction?.target, 'release-ops');
+});
+
+test('readTranscriptActivityTail reads trailing 8 KB, masks /home/ paths, caches by mtime, and updates cleanly', () => {
+  const dir = makeScratchDir('tail-peek-');
+  try {
+    const conv = 'aaaa1111-1111-4111-8111-111111111111';
+    const logDir = join(dir, 'brain', conv, '.system_generated', 'logs');
+    mkdirSync(logDir, { recursive: true });
+    const tp = join(logDir, 'transcript.jsonl');
+
+    // Seed > 10 KB of older history so bounded 8 KB reader skips earlier steps
+    const pad = 'x'.repeat(300);
+    const oldLines = Array.from({ length: 36 }, (_, i) =>
+      JSON.stringify({
+        step_index: i,
+        type: 'PLANNER_RESPONSE',
+        content: pad,
+        created_at: '2026-11-25T12:00:00Z',
+        tool_calls: [{ name: 'read_file', args: { Path: '/home/alice/repo/old.ts' } }],
+      }),
+    ).join('\n');
+    const latestStep = JSON.stringify({
+      step_index: 36,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-25T12:05:00Z',
+      tool_calls: [{ name: 'run_command', args: { CommandLine: 'cargo test --manifest-path /home/alice/work/app/Cargo.toml' } }],
+    });
+    writeFileSync(tp, `${oldLines}\n${latestStep}\n`);
+
+    const p1 = readTranscriptActivityTail(dir, conv);
+    assert.ok(p1);
+    assert.equal(p1.status, 'working');
+    assert.equal(p1.tool, 'run_command');
+    assert.ok(p1.label.includes('~/work/app/Cargo.toml'), `Expected ~/ masking, got ${p1.label}`);
+    assert.ok(!p1.label.includes('/home/'), `Leaked /home/: ${p1.label}`);
+
+    // Unchanged stat returns identical cached object
+    const p1Cached = readTranscriptActivityTail(dir, conv);
+    assert.equal(p1Cached, p1);
+
+    // Appending a swarm_wait step shifts tail peek to waiting
+    appendFileSync(
+      tp,
+      `${JSON.stringify({
+        step_index: 37,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-25T12:06:00Z',
+        tool_calls: [{ name: 'swarm_wait', args: { since: 10 } }],
+      })}\n`,
+    );
+    const p2 = readTranscriptActivityTail(dir, conv);
+    assert.equal(p2.status, 'waiting');
+    assert.equal(p2.tool, 'swarm_wait');
+    assert.equal(p2.label, 'Waiting for posts');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

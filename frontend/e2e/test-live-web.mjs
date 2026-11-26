@@ -69,6 +69,22 @@ await check("plan.json goal & humanized workstreams visible", async () => {
   return txt.includes("Deliver native aux-pane Swarm Command Center") && txt.includes("In progress");
 });
 
+await check("Roster & Triage show masked 1-line activityPeek for working and waiting workers", async () => {
+  await page.waitForSelector('[data-testid="triage-activity-peek-verifier"]');
+  const tPeek = await page.locator('[data-testid="triage-activity-peek-verifier"]').textContent();
+  await page.locator("#tab-roster").click();
+  const rBuilder = await page.locator('[data-testid="roster-activity-peek-builder"]').textContent();
+  const rUi = await page.locator('[data-testid="roster-activity-peek-ui-dev"]').textContent();
+  await page.locator("#tab-triage").click();
+  return (
+    tPeek.includes("waiting:") &&
+    tPeek.includes("~/workspace/fleet-ui") &&
+    !tPeek.includes("/home/") &&
+    rBuilder.includes("waiting: Run unit and security tests") &&
+    rUi.includes("working: Polishing 380px sidebar responsive grid")
+  );
+});
+
 await check("Geist woff2 fonts embedded & loaded with zero network font requests", async () => {
   return await page.evaluate(async () => {
     await document.fonts.ready;

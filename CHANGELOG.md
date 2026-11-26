@@ -3,6 +3,12 @@
 Each release is tagged `vMAJOR.MINOR.PATCH` and published on GitHub Releases as an
 Antigravity plugin archive (`tar.gz` and `zip`) with `SHA256SUMS`.
 
+## 1.18.0 - 2026-11-25
+
+- Added a bounded, strictly read-only, mtime-cached 8 KB tail reader (`readTranscriptActivityTail`) in `sidecars/fleet_pane/swarm_store.mjs` reusing the shared 32 KB chunk buffer and masking `/home/` and `/Users/` paths as `~/`, attaching `activityPeek` (`status`, `label`, `tool`, `ts`) to non-killed members in `buildSwarmSnapshot`, `frontend/src/types.ts`, and `frontend/scripts/web-engine.js`.
+- Added shared `<MemberActivityLine />` in `frontend/src/ui.tsx` rendered across Roster worker cards (`[data-testid="roster-activity-peek-*"]` in `RosterView.tsx`) and Triage attention rows (`[data-testid="triage-activity-peek-*"]` in `TriageView.tsx`) for both working and waiting workers.
+- Deferred background `server_core.mjs` warmup and `--jitless` `node:v8` tuning by 25 ms after standalone HTTP socket bind in `sidecars/fleet_pane/main.mjs` and set `--max-old-space-size=16` in `sidecars/fleet_pane/sidecar.json` (`39.59 ms` cold boot on `audit_runner.py`, `102.05 ms` `--jitless` boot, `63.61 MB` `--jitless` `VmHWM` on `2k/50k`, `4,764.6 req/s` keep-alive, `1,839.4 req/s` / `11.90 ms` p95 / `99.84 MB` default RSS / `0` errors / `30/30` fuzz / `5/5` SSE on `audit_runner.py` under `#154` isolation), refreshed all 8 `docs/screenshots/*.png`, and verified `12/12` backend unit tests, `51/51` gate, `8/8` replay, `13/13` live-web, and `SLOP 0/0/0`.
+
 ## 1.17.0 - 2026-11-25
 
 - Added a 1-click **Copy Handoff Digest** control (`[data-testid="copy-handoff-digest"]`) inside the Triage header in `frontend/src/components/TriageView.tsx` and upgraded `formatSwarmDigest` in `frontend/src/ui.tsx` to export plain-prose Markdown covering active goal, verification gate, gate readiness and wave velocity, worker states, verified deliverables, recent commit refs, blockers, and worktree safe-land readiness with zero local `/home/` path leaks.

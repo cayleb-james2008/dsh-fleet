@@ -673,6 +673,26 @@ export function ActivityPeek({ member, mode = "roster" }: { member: SwarmMember;
   );
 }
 
+/** Compact 1-line bounded transcript tail activity strip (`status`, label, age). */
+export function MemberActivityLine({ member, testId }: { member: SwarmMember; testId?: string }) {
+  if (member.killed) return null;
+  const peek = member.activityPeek;
+  const rawLabel = peek?.label || (member.activity ? `${member.activityKind === "thinking" ? "Thinking: " : ""}${member.activity}` : "");
+  const label = maskHome(rawLabel);
+  if (!label) return null;
+  const working = (peek?.status || member.status) === "working";
+  const ts = peek?.ts || member.transcriptMtime || 0;
+  return (
+    <p
+      data-testid={testId}
+      className={cn("row gap-2 text-[12px] min-w-0", working ? "text-info fleet-live-shimmer" : "text-ink-2")}
+    >
+      <span className="truncate">{working ? "working" : "waiting"}: {label}</span>
+      {ts > 0 && <span className="shrink-0 num text-ink-3">{fmtTimeAgo(ts)}</span>}
+    </p>
+  );
+}
+
 /** Shared pinned board posts list across Triage and Board views. */
 export function PinnedList({
   messages,

@@ -400,19 +400,27 @@ export function oneLine(s, maxLen = 96) {
   return out.length > maxLen ? `${out.slice(0, maxLen - 1).trimEnd()}…` : out;
 }
 
+const maskHomePath = (s) => String(s || '').replace(/\/(?:home|Users)\/[^/\s"'`]+(\/|$)/g, (_, sepCh) => `~${sepCh}`);
+
 function describeToolCall(tc) {
   const name = tc?.name || '';
   if (!name) return '';
   if (BOARD_ACTIVITY[name]) return BOARD_ACTIVITY[name];
   const args = tc.args && typeof tc.args === 'object' ? tc.args : {};
-  const summary = unquote(args.toolSummary) || unquote(args.toolAction);
-  if (summary) return oneLine(summary);
+  const summary = unquote(args.toolSummary) || unquote(args.toolAction) || unquote(args.Description);
+  if (summary) return oneLine(maskHomePath(summary));
+  if (name === 'run_command' && args.CommandLine) {
+    return oneLine(`Run ${maskHomePath(unquote(args.CommandLine))}`, 64);
+  }
+  if ((name === 'manage_task' || name === 'schedule') && (args.Action || args.Prompt)) {
+    return oneLine(maskHomePath(unquote(args.Action || args.Prompt)), 64);
+  }
   const filePath = unquote(args.Path || args.AbsolutePath || args.TargetFile);
   if (filePath) {
     const verb = { read_file: 'Read', write_file: 'Write', edit_file: 'Edit' }[name];
     if (verb) return `${verb} ${basename(filePath)}`;
   }
-  if (name === 'code_search' && args.Query) return oneLine(`Search ${unquote(args.Query)}`);
+  if (name === 'code_search' && args.Query) return oneLine(maskHomePath(`Search ${unquote(args.Query)}`));
   if (name === 'swarm' && args.action) return oneLine(`swarm ${unquote(args.action)} ${unquote(args.name)}`);
   return name;
 }
@@ -420,7 +428,7 @@ function describeToolCall(tc) {
 function thinkingHeading(thinking) {
   if (typeof thinking !== 'string') return '';
   const hs = [...thinking.matchAll(/(?:^|\n)\s*\*\*([^*\n]{3,96})\*\*\s*(?=\n|$)/g)];
-  return hs.length ? oneLine(hs[hs.length - 1][1]) : '';
+  return hs.length ? oneLine(maskHomePath(hs[hs.length - 1][1])) : '';
 }
 
 function turnEnded(tailSteps) {
@@ -465,7 +473,114 @@ function replyQuestion(text) {
 }
 
 const transcriptCache = new Map();
+const activityTailCache = new Map();
+const TAIL_PEEK_BYTES = 8192;
 const NO_TRANSCRIPT = { key: '-', summary: null };
+
+function parseTailActivitySteps(buf, len, partialStart) {
+  const steps = [];
+  let pos = 0;
+  if (partialStart) {
+    const firstNl = buf.indexOf(0x0a, 0);
+    if (firstNl < 0 || firstNl >= len) return steps;
+    pos = firstNl + 1;
+  }
+  for (let nl = buf.indexOf(0x0a, pos); nl >= 0 && nl < len; nl = buf.indexOf(0x0a, pos)) {
+    const line = buf.toString('utf8', pos, nl).trim();
+    pos = nl + 1;
+    if (!line) continue;
+    try {
+      const obj = JSON.parse(line);
+      if (obj && typeof obj === 'object' && !Array.isArray(obj)) steps.push(obj);
+    } catch {}
+  }
+  if (pos < len) {
+    const tailLine = buf.toString('utf8', pos, len).trim();
+    if (tailLine) {
+      try {
+        const obj = JSON.parse(tailLine);
+        if (obj && typeof obj === 'object' && !Array.isArray(obj)) steps.push(obj);
+      } catch {}
+    }
+  }
+  return steps;
+}
+
+/**
+ * Bounded, strictly read-only mtime-cached tail reader (~8 KB) exposing
+ * a compact 1-line `{ status, label, tool, ts }` activity peek per member
+ * with `/home/` and `/Users/` paths masked as `~/`.
+ */
+export function readTranscriptActivityTail(appData, conv) {
+  if (!appData || !conv || !ID_RE.test(conv)) return null;
+  const path = transcriptPath(appData, conv);
+  let st;
+  try {
+    st = statSync(path);
+  } catch {
+    activityTailCache.delete(path);
+    return null;
+  }
+  const key = `${st.ino}:${st.mtimeMs}:${st.size}`;
+  const cached = activityTailCache.get(path);
+  if (cached && cached.key === key) return cached.peek;
+
+  let bytesRead = 0;
+  const offset = Math.max(0, st.size - TAIL_PEEK_BYTES);
+  const fd = openSync(path, 'r');
+  try {
+    bytesRead = readSync(fd, SHARED_CHUNK_BUF, 0, Math.min(TAIL_PEEK_BYTES, st.size), offset);
+  } finally {
+    closeSync(fd);
+  }
+
+  const steps = parseTailActivitySteps(SHARED_CHUNK_BUF, bytesRead, offset > 0);
+  let peek = null;
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const step = steps[i];
+    if (!step) continue;
+    if (step.type === 'USER_INPUT') break;
+    const stepTs = boardTimeMs(step.created_at) || Math.floor(st.mtimeMs);
+    if (step.type === 'ERROR_MESSAGE') {
+      peek = {
+        status: 'waiting',
+        label: oneLine(maskHomePath(step.error || 'Model error'), 96),
+        tool: 'error',
+        ts: stepTs,
+      };
+      break;
+    }
+    if (step.type !== 'PLANNER_RESPONSE') continue;
+    const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+    const labeledCall = [...calls].reverse().find((c) => describeToolCall(c));
+    if (labeledCall) {
+      const name = String(labeledCall.name || '');
+      const isWaiting = name === 'swarm_wait' || Boolean(labeledCall.args?.IsDaemon);
+      peek = {
+        status: isWaiting ? 'waiting' : 'working',
+        label: maskHomePath(describeToolCall(labeledCall)),
+        tool: name || 'tool',
+        ts: stepTs,
+      };
+      break;
+    }
+    const th = thinkingHeading(step.thinking);
+    if (th) {
+      peek = {
+        status: calls.length === 0 ? 'waiting' : 'working',
+        label: maskHomePath(th),
+        tool: 'thinking',
+        ts: stepTs,
+      };
+      break;
+    }
+  }
+  if (!peek && st.size > 0) {
+    peek = { status: 'waiting', label: 'Idle on turn', tool: '', ts: Math.floor(st.mtimeMs) };
+  }
+  lruSet(activityTailCache, path, { key, peek }, 32);
+  return peek;
+}
 
 function num(v) {
   return Number.isFinite(v) && v >= 0 ? v : 0;
@@ -1398,6 +1513,20 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
       unread = visibleUnread(name, storedRole, current, msgs, last, channels);
       chanFields = { channels: effectiveChannels(storedRole, current, name).filter((c) => typeof c === 'string') };
     }
+    const tailPeek = !m.killed ? readTranscriptActivityTail(appData, m.conversation_id) : null;
+    const status = statusOf(m, tr);
+    const activityPeek = !m.killed
+      ? tailPeek
+        ? {
+            status: tailPeek.tool === 'swarm_wait' ? 'waiting' : status === 'killed' ? 'waiting' : status,
+            label: tailPeek.label,
+            tool: tailPeek.tool,
+            ts: tailPeek.ts,
+          }
+        : tr?.activity
+          ? { status, label: maskHomePath(tr.activity), tool: tr.activityKind || '', ts: tr.mtime || 0 }
+          : null
+      : null;
     const usage = tr?.usage || { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, totalTokens: 0 };
     totalInputTokens += usage.inputTokens;
     totalCacheReadTokens += usage.cacheReadTokens;
@@ -1409,7 +1538,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
       model: m.model || tr?.model || '',
       role,
       wake_mode: m.wake_mode || '',
-      status: statusOf(m, tr),
+      status,
       wait_since: Number(m.wait_since) || 0,
       last_read_seq: last,
       unread,
@@ -1417,6 +1546,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
       steps: tr?.steps || 0,
       activity: tr?.activity || '',
       activityKind: tr?.activityKind || '',
+      activityPeek,
       replied: !!tr?.replied,
       replyAsk: tr?.replyAsk || '',
       narrator: narratorRank(name, m) >= 0,

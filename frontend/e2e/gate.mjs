@@ -560,6 +560,25 @@ await runChecks("gate", async (check) => {
     return bannerTxt.includes("Live updates paused");
   });
 
+  await check("live per-worker activityPeek renders masked 1-line tool, status, and age on Triage attention and Roster", async () => {
+    const tPeek = page.locator('[data-testid="triage-activity-peek-verifier"]');
+    await tPeek.waitFor();
+    const tTxt = await tPeek.textContent();
+    await page.locator("#tab-roster").click();
+    await page.waitForSelector("#panel-roster");
+    const rBuilder = await page.locator('[data-testid="roster-activity-peek-builder"]').textContent();
+    const rVerifier = await page.locator('[data-testid="roster-activity-peek-verifier"]').textContent();
+    await page.locator("#tab-triage").click();
+    return (
+      tTxt.includes("working: Read main.mjs") &&
+      !tTxt.includes("/home/") &&
+      rBuilder.includes("waiting: Run sidecar security tests") &&
+      rVerifier.includes("working: Read main.mjs") &&
+      !rBuilder.includes("/home/") &&
+      !rVerifier.includes("/home/")
+    );
+  });
+
   // 26-28: Clean runtime guarantees
   await check("zero console errors", () => consoleErrors.length === 0);
   await check("zero uncaught page errors", () => pageErrors.length === 0);
