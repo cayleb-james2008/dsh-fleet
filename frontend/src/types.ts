@@ -133,6 +133,21 @@ export interface SwarmSummary {
   lastActivityTs: number;
 }
 
+export interface BurnWorker {
+  name: string;
+  totalTokens: number;
+  sharePct: number;
+  level: "normal" | "warn" | "critical";
+  killed?: boolean;
+}
+
+export interface BurnSummary {
+  totalTokens: number;
+  topWorker: BurnWorker | null;
+  highBurnCount: number;
+  workers: BurnWorker[];
+}
+
 export interface SwarmSnapshot {
   conversationId: string | null;
   swarm: string | null;
@@ -151,6 +166,7 @@ export interface SwarmSnapshot {
   frames?: FrameAsset[];
   allowedFiles?: Record<string, string>;
   triage?: TriageItem[];
+  burnSummary?: BurnSummary;
   usage?: TokenUsage;
   unseen?: number[];
   swarms?: SwarmSummary[];

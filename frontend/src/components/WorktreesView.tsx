@@ -12,6 +12,9 @@ const FILE_TONE: Record<string, "success" | "warning" | "danger" | "neutral"> = 
   R: "warning",
 };
 
+const diffLineCls = (l: string) =>
+  l[0] === "+" && !l.startsWith("+++") ? "text-ok" : l[0] === "-" && !l.startsWith("---") ? "text-danger" : l.startsWith("@@") ? "text-info" : "text-ink-2";
+
 export function WorktreesView({
   workspaceUris,
   payload,
@@ -89,18 +92,14 @@ export function WorktreesView({
         </form>
       )}
 
-      {allRoots.length === 0 ? (
+      {allRoots.length === 0 || worktrees.length === 0 ? (
         <Card className="p-4 space-y-1 bg-board">
-          <p className="text-[14px] font-medium text-ink">No open workspace folder</p>
-          <p className="text-[13px] text-ink-2">
-            Open a workspace folder or enter a local repository path above.
+          <p className="text-[14px] font-medium text-ink">
+            {allRoots.length === 0 ? "No open workspace folder" : loading ? "Inspecting worktrees..." : "No git worktrees detected."}
           </p>
-        </Card>
-      ) : worktrees.length === 0 ? (
-        <Card className="p-4 bg-board">
-          <p className="text-[14px] text-ink-2">
-            {loading ? "Inspecting worktrees..." : "No git worktrees detected."}
-          </p>
+          {allRoots.length === 0 && (
+            <p className="text-[13px] text-ink-2">Open a workspace folder or enter a local repository path above.</p>
+          )}
         </Card>
       ) : (
         <div className="space-y-2">
@@ -158,10 +157,8 @@ export function WorktreesView({
                     const diffOpen = openDiffKey === key;
                     const diffEntry = diffByKey[key];
                     const diffBusy = diffLoadingKey === key;
-                    const diffLineCls = (l: string) =>
-    l[0] === "+" && !l.startsWith("+++") ? "text-ok" : l[0] === "-" && !l.startsWith("---") ? "text-danger" : l.startsWith("@@") ? "text-info" : "text-ink-2";
 
-  return (
+                    return (
                       <li key={f.path} className="py-1 space-y-1">
                         <div className="row flex-wrap">
                           <div className="flex items-center gap-1 min-w-0 flex-1">

@@ -424,6 +424,25 @@
       },
       { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, totalTokens: 0 },
     );
+    var burnRows = sw.members
+      .filter(function (m) { return !m.roleWorker && m.usage.totalTokens > 0; })
+      .map(function (m) {
+        var tok = m.usage.totalTokens;
+        var sharePct = usage.totalTokens > 0 ? Math.round((tok / usage.totalTokens) * 100) : 0;
+        var level = tok >= 400000 || (usage.totalTokens >= 20000 && sharePct >= 65 && sw.members.length >= 2)
+          ? "critical"
+          : tok >= 150000 || (usage.totalTokens >= 10000 && sharePct >= 45 && sw.members.length >= 2)
+            ? "warn"
+            : "normal";
+        return { name: m.name, totalTokens: tok, sharePct: sharePct, level: level, killed: Boolean(m.killed) };
+      })
+      .sort(function (a, b) { return b.totalTokens - a.totalTokens || a.name.localeCompare(b.name); });
+    var burnSummary = {
+      totalTokens: usage.totalTokens,
+      topWorker: burnRows[0] || null,
+      highBurnCount: burnRows.filter(function (r) { return r.level !== "normal"; }).length,
+      workers: burnRows.slice(0, 6),
+    };
     return {
       conversationId: sw.id,
       swarm: sw.id,
@@ -438,6 +457,7 @@
       plan: sw.plan,
       frames: sw.frames,
       triage: triage,
+      burnSummary: burnSummary,
       usage: usage,
       capabilities: { canSendMessage: true, isSidecar: false, sseStream: false },
     };
@@ -546,7 +566,7 @@
       return jsonResp({ ok: true, delivered: targets.length });
     }
     if (url.pathname === "/api/health") {
-      return jsonResp({ ok: true, name: "fleet", version: "1.10.0", mode: "live-web", canSendMessage: true, sseStream: false });
+      return jsonResp({ ok: true, name: "fleet", version: "1.11.0", mode: "live-web", canSendMessage: true, sseStream: false });
     }
     if (url.pathname === "/api/swarms") {
       return jsonResp({ swarms: listSwarms(), defaultConversationId: COORD_ID });

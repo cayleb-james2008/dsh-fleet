@@ -573,7 +573,7 @@ export function App() {
           <div className="rounded-card bg-board p-3 text-[12px] text-ink-2 space-y-1">
             <div className="flex items-center gap-1 font-medium text-ink">
               <CommandIcon />
-              <span>Fleet Antigravity Plugin v1.10.0</span>
+              <span>Fleet Antigravity Plugin v1.11.0</span>
             </div>
             <p>Loopback swarm &amp; worktree monitor. Zero telemetry.</p>
           </div>

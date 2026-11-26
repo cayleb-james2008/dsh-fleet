@@ -229,7 +229,7 @@ export function createFleetHandlers({
       healthPacked = pack({
         ok: true,
         name: 'fleet',
-        version: '1.10.0',
+        version: '1.11.0',
         mode: isSidecar ? 'sidecar' : 'standalone',
         canSendMessage: Boolean(sendMessageFn),
         sseStream: !isSidecar,
@@ -272,7 +272,7 @@ export function createFleetHandlers({
       );
       const unchangedPacked = pack({ conversationId: id, swarm: id, member, unchanged: true, etag: fullEtag });
       if (swarmPayloadCache.has(cacheKey)) swarmPayloadCache.delete(cacheKey);
-      else if (swarmPayloadCache.size >= 3) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
+      else if (swarmPayloadCache.size >= 2) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
       swarmPayloadCache.set(cacheKey, {
         checkedAt: now,
         appData,
@@ -414,7 +414,7 @@ export function createFleetHandlers({
     if (!includeRaw) {
       const unchangedPacked = pack({ conversationId: conv, swarm: res.swarm, member: res.member, unchanged: true, etag });
       if (swarmPayloadCache.has(cacheKey)) swarmPayloadCache.delete(cacheKey);
-      else if (swarmPayloadCache.size >= 3) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
+      else if (swarmPayloadCache.size >= 2) swarmPayloadCache.delete(swarmPayloadCache.keys().next().value);
       swarmPayloadCache.set(cacheKey, {
         checkedAt: now,
         appData: res.appData,
@@ -439,7 +439,7 @@ export function createFleetHandlers({
     const data = await probeWorktrees(rootsKey);
     const packed = pack(data);
     if (worktreesPayloadCache.has(rootsKey)) worktreesPayloadCache.delete(rootsKey);
-    else if (worktreesPayloadCache.size >= 3) worktreesPayloadCache.delete(worktreesPayloadCache.keys().next().value);
+    else if (worktreesPayloadCache.size >= 2) worktreesPayloadCache.delete(worktreesPayloadCache.keys().next().value);
     worktreesPayloadCache.set(rootsKey, { at: now, packed });
     return packed;
   }

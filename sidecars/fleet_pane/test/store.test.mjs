@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parsePorcelainWorktrees, probeWorktreeDiff, probeWorktrees } from '../git_probe.mjs';
-import { buildSwarmSnapshot, listSwarms, summarizeTranscript } from '../swarm_store.mjs';
+import { buildSwarmSnapshot, computeBurnSummary, listSwarms, summarizeTranscript } from '../swarm_store.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -264,4 +264,30 @@ test('git_probe parses porcelain output, inspects real git worktrees, and reject
   } finally {
     rmSync(repoDir, { recursive: true, force: true });
   }
+});
+
+test('computeBurnSummary flags top consumer share and high-burn levels cleanly', () => {
+  const burn = computeBurnSummary(
+    [
+      { name: 'coordinator', usage: { totalTokens: 6000 }, roleWorker: false },
+      { name: 'builder', usage: { totalTokens: 28000 }, roleWorker: false },
+      { name: 'narrator-1', usage: { totalTokens: 999999 }, roleWorker: true },
+    ],
+    34000,
+  );
+  assert.equal(burn.topWorker?.name, 'builder');
+  assert.equal(burn.topWorker?.sharePct, 82);
+  assert.equal(burn.topWorker?.level, 'critical');
+  assert.equal(burn.highBurnCount, 1);
+  assert.equal(burn.workers.length, 2);
+
+  const warnBurn = computeBurnSummary(
+    [
+      { name: 'coordinator', usage: { totalTokens: 7000 }, roleWorker: false },
+      { name: 'builder', usage: { totalTokens: 8000 }, roleWorker: false },
+    ],
+    15000,
+  );
+  assert.equal(warnBurn.topWorker?.level, 'warn');
+  assert.equal(warnBurn.topWorker?.sharePct, 53);
 });
