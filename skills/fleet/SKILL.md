@@ -50,11 +50,13 @@ When the **Fleet** sidecar pane is enabled (`fleet/fleet_pane`), surface a singl
 
 ## Operator control directives
 
-When the operator triggers an action from the Fleet sidecar pane, the sidecar sends the coordinator a message whose first line starts with `[fleet-operator:<op>]`. Treat these directives as confirmed operator instructions and run them right away using your native swarm tools.
+When the operator triggers an action from the Fleet sidecar pane, the sidecar sends the coordinator a message whose first line starts with `[fleet-operator:<op>]` and carries `opId=<opId>` (nudge messages carry `[opId=<opId>]` as well). Treat these directives as confirmed operator instructions and run them right away using your native swarm tools.
 
-- `[fleet-operator:board_post]`: Post the message body to the swarm board with `post_message`, keeping the requested channel or `#seq` citation when specified.
-- `[fleet-operator:spawn_worker]`: Spawn the named worker with `swarm` (`action: "add"`) using the requested `workspace` mode (`inherit`, `share`, or `branch`), optional `model`, and optional `fork`.
-- `[fleet-operator:switch_model]`: Switch the named waiting worker to the requested model with `swarm` (`action: "model"`), keeping its conversation history intact.
-- `[fleet-operator:kill_worker]`: Verify that the worker's `share` or `branch` workspace is merged or landed before calling `swarm` (`action: "kill"`), unless `forceUnmerged=true` is present in the header.
-- `[fleet-operator:channel_op]`: Apply the requested `create`, `archive`, `subscribe`, or `unsubscribe` channel operation for the named channel and member.
-- `[fleet-operator:gate_verdict]`: Post the operator's `[verified]`, `[blocked]`, or `ship` verdict to the board referencing the target `#seq` and member, then update `plan.json` if a workstream or milestone status changed.
+When you answer or confirm an operator directive on the board, include `[opId=<opId>]` in the resulting post so Fleet's `fleet_ops.json` ledger marks the command verified instead of timing out after 45 seconds:
+
+- `[fleet-operator:board_post]`: Post the message body to the swarm board with `post_message`, keeping the requested channel, `#seq` citation, and `[opId=<opId>]` tag.
+- `[fleet-operator:spawn_worker]`: Spawn the named worker with `swarm` (`action: "add"`) using the requested `workspace` mode (`inherit`, `share`, or `branch`), optional `model`, and optional `fork`, then post `[opId=<opId>]` if announcing readiness.
+- `[fleet-operator:switch_model]`: Switch the named waiting, stopped, or errored worker (or a working worker when `allowWorking` was approved) to the requested model with `swarm` (`action: "model"`), keeping its conversation history intact, and tag `[opId=<opId>]` on any confirmation post.
+- `[fleet-operator:kill_worker]`: Verify that the worker's `share` or `branch` workspace is merged or landed before calling `swarm` (`action: "kill"`), unless `forceUnmerged=true` is present in the header, and tag `[opId=<opId>]` if posting confirmation.
+- `[fleet-operator:channel_op]`: Apply the requested `create`, `archive`, `subscribe`, or `unsubscribe` channel operation for the named channel and member, and tag `[opId=<opId>]` when confirming.
+- `[fleet-operator:gate_verdict]`: Post the operator's `[verified]`, `[blocked]`, or `ship` verdict to the board referencing the target `#seq`, member, and `[opId=<opId>]`, then update `plan.json` if a workstream or milestone status changed.

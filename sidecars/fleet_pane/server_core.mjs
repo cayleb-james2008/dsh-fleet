@@ -9,6 +9,7 @@
  *    pre-serialized/pre-gzipped cached JSON snapshots, security headers,
  *    Host loopback-403 check, prompt 413 payload enforcement, and `/preload.js`.
  */
+import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, watch } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
@@ -241,15 +242,21 @@ export function createFleetHandlers({
     computeSwarmFingerprint,
     findAppDataDirs,
     findCoordinatorConvId,
+    getMemberLiveState,
     getSwarmMetaKeys,
+    getSwarmOpContext,
     getSwarmRoster,
     listSwarms,
     oneLine,
+    readOperatorOps,
     readTranscriptSteps,
+    reconcileOperatorOps,
+    recordOperatorOp,
     resolveAllowedFrame,
     resolveConversationSwarm,
     roleOf,
     unseenBy,
+    updateOperatorOp,
     validatePlanPatch,
     writeSwarmPlan,
   } = store;
@@ -549,7 +556,7 @@ export function createFleetHandlers({
     const swDir = join(appData, 'brain', swarmId, '.system_generated', 'swarm');
     const paths = [];
     if (existsSync(swDir)) paths.push(swDir);
-    for (const f of ['board.jsonl', 'members.json', 'plan.json', 'view.json']) {
+    for (const f of ['board.jsonl', 'members.json', 'plan.json', 'view.json', 'fleet_ops.json']) {
       const p = join(swDir, f);
       if (existsSync(p)) paths.push(p);
     }
@@ -919,10 +926,43 @@ export function createFleetHandlers({
     }
   }
 
+  const generateOpId = () => `op-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
+
+  function dispatchMessageAsync(targets, swarmRef, opId) {
+    setImmediate(() => {
+      Promise.resolve()
+        .then(async () => {
+          for (const t of targets) {
+            await sendMessageFn(t.convId, t.text);
+          }
+        })
+        .catch((err) => {
+          if (swarmRef?.appData && swarmRef?.swarm && opId && updateOperatorOp) {
+            const msg = oneLine ? oneLine(String(err?.message || err), 240) : String(err?.message || err).slice(0, 240);
+            updateOperatorOp(swarmRef.appData, swarmRef.swarm, opId, (rec) => ({
+              publicOp: {
+                ...rec.publicOp,
+                status: 'failed',
+                updatedAt: new Date().toISOString(),
+                error: msg || 'Dispatch failed',
+              },
+              meta: rec.meta,
+            }));
+            invalidateSwarmPayloadCache(swarmRef.swarm);
+          }
+        });
+    });
+  }
+
   async function postNudge(body = {}) {
-    if (!body || body.confirm !== true) {
+    if (!body || typeof body !== 'object' || Array.isArray(body) || body.confirm !== true) {
       return { status: 400, json: { error: 'Confirmation required (confirm: true)' } };
     }
+    const clientOpChk = checkControlString(body.clientOpId, 'clientOpId', { required: false, maxLen: 64, singleLine: true });
+    if (!clientOpChk.ok) {
+      return { status: 400, json: { error: clientOpChk.error } };
+    }
+    const clientOpId = clientOpChk.value || null;
     const rawMsg = typeof body.message === 'string' ? body.message : '';
     if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(rawMsg)) {
       return { status: 400, json: { error: 'Control characters are not permitted in nudge message' } };
@@ -932,11 +972,11 @@ export function createFleetHandlers({
       return { status: 400, json: { error: 'Non-empty message (<= 4000 chars) required' } };
     }
     const rawIds = Array.isArray(body.conversationIds) ? body.conversationIds : null;
+    let targets = [];
     if (rawIds) {
       if (rawIds.length === 0 || rawIds.length > 24) {
         return { status: 400, json: { error: 'Between 1 and 24 target conversationIds required' } };
       }
-      const targets = [];
       const seen = new Set();
       for (const item of rawIds) {
         const id = typeof item === 'string' ? item.trim() : '';
@@ -954,24 +994,91 @@ export function createFleetHandlers({
           json: { error: 'Direct agent broadcast requires live Antigravity sidecar runtime' },
         };
       }
-      const results = [];
-      for (const id of targets) {
-        results.push(await sendMessageFn(id, message));
+    } else {
+      const targetConv = typeof body.conversationId === 'string' ? body.conversationId.trim() : '';
+      if (!targetConv || !ID_RE.test(targetConv)) {
+        return { status: 400, json: { error: 'Valid target conversationId required' } };
       }
-      return { status: 200, json: { ok: true, delivered: targets.length, results } };
+      if (!sendMessageFn) {
+        return {
+          status: 501,
+          json: { error: 'Direct agent nudge requires live Antigravity sidecar runtime' },
+        };
+      }
+      targets = [targetConv];
     }
-    const targetConv = typeof body.conversationId === 'string' ? body.conversationId.trim() : '';
-    if (!targetConv || !ID_RE.test(targetConv)) {
-      return { status: 400, json: { error: 'Valid target conversationId required' } };
+
+    const opId = generateOpId();
+    const nowIso = new Date().toISOString();
+    const taggedMessage = `${message}\n[opId=${opId}]`;
+    const appDataDirs = getAppDirs();
+    const res = resolveConversationSwarm(appDataDirs, targets[0]);
+    const opCtx = res?.swarm && res?.appData && getSwarmOpContext ? getSwarmOpContext(res.appData, res.swarm) : null;
+    const coordinatorId = opCtx?.coordinatorId || '';
+    const coordinatorState = opCtx?.coordinatorState || 'unknown';
+
+    if (res?.swarm && res?.appData && recordOperatorOp) {
+      const rec = recordOperatorOp(
+        res.appData,
+        res.swarm,
+        {
+          opId,
+          clientOpId,
+          op: 'nudge',
+          target: targets.length > 1 ? targets.join(',') : targets[0],
+          payload: { conversationIds: targets, message },
+          status: 'dispatched',
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          coordinatorId,
+          resolvedSeq: null,
+          error: null,
+        },
+        {
+          baselineSeq: opCtx?.baselineSeq || 0,
+          baselinePlanKey: opCtx?.baselinePlanKey,
+          dispatchedAt: nowIso,
+        },
+      );
+      if (!rec.ok && rec.status === 403) {
+        return { status: 403, json: { error: rec.error || 'Operator ops path outside brain root' } };
+      }
+      invalidateSwarmPayloadCache(res.swarm);
     }
-    if (!sendMessageFn) {
+
+    dispatchMessageAsync(
+      targets.map((convId) => ({ convId, text: taggedMessage })),
+      res?.swarm && res?.appData ? res : null,
+      opId,
+    );
+
+    if (rawIds) {
       return {
-        status: 501,
-        json: { error: 'Direct agent nudge requires live Antigravity sidecar runtime' },
+        status: 200,
+        json: {
+          ok: true,
+          opId,
+          clientOpId,
+          status: 'dispatched',
+          coordinatorState,
+          delivered: targets.length,
+          results: targets.map((id) => ({ ok: true, opId, conversationId: id, status: 'dispatched' })),
+          deliveredAt: nowIso,
+        },
       };
     }
-    const result = await sendMessageFn(targetConv, message);
-    return { status: 200, json: { ok: true, result } };
+    return {
+      status: 200,
+      json: {
+        ok: true,
+        opId,
+        clientOpId,
+        status: 'dispatched',
+        coordinatorState,
+        result: { ok: true, opId, status: 'dispatched' },
+        deliveredAt: nowIso,
+      },
+    };
   }
 
   function invalidateSwarmPayloadCache(swarmId) {
@@ -1103,6 +1210,80 @@ export function createFleetHandlers({
     return { ok: true, value: trimmed };
   }
 
+  const inlineClean = (s, max = 160) => (oneLine ? oneLine(s, max) : String(s).replace(/\s+/g, ' ').trim().slice(0, max));
+
+  function buildControlDirective(op, payload, opId) {
+    const p = payload && typeof payload === 'object' ? payload : {};
+    if (op === 'board_post') {
+      const channel = typeof p.channel === 'string' && p.channel ? p.channel : 'main';
+      const replyToSeq = Number(p.replyToSeq) || 0;
+      const text = typeof p.text === 'string' ? p.text : '';
+      const header = `[fleet-operator:board_post] opId=${opId} channel=#${channel}${replyToSeq ? ` replyTo=#${replyToSeq}` : ''}`;
+      const bodyLine = replyToSeq && !text.includes(`#${replyToSeq}`) ? `Re #${replyToSeq}: ${text}` : text;
+      return `${header}\nPost on the swarm board${channel !== 'main' ? ` in #${channel}` : ''} (include [opId=${opId}]):\n${bodyLine}`;
+    }
+    if (op === 'spawn_worker') {
+      const name = String(p.name || '');
+      const workspaceMode = String(p.workspaceMode || 'inherit');
+      const channel = typeof p.channel === 'string' ? p.channel : '';
+      const model = typeof p.model === 'string' ? p.model : '';
+      const forkFrom = typeof p.forkFrom === 'string' ? p.forkFrom : '';
+      const brief = String(p.brief || '');
+      const header = `[fleet-operator:spawn_worker] opId=${opId} name=${name} workspace=${workspaceMode}${channel ? ` channel=#${channel}` : ''}${model ? ` model=${model}` : ''}${forkFrom ? ` forkFrom=${forkFrom}` : ''}`;
+      return `${header}\nSpawn worker ${name} via swarm(action:"add", name:${JSON.stringify(name)}, workspace:${JSON.stringify(workspaceMode)}${model ? `, model:${JSON.stringify(model)}` : ''}${forkFrom ? `, fork:${JSON.stringify(forkFrom)}` : ''}) and post [opId=${opId}] once ready with brief:\n${brief}`;
+    }
+    if (op === 'switch_model') {
+      const member = String(p.member || '');
+      const model = String(p.model || '');
+      const reason = typeof p.reason === 'string' ? p.reason : '';
+      const header = `[fleet-operator:switch_model] opId=${opId} member=${member} model=${model}${reason ? ` reason=${inlineClean(reason, 160)}` : ''}`;
+      return `${header}\nSwitch @${member} to model ${model} via swarm(action:"model", name:${JSON.stringify(member)}, model:${JSON.stringify(model)})${reason ? `. Reason: ${reason}` : '.'} Tag [opId=${opId}] if posting confirmation.`;
+    }
+    if (op === 'kill_worker') {
+      const member = String(p.member || '');
+      const forceUnmerged = p.forceUnmerged === true;
+      const reason = typeof p.reason === 'string' ? p.reason : '';
+      const header = `[fleet-operator:kill_worker] opId=${opId} member=${member} forceUnmerged=${forceUnmerged}${reason ? ` reason=${inlineClean(reason, 160)}` : ''}`;
+      return `${header}\nKill worker @${member} via swarm(action:"kill", name:${JSON.stringify(member)})${forceUnmerged ? ' (operator confirmed forceUnmerged=true)' : ''}${reason ? `. Reason: ${reason}` : '.'} Tag [opId=${opId}] if posting confirmation.`;
+    }
+    if (op === 'channel_op') {
+      const action = String(p.action || '');
+      const channel = String(p.channel || '');
+      const member = typeof p.member === 'string' ? p.member : '';
+      const topic = typeof p.topic === 'string' ? p.topic : '';
+      const header = `[fleet-operator:channel_op] opId=${opId} action=${action} channel=#${channel}${member ? ` member=${member}` : ''}${topic ? ` topic=${inlineClean(topic, 160)}` : ''}`;
+      return `${header}\nRun channel operation ${action} on #${channel}${member ? ` for @${member}` : ''}${topic ? ` with topic ${JSON.stringify(topic)}` : ''} and tag [opId=${opId}].`;
+    }
+    if (op === 'gate_verdict') {
+      const verdict = String(p.verdict || '');
+      const seq = Number(p.seq) || 0;
+      const targetMember = typeof p.targetMember === 'string' ? p.targetMember : '';
+      const note = String(p.note || '');
+      const header = `[fleet-operator:gate_verdict] opId=${opId} verdict=${verdict} seq=#${seq}${targetMember ? ` targetMember=${targetMember}` : ''}`;
+      return `${header}\nOperator gate verdict [${verdict}] on #${seq}${targetMember ? ` for @${targetMember}` : ''} (include [opId=${opId}]):\n${note}`;
+    }
+    return '';
+  }
+
+  function checkSwitchModelState(appData, roster, memberName, allowWorking) {
+    const membersMap = roster?.members && typeof roster.members === 'object' ? roster.members : null;
+    const memberObj = membersMap && Object.hasOwn(membersMap, memberName) ? membersMap[memberName] : null;
+    if (membersMap && !memberObj) {
+      return { ok: false, status: 404, json: { error: `Member "${memberName}" not found in swarm` } };
+    }
+    if (memberObj?.killed) {
+      return { ok: false, status: 409, json: { error: 'worker_not_waiting', status: 'killed' } };
+    }
+    if (!allowWorking && memberObj && getMemberLiveState) {
+      const live = getMemberLiveState(appData, memberObj);
+      const allowed = live.status === 'waiting' || live.status === 'stopped' || Boolean(live.failure);
+      if (!allowed) {
+        return { ok: false, status: 409, json: { error: 'worker_not_waiting', status: live.status } };
+      }
+    }
+    return { ok: true };
+  }
+
   async function postControl(body = {}) {
     if (!body || typeof body !== 'object' || Array.isArray(body) || body.confirm !== true) {
       return { status: 400, json: { error: 'Confirmation required (confirm: true)' } };
@@ -1118,11 +1299,16 @@ export function createFleetHandlers({
     }
 
     const bad = (error) => ({ status: 400, json: { error } });
-    const inlineClean = (s, max = 160) => (oneLine ? oneLine(s, max) : String(s).replace(/\s+/g, ' ').trim().slice(0, max));
+    const clientOpChk = checkControlString(body.clientOpId, 'clientOpId', { required: false, maxLen: 64, singleLine: true });
+    if (!clientOpChk.ok) return bad(clientOpChk.error);
+    const clientOpId = clientOpChk.value || null;
 
-    let directive = '';
+    let target = '';
+    let payload = {};
     let killTarget = '';
     let forceUnmerged = false;
+    let switchTarget = '';
+    let allowWorking = false;
 
     if (op === 'board_post') {
       const textChk = checkControlString(body.text, 'text', { required: true, maxLen: 4000 });
@@ -1144,11 +1330,8 @@ export function createFleetHandlers({
         }
         replyToSeq = body.replyToSeq;
       }
-      const header = `[fleet-operator:board_post] channel=#${channel}${replyToSeq ? ` replyTo=#${replyToSeq}` : ''}`;
-      const bodyLine = replyToSeq && !textChk.value.includes(`#${replyToSeq}`)
-        ? `Re #${replyToSeq}: ${textChk.value}`
-        : textChk.value;
-      directive = `${header}\nPost on the swarm board${channel !== 'main' ? ` in #${channel}` : ''}:\n${bodyLine}`;
+      target = `#${channel}`;
+      payload = { channel, text: textChk.value, ...(replyToSeq ? { replyToSeq } : {}) };
     } else if (op === 'spawn_worker') {
       const nameChk = checkControlString(body.name, 'name', { required: true, maxLen: 64, singleLine: true });
       if (!nameChk.ok) return bad(nameChk.error);
@@ -1175,8 +1358,15 @@ export function createFleetHandlers({
       if (forkChk.value && ((!MEMBER_REF_RE.test(forkChk.value) && !ID_RE.test(forkChk.value)) || RESERVED_MEMBER_REFS.has(forkChk.value.toLowerCase()))) {
         return bad('Invalid forkFrom member');
       }
-      const header = `[fleet-operator:spawn_worker] name=${name} workspace=${workspaceMode}${channel ? ` channel=#${channel}` : ''}${modelChk.value ? ` model=${modelChk.value}` : ''}${forkChk.value ? ` forkFrom=${forkChk.value}` : ''}`;
-      directive = `${header}\nSpawn worker ${name} via swarm(action:"add", name:${JSON.stringify(name)}, workspace:${JSON.stringify(workspaceMode)}${modelChk.value ? `, model:${JSON.stringify(modelChk.value)}` : ''}${forkChk.value ? `, fork:${JSON.stringify(forkChk.value)}` : ''}) with brief:\n${briefChk.value}`;
+      target = name;
+      payload = {
+        name,
+        brief: briefChk.value,
+        workspaceMode,
+        ...(channel ? { channel } : {}),
+        ...(modelChk.value ? { model: modelChk.value } : {}),
+        ...(forkChk.value ? { forkFrom: forkChk.value } : {}),
+      };
     } else if (op === 'switch_model') {
       const memChk = checkControlString(body.member, 'member', { required: true, maxLen: 64, singleLine: true });
       if (!memChk.ok || !MEMBER_REF_RE.test(memChk.value) || RESERVED_MEMBER_REFS.has(memChk.value.toLowerCase())) {
@@ -1184,10 +1374,20 @@ export function createFleetHandlers({
       }
       const modelChk = checkControlString(body.model, 'model', { required: true, maxLen: 256, singleLine: true });
       if (!modelChk.ok) return bad(modelChk.error);
+      if (body.allowWorking !== undefined && typeof body.allowWorking !== 'boolean') {
+        return bad('allowWorking must be a boolean');
+      }
       const reasonChk = checkControlString(body.reason, 'reason', { required: false, maxLen: 4000, singleLine: true });
       if (!reasonChk.ok) return bad(reasonChk.error);
-      const header = `[fleet-operator:switch_model] member=${memChk.value} model=${modelChk.value}${reasonChk.value ? ` reason=${inlineClean(reasonChk.value, 160)}` : ''}`;
-      directive = `${header}\nSwitch @${memChk.value} to model ${modelChk.value} via swarm(action:"model", name:${JSON.stringify(memChk.value)}, model:${JSON.stringify(modelChk.value)})${reasonChk.value ? `. Reason: ${reasonChk.value}` : '.'}`;
+      switchTarget = memChk.value;
+      allowWorking = body.allowWorking === true;
+      target = switchTarget;
+      payload = {
+        member: switchTarget,
+        model: modelChk.value,
+        ...(allowWorking ? { allowWorking: true } : {}),
+        ...(reasonChk.value ? { reason: reasonChk.value } : {}),
+      };
     } else if (op === 'kill_worker') {
       const memChk = checkControlString(body.member, 'member', { required: true, maxLen: 64, singleLine: true });
       if (!memChk.ok || !MEMBER_REF_RE.test(memChk.value) || RESERVED_MEMBER_REFS.has(memChk.value.toLowerCase())) {
@@ -1200,8 +1400,13 @@ export function createFleetHandlers({
       if (!reasonChk.ok) return bad(reasonChk.error);
       killTarget = memChk.value;
       forceUnmerged = body.forceUnmerged === true;
-      const header = `[fleet-operator:kill_worker] member=${killTarget} forceUnmerged=${forceUnmerged}${reasonChk.value ? ` reason=${inlineClean(reasonChk.value, 160)}` : ''}`;
-      directive = `${header}\nKill worker @${killTarget} via swarm(action:"kill", name:${JSON.stringify(killTarget)})${forceUnmerged ? ' (operator confirmed forceUnmerged=true)' : ''}${reasonChk.value ? `. Reason: ${reasonChk.value}` : '.'}`;
+      target = killTarget;
+      payload = {
+        member: killTarget,
+        forceUnmerged,
+        ...(body.explicit === true || body.allowProtected === true || body.forceProtected === true ? { allowProtected: true } : {}),
+        ...(reasonChk.value ? { reason: reasonChk.value } : {}),
+      };
     } else if (op === 'channel_op') {
       const action = typeof body.action === 'string' ? body.action.trim() : '';
       if (!CHANNEL_ACTIONS.has(action)) {
@@ -1221,8 +1426,13 @@ export function createFleetHandlers({
       if (memChk.value && (!MEMBER_REF_RE.test(memChk.value) || RESERVED_MEMBER_REFS.has(memChk.value.toLowerCase()))) {
         return bad('Invalid member name');
       }
-      const header = `[fleet-operator:channel_op] action=${action} channel=#${channel}${memChk.value ? ` member=${memChk.value}` : ''}${topicChk.value ? ` topic=${inlineClean(topicChk.value, 160)}` : ''}`;
-      directive = `${header}\nRun channel operation ${action} on #${channel}${memChk.value ? ` for @${memChk.value}` : ''}${topicChk.value ? ` with topic ${JSON.stringify(topicChk.value)}` : ''}.`;
+      target = `#${channel}`;
+      payload = {
+        action,
+        channel,
+        ...(memChk.value ? { member: memChk.value } : {}),
+        ...(topicChk.value ? { topic: topicChk.value } : {}),
+      };
     } else if (op === 'gate_verdict') {
       const verdict = typeof body.verdict === 'string' ? body.verdict.trim() : '';
       if (!GATE_VERDICTS.has(verdict)) {
@@ -1238,8 +1448,13 @@ export function createFleetHandlers({
       }
       const noteChk = checkControlString(body.note, 'note', { required: true, maxLen: 4000 });
       if (!noteChk.ok) return bad(noteChk.error);
-      const header = `[fleet-operator:gate_verdict] verdict=${verdict} seq=#${body.seq}${targetChk.value ? ` targetMember=${targetChk.value}` : ''}`;
-      directive = `${header}\nOperator gate verdict [${verdict}] on #${body.seq}${targetChk.value ? ` for @${targetChk.value}` : ''}:\n${noteChk.value}`;
+      target = targetChk.value || `#${body.seq}`;
+      payload = {
+        verdict,
+        seq: body.seq,
+        ...(targetChk.value ? { targetMember: targetChk.value } : {}),
+        note: noteChk.value,
+      };
     }
 
     const appDataDirs = getAppDirs();
@@ -1253,6 +1468,11 @@ export function createFleetHandlers({
       : null;
     if (!coordinatorId) {
       return { status: 404, json: { error: 'Coordinator conversation not found' } };
+    }
+
+    if (op === 'switch_model') {
+      const swChk = checkSwitchModelState(res.appData, roster, switchTarget, allowWorking);
+      if (!swChk.ok) return { status: swChk.status, json: swChk.json };
     }
 
     if (op === 'kill_worker') {
@@ -1296,16 +1516,253 @@ export function createFleetHandlers({
       };
     }
 
-    await sendMessageFn(coordinatorId, directive);
-    const deliveredAt = new Date().toISOString();
+    const opId = generateOpId();
+    const directive = buildControlDirective(op, payload, opId);
+    const nowIso = new Date().toISOString();
+    const opCtx = getSwarmOpContext ? getSwarmOpContext(res.appData, res.swarm) : null;
+    const coordinatorState = opCtx?.coordinatorState || 'unknown';
+
+    if (recordOperatorOp) {
+      const rec = recordOperatorOp(
+        res.appData,
+        res.swarm,
+        {
+          opId,
+          clientOpId,
+          op,
+          target,
+          payload,
+          status: 'dispatched',
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          coordinatorId,
+          resolvedSeq: null,
+          error: null,
+        },
+        {
+          baselineSeq: opCtx?.baselineSeq || 0,
+          baselinePlanKey: opCtx?.baselinePlanKey,
+          dispatchedAt: nowIso,
+          ...(op === 'kill_worker' ? { existedAtDispatch: true } : {}),
+        },
+      );
+      if (!rec.ok) {
+        return { status: rec.status || 403, json: { error: rec.error || 'Failed to record operator command' } };
+      }
+      invalidateSwarmPayloadCache(res.swarm);
+    }
+
+    dispatchMessageAsync([{ convId: coordinatorId, text: directive }], res, opId);
+
     return {
       status: 200,
       json: {
         ok: true,
+        opId,
+        clientOpId,
+        status: 'dispatched',
+        coordinatorState,
         op,
         coordinatorId,
         directivePreview: inlineClean(directive, 240),
-        deliveredAt,
+        deliveredAt: nowIso,
+      },
+    };
+  }
+
+  const OP_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+  const OPS_ACTIONS = new Set(['retry', 'dismiss', 'mark_verified']);
+
+  function getOps(query = {}) {
+    const q = query && typeof query === 'object' && !Array.isArray(query) ? query : {};
+    let requestedConv = '';
+    if (q.conversationId !== undefined) {
+      if (typeof q.conversationId !== 'string') {
+        return { status: 400, packed: pack({ ok: false, error: 'Valid conversationId required' }) };
+      }
+      requestedConv = q.conversationId.trim();
+      if (!requestedConv || !ID_RE.test(requestedConv)) {
+        return { status: 400, packed: pack({ ok: false, error: 'Valid conversationId required' }) };
+      }
+    }
+    const appDataDirs = getAppDirs();
+    let conv = requestedConv || defaultConversationId;
+    if (!conv) {
+      const swarmsData = getSwarmsEntry().swarms;
+      if (swarmsData.length) conv = swarmsData[0].id;
+    }
+    if (!conv || !ID_RE.test(conv)) {
+      return { status: 404, packed: pack({ ok: false, error: 'Swarm not found' }) };
+    }
+    const res = resolveConversationSwarm(appDataDirs, conv);
+    if (!res.swarm || !res.appData) {
+      return { status: 404, packed: pack({ ok: false, error: 'Swarm not found' }) };
+    }
+    if (readOperatorOps) {
+      const chk = readOperatorOps(res.appData, res.swarm);
+      if (!chk.ok) {
+        return { status: chk.status || 403, packed: pack({ ok: false, error: chk.error || 'Operator ops not accessible' }) };
+      }
+    }
+    const reconciled = reconcileOperatorOps ? reconcileOperatorOps(res.appData, res.swarm) : { ops: [] };
+    return {
+      status: 200,
+      packed: pack({
+        ok: true,
+        conversationId: conv,
+        swarm: res.swarm,
+        ops: reconciled.ops,
+      }),
+    };
+  }
+
+  async function postOpsAction(body = {}) {
+    if (!body || typeof body !== 'object' || Array.isArray(body) || body.confirm !== true) {
+      return { status: 400, json: { error: 'Confirmation required (confirm: true)' } };
+    }
+    const convChk = checkControlString(body.conversationId, 'conversationId', { required: true, maxLen: 128, singleLine: true });
+    if (!convChk.ok || !ID_RE.test(convChk.value)) {
+      return { status: 400, json: { error: 'Valid conversationId required' } };
+    }
+    const opIdChk = checkControlString(body.opId, 'opId', { required: true, maxLen: 128, singleLine: true });
+    if (!opIdChk.ok || !OP_ID_RE.test(opIdChk.value)) {
+      return { status: 400, json: { error: opIdChk.ok ? 'Valid opId required' : opIdChk.error } };
+    }
+    const action = typeof body.action === 'string' ? body.action.trim() : '';
+    if (!OPS_ACTIONS.has(action)) {
+      return { status: 400, json: { error: 'action must be retry, dismiss, or mark_verified' } };
+    }
+    if (body.allowWorking !== undefined && typeof body.allowWorking !== 'boolean') {
+      return { status: 400, json: { error: 'allowWorking must be a boolean' } };
+    }
+
+    const conv = convChk.value;
+    const opId = opIdChk.value;
+    const appDataDirs = getAppDirs();
+    const res = resolveConversationSwarm(appDataDirs, conv);
+    if (!res.swarm || !res.appData) {
+      return { status: 404, json: { error: 'Swarm not found' } };
+    }
+
+    const readRes = readOperatorOps ? readOperatorOps(res.appData, res.swarm) : { ok: true, ops: [] };
+    if (!readRes.ok) {
+      return { status: readRes.status || 403, json: { error: readRes.error || 'Operator ops not accessible' } };
+    }
+    const existing = readRes.ops.find((o) => o.opId === opId);
+    if (!existing) {
+      return { status: 404, json: { error: `Operator command "${opId}" not found` } };
+    }
+
+    const nowIso = new Date().toISOString();
+    if (action === 'dismiss' || action === 'mark_verified') {
+      const nextStatus = action === 'dismiss' ? 'dismissed' : 'verified';
+      const upd = updateOperatorOp(res.appData, res.swarm, opId, (rec) => ({
+        publicOp: {
+          ...rec.publicOp,
+          status: nextStatus,
+          updatedAt: nowIso,
+          ...(nextStatus === 'verified' ? { error: null } : {}),
+        },
+        meta: rec.meta,
+      }));
+      if (!upd.ok) {
+        return { status: upd.status || 400, json: { error: upd.error || 'Failed to update operator command' } };
+      }
+      invalidateSwarmPayloadCache(res.swarm);
+      return {
+        status: 200,
+        json: {
+          ok: true,
+          action,
+          opId,
+          status: upd.op.status,
+          op: upd.op,
+          ops: upd.ops,
+        },
+      };
+    }
+
+    // action === 'retry'
+    if (!sendMessageFn) {
+      return {
+        status: 501,
+        json: { error: 'Swarm control requires live Antigravity sidecar runtime' },
+      };
+    }
+
+    const opCtx = getSwarmOpContext ? getSwarmOpContext(res.appData, res.swarm) : null;
+    const coordinatorState = opCtx?.coordinatorState || 'unknown';
+    let targets = [];
+    let nextMeta = {
+      baselineSeq: opCtx?.baselineSeq || 0,
+      baselinePlanKey: opCtx?.baselinePlanKey,
+      dispatchedAt: nowIso,
+    };
+
+    if (existing.op === 'nudge') {
+      const pIds = Array.isArray(existing.payload?.conversationIds)
+        ? existing.payload.conversationIds.filter((x) => typeof x === 'string' && ID_RE.test(x))
+        : [];
+      const convIds = pIds.length ? pIds : ID_RE.test(existing.target) ? [existing.target] : [];
+      if (!convIds.length) {
+        return { status: 400, json: { error: 'Cannot retry nudge without valid target conversationId' } };
+      }
+      const msg = typeof existing.payload?.message === 'string' ? existing.payload.message : '';
+      const tagged = `${msg}\n[opId=${opId}]`;
+      targets = convIds.map((convId) => ({ convId, text: tagged }));
+    } else if (CONTROL_OPS.has(existing.op)) {
+      const coordId = opCtx?.coordinatorId || existing.coordinatorId || '';
+      if (!coordId) {
+        return { status: 404, json: { error: 'Coordinator conversation not found' } };
+      }
+      if (existing.op === 'switch_model') {
+        const allowWorking = body.allowWorking === true || existing.payload?.allowWorking === true;
+        const memName = typeof existing.payload?.member === 'string' ? existing.payload.member : existing.target;
+        const swChk = checkSwitchModelState(res.appData, opCtx?.roster, memName, allowWorking);
+        if (!swChk.ok) return { status: swChk.status, json: swChk.json };
+      } else if (existing.op === 'kill_worker') {
+        const memName = typeof existing.payload?.member === 'string' ? existing.payload.member : existing.target;
+        const membersMap = opCtx?.roster?.members && typeof opCtx.roster.members === 'object' ? opCtx.roster.members : null;
+        const memberObj = membersMap && Object.hasOwn(membersMap, memName) ? membersMap[memName] : null;
+        if (membersMap && !memberObj) {
+          return { status: 404, json: { error: `Member "${memName}" not found in swarm` } };
+        }
+        if (memberObj?.killed) {
+          return { status: 409, json: { error: `Member "${memName}" is already killed` } };
+        }
+        nextMeta.existedAtDispatch = true;
+      }
+      const directive = buildControlDirective(existing.op, existing.payload, opId);
+      targets = [{ convId: coordId, text: directive }];
+    } else {
+      return { status: 400, json: { error: 'Unsupported op for retry' } };
+    }
+
+    const upd = updateOperatorOp(res.appData, res.swarm, opId, (rec) => ({
+      publicOp: {
+        ...rec.publicOp,
+        status: 'dispatched',
+        updatedAt: nowIso,
+        resolvedSeq: null,
+        error: null,
+      },
+      meta: nextMeta,
+    }));
+    if (!upd.ok) {
+      return { status: upd.status || 400, json: { error: upd.error || 'Failed to retry operator command' } };
+    }
+    invalidateSwarmPayloadCache(res.swarm);
+    dispatchMessageAsync(targets, res, opId);
+    return {
+      status: 200,
+      json: {
+        ok: true,
+        action,
+        opId,
+        status: 'dispatched',
+        coordinatorState,
+        op: upd.op,
+        ops: upd.ops,
       },
     };
   }
@@ -1345,9 +1802,11 @@ export function createFleetHandlers({
     getWorktreeDiff,
     getTranscript,
     getFrame,
+    getOps,
     postNudge,
     postPlan,
     postControl,
+    postOpsAction,
     postWorktreeAction,
     resolveStreamTarget,
   };
@@ -1730,6 +2189,13 @@ export async function createStandaloneRouter({
         sendPacked(req, res, out.status, out.packed);
       });
     }
+    if (req.method === 'GET' && pathname === '/api/ops') {
+      const q = parseQueryFast(search);
+      return withHandlers((h) => {
+        const out = h.getOps(q);
+        sendPacked(req, res, out.status, out.packed);
+      });
+    }
     if (req.method === 'GET' && pathname === '/api/frame') {
       const q = parseQueryFast(search);
       return withHandlers((h) => {
@@ -1798,6 +2264,9 @@ export async function createStandaloneRouter({
     }
     if (req.method === 'POST' && pathname === '/api/control') {
       return handleJsonPost(req, res, (h, body) => h.postControl(body));
+    }
+    if (req.method === 'POST' && pathname === '/api/ops/action') {
+      return handleJsonPost(req, res, (h, body) => h.postOpsAction(body));
     }
     if (req.method === 'POST' && pathname === '/api/worktrees/action') {
       return handleJsonPost(req, res, (h, body) => h.postWorktreeAction(body), MAX_WORKTREE_ACTION_BYTES);
@@ -1907,6 +2376,10 @@ export async function runSidecarApp({ appDataDir = '' } = {}) {
     const out = handlers.getTranscript(data);
     return new Response(out.packed.raw, { status: out.status, contentType: 'application/json', headers: SECURITY_HEADERS });
   }, 'GET');
+  app.api('/api/ops', (data) => {
+    const out = handlers.getOps(data);
+    return new Response(out.packed.raw, { status: out.status, contentType: 'application/json', headers: SECURITY_HEADERS });
+  }, 'GET');
   app.api('/api/frame', (data) => {
     const out = handlers.getFrame(data);
     return new Response(out.body, { status: out.status, contentType: out.contentType, headers: out.headers || SECURITY_HEADERS });
@@ -1953,6 +2426,7 @@ export async function runSidecarApp({ appDataDir = '' } = {}) {
 
   registerJsonPost('/api/plan', (payload) => handlers.postPlan(payload));
   registerJsonPost('/api/control', (payload) => handlers.postControl(payload));
+  registerJsonPost('/api/ops/action', (payload) => handlers.postOpsAction(payload));
   registerJsonPost('/api/worktrees/action', (payload) => handlers.postWorktreeAction(payload), MAX_WORKTREE_ACTION_BYTES);
 
   await app.run();

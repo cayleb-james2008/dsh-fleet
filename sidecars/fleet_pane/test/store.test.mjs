@@ -12,6 +12,7 @@ import {
   probeWorktrees,
 } from '../git_probe.mjs';
 import {
+  OPS_TIMEOUT_MS,
   buildSwarmDelta,
   buildSwarmSnapshot,
   computeBurnSummary,
@@ -19,10 +20,14 @@ import {
   findCoordinatorConvId,
   getBoardTailStats,
   getModelSpec,
+  getSwarmOpContext,
   listSwarms,
   normalizePlan,
+  readOperatorOps,
   readTranscriptActivityTail,
   readTranscriptSteps,
+  reconcileOperatorOps,
+  recordOperatorOp,
   summarizeTranscript,
   writeSwarmPlan,
 } from '../swarm_store.mjs';
@@ -2062,6 +2067,242 @@ test('E3 hardening: clamps negative/NaN/Infinity tokens, guards division-by-zero
     assert.equal(burn.cacheHitPct, 0);
     assert.equal(burn.costUsd, 0.5);
     assert.equal(Number.isFinite(burn.topWorker?.sharePct), true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('fleet_ops.json enforces atomic 64-entry ring persistence, sanitization, corrupt recovery, and CWE-22/CWE-59 confinement', () => {
+  const dir = makeScratchDir('ops-ring-');
+  try {
+    const coordId = '11111111-1111-4111-8111-111111111111';
+    const swDir = join(dir, 'brain', coordId, '.system_generated', 'swarm');
+    mkdirSync(swDir, { recursive: true });
+    writeFileSync(
+      join(swDir, 'members.json'),
+      JSON.stringify({
+        title: 'Ops Ring Swarm',
+        members: { coordinator: { conversation_id: coordId, role: 'coordinator', wake_mode: 'mentions' } },
+      }),
+    );
+
+    // Record 70 entries -> strictly retains latest 64
+    for (let i = 1; i <= 70; i++) {
+      const payload = JSON.parse(`{"channel":"main","text":"post-${i}","__proto__":{"polluted":true}}`);
+      const res = recordOperatorOp(dir, coordId, {
+        opId: `op-${i}`,
+        clientOpId: `cli-${i}`,
+        op: 'board_post',
+        target: '#main',
+        payload,
+        status: 'dispatched',
+        createdAt: new Date(1_700_000_000_000 + i * 100).toISOString(),
+        updatedAt: new Date(1_700_000_000_000 + i * 100).toISOString(),
+        coordinatorId: coordId,
+        resolvedSeq: null,
+        error: null,
+      }, { baselineSeq: i });
+      assert.equal(res.ok, true);
+    }
+
+    const readBack = readOperatorOps(dir, coordId);
+    assert.equal(readBack.ok, true);
+    assert.equal(readBack.ops.length, 64);
+    assert.equal(readBack.ops[0].opId, 'op-7');
+    assert.equal(readBack.ops[63].opId, 'op-70');
+    assert.equal(Object.hasOwn(readBack.ops[63].payload, '__proto__'), false);
+    assert.equal(Object.hasOwn(readBack.ops[63], '_meta'), false);
+    assert.equal(({}).polluted, undefined);
+
+    // Corrupt fleet_ops.json recovers safely to []
+    const opsPath = join(swDir, 'fleet_ops.json');
+    writeFileSync(opsPath, '{corrupt json');
+    assert.deepEqual(readOperatorOps(dir, coordId), { ok: true, ops: [] });
+    const snapCorrupt = buildSwarmSnapshot(dir, coordId);
+    assert.deepEqual(snapCorrupt.ops, []);
+
+    // CWE-22 traversal and CWE-59 symlink escape fail closed
+    assert.equal(readOperatorOps(dir, '../escape').ok, false);
+    const outsideFile = join(dir, 'outside-ops.json');
+    writeFileSync(outsideFile, '[]');
+    rmSync(opsPath, { force: true });
+    symlinkSync(outsideFile, opsPath);
+    const symRead = readOperatorOps(dir, coordId);
+    assert.equal(symRead.ok, false);
+    assert.equal(symRead.status, 403);
+    const symWrite = recordOperatorOp(dir, coordId, { opId: 'op-sym', op: 'nudge', target: coordId });
+    assert.equal(symWrite.ok, false);
+    assert.equal(symWrite.status, 403);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('reconcileOperatorOps verifies via board/members/plan, handles ERROR_MESSAGE & 45000ms timeout, and updates snapshots & deltas', () => {
+  const dir = makeScratchDir('ops-reconcile-');
+  try {
+    const coordId = '11111111-1111-4111-8111-111111111111';
+    const workerId = '22222222-2222-4222-8222-222222222222';
+    const swDir = join(dir, 'brain', coordId, '.system_generated', 'swarm');
+    const coordLogs = join(dir, 'brain', coordId, '.system_generated', 'logs');
+    mkdirSync(swDir, { recursive: true });
+    mkdirSync(coordLogs, { recursive: true });
+
+    const membersPath = join(swDir, 'members.json');
+    const boardPath = join(swDir, 'board.jsonl');
+    const planPath = join(swDir, 'plan.json');
+    const coordTrPath = join(coordLogs, 'transcript.jsonl');
+
+    const t0 = Date.now();
+    const t0Iso = new Date(t0).toISOString();
+
+    writeFileSync(
+      membersPath,
+      JSON.stringify({
+        title: 'Reconcile Swarm',
+        members: {
+          coordinator: { conversation_id: coordId, role: 'coordinator', wake_mode: 'mentions' },
+          worker: { conversation_id: workerId, role: 'worker', model: 'gemini-2.5-flash', wake_mode: 'mentions' },
+          builder: { conversation_id: '44444444-4444-4444-8444-444444444444', role: 'worker', model: 'gemini-2.5-flash', wake_mode: 'mentions' },
+        },
+      }),
+    );
+    writeFileSync(boardPath, JSON.stringify({ seq: 1, agent: 'coordinator', text: 'Init' }) + '\n');
+    writeFileSync(planPath, JSON.stringify({ title: 'Seed', milestones: [{ title: 'Gate', status: 'in_progress' }] }));
+    // Pre-existing ERROR_MESSAGE before t0 must NOT fail ops dispatched at t0
+    writeFileSync(
+      coordTrPath,
+      JSON.stringify({
+        step_index: 0,
+        type: 'ERROR_MESSAGE',
+        created_at: new Date(t0 - 10_000).toISOString(),
+        error: 'Stale error before dispatch',
+      }) + '\n',
+    );
+
+    const opsSeed = [
+      { opId: 'op-spawn', op: 'spawn_worker', target: 'qa-bot', payload: { name: 'qa-bot' } },
+      { opId: 'op-model', op: 'switch_model', target: 'builder', payload: { member: 'builder', model: 'gemini-3-pro' } },
+      { opId: 'op-kill', op: 'kill_worker', target: 'worker', payload: { member: 'worker' } },
+      { opId: 'op-post', op: 'board_post', target: '#backend', payload: { channel: 'backend', text: 'Run smoke tests' } },
+      { opId: 'op-chan', op: 'channel_op', target: '#ops', payload: { action: 'create', channel: 'ops' } },
+      { opId: 'op-gate-plan', op: 'gate_verdict', target: '#1', payload: { verdict: 'verified', seq: 1, note: 'ok' } },
+      { opId: 'op-tag', op: 'nudge', target: workerId, payload: { conversationIds: [workerId], message: 'Ping' } },
+      { opId: 'op-stale', op: 'board_post', target: '#main', payload: { channel: 'main', text: 'Never answered' } },
+    ];
+    const initialCtx = getSwarmOpContext(dir, coordId);
+    for (const o of opsSeed) {
+      recordOperatorOp(
+        dir,
+        coordId,
+        {
+          ...o,
+          clientOpId: null,
+          status: 'dispatched',
+          createdAt: t0Iso,
+          updatedAt: t0Iso,
+          coordinatorId: coordId,
+          resolvedSeq: null,
+          error: null,
+        },
+        {
+          baselineSeq: initialCtx.baselineSeq,
+          baselinePlanKey: initialCtx.baselinePlanKey,
+          dispatchedAt: t0Iso,
+          existedAtDispatch: o.op === 'kill_worker',
+        },
+      );
+    }
+
+    // Before any evidence and before 45s -> all remain dispatched
+    const r0 = reconcileOperatorOps(dir, coordId, { now: t0 + 10_000 });
+    assert.equal(r0.ops.every((o) => o.status === 'dispatched'), true);
+
+    // Apply evidence on members.json, board.jsonl, and plan.json
+    writeFileSync(
+      membersPath,
+      JSON.stringify({
+        title: 'Reconcile Swarm',
+        members: {
+          coordinator: { conversation_id: coordId, role: 'coordinator', wake_mode: 'mentions' },
+          worker: { conversation_id: workerId, role: 'worker', model: 'gemini-2.5-flash', killed: true },
+          builder: { conversation_id: '44444444-4444-4444-8444-444444444444', role: 'worker', model: 'gemini-3-pro', wake_mode: 'mentions' },
+          'qa-bot': { conversation_id: '33333333-3333-4333-8333-333333333333', role: 'worker' },
+        },
+      }),
+    );
+    appendFileSync(
+      boardPath,
+      [
+        JSON.stringify({ seq: 2, agent: 'coordinator', channel: 'backend', text: 'Run smoke tests right now' }),
+        JSON.stringify({ seq: 3, agent: 'coordinator', text: 'Channel created', control: { op: 'create', channel: 'ops' } }),
+        JSON.stringify({ seq: 4, agent: 'worker', text: 'Acknowledged [opId=op-tag]' }),
+      ].join('\n') + '\n',
+    );
+    writeFileSync(planPath, JSON.stringify({ title: 'Seed', milestones: [{ title: 'Gate', status: 'done' }] }));
+
+    const snapBeforeTimeout = buildSwarmSnapshot(dir, coordId);
+    const byId1 = Object.fromEntries(snapBeforeTimeout.ops.map((o) => [o.opId, o]));
+    assert.equal(byId1['op-spawn'].status, 'verified');
+    assert.equal(byId1['op-model'].status, 'verified');
+    assert.equal(byId1['op-kill'].status, 'verified');
+    assert.equal(byId1['op-post'].status, 'verified');
+    assert.equal(byId1['op-post'].resolvedSeq, 2);
+    assert.equal(byId1['op-chan'].status, 'verified');
+    assert.equal(byId1['op-chan'].resolvedSeq, 3);
+    assert.equal(byId1['op-gate-plan'].status, 'verified');
+    assert.equal(byId1['op-tag'].status, 'verified');
+    assert.equal(byId1['op-tag'].resolvedSeq, 4);
+    assert.equal(byId1['op-stale'].status, 'dispatched');
+
+    // Past 45000ms -> op-stale transitions to timed_out
+    const rTimeout = reconcileOperatorOps(dir, coordId, { now: t0 + OPS_TIMEOUT_MS + 100 });
+    const staleAfter = rTimeout.ops.find((o) => o.opId === 'op-stale');
+    assert.equal(staleAfter.status, 'timed_out');
+
+    // New op fails when coordinator transcript emits ERROR_MESSAGE after createdAt, reflected in buildSwarmDelta
+    const deltaInit = buildSwarmDelta({ appData: dir, conversationId: coordId, since: 4 });
+    const t1 = Date.now();
+    const t1Iso = new Date(t1).toISOString();
+    recordOperatorOp(
+      dir,
+      coordId,
+      {
+        opId: 'op-err',
+        clientOpId: null,
+        op: 'board_post',
+        target: '#main',
+        payload: { channel: 'main', text: 'Will fail' },
+        status: 'dispatched',
+        createdAt: t1Iso,
+        updatedAt: t1Iso,
+        coordinatorId: coordId,
+        resolvedSeq: null,
+        error: null,
+      },
+      { baselineSeq: 4, dispatchedAt: t1Iso },
+    );
+    appendFileSync(
+      coordTrPath,
+      JSON.stringify({
+        step_index: 1,
+        type: 'ERROR_MESSAGE',
+        created_at: new Date(t1 + 5).toISOString(),
+        error: 'Rate limit Bearer sk-secret123456',
+      }) + '\n',
+    );
+    const deltaAfterErr = buildSwarmDelta({
+      appData: dir,
+      conversationId: coordId,
+      since: 4,
+      prevEtag: deltaInit.etag,
+    });
+    assert.equal(deltaAfterErr.mode, 'delta');
+    assert.notEqual(deltaAfterErr.etag, deltaInit.etag);
+    const failedOp = deltaAfterErr.ops.find((o) => o.opId === 'op-err');
+    assert.equal(failedOp.status, 'failed');
+    assert.ok(failedOp.error.includes('Rate limit'));
+    assert.ok(!failedOp.error.includes('sk-secret123456'));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

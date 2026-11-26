@@ -1049,7 +1049,7 @@ test('POST /api/control executes all 6 ops, enforces 400/403/404/409/413/501 gua
       },
       {
         op: 'switch_model',
-        payload: { confirm: true, conversationId: fx.coord, op: 'switch_model', member: 'worker', model: 'gemini-3-pro', reason: 'quota exhausted' },
+        payload: { confirm: true, conversationId: fx.coord, op: 'switch_model', member: 'worker', model: 'gemini-3-pro', allowWorking: true, reason: 'quota exhausted' },
       },
       {
         op: 'channel_op',
@@ -1066,9 +1066,12 @@ test('POST /api/control executes all 6 ops, enforces 400/403/404/409/413/501 gua
       assert.equal(res.status, 200, `Expected 200 for ${item.op}`);
       const json = await res.json();
       assert.equal(json.ok, true);
+      assert.ok(typeof json.opId === 'string' && json.opId.startsWith('op-'));
+      assert.equal(json.status, 'dispatched');
+      assert.ok(typeof json.coordinatorState === 'string' && json.coordinatorState.length > 0);
       assert.equal(json.op, item.op);
       assert.equal(json.coordinatorId, fx.coord);
-      assert.ok(json.directivePreview.startsWith(`[fleet-operator:${item.op}]`));
+      assert.ok(json.directivePreview.startsWith(`[fleet-operator:${item.op}] opId=${json.opId}`));
       assert.ok(typeof json.deliveredAt === 'string' && json.deliveredAt.length > 0);
     }
 
@@ -1854,6 +1857,314 @@ test('E1/E2 HTTP hardening: rapid delta reconnects clean waiters without cap exh
     assert.ok(!trJson.steps[0].content.includes('ab12'));
     assert.ok(!trJson.steps[0].content.includes('ghp_1234'));
     assert.ok(!trJson.steps[0].content.includes('sk-ab12'));
+  } finally {
+    await srv.close();
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test('Closed-loop operator control: async non-blocking dispatch, 409 worker_not_waiting, GET /api/ops, POST /api/ops/action, and SidecarApp RPC', async () => {
+  const fx = setupFixtureAppData();
+  const swDir = join(fx.appData, 'brain', fx.coord, '.system_generated', 'swarm');
+  const boardPath = join(swDir, 'board.jsonl');
+  const membersPath = join(swDir, 'members.json');
+  const erroredWorker = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const stoppedWorker = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  const waitingWorker = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+
+  const errLogs = join(fx.appData, 'brain', erroredWorker, '.system_generated', 'logs');
+  mkdirSync(errLogs, { recursive: true });
+  writeFileSync(
+    join(errLogs, 'transcript.jsonl'),
+    JSON.stringify({ step_index: 0, type: 'ERROR_MESSAGE', error: 'quota exhausted' }) + '\n',
+  );
+
+  writeFileSync(
+    membersPath,
+    JSON.stringify({
+      title: 'Ops Control Loop',
+      members: {
+        coordinator: { conversation_id: fx.coord, role: 'coordinator', wake_mode: 'mentions' },
+        working_bot: { conversation_id: fx.worker, role: 'worker' },
+        waiting_bot: { conversation_id: waitingWorker, role: 'worker', wake_mode: 'mentions' },
+        stopped_bot: { conversation_id: stoppedWorker, role: 'worker', state: 'stopped' },
+        errored_bot: { conversation_id: erroredWorker, role: 'worker' },
+      },
+    }),
+  );
+  writeFileSync(boardPath, JSON.stringify({ seq: 1, agent: 'coordinator', text: '@all init' }) + '\n');
+
+  let sendMode = 'hang'; // 'hang' | 'fail' | 'ok'
+  const delivered = [];
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+    sendMessageFn: async (conv, msg) => {
+      delivered.push({ conv, msg });
+      if (sendMode === 'hang') {
+        await new Promise((r) => setTimeout(r, 1500));
+        return { ok: true };
+      }
+      if (sendMode === 'fail') {
+        throw new Error('RPC transport failed');
+      }
+      return { ok: true };
+    },
+  });
+
+  try {
+    const post = (path, body, headers = {}) =>
+      fetch(`${srv.url}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify(body),
+      });
+
+    // 1. switch_model rejects working worker with 409 { error: 'worker_not_waiting', status: 'working' }
+    const workingReject = await post('/api/control', {
+      confirm: true,
+      conversationId: fx.coord,
+      op: 'switch_model',
+      member: 'working_bot',
+      model: 'gemini-3-pro',
+    });
+    assert.equal(workingReject.status, 409);
+    assert.deepEqual(await workingReject.json(), { error: 'worker_not_waiting', status: 'working' });
+    assert.equal(delivered.length, 0);
+
+    // 2. switch_model allows waiting, stopped, errored, and allowWorking=true
+    for (const payload of [
+      { member: 'waiting_bot', model: 'gemini-3-pro' },
+      { member: 'stopped_bot', model: 'gemini-3-pro' },
+      { member: 'errored_bot', model: 'gemini-3-pro' },
+      { member: 'working_bot', model: 'gemini-3-pro', allowWorking: true },
+    ]) {
+      const r = await post('/api/control', { confirm: true, conversationId: fx.coord, op: 'switch_model', ...payload });
+      assert.equal(r.status, 200);
+    }
+
+    // 3. clientOpId > 64 chars rejected 400; valid clientOpId accepted and returned
+    assert.equal(
+      (await post('/api/control', { confirm: true, conversationId: fx.coord, op: 'board_post', text: 'x', clientOpId: 'c'.repeat(65) })).status,
+      400,
+    );
+    assert.equal(
+      (await post('/api/nudge', { confirm: true, conversationId: fx.worker, message: 'x', clientOpId: 'bad\ncli' })).status,
+      400,
+    );
+
+    // 4. Non-blocking dispatch: even when sendMessageFn hangs 1500ms, POST /api/control and POST /api/nudge return < 250ms
+    const tStart = Date.now();
+    const ctrlRes = await post('/api/control', {
+      confirm: true,
+      conversationId: fx.coord,
+      clientOpId: 'ui-post-42',
+      op: 'board_post',
+      channel: 'main',
+      text: 'Verify non-blocking dispatch',
+    });
+    const ctrlElapsed = Date.now() - tStart;
+    assert.equal(ctrlRes.status, 200);
+    assert.ok(ctrlElapsed < 400, `Expected non-blocking return, took ${ctrlElapsed}ms`);
+    const ctrlJson = await ctrlRes.json();
+    assert.equal(ctrlJson.ok, true);
+    assert.equal(ctrlJson.clientOpId, 'ui-post-42');
+    assert.equal(ctrlJson.status, 'dispatched');
+    assert.equal(ctrlJson.coordinatorState, 'waiting');
+    assert.ok(ctrlJson.opId);
+
+    const tNudge = Date.now();
+    const nudgeRes = await post('/api/nudge', {
+      confirm: true,
+      conversationId: waitingWorker,
+      clientOpId: 'ui-nudge-1',
+      message: 'Check status',
+    });
+    assert.equal(nudgeRes.status, 200);
+    assert.ok(Date.now() - tNudge < 400);
+    const nudgeJson = await nudgeRes.json();
+    assert.equal(nudgeJson.status, 'dispatched');
+    assert.equal(nudgeJson.coordinatorState, 'waiting');
+    assert.ok(nudgeJson.opId);
+
+    // Wait one tick so setImmediate delivers to sendMessageFn mock and verify [opId=...] tagging
+    await new Promise((r) => setTimeout(r, 25));
+    const ctrlDelivered = delivered.find((d) => d.msg.includes(`opId=${ctrlJson.opId}`));
+    assert.ok(ctrlDelivered);
+    const nudgeDelivered = delivered.find((d) => d.msg.includes(`[opId=${nudgeJson.opId}]`));
+    assert.ok(nudgeDelivered);
+
+    // 5. GET /api/ops reconciles when board.jsonl tags [opId=<opId>], and delta exposes ops
+    const deltaBefore = await (await fetch(`${srv.url}/api/swarm/delta?conversationId=${fx.coord}&since=1`)).json();
+    assert.ok(Array.isArray(deltaBefore.ops));
+
+    appendFileSync(boardPath, JSON.stringify({ seq: 2, agent: 'coordinator', text: `Done [opId=${ctrlJson.opId}]` }) + '\n');
+    const opsAfterRes = await fetch(`${srv.url}/api/ops?conversationId=${fx.coord}`);
+    assert.equal(opsAfterRes.status, 200);
+    const opsAfter = await opsAfterRes.json();
+    const verifiedCtrl = opsAfter.ops.find((o) => o.opId === ctrlJson.opId);
+    assert.equal(verifiedCtrl.status, 'verified');
+    assert.equal(verifiedCtrl.resolvedSeq, 2);
+
+    const deltaAfter = await (await fetch(`${srv.url}/api/swarm/delta?conversationId=${fx.coord}&since=1&etag=${encodeURIComponent(deltaBefore.etag)}`)).json();
+    assert.equal(deltaAfter.mode, 'delta');
+    assert.ok(Array.isArray(deltaAfter.ops));
+    assert.equal(deltaAfter.ops.find((o) => o.opId === ctrlJson.opId)?.status, 'verified');
+
+    // 6. Async sendMessageFn failure marks op failed
+    sendMode = 'fail';
+    const failCtrl = await (await post('/api/control', {
+      confirm: true,
+      conversationId: fx.coord,
+      op: 'board_post',
+      text: 'This dispatch rejects',
+    })).json();
+    await new Promise((r) => setTimeout(r, 40));
+    const opsAfterFail = await (await fetch(`${srv.url}/api/ops?conversationId=${fx.coord}`)).json();
+    const failedEntry = opsAfterFail.ops.find((o) => o.opId === failCtrl.opId);
+    assert.equal(failedEntry.status, 'failed');
+    assert.ok(failedEntry.error.includes('RPC transport failed'));
+
+    // 7. POST /api/ops/action guards (Origin-403, Host-403, 400, 404) & retry / dismiss / mark_verified
+    assert.equal(
+      (await post('/api/ops/action', { confirm: true, conversationId: fx.coord, opId: failCtrl.opId, action: 'dismiss' }, { Origin: 'https://evil.example' })).status,
+      403,
+    );
+    const badHostOps = await new Promise((resolve, reject) => {
+      const sock = net.connect(srv.port, '127.0.0.1', () => {
+        sock.write(`GET /api/ops?conversationId=${fx.coord} HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n`);
+      });
+      const chunks = [];
+      sock.on('data', (c) => chunks.push(c));
+      sock.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      sock.on('error', reject);
+    });
+    assert.ok(badHostOps.startsWith('HTTP/1.1 403'));
+
+    assert.equal((await post('/api/ops/action', { conversationId: fx.coord, opId: failCtrl.opId, action: 'dismiss' })).status, 400);
+    assert.equal((await post('/api/ops/action', { confirm: true, conversationId: fx.coord, opId: failCtrl.opId, action: 'bogus' })).status, 400);
+    assert.equal((await post('/api/ops/action', { confirm: true, conversationId: fx.coord, opId: 'op-missing', action: 'dismiss' })).status, 404);
+
+    sendMode = 'ok';
+    const retryRes = await post('/api/ops/action', {
+      confirm: true,
+      conversationId: fx.coord,
+      opId: failCtrl.opId,
+      action: 'retry',
+    });
+    assert.equal(retryRes.status, 200);
+    const retryJson = await retryRes.json();
+    assert.equal(retryJson.status, 'dispatched');
+    assert.equal(retryJson.op.error, null);
+
+    const markRes = await post('/api/ops/action', {
+      confirm: true,
+      conversationId: fx.coord,
+      opId: failCtrl.opId,
+      action: 'mark_verified',
+    });
+    assert.equal(markRes.status, 200);
+    assert.equal((await markRes.json()).status, 'verified');
+
+    const dismissRes = await post('/api/ops/action', {
+      confirm: true,
+      conversationId: fx.coord,
+      opId: nudgeJson.opId,
+      action: 'dismiss',
+    });
+    assert.equal(dismissRes.status, 200);
+    assert.equal((await dismissRes.json()).status, 'dismissed');
+
+    // 8. SidecarApp RPC registers GET /api/ops, POST /api/ops/action, and non-blocking /api/control
+    const rpcSent = [];
+    const mockSidecarUrl = new URL('data:text/javascript,' + encodeURIComponent(`
+      export class Response {
+        constructor(body, init = {}) {
+          this.body = body;
+          this.status = init.status || 200;
+          this.contentType = init.contentType || 'application/json';
+          this.headers = init.headers || {};
+        }
+      }
+      export class SidecarApp {
+        constructor() {
+          this.config = { conversationId: globalThis.__FLEET_TEST_OPS_COORD || '' };
+          this.routes = new Map();
+          globalThis.__FLEET_TEST_OPS_RPC = this;
+        }
+        page(p, fn) { this.routes.set('PAGE ' + p, fn); }
+        api(p, fn, method = 'GET') { this.routes.set(method + ' ' + p, fn); }
+        async sendMessage(convId, message) {
+          globalThis.__FLEET_TEST_OPS_SENT?.push({ convId, message });
+          await new Promise((r) => setTimeout(r, 1500));
+          return { ok: true };
+        }
+        async run() {}
+      }
+    `));
+    globalThis.__FLEET_TEST_OPS_COORD = fx.coord;
+    globalThis.__FLEET_TEST_OPS_SENT = rpcSent;
+    const hook = registerHooks({
+      resolve(specifier, ctx, next) {
+        if (specifier === 'sidecar_sdk') return { shortCircuit: true, url: mockSidecarUrl.href };
+        return next(specifier, ctx);
+      },
+    });
+    try {
+      await runSidecarApp({ appDataDir: fx.appData });
+      const app = globalThis.__FLEET_TEST_OPS_RPC;
+      const opsGet = app.routes.get('GET /api/ops');
+      const opsAct = app.routes.get('POST /api/ops/action');
+      const ctrlRpc = app.routes.get('POST /api/control');
+      assert.equal(typeof opsGet, 'function');
+      assert.equal(typeof opsAct, 'function');
+      assert.equal(typeof ctrlRpc, 'function');
+
+      const tRpc = Date.now();
+      const rpcCtrlResp = await ctrlRpc({
+        confirm: true,
+        conversationId: fx.coord,
+        op: 'board_post',
+        text: 'RPC non-blocking',
+      });
+      assert.equal(rpcCtrlResp.status, 200);
+      assert.ok(Date.now() - tRpc < 400);
+      const rpcCtrlJson = JSON.parse(rpcCtrlResp.body);
+      assert.equal(rpcCtrlJson.status, 'dispatched');
+
+      const rpcOpsResp = await opsGet({ conversationId: fx.coord });
+      assert.equal(rpcOpsResp.status, 200);
+      const rpcOpsJson = JSON.parse(Buffer.from(rpcOpsResp.body).toString('utf8'));
+      assert.ok(rpcOpsJson.ops.some((o) => o.opId === rpcCtrlJson.opId));
+
+      const rpcDismissResp = await opsAct({
+        confirm: true,
+        conversationId: fx.coord,
+        opId: rpcCtrlJson.opId,
+        action: 'dismiss',
+      });
+      assert.equal(rpcDismissResp.status, 200);
+      assert.equal(JSON.parse(rpcDismissResp.body).status, 'dismissed');
+    } finally {
+      hook?.deregister?.();
+      delete globalThis.__FLEET_TEST_OPS_RPC;
+      delete globalThis.__FLEET_TEST_OPS_COORD;
+      delete globalThis.__FLEET_TEST_OPS_SENT;
+    }
+
+    // 9. CWE-59 symlink escape on fleet_ops.json -> 403 on GET /api/ops and POST /api/ops/action
+    const opsPath = join(swDir, 'fleet_ops.json');
+    const outsideOps = join(fx.dir, 'outside-ops.json');
+    writeFileSync(outsideOps, '[]');
+    rmSync(opsPath, { force: true });
+    symlinkSync(outsideOps, opsPath);
+    assert.equal((await fetch(`${srv.url}/api/ops?conversationId=${fx.coord}`)).status, 403);
+    assert.equal(
+      (await post('/api/ops/action', { confirm: true, conversationId: fx.coord, opId: ctrlJson.opId, action: 'dismiss' })).status,
+      403,
+    );
   } finally {
     await srv.close();
     rmSync(fx.dir, { recursive: true, force: true });

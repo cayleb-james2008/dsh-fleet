@@ -58,6 +58,11 @@ const TAIL_CAP = 16;
 const RECENT_TOOLS_CAP = 5;
 const MAX_LINE_BYTES = 2 * 1024 * 1024;
 const TAIL_ANCHOR_BYTES = 64;
+const OPS_FILE = 'fleet_ops.json';
+const OPS_RING_LIMIT = 64;
+const OPS_MAX_BYTES = 512 * 1024;
+export const OPS_TIMEOUT_MS = 45_000;
+const OP_STATUSES = new Set(['dispatched', 'verified', 'failed', 'timed_out', 'dismissed']);
 
 function cleanTok(v) {
   if (typeof v === 'boolean' || v === null || v === undefined || v === '') return 0;
@@ -955,6 +960,7 @@ export function summarizeTranscript(appData, conv) {
     tailSteps: [],
     recentTools: [],
     latestThinking: '',
+    lastError: null,
     tailCursor: 0,
     parsedTailCursor: 0,
   });
@@ -1079,6 +1085,21 @@ export function summarizeTranscript(appData, conv) {
     }
     if (typeof step.model === 'string' && step.model.trim()) setAccModel(a, step.model);
     const stepType = typeof step.type === 'string' ? step.type : '';
+    const stepCreatedAt = typeof step.created_at === 'string' ? step.created_at : '';
+    const errText =
+      typeof step.error === 'string' && step.error
+        ? oneLine(step.error, 240)
+        : stepType === 'ERROR_MESSAGE' && typeof step.content === 'string'
+          ? oneLine(step.content, 240)
+          : '';
+    if (stepType === 'ERROR_MESSAGE') {
+      const parsedErrTs = stepCreatedAt ? Date.parse(stepCreatedAt) : NaN;
+      a.lastError = {
+        createdAt: stepCreatedAt,
+        ts: Number.isFinite(parsedErrTs) ? parsedErrTs : null,
+        error: errText || 'model error',
+      };
+    }
     const th = stepType === 'PLANNER_RESPONSE' ? thinkingHeading(step.thinking) : '';
     if (th) a.latestThinking = th;
     const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
@@ -1092,7 +1113,7 @@ export function summarizeTranscript(appData, conv) {
         a.recentTools.push({
           name: name || 'tool',
           summary,
-          time: typeof step.created_at === 'string' ? step.created_at : '',
+          time: stepCreatedAt,
         });
         if (a.recentTools.length > RECENT_TOOLS_CAP) a.recentTools.shift();
       }
@@ -1100,7 +1121,8 @@ export function summarizeTranscript(appData, conv) {
     a.tailSteps[ti % TAIL_CAP] = {
       type: stepType,
       status: safeStr(step.status),
-      error: typeof step.error === 'string' ? oneLine(step.error, 240) : '',
+      error: errText,
+      createdAt: stepCreatedAt,
       tool_calls: compactCalls,
       thinkingHeading: th,
       content: stepType === 'PLANNER_RESPONSE' && calls.length === 0 ? safeStr(step.content).slice(0, 1200) : '',
@@ -1141,6 +1163,20 @@ export function summarizeTranscript(appData, conv) {
     break;
   }
 
+  const recentErrors = [];
+  for (const step of tailSteps) {
+    if (!step || step.type !== 'ERROR_MESSAGE') continue;
+    const ts = step.createdAt ? Date.parse(step.createdAt) : NaN;
+    recentErrors.push({
+      createdAt: step.createdAt || '',
+      ts: Number.isFinite(ts) ? ts : null,
+      error: step.error || 'model error',
+    });
+  }
+  if (a.lastError && !recentErrors.some((e) => e.createdAt === a.lastError.createdAt && e.error === a.lastError.error)) {
+    recentErrors.push(a.lastError);
+  }
+
   const idle = turnEnded(tailSteps);
   const reply = finalReply(tailSteps);
   const replied = reply !== null;
@@ -1160,6 +1196,7 @@ export function summarizeTranscript(appData, conv) {
       activity,
       activityKind,
       last,
+      recentErrors,
       idle,
       replied,
       replyAsk,
@@ -1190,9 +1227,23 @@ export function summarizeTranscript(appData, conv) {
 
 function statusOf(m, tr) {
   if (m.killed) return 'killed';
+  if (m.state === 'stopped' || m.status === 'stopped') return 'stopped';
   if (typeof tr?.idle === 'boolean') return tr.idle ? 'waiting' : 'working';
   if (m.wake_mode === 'mentions' || m.wake_mode === 'anything') return 'waiting';
   return 'working';
+}
+
+/** Return live status, failure, and collapsed state for a single swarm member. */
+export function getMemberLiveState(appData, memberObj, now = Date.now()) {
+  if (!memberObj || typeof memberObj !== 'object') {
+    return { status: 'unknown', failure: null, state: 'unknown' };
+  }
+  const convId = typeof memberObj.conversation_id === 'string' ? memberObj.conversation_id : '';
+  const tr = appData && convId ? summarizeTranscript(appData, convId).summary : null;
+  const status = statusOf(memberObj, tr);
+  const failure = stepFailure(tr, now);
+  const state = memberObj.killed ? 'killed' : failure ? 'error' : status;
+  return { status, failure, state };
 }
 
 function boardTimeMs(t) {
@@ -1674,7 +1725,7 @@ function readPlan(dir) {
   }
   const etag = computePlanEtag(pf, pf.text);
   const plan = raw ? normalizePlan(raw, etag) : null;
-  return { plan, etag, key: etag || `${pf.mtime}:${pf.size}` };
+  return { plan, etag, key: etag || `${pf.mtime}:${pf.size}`, mtime: pf.mtime || 0 };
 }
 
 /**
@@ -1901,6 +1952,560 @@ export function writeSwarmPlan(appData, swarmId, { ifMatch = '', mode = 'patch',
   return { ok: true, plan: normalizePlan(next, newEtag), etag: newEtag };
 }
 
+function parseOpTimeMs(v) {
+  if (typeof v === 'number') return Number.isFinite(v) && v >= 0 ? v : null;
+  if (typeof v === 'string' && v) {
+    const ms = Date.parse(v);
+    return Number.isFinite(ms) ? ms : null;
+  }
+  return null;
+}
+
+function sanitizeOpPayload(val, depth = 0) {
+  if (depth > 4) return null;
+  if (val === null || val === undefined) return null;
+  if (typeof val === 'string') return val.length > 4000 ? val.slice(0, 4000) : val;
+  if (typeof val === 'number') return Number.isFinite(val) ? val : null;
+  if (typeof val === 'boolean') return val;
+  if (Array.isArray(val)) {
+    return val.slice(0, 64).map((item) => sanitizeOpPayload(item, depth + 1));
+  }
+  if (isPlainObj(val)) {
+    const out = {};
+    for (const [k, v] of Object.entries(val)) {
+      if (FORBIDDEN_KEYS.has(k)) continue;
+      const sv = sanitizeOpPayload(v, depth + 1);
+      if (sv !== undefined) out[k] = sv;
+    }
+    return out;
+  }
+  return null;
+}
+
+function normalizeOpRecord(raw) {
+  if (!isPlainObj(raw)) return null;
+  const opId = typeof raw.opId === 'string' && raw.opId.trim() ? raw.opId.trim().slice(0, 128) : '';
+  if (!opId) return null;
+  const clientOpId =
+    typeof raw.clientOpId === 'string' && raw.clientOpId.trim()
+      ? raw.clientOpId.trim().slice(0, 64)
+      : null;
+  const op = typeof raw.op === 'string' ? raw.op.trim().slice(0, 64) : '';
+  const target = typeof raw.target === 'string' ? raw.target.slice(0, 256) : '';
+  const payload = isPlainObj(raw.payload) ? sanitizeOpPayload(raw.payload) : {};
+  const status = OP_STATUSES.has(raw.status) ? raw.status : 'dispatched';
+  const createdAt =
+    typeof raw.createdAt === 'string' && raw.createdAt
+      ? raw.createdAt
+      : typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt)
+        ? new Date(raw.createdAt).toISOString()
+        : new Date().toISOString();
+  const updatedAt =
+    typeof raw.updatedAt === 'string' && raw.updatedAt
+      ? raw.updatedAt
+      : typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)
+        ? new Date(raw.updatedAt).toISOString()
+        : createdAt;
+  const coordinatorId = typeof raw.coordinatorId === 'string' ? raw.coordinatorId.slice(0, 128) : '';
+  const seqNum = Number(raw.resolvedSeq);
+  const resolvedSeq = Number.isSafeInteger(seqNum) && seqNum > 0 ? seqNum : null;
+  const error = typeof raw.error === 'string' && raw.error ? raw.error.slice(0, 500) : null;
+
+  const rawMeta = isPlainObj(raw._meta) ? raw._meta : {};
+  const baselineSeq = Number.isSafeInteger(Number(rawMeta.baselineSeq)) && Number(rawMeta.baselineSeq) > 0
+    ? Number(rawMeta.baselineSeq)
+    : 0;
+  const baselinePlanKey = typeof rawMeta.baselinePlanKey === 'string' ? rawMeta.baselinePlanKey : undefined;
+  const dispatchedAt = typeof rawMeta.dispatchedAt === 'string' && rawMeta.dispatchedAt ? rawMeta.dispatchedAt : undefined;
+  const existedAtDispatch = rawMeta.existedAtDispatch === true;
+
+  return {
+    publicOp: {
+      opId,
+      clientOpId,
+      op,
+      target,
+      payload,
+      status,
+      createdAt,
+      updatedAt,
+      coordinatorId,
+      resolvedSeq,
+      error,
+    },
+    meta: {
+      ...(baselineSeq > 0 ? { baselineSeq } : {}),
+      ...(baselinePlanKey !== undefined ? { baselinePlanKey } : {}),
+      ...(dispatchedAt ? { dispatchedAt } : {}),
+      ...(existedAtDispatch ? { existedAtDispatch: true } : {}),
+    },
+  };
+}
+
+function parseOpsText(text) {
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    const arr = Array.isArray(parsed) ? parsed : isPlainObj(parsed) && Array.isArray(parsed.ops) ? parsed.ops : [];
+    const out = [];
+    for (const item of arr) {
+      const rec = normalizeOpRecord(item);
+      if (rec) out.push(rec);
+    }
+    return out.slice(-OPS_RING_LIMIT);
+  } catch {
+    return [];
+  }
+}
+
+function resolveConfinedOpsPath(appData, swarmId) {
+  if (!appData || typeof appData !== 'string' || typeof swarmId !== 'string' || !ID_RE.test(swarmId) || swarmId === '.' || swarmId === '..') {
+    return { ok: false, status: 400, error: 'Valid swarmId required' };
+  }
+  let brainReal;
+  try {
+    brainReal = realpathSync(join(appData, 'brain'));
+  } catch {
+    return { ok: false, status: 404, error: 'Swarm not found' };
+  }
+  const brainRoot = brainReal.endsWith(sep) ? brainReal : brainReal + sep;
+  const swarmPath = join(appData, 'brain', swarmId);
+  const sysPath = join(swarmPath, '.system_generated');
+  const dirPath = join(sysPath, 'swarm');
+  const opsPath = join(dirPath, OPS_FILE);
+  const membersPath = join(dirPath, 'members.json');
+
+  const expectedSwarm = join(brainReal, swarmId);
+  const expectedSys = join(expectedSwarm, '.system_generated');
+  const expectedDir = join(expectedSys, 'swarm');
+  const expectedOps = join(expectedDir, OPS_FILE);
+  const expectedMembers = join(expectedDir, 'members.json');
+
+  for (const [seg, exp] of [
+    [swarmPath, expectedSwarm],
+    [sysPath, expectedSys],
+    [dirPath, expectedDir],
+  ]) {
+    const st = checkConfinedSegment(seg, exp, brainRoot);
+    if (st === 'escape') return { ok: false, status: 403, error: 'Swarm path outside brain root' };
+    if (st === 'missing') return { ok: false, status: 404, error: 'Swarm not found' };
+  }
+
+  const memSt = checkConfinedSegment(membersPath, expectedMembers, brainRoot);
+  if (memSt === 'escape') return { ok: false, status: 403, error: 'Swarm path outside brain root' };
+  if (memSt === 'missing') return { ok: false, status: 404, error: 'Swarm not found' };
+
+  const opsSt = checkConfinedSegment(opsPath, expectedOps, brainRoot);
+  if (opsSt === 'escape') return { ok: false, status: 403, error: 'Operator ops path outside brain root' };
+  if (opsSt === 'missing') {
+    return { ok: true, missing: true, realFile: expectedOps, dir: dirPath };
+  }
+  try {
+    if (!statSync(expectedOps).isFile()) {
+      return { ok: false, status: 403, error: 'Invalid operator ops file' };
+    }
+  } catch {
+    return { ok: false, status: 403, error: 'Invalid operator ops file' };
+  }
+  return { ok: true, missing: false, realFile: expectedOps, dir: dirPath };
+}
+
+function readOpsMeta(dir, now = Date.now()) {
+  const opsPath = join(dir, OPS_FILE);
+  const of = readSmallCached(opsPath, smallFileCache, OPS_MAX_BYTES);
+  if (of.size < 0 || !of.isFile) {
+    return { records: [], opsKey: '0:0:-1', hasFile: false };
+  }
+  const records = parseOpsText(of.text);
+  let hasExpired = false;
+  for (const r of records) {
+    if (r.publicOp.status !== 'dispatched') continue;
+    const sinceMs = parseOpTimeMs(r.meta.dispatchedAt) ?? parseOpTimeMs(r.publicOp.createdAt);
+    if (sinceMs !== null && now - sinceMs >= OPS_TIMEOUT_MS) {
+      hasExpired = true;
+      break;
+    }
+  }
+  return {
+    records,
+    opsKey: `${of.ino}:${of.mtime}:${of.size}${hasExpired ? ':exp' : ''}`,
+    hasFile: true,
+  };
+}
+
+function writeOpsFileAtomic(realFile, appData, swarmId, records) {
+  const ring = records.slice(-OPS_RING_LIMIT);
+  const payload = {
+    version: 1,
+    ops: ring.map((r) => (Object.keys(r.meta).length ? { ...r.publicOp, _meta: r.meta } : r.publicOp)),
+  };
+  const serialized = JSON.stringify(payload, null, 2) + '\n';
+  const tmpPath = `${realFile}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 10)}`;
+  try {
+    writeFileSync(tmpPath, serialized, 'utf-8');
+    renameSync(tmpPath, realFile);
+  } finally {
+    try {
+      if (existsSync(tmpPath)) unlinkSync(tmpPath);
+    } catch {}
+  }
+  smallFileCache.delete(realFile);
+  smallFileCache.delete(join(swarmDir(appData, swarmId), OPS_FILE));
+  summaryMetaCache.delete(`${appData}\0${swarmId}`);
+  const st = statOf(realFile);
+  return `${st.ino}:${st.mtime}:${st.size}`;
+}
+
+/** Read confined operator command ledger for a swarm without mutating disk state. */
+export function readOperatorOps(appData, swarmId) {
+  const loc = resolveConfinedOpsPath(appData, swarmId);
+  if (!loc.ok) return loc;
+  if (loc.missing) return { ok: true, ops: [] };
+  smallFileCache.delete(loc.realFile);
+  const text = readFileSync(loc.realFile, 'utf-8');
+  const records = parseOpsText(text);
+  return { ok: true, ops: records.map((r) => r.publicOp) };
+}
+
+/** Append an operator command entry atomically to the 64-entry confined `fleet_ops.json` ring. */
+export function recordOperatorOp(appData, swarmId, entry, internalMeta = {}) {
+  const loc = resolveConfinedOpsPath(appData, swarmId);
+  if (!loc.ok) return loc;
+  let records = [];
+  if (!loc.missing) {
+    try {
+      records = parseOpsText(readFileSync(loc.realFile, 'utf-8'));
+    } catch {
+      records = [];
+    }
+  }
+  const normalized = normalizeOpRecord({ ...entry, _meta: internalMeta });
+  if (!normalized) return { ok: false, status: 400, error: 'Invalid operator command record' };
+  records.push(normalized);
+  writeOpsFileAtomic(loc.realFile, appData, swarmId, records);
+  return { ok: true, op: normalized.publicOp, ops: records.slice(-OPS_RING_LIMIT).map((r) => r.publicOp) };
+}
+
+/** Update an existing operator command entry by `opId` atomically inside `fleet_ops.json`. */
+export function updateOperatorOp(appData, swarmId, opId, updater) {
+  const loc = resolveConfinedOpsPath(appData, swarmId);
+  if (!loc.ok) return loc;
+  if (loc.missing) return { ok: false, status: 404, error: `Operator command "${opId}" not found` };
+  let records = [];
+  try {
+    records = parseOpsText(readFileSync(loc.realFile, 'utf-8'));
+  } catch {
+    records = [];
+  }
+  const idx = records.findIndex((r) => r.publicOp.opId === opId);
+  if (idx < 0) return { ok: false, status: 404, error: `Operator command "${opId}" not found` };
+  const current = records[idx];
+  const updated = typeof updater === 'function' ? updater(current) : current;
+  const normalized = normalizeOpRecord({
+    ...(updated?.publicOp || current.publicOp),
+    _meta: updated?.meta || current.meta,
+  });
+  if (!normalized) return { ok: false, status: 400, error: 'Invalid operator command update' };
+  records[idx] = normalized;
+  writeOpsFileAtomic(loc.realFile, appData, swarmId, records);
+  return { ok: true, op: normalized.publicOp, ops: records.map((r) => r.publicOp) };
+}
+
+function hasOpIdTag(text, opId) {
+  if (!text || !opId) return false;
+  let idx = text.indexOf(opId);
+  while (idx >= 0) {
+    const before = text.slice(Math.max(0, idx - 6), idx).toLowerCase();
+    const afterChar = idx + opId.length < text.length ? text[idx + opId.length] : '';
+    const afterOk = !afterChar || !/[A-Za-z0-9_-]/.test(afterChar);
+    if (afterOk && (before.endsWith('opid=') || before.endsWith('[opid='))) {
+      return true;
+    }
+    idx = text.indexOf(opId, idx + opId.length);
+  }
+  return false;
+}
+
+function normOpText(s) {
+  return safeStr(s).replace(/\s+/g, ' ').trim();
+}
+
+function matchBoardMessageForOp(rec, msg, sinceMs) {
+  if (!msg || typeof msg !== 'object') return false;
+  const { publicOp: op, meta: internal } = rec;
+  const seq = safeSeq(msg.seq);
+  const baselineSeq = internal.baselineSeq || 0;
+  const msgTs = typeof msg.ts === 'number' && Number.isFinite(msg.ts) ? msg.ts : boardTimeMs(msg.time);
+
+  if (baselineSeq > 0) {
+    if (seq > 0 && seq <= baselineSeq) return false;
+  } else if (sinceMs !== null && msgTs !== null && msgTs < sinceMs) {
+    return false;
+  }
+
+  const text = safeStr(msg.text);
+  if (hasOpIdTag(text, op.opId)) return true;
+
+  const p = op.payload || {};
+  if (op.op === 'channel_op') {
+    const c = controlOf(msg);
+    if (!c) return false;
+    if (c.op !== p.action || c.channel !== p.channel) return false;
+    if ((p.action === 'subscribe' || p.action === 'unsubscribe') && p.member) {
+      return Array.isArray(c.members) && c.members.includes(p.member);
+    }
+    return true;
+  }
+
+  if (controlOf(msg)) return false;
+
+  if (op.op === 'board_post') {
+    const expectedChannel = typeof p.channel === 'string' && p.channel ? p.channel : MAIN;
+    if (channelOf(msg) !== expectedChannel) return false;
+    const replySeq = Number(p.replyToSeq) || 0;
+    if (replySeq > 0) {
+      const explicitReply = Number(msg.replyToSeq ?? msg.reply_to) || 0;
+      if (explicitReply !== replySeq && !text.includes(`#${replySeq}`)) return false;
+    }
+    const expectedSnippet = normOpText(p.text).slice(0, 64);
+    if (!expectedSnippet) return true;
+    return normOpText(text).includes(expectedSnippet);
+  }
+
+  if (op.op === 'gate_verdict') {
+    const verdict = typeof p.verdict === 'string' ? p.verdict : '';
+    const verdictMatch =
+      verdict === 'ship'
+        ? /\[ship\]|\bshipped\b/i.test(text)
+        : verdict === 'verified'
+          ? /\[verified\]/i.test(text)
+          : verdict === 'blocked'
+            ? /\[blocked\]/i.test(text)
+            : false;
+    if (!verdictMatch) return false;
+    const targetSeq = Number(p.seq) || 0;
+    if (targetSeq > 0) {
+      const explicitReply = Number(msg.replyToSeq ?? msg.reply_to) || 0;
+      if (explicitReply !== targetSeq && !text.includes(`#${targetSeq}`)) return false;
+    }
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Reconcile persisted `fleet_ops.json` entries against current `members.json`,
+ * `board.jsonl`, `plan.json`, and coordinator transcript `ERROR_MESSAGE` steps.
+ */
+export function reconcileOperatorOps(appData, swarmId, { meta = null, messages = null, now = Date.now() } = {}) {
+  const loc = resolveConfinedOpsPath(appData, swarmId);
+  if (!loc.ok || loc.missing) {
+    return { ops: [], opsKey: '0:0:-1' };
+  }
+
+  const opsStat = statOf(loc.realFile);
+  if (opsStat.size < 0 || !opsStat.isFile) {
+    return { ops: [], opsKey: '0:0:-1' };
+  }
+
+  let records;
+  if (meta?.opsMeta?.hasFile) {
+    records = meta.opsMeta.records.map((r) => ({
+      publicOp: { ...r.publicOp },
+      meta: { ...r.meta },
+    }));
+  } else {
+    try {
+      records = parseOpsText(readFileSync(loc.realFile, 'utf-8'));
+    } catch {
+      records = [];
+    }
+  }
+
+  if (records.length === 0) {
+    return { ops: [], opsKey: `${opsStat.ino}:${opsStat.mtime}:${opsStat.size}` };
+  }
+
+  const hasDispatched = records.some((r) => r.publicOp.status === 'dispatched');
+  if (!hasDispatched) {
+    return {
+      ops: records.map((r) => r.publicOp),
+      opsKey: `${opsStat.ino}:${opsStat.mtime}:${opsStat.size}`,
+    };
+  }
+
+  const resolvedMeta = meta || readSwarmMeta(appData, swarmId, now);
+  if (!resolvedMeta) {
+    return {
+      ops: records.map((r) => r.publicOp),
+      opsKey: `${opsStat.ino}:${opsStat.mtime}:${opsStat.size}`,
+    };
+  }
+
+  let boardMsgs = messages;
+  if (!boardMsgs) {
+    boardMsgs = resolvedMeta.boardStat.size > 0 ? streamBoardLines(resolvedMeta.boardPath, null).parsed : [];
+  }
+
+  const membersMap = resolvedMeta.roster?.members && typeof resolvedMeta.roster.members === 'object'
+    ? resolvedMeta.roster.members
+    : {};
+  const coordName =
+    resolvedMeta.names.find((n) => roleOf(n, membersMap[n]) === 'coordinator' || n === 'coordinator') || '';
+  const coordTr = coordName ? resolvedMeta.transcripts.get(coordName)?.summary : null;
+  const nowIso = new Date(now).toISOString();
+  let dirty = false;
+
+  for (const rec of records) {
+    const op = rec.publicOp;
+    if (op.status !== 'dispatched') continue;
+
+    const sinceMs = parseOpTimeMs(rec.meta.dispatchedAt) ?? parseOpTimeMs(op.createdAt);
+    const p = op.payload || {};
+    let verifiedSeq = null;
+    let verified = false;
+
+    // 1. Check board.jsonl ([opId=...], channel_op, board_post, gate_verdict)
+    for (let i = 0; i < boardMsgs.length; i++) {
+      const msg = boardMsgs[i];
+      if (matchBoardMessageForOp(rec, msg, sinceMs)) {
+        verified = true;
+        const seq = safeSeq(msg.seq);
+        if (seq > 0) verifiedSeq = seq;
+        break;
+      }
+    }
+
+    // 2. Check members.json for spawn_worker, switch_model, kill_worker
+    if (!verified) {
+      if (op.op === 'spawn_worker') {
+        const name = typeof p.name === 'string' && p.name ? p.name : op.target;
+        const m = name && Object.hasOwn(membersMap, name) ? membersMap[name] : null;
+        if (m && !m.killed) verified = true;
+      } else if (op.op === 'switch_model') {
+        const name = typeof p.member === 'string' && p.member ? p.member : op.target;
+        const m = name && Object.hasOwn(membersMap, name) ? membersMap[name] : null;
+        if (m && !m.killed && typeof p.model === 'string' && p.model && m.model === p.model) {
+          verified = true;
+        }
+      } else if (op.op === 'kill_worker') {
+        const name = typeof p.member === 'string' && p.member ? p.member : op.target;
+        const m = name && Object.hasOwn(membersMap, name) ? membersMap[name] : null;
+        if ((m && m.killed === true) || (!m && rec.meta.existedAtDispatch)) {
+          verified = true;
+        }
+      }
+    }
+
+    // 3. Check plan.json advancement for gate_verdict
+    if (!verified && op.op === 'gate_verdict' && resolvedMeta.plan) {
+      if (rec.meta.baselinePlanKey !== undefined) {
+        if (resolvedMeta.planKey && resolvedMeta.planKey !== rec.meta.baselinePlanKey) {
+          verified = true;
+        }
+      } else if (sinceMs !== null && resolvedMeta.planMtime > sinceMs) {
+        verified = true;
+      }
+    }
+
+    if (verified) {
+      op.status = 'verified';
+      op.updatedAt = nowIso;
+      if (verifiedSeq !== null) op.resolvedSeq = verifiedSeq;
+      op.error = null;
+      dirty = true;
+      continue;
+    }
+
+    // 4. Check coordinator transcript for ERROR_MESSAGE after dispatch/createdAt
+    const coordErrors = Array.isArray(coordTr?.recentErrors) ? coordTr.recentErrors : [];
+    let matchedErr = null;
+    for (let i = coordErrors.length - 1; i >= 0; i--) {
+      const e = coordErrors[i];
+      if (!e) continue;
+      if (sinceMs === null) {
+        matchedErr = e;
+        break;
+      }
+      if (e.ts !== null ? e.ts >= sinceMs : (coordTr?.mtime || 0) >= sinceMs) {
+        matchedErr = e;
+        break;
+      }
+    }
+    if (matchedErr) {
+      op.status = 'failed';
+      op.updatedAt = nowIso;
+      op.error = oneLine(scrubTranscriptText(matchedErr.error || 'Coordinator reported ERROR_MESSAGE'), 240);
+      dirty = true;
+      continue;
+    }
+
+    // 5. Transition stale unresolved ops to timed_out after 45000ms
+    if (sinceMs !== null && now - sinceMs >= OPS_TIMEOUT_MS) {
+      op.status = 'timed_out';
+      op.updatedAt = nowIso;
+      op.error = op.error || `Timed out after ${OPS_TIMEOUT_MS}ms waiting for confirmation`;
+      dirty = true;
+    }
+  }
+
+  let opsKey = `${opsStat.ino}:${opsStat.mtime}:${opsStat.size}`;
+  if (dirty) {
+    opsKey = writeOpsFileAtomic(loc.realFile, appData, swarmId, records);
+  }
+  return {
+    ops: records.map((r) => r.publicOp),
+    opsKey,
+  };
+}
+
+/** Return lightweight dispatch baseline and live coordinator state for operator commands. */
+export function getSwarmOpContext(appData, swarmId, now = Date.now()) {
+  if (!appData || !swarmId || !ID_RE.test(swarmId)) return null;
+  const dir = swarmDir(appData, swarmId);
+  const roster = getSwarmRoster(appData, swarmId);
+  if (!roster) return null;
+  const coordinatorId = findCoordinatorConvId(roster);
+  const membersMap = roster.members && typeof roster.members === 'object' ? roster.members : {};
+  const coordEntry = Object.entries(membersMap).find(
+    ([name, m]) => m && typeof m === 'object' && !m.killed && (roleOf(name, m) === 'coordinator' || name === 'coordinator'),
+  );
+  const coordinatorState = coordEntry ? getMemberLiveState(appData, coordEntry[1], now).state : 'unknown';
+
+  const { key: baselinePlanKey } = readPlan(dir);
+  const boardPath = join(dir, 'board.jsonl');
+  const boardStat = statOf(boardPath);
+  let baselineSeq = 0;
+  if (boardStat.isFile && boardStat.size > 0) {
+    const cached = boardTailCache.get(dir);
+    if (
+      cached &&
+      cached.meta &&
+      cached.meta.ino === boardStat.ino &&
+      cached.meta.size === boardStat.size &&
+      cached.meta.mtime === boardStat.mtime
+    ) {
+      baselineSeq = cached.acc?.head || 0;
+    } else {
+      const { parsed } = streamBoardLines(boardPath, null);
+      for (const m of parsed) {
+        const seq = safeSeq(m?.seq);
+        if (seq > baselineSeq) baselineSeq = seq;
+      }
+      if (baselineSeq === 0 && parsed.length > 0) baselineSeq = parsed.length;
+    }
+  }
+
+  return {
+    roster,
+    coordinatorId,
+    coordinatorState,
+    baselineSeq,
+    baselinePlanKey,
+  };
+}
+
 /** Read and parse `members.json` for a swarm. */
 export function getSwarmRoster(appData, swarmId) {
   const mf = readSmallCached(join(swarmDir(appData, swarmId), 'members.json'), smallFileCache, 1024 * 1024);
@@ -2114,6 +2719,10 @@ const BOARD_RECENT_CAP = 64;
 const BOARD_TAIL_CACHE_LIMIT = 16;
 const SNAPSHOT_TRANSCRIPT_TTL_MS = 250;
 
+function buildSwarmEtag({ membersKey, boardKey, title, trKeys, viewEtag, planKey, stuckKeys, opsKey }) {
+  return `${membersKey}|${boardKey}|${title}|${trKeys}|${viewEtag}|${planKey}|${stuckKeys}|${opsKey}`;
+}
+
 /**
  * Compute lightweight snapshot fingerprint (`etag`) + stat keys using ONLY file stats
  * and incremental transcript checks, WITHOUT reading or parsing `board.jsonl`.
@@ -2141,7 +2750,17 @@ export function computeSwarmFingerprint(appData, id) {
       return `${f ? f.kind : ''}${mt && now - mt > STUCK_MS ? 's' : ''}`;
     })
     .join(',');
-  const etag = `${membersKey}|${boardKey}|${title}|${trKeys}|${vf.etag}|${planKey}|${stuckKeys}`;
+  const { opsKey } = readOpsMeta(dir, now);
+  const etag = buildSwarmEtag({
+    membersKey,
+    boardKey,
+    title,
+    trKeys,
+    viewEtag: vf.etag,
+    planKey,
+    stuckKeys,
+    opsKey,
+  });
   const member = roster.members ? Object.entries(roster.members).find(([, m]) => m?.conversation_id === id)?.[0] || null : null;
   return { membersKey, boardKey, etag, member };
 }
@@ -2456,7 +3075,7 @@ function readSwarmMeta(appData, id, now = Date.now()) {
   const trKeys = names.map((n) => `${n}:${transcripts.get(n).key}`).join(',');
   const narratorName = pickNarrator(roster);
   const vf = readView(appData, id, dir, narratorName ? roster.members[narratorName] : null);
-  const { plan, key: planKey } = readPlan(dir);
+  const { plan, key: planKey, mtime: planMtime } = readPlan(dir);
   const failures = new Map(names.map((n) => [n, stepFailure(transcripts.get(n).summary, now)]));
   const stuckKeys = names
     .map((n) => {
@@ -2465,8 +3084,18 @@ function readSwarmMeta(appData, id, now = Date.now()) {
       return `${f ? f.kind : ''}${mt && now - mt > STUCK_MS ? 's' : ''}`;
     })
     .join(',');
+  const opsMeta = readOpsMeta(dir, now);
 
-  const etag = `${membersKey}|${boardKey}|${title}|${trKeys}|${vf.etag}|${planKey}|${stuckKeys}`;
+  const etag = buildSwarmEtag({
+    membersKey,
+    boardKey,
+    title,
+    trKeys,
+    viewEtag: vf.etag,
+    planKey,
+    stuckKeys,
+    opsKey: opsMeta.opsKey,
+  });
   const member = names.find((n) => roster.members[n]?.conversation_id === id) || null;
   return {
     dir,
@@ -2484,6 +3113,9 @@ function readSwarmMeta(appData, id, now = Date.now()) {
     vf,
     plan,
     planKey,
+    planMtime,
+    stuckKeys,
+    opsMeta,
     failures,
     etag,
     member,
@@ -2956,13 +3588,26 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     return null;
   }
 
-  const { dir, boardPath, boardStat, membersFile, roster, title, names, rosterSig, vf, etag } = meta;
+  const { dir, boardPath, boardStat, membersFile, roster, title, names, rosterSig, vf } = meta;
   const allowedFiles = allowedFilesOf(appData, vf.view.json);
   const { res, parsed: msgs } = boardStat.size > 0 ? streamBoardLines(boardPath, null) : { res: { exists: false, meta: null }, parsed: [] };
   const frames = postedFrames(roster, msgs);
   const matchMentions = createMentionsMatcher(names);
   const acc = createBoardAcc();
   applyBoardBatch(acc, msgs, roster, names, matchMentions);
+
+  const { ops, opsKey } = reconcileOperatorOps(appData, id, { meta, messages: msgs, now });
+  const etag = buildSwarmEtag({
+    membersKey: meta.membersKey,
+    boardKey: meta.boardKey,
+    title,
+    trKeys: meta.trKeys,
+    viewEtag: vf.etag,
+    planKey: meta.planKey,
+    stuckKeys: meta.stuckKeys,
+    opsKey,
+  });
+  meta.etag = etag;
 
   const telemetry = buildMembersAndTelemetry(appData, id, meta, acc, now);
 
@@ -2991,6 +3636,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     edges,
     view: telemetry.view,
     plan: telemetry.plan,
+    ops,
     frames,
     allowedFiles,
     systemAttention: telemetry.sysAttention,
@@ -3225,6 +3871,19 @@ export function buildSwarmDelta({ appData, conversationId, since = 0, prevEtag =
   trimRecentMsgs(acc);
   lruSet(boardTailCache, dir, { meta: streamMeta, rosterSig, acc }, BOARD_TAIL_CACHE_LIMIT);
 
+  const { ops, opsKey } = reconcileOperatorOps(appData, swarmId, { meta, messages: acc.recentMsgs, now });
+  const finalEtag = buildSwarmEtag({
+    membersKey: meta.membersKey,
+    boardKey: meta.boardKey,
+    title: meta.title,
+    trKeys: meta.trKeys,
+    viewEtag: meta.vf.etag,
+    planKey: meta.planKey,
+    stuckKeys: meta.stuckKeys,
+    opsKey,
+  });
+  meta.etag = finalEtag;
+
   const telemetry = buildMembersAndTelemetry(appData, swarmId, meta, acc, now);
 
   return {
@@ -3234,7 +3893,7 @@ export function buildSwarmDelta({ appData, conversationId, since = 0, prevEtag =
     conversationId,
     swarm: swarmId,
     member: resolvedMember,
-    etag,
+    etag: finalEtag,
     since: sinceNum,
     head: acc.head,
     messagesDelta,
@@ -3243,6 +3902,7 @@ export function buildSwarmDelta({ appData, conversationId, since = 0, prevEtag =
     members: telemetry.members,
     ...(telemetry.channels.length ? { channels: telemetry.channels } : {}),
     plan: telemetry.plan,
+    ops,
     view: telemetry.view,
     triage: telemetry.triage,
     burnSummary: telemetry.burnSummary,
