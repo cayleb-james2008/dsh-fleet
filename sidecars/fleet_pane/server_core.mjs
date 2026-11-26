@@ -483,16 +483,20 @@ export function createFleetHandlers({
   }
 
     function getWorktreesPackedSync(query = {}) {
-      const rootsKey = String(query.roots || '');
+      const rootsKey = typeof query.roots === 'string' ? query.roots : '';
+      if (rootsKey.length > 8192) return null;
       const hit = worktreesPayloadCache.get(rootsKey);
       if (hit && Date.now() - hit.at < 3000) return hit.packed;
       return null;
     }
 
     async function getWorktreesPacked(query = {}) {
+      const rootsKey = typeof query.roots === 'string' ? query.roots : '';
+      if (rootsKey.length > 8192) {
+        return pack({ roots: [], worktrees: [], collisions: [], rejected: ['roots parameter too large'], cachedTtlMs: 3000 });
+      }
       const sync = getWorktreesPackedSync(query);
       if (sync) return sync;
-      const rootsKey = String(query.roots || '');
       const now = Date.now();
       const { probeWorktrees } = await getGitProbe();
       const data = await probeWorktrees(rootsKey);
@@ -573,12 +577,16 @@ export function createFleetHandlers({
     if (!frame) {
       return { status: 404, contentType: 'text/plain', body: 'not found' };
     }
-    return {
-      status: 200,
-      contentType: frame.contentType,
-      body: readFileSync(frame.real),
-      headers: { 'Cache-Control': 'private, max-age=3600', ...SECURITY_HEADERS },
-    };
+    try {
+      return {
+        status: 200,
+        contentType: frame.contentType,
+        body: readFileSync(frame.real),
+        headers: { 'Cache-Control': 'private, max-age=3600', ...SECURITY_HEADERS },
+      };
+    } catch {
+      return { status: 404, contentType: 'text/plain', body: 'not found' };
+    }
   }
 
   async function postNudge(body = {}) {
@@ -655,7 +663,7 @@ export function createFleetHandlers({
       return { status: 400, json: { error: 'ifMatch must be a string' } };
     }
     const ifMatch = typeof body.ifMatch === 'string' ? body.ifMatch.trim() : '';
-    if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(ifMatch)) {
+    if (SINGLE_LINE_CTRL_RE.test(ifMatch)) {
       return { status: 400, json: { error: 'Control characters are not permitted in ifMatch' } };
     }
     const mode = body.mode === undefined ? 'patch' : body.mode;
@@ -689,6 +697,7 @@ export function createFleetHandlers({
           json: {
             error: written.error || 'plan changed on disk',
             plan: written.plan || null,
+            etag: written.etag || written.plan?.etag || '',
           },
         };
       }
@@ -726,15 +735,18 @@ export function createFleetHandlers({
     };
   }
 
-  const CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/;
-  const SINGLE_LINE_CTRL_RE = /[\x00-\x1f\x7f]/;
+  const CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/;
+  const SINGLE_LINE_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
   const WORKER_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/;
   const CHANNEL_NAME_RE = /^[a-z][a-z0-9-]{0,23}$/;
   const MEMBER_REF_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
-  const RESERVED_WORKERS = new Set(['all', 'coordinator']);
+  const RESERVED_WORKERS = new Set(['all', 'coordinator', 'here']);
+  const RESERVED_MEMBER_REFS = new Set(['all', 'here', '__proto__', 'constructor', 'prototype']);
   const RESERVED_CHANNELS = new Set(['main', 'all', 'here']);
   const PROTECTED_ROLES = new Set(['coordinator', 'narrator', 'monitor']);
   const PROTECTED_NAME_RE = /^(?:coordinator|narrator|monitor)(?:-\d+)?$/i;
+  const COORDINATOR_NAME_RE = /^coordinator(?:-\d+)?$/i;
+  const MAX_SEQ_INT = 1_000_000_000;
   const WORKSPACE_MODES = new Set(['inherit', 'share', 'branch']);
   const CHANNEL_ACTIONS = new Set(['create', 'archive', 'subscribe', 'unsubscribe']);
   const GATE_VERDICTS = new Set(['verified', 'blocked', 'ship']);
@@ -796,7 +808,7 @@ export function createFleetHandlers({
       }
       let replyToSeq = 0;
       if (body.replyToSeq !== undefined && body.replyToSeq !== null) {
-        if (typeof body.replyToSeq !== 'number' || !Number.isInteger(body.replyToSeq) || body.replyToSeq <= 0) {
+        if (typeof body.replyToSeq !== 'number' || !Number.isSafeInteger(body.replyToSeq) || body.replyToSeq <= 0 || body.replyToSeq > MAX_SEQ_INT) {
           return bad('replyToSeq must be a positive integer');
         }
         replyToSeq = body.replyToSeq;
@@ -829,15 +841,17 @@ export function createFleetHandlers({
       if (!modelChk.ok) return bad(modelChk.error);
       const forkChk = checkControlString(body.forkFrom, 'forkFrom', { required: false, maxLen: 128, singleLine: true });
       if (!forkChk.ok) return bad(forkChk.error);
-      if (forkChk.value && !MEMBER_REF_RE.test(forkChk.value) && !ID_RE.test(forkChk.value)) {
+      if (forkChk.value && ((!MEMBER_REF_RE.test(forkChk.value) && !ID_RE.test(forkChk.value)) || RESERVED_MEMBER_REFS.has(forkChk.value.toLowerCase()))) {
         return bad('Invalid forkFrom member');
       }
       const header = `[fleet-operator:spawn_worker] name=${name} workspace=${workspaceMode}${channel ? ` channel=#${channel}` : ''}${modelChk.value ? ` model=${modelChk.value}` : ''}${forkChk.value ? ` forkFrom=${forkChk.value}` : ''}`;
       directive = `${header}\nSpawn worker ${name} via swarm(action:"add", name:${JSON.stringify(name)}, workspace:${JSON.stringify(workspaceMode)}${modelChk.value ? `, model:${JSON.stringify(modelChk.value)}` : ''}${forkChk.value ? `, fork:${JSON.stringify(forkChk.value)}` : ''}) with brief:\n${briefChk.value}`;
     } else if (op === 'switch_model') {
       const memChk = checkControlString(body.member, 'member', { required: true, maxLen: 64, singleLine: true });
-      if (!memChk.ok || !MEMBER_REF_RE.test(memChk.value)) return bad(memChk.ok ? 'Invalid member name' : memChk.error);
-      const modelChk = checkControlString(body.model, 'model', { required: true, maxLen: 4000, singleLine: true });
+      if (!memChk.ok || !MEMBER_REF_RE.test(memChk.value) || RESERVED_MEMBER_REFS.has(memChk.value.toLowerCase())) {
+        return bad(memChk.ok ? 'Invalid member name' : memChk.error);
+      }
+      const modelChk = checkControlString(body.model, 'model', { required: true, maxLen: 256, singleLine: true });
       if (!modelChk.ok) return bad(modelChk.error);
       const reasonChk = checkControlString(body.reason, 'reason', { required: false, maxLen: 4000, singleLine: true });
       if (!reasonChk.ok) return bad(reasonChk.error);
@@ -845,7 +859,9 @@ export function createFleetHandlers({
       directive = `${header}\nSwitch @${memChk.value} to model ${modelChk.value} via swarm(action:"model", name:${JSON.stringify(memChk.value)}, model:${JSON.stringify(modelChk.value)})${reasonChk.value ? `. Reason: ${reasonChk.value}` : '.'}`;
     } else if (op === 'kill_worker') {
       const memChk = checkControlString(body.member, 'member', { required: true, maxLen: 64, singleLine: true });
-      if (!memChk.ok || !MEMBER_REF_RE.test(memChk.value)) return bad(memChk.ok ? 'Invalid member name' : memChk.error);
+      if (!memChk.ok || !MEMBER_REF_RE.test(memChk.value) || RESERVED_MEMBER_REFS.has(memChk.value.toLowerCase())) {
+        return bad(memChk.ok ? 'Invalid member name' : memChk.error);
+      }
       if (body.forceUnmerged !== undefined && typeof body.forceUnmerged !== 'boolean') {
         return bad('forceUnmerged must be a boolean');
       }
@@ -871,7 +887,7 @@ export function createFleetHandlers({
       const needsMember = action === 'subscribe' || action === 'unsubscribe';
       const memChk = checkControlString(body.member, 'member', { required: needsMember, maxLen: 64, singleLine: true });
       if (!memChk.ok) return bad(memChk.error);
-      if (memChk.value && !MEMBER_REF_RE.test(memChk.value)) {
+      if (memChk.value && (!MEMBER_REF_RE.test(memChk.value) || RESERVED_MEMBER_REFS.has(memChk.value.toLowerCase()))) {
         return bad('Invalid member name');
       }
       const header = `[fleet-operator:channel_op] action=${action} channel=#${channel}${memChk.value ? ` member=${memChk.value}` : ''}${topicChk.value ? ` topic=${inlineClean(topicChk.value, 160)}` : ''}`;
@@ -881,12 +897,12 @@ export function createFleetHandlers({
       if (!GATE_VERDICTS.has(verdict)) {
         return bad('verdict must be verified, blocked, or ship');
       }
-      if (typeof body.seq !== 'number' || !Number.isInteger(body.seq) || body.seq <= 0) {
+      if (typeof body.seq !== 'number' || !Number.isSafeInteger(body.seq) || body.seq <= 0 || body.seq > MAX_SEQ_INT) {
         return bad('seq must be a positive integer');
       }
       const targetChk = checkControlString(body.targetMember, 'targetMember', { required: false, maxLen: 64, singleLine: true });
       if (!targetChk.ok) return bad(targetChk.error);
-      if (targetChk.value && !MEMBER_REF_RE.test(targetChk.value)) {
+      if (targetChk.value && (!MEMBER_REF_RE.test(targetChk.value) || RESERVED_MEMBER_REFS.has(targetChk.value.toLowerCase()))) {
         return bad('Invalid targetMember name');
       }
       const noteChk = checkControlString(body.note, 'note', { required: true, maxLen: 4000 });
@@ -909,12 +925,22 @@ export function createFleetHandlers({
     }
 
     if (op === 'kill_worker') {
-      const memberObj = roster?.members?.[killTarget] || null;
+      const membersMap = roster?.members && typeof roster.members === 'object' ? roster.members : null;
+      const memberObj = membersMap && Object.hasOwn(membersMap, killTarget) ? membersMap[killTarget] : null;
       const targetRole = roleOf ? roleOf(killTarget, memberObj) : (memberObj?.role || '');
+      if (targetRole === 'coordinator' || COORDINATOR_NAME_RE.test(killTarget)) {
+        return bad(`Refusing to kill coordinator role "${killTarget}"`);
+      }
       const isProtected = PROTECTED_ROLES.has(targetRole) || PROTECTED_NAME_RE.test(killTarget);
       const explicitProtected = body.explicit === true || body.allowProtected === true || body.forceProtected === true;
       if (isProtected && !explicitProtected) {
         return bad(`Refusing to kill protected role "${killTarget}" without explicit confirmation`);
+      }
+      if (membersMap && !memberObj) {
+        return { status: 404, json: { error: `Member "${killTarget}" not found in swarm` } };
+      }
+      if (memberObj?.killed) {
+        return { status: 409, json: { error: `Member "${killTarget}" is already killed` } };
       }
       if (memberObj?.workspace && memberObj.workspace_mode !== 'inherit' && !forceUnmerged) {
         const { probeMemberWorktree } = await getGitProbe();

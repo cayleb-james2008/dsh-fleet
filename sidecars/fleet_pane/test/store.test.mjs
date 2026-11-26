@@ -826,3 +826,272 @@ test('probeMemberWorktree reports dirtyFiles and ahead commits accurately', asyn
     rmSync(baseDir, { recursive: true, force: true });
   }
 });
+
+test('buildSwarmSnapshot recovers from corrupt/truncated JSONL, malformed plan/view, and non-primitive fields', () => {
+  const dir = makeScratchDir('corrupt-recovery-');
+  try {
+    const coordId = '1111aaaa-1111-4111-8111-111111111111';
+    const workerId = '2222bbbb-2222-4222-8222-222222222222';
+    const swDir = join(dir, 'brain', coordId, '.system_generated', 'swarm');
+    const logDir = join(dir, 'brain', workerId, '.system_generated', 'logs');
+    mkdirSync(swDir, { recursive: true });
+    mkdirSync(logDir, { recursive: true });
+
+    writeFileSync(
+      join(swDir, 'members.json'),
+      JSON.stringify({
+        title: 'Corrupt Recovery Swarm',
+        members: {
+          coordinator: { conversation_id: coordId, role: 'coordinator', last_read_seq: 1 },
+          worker: { conversation_id: workerId, role: 'worker', channels: ['main', 123], last_read_seq: 0 },
+          badconv: { conversation_id: 999, role: 'worker' },
+        },
+      }),
+    );
+
+    // Mix valid lines, mid-file corrupt JSON, primitive JSON lines, objects with non-primitive fields, and trailing torn line
+    writeFileSync(
+      join(swDir, 'board.jsonl'),
+      [
+        '{"seq": 1, "agent": "coordinator", "text": "@worker start", "time": "2026-11-26 10:00:00"}',
+        '{corrupt mid-file line',
+        'null',
+        '[1, 2, 3]',
+        '"just a string"',
+        '{"seq": "1e999", "agent": {"toString": 1}, "text": {"toString": 1}, "time": {"toString": 1}}',
+        '{"seq": 2, "agent": "worker", "text": "Re #1: recovered cleanly", "time": "2026-11-26 10:01:00"}',
+        '{"seq": 3, "agent": "worker", "text": "trailing truncated',
+      ].join('\n'),
+    );
+
+    writeFileSync(
+      join(logDir, 'transcript.jsonl'),
+      [
+        '{broken_start_line',
+        JSON.stringify({ step_index: 0, type: { toString: 1 }, status: { toString: 1 }, tool_calls: [null, { name: { toString: 1 }, args: { toolSummary: { toString: 1 } } }] }),
+        JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', input_tokens: 300, output_tokens: 50, tool_calls: [{ name: 'read_file', args: { Path: '/tmp/ok.ts' } }] }),
+        '{"step_index": 2, "type": "PLANNER_RESPONSE", "broken_tail',
+      ].join('\n'),
+    );
+
+    // Malformed plan.json and malformed view.json
+    writeFileSync(join(swDir, 'plan.json'), '{not valid json');
+    writeFileSync(join(swDir, 'view.json'), '{"headline": "ok", ');
+
+    const snap1 = buildSwarmSnapshot(dir, coordId);
+    assert.ok(snap1);
+    assert.equal(snap1.plan, null);
+    assert.equal(snap1.view.jsonError, 'invalid');
+    assert.equal(snap1.view.json, null);
+    assert.equal(snap1.messages.length, 3);
+    assert.equal(snap1.head, 2);
+    assert.equal(snap1.usage.totalTokens, 350);
+
+    // Valid view.json followed by transient corrupt write preserves last-good view.json
+    writeFileSync(join(swDir, 'view.json'), JSON.stringify({ headline: 'Last good view', phase: 'verify' }));
+    const snapGoodView = buildSwarmSnapshot(dir, coordId);
+    assert.equal(snapGoodView.view.json?.headline, 'Last good view');
+    assert.equal(snapGoodView.view.jsonError, '');
+
+    writeFileSync(join(swDir, 'view.json'), '{"corrupt": ');
+    const snapFallbackView = buildSwarmSnapshot(dir, coordId);
+    assert.equal(snapFallbackView.view.json?.headline, 'Last good view');
+    assert.equal(snapFallbackView.view.jsonError, 'invalid');
+
+    // Control characters on disk in plan.json are stripped by normalizePlan
+    const cleanFromCorrupt = normalizePlan({
+      title: 'Title\x07\nWith\x1bCtrl',
+      goal: 'Goal\x00line',
+      tasks: { a: { toString: 1 }, b: 'ok\x07' },
+      threads: [{ id: 't-1\n', title: 'T\x07', goal: { line: 'G\x00' }, tasks: ['a', 42] }],
+      workstreams: [{ id: 'ws-1\n', title: 'W\x07', owner: 'worker\n', status: 'in_progress' }],
+    }, '1:1');
+    assert.equal(cleanFromCorrupt.title, 'Title WithCtrl');
+    assert.equal(cleanFromCorrupt.goal, 'Goalline');
+    assert.equal(cleanFromCorrupt.tasks.b, 'ok');
+    assert.equal(cleanFromCorrupt.workstreams[0].owner, 'worker');
+    assert.equal(cleanFromCorrupt.workstreams[0].status, 'running');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('writeSwarmPlan sanitizes unknown/corrupt fields and detects same-size CAS conflicts via content hash', () => {
+  const dir = makeScratchDir('plan-sanitize-');
+  try {
+    const coordId = '3333cccc-3333-4333-8333-333333333333';
+    const swDir = join(dir, 'brain', coordId, '.system_generated', 'swarm');
+    mkdirSync(swDir, { recursive: true });
+    writeFileSync(
+      join(swDir, 'members.json'),
+      JSON.stringify({ title: 'Plan Sanitize', members: { coordinator: { conversation_id: coordId, role: 'coordinator' } } }),
+    );
+    // Corrupt non-array workstreams on disk initially
+    writeFileSync(join(swDir, 'plan.json'), JSON.stringify({ title: 'Init', workstreams: 'corrupt-type' }));
+    const snap0 = buildSwarmSnapshot(dir, coordId);
+    assert.ok(snap0.plan.etag);
+
+    // Patch strips unknown top-level keys and drops corrupt non-array base workstreams
+    const w1 = writeSwarmPlan(dir, coordId, {
+      ifMatch: snap0.plan.etag,
+      mode: 'patch',
+      patch: {
+        title: 'Clean\nTitle',
+        gate: 'npm\ntest',
+        unknownEvilField: 'dropped',
+        etag: 'spoofed',
+        schema: 'spoofed',
+        workstreams: [{ id: 'ws-1', title: 'Hardening', owner: 'be', status: 'done' }],
+      },
+    });
+    assert.equal(w1.ok, true);
+    assert.equal(w1.plan.title, 'Clean Title');
+    assert.equal(w1.plan.gate, 'npm test');
+    const rawDisk1 = JSON.parse(readFileSync(join(swDir, 'plan.json'), 'utf8'));
+    assert.equal(rawDisk1.unknownEvilField, undefined);
+    assert.equal(rawDisk1.etag, undefined);
+    assert.equal(rawDisk1.schema, undefined);
+
+    // Same-length modification changes content-hash etag even within same ms tick
+    const w2 = writeSwarmPlan(dir, coordId, {
+      ifMatch: w1.etag,
+      mode: 'patch',
+      patch: { title: 'Clean\nTitl2' },
+    });
+    assert.equal(w2.ok, true);
+    assert.notEqual(w2.etag, w1.etag);
+
+    // Prototype keys & C1 controls rejected
+    assert.equal(writeSwarmPlan(dir, coordId, { ifMatch: w2.etag, patch: JSON.parse('{"__proto__":{"polluted":true}}') }).status, 400);
+    assert.equal(writeSwarmPlan(dir, coordId, { ifMatch: w2.etag, patch: { gate: 'bad\x85c1' } }).status, 400);
+    assert.equal(writeSwarmPlan(dir, coordId, { ifMatch: 'bad\nmatch', patch: { gate: 'ok' } }).status, 400);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('git_probe handles missing baseBranch, custom default branch, huge diffs, symlink CWE-59, and action edge cases', async () => {
+  const baseDir = makeScratchDir('gitprobe-h1-');
+  const trunkRepo = join(baseDir, 'trunk-repo');
+  const trunkWt = join(baseDir, 'trunk-wt');
+  const detRepo = join(baseDir, 'det-repo');
+  const detWt = join(baseDir, 'det-wt');
+  const lockedWt = join(baseDir, 'locked-wt');
+  const symWt = join(baseDir, 'sym-wt');
+  const outsideDir = join(baseDir, 'outside');
+  mkdirSync(outsideDir, { recursive: true });
+  writeFileSync(join(outsideDir, 'secret.txt'), 'secret');
+
+  try {
+    // 1. Repo with custom default branch 'trunk' (no main/master)
+    execFileSync('git', ['init', '-b', 'trunk', trunkRepo], { stdio: 'ignore' });
+    execFileSync('git', ['-C', trunkRepo, 'config', 'user.email', 'test@example.com'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', trunkRepo, 'config', 'user.name', 'Test'], { stdio: 'ignore' });
+    writeFileSync(join(trunkRepo, 'big.txt'), 'init\n');
+    execFileSync('git', ['-C', trunkRepo, 'add', '.'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', trunkRepo, 'commit', '-m', 'Initial trunk'], { stdio: 'ignore' });
+
+    execFileSync('git', ['-C', trunkRepo, 'worktree', 'add', '-b', 'feat/huge', trunkWt], { stdio: 'ignore' });
+    execFileSync('git', ['-C', trunkRepo, 'worktree', 'add', '-b', 'feat/locked', lockedWt], { stdio: 'ignore' });
+    execFileSync('git', ['-C', trunkRepo, 'worktree', 'lock', lockedWt], { stdio: 'ignore' });
+
+    // Huge > 2.5 MB diff (exceeds old 2 MB maxBuffer) on feat/huge
+    const hugeBody = Array.from({ length: 45000 }, (_, i) => `line-${i}-${'x'.repeat(50)}`).join('\n') + '\n';
+    writeFileSync(join(trunkWt, 'big.txt'), hugeBody);
+    execFileSync('git', ['-C', trunkWt, 'commit', '-am', 'Huge diff commit'], { stdio: 'ignore' });
+
+    const trunkProbe = await probeWorktrees([trunkRepo], { ttlMs: 0 });
+    const hugeWtInfo = trunkProbe.worktrees.find((w) => w.branch === 'feat/huge');
+    assert.equal(hugeWtInfo?.baseBranch, 'trunk');
+    assert.equal(hugeWtInfo?.ahead, 1);
+
+    const hugeBranchDiff = await probeWorktreeDiff({ path: trunkWt, file: 'big.txt', mode: 'branch' });
+    assert.equal(hugeBranchDiff.ok, true);
+    assert.equal(hugeBranchDiff.truncated, true);
+    assert.ok(hugeBranchDiff.diff.includes('line-0-'));
+    assert.ok(Buffer.byteLength(hugeBranchDiff.diff, 'utf8') <= 8192);
+
+    // Working huge diff too (> 2.5 MB working change)
+    writeFileSync(join(trunkWt, 'big.txt'), hugeBody.replaceAll('line-', 'mod-'));
+    const hugeWorkDiff = await probeWorktreeDiff({ path: trunkWt, file: 'big.txt', mode: 'working' });
+    assert.equal(hugeWorkDiff.ok, true);
+    assert.equal(hugeWorkDiff.truncated, true);
+    assert.ok(hugeWorkDiff.diff.includes('-line-0-'));
+    assert.ok(Buffer.byteLength(hugeWorkDiff.diff, 'utf8') <= 8192);
+    execFileSync('git', ['-C', trunkWt, 'checkout', '--', 'big.txt'], { stdio: 'ignore' });
+
+    // 2. Symlinked worktree path CWE-59 guards (with and without trailing slash) + dangling symlink + conflicting params
+    symlinkSync(trunkWt, symWt);
+    const symProbe = await probeWorktrees([symWt, `${symWt}/`], { ttlMs: 0 });
+    assert.equal(symProbe.rejected.length, 2);
+    assert.equal(symProbe.worktrees.length, 0);
+
+    const symDiff = await probeWorktreeDiff({ path: `${symWt}/`, file: 'big.txt' });
+    assert.equal(symDiff.ok, false);
+    assert.equal(symDiff.status, 400);
+
+    const symAction = await executeWorktreeAction({ action: 'remove_worktree', path: symWt });
+    assert.equal(symAction.ok, false);
+    assert.equal(symAction.httpStatus, 400);
+
+    const symMember = await probeMemberWorktree(symWt);
+    assert.equal(symMember.ok, false);
+
+    // Dangling symlink and dangling parent symlink inside worktree
+    symlinkSync('/nonexistent/outside/secret', join(trunkWt, 'dangling-link'));
+    const danglingDiff = await probeWorktreeDiff({ path: trunkWt, file: 'dangling-link' });
+    assert.equal(danglingDiff.ok, false);
+    assert.equal(danglingDiff.status, 404);
+    rmSync(join(trunkWt, 'dangling-link'));
+
+    symlinkSync('/nonexistent/outside/dir', join(trunkWt, 'dangling-dir'));
+    const danglingParentDiff = await probeWorktreeDiff({ path: trunkWt, file: 'dangling-dir/passwd' });
+    assert.equal(danglingParentDiff.ok, false);
+    assert.equal(danglingParentDiff.status, 404);
+    rmSync(join(trunkWt, 'dangling-dir'));
+
+    // Conflicting worktree vs path
+    const conflictParams = await probeWorktreeDiff({ worktree: trunkWt, path: lockedWt, file: 'big.txt' });
+    assert.equal(conflictParams.ok, false);
+    assert.equal(conflictParams.status, 400);
+
+    // 3. Action edge cases: locked worktree, in-progress rebase preservation
+    const lockedRm = await executeWorktreeAction({ action: 'remove_worktree', path: lockedWt });
+    assert.equal(lockedRm.ok, false);
+    assert.equal(lockedRm.httpStatus, 409);
+    assert.equal(lockedRm.payload.status, 'locked');
+
+    // Simulate external in-progress rebase marker -> must fail 409 in_progress without aborting it
+    const rebaseMergeDir = execFileSync('git', ['-C', trunkWt, 'rev-parse', '--git-path', 'rebase-merge'], { encoding: 'utf8' }).trim();
+    const absRebaseDir = join(trunkWt, rebaseMergeDir).includes(baseDir) ? rebaseMergeDir : join(trunkWt, rebaseMergeDir);
+    mkdirSync(absRebaseDir, { recursive: true });
+    const inProgRebase = await executeWorktreeAction({ action: 'rebase', path: trunkWt });
+    assert.equal(inProgRebase.ok, false);
+    assert.equal(inProgRebase.httpStatus, 409);
+    assert.equal(inProgRebase.payload.status, 'in_progress');
+    rmSync(absRebaseDir, { recursive: true, force: true });
+
+    // 4. Missing baseBranch (detached HEAD root with no main/master)
+    execFileSync('git', ['init', '-b', 'custom', detRepo], { stdio: 'ignore' });
+    execFileSync('git', ['-C', detRepo, 'config', 'user.email', 'test@example.com'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', detRepo, 'config', 'user.name', 'Test'], { stdio: 'ignore' });
+    writeFileSync(join(detRepo, 'a.txt'), 'a\n');
+    execFileSync('git', ['-C', detRepo, 'add', '.'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', detRepo, 'commit', '-m', 'Init'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', detRepo, 'checkout', '--detach'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', detRepo, 'branch', '-D', 'custom'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', detRepo, 'worktree', 'add', '-b', 'feat/no-base', detWt], { stdio: 'ignore' });
+
+    const detProbe = await probeWorktrees([detRepo], { ttlMs: 0 });
+    const noBaseWt = detProbe.worktrees.find((w) => w.branch === 'feat/no-base');
+    assert.equal(noBaseWt?.baseBranch, '');
+    assert.equal(noBaseWt?.mergeability, 'unknown');
+
+    const noBaseAction = await executeWorktreeAction({ action: 'dry_run_merge', path: detWt });
+    assert.equal(noBaseAction.ok, false);
+    assert.equal(noBaseAction.httpStatus, 400);
+    assert.equal(noBaseAction.payload.status, 'no_base');
+  } finally {
+    rmSync(baseDir, { recursive: true, force: true });
+  }
+});

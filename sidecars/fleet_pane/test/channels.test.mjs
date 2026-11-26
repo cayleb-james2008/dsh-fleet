@@ -45,3 +45,17 @@ test('channel registry, @#channel mentions, and visibleUnread respect role defau
   assert.deepEqual(effectiveChannels('coordinator', null, 'coordinator'), ['*']);
   assert.equal(visibleUnread('coordinator', 'coordinator', null, msgs, 0, reg), 2);
 });
+
+test('channels handles corrupt non-string fields and prototype member names without throwing', () => {
+  const msgs = [
+    { seq: 1, agent: { toString: 1 }, text: { toString: 1 }, control: { op: 'create', channel: 'ops', topic: { bad: 1 } } },
+    { seq: 2, agent: 'worker', channel: 'ops', text: { toString: 1 } },
+    { seq: 3, agent: 'coordinator', text: '@worker check @#ops', control: { op: 'subscribe', channel: 'ops', members: ['worker'], prev: {}, next: { worker: ['ops', 123] } } },
+  ];
+  const reg = channelRegistry(msgs);
+  assert.equal(reg.length, 1);
+  assert.equal(reg[0].created_by, '');
+  const view = memberView('toString', 'worker', null, msgs, reg);
+  assert.equal(view.visible.length, 3);
+  assert.equal(visibleUnread('worker', 'worker', null, msgs, 0, reg), 1);
+});

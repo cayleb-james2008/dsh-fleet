@@ -55,6 +55,18 @@ const CHUNK_BYTES = 32 * 1024;
 const SHARED_CHUNK_BUF = Buffer.allocUnsafe(CHUNK_BYTES);
 const TAIL_CAP = 16;
 const RECENT_TOOLS_CAP = 5;
+const MAX_LINE_BYTES = 2 * 1024 * 1024;
+
+function safeStr(v, fallback = '') {
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  return fallback;
+}
+
+function safeSeq(v) {
+  const n = Number(v);
+  return Number.isSafeInteger(n) && n > 0 ? n : 0;
+}
 
 function safeReaddir(path) {
   try {
@@ -67,9 +79,9 @@ function safeReaddir(path) {
 export function statOf(path) {
   try {
     const s = statSync(path);
-    return { ino: s.ino, mtime: s.mtimeMs, size: s.size };
+    return { ino: s.ino, mtime: s.mtimeMs, size: s.size, isFile: s.isFile() };
   } catch {
-    return { ino: 0, mtime: 0, size: -1 };
+    return { ino: 0, mtime: 0, size: -1, isFile: false };
   }
 }
 
@@ -81,14 +93,17 @@ function lruSet(cache, key, val, limit) {
 
 function readSmallCached(path, cache, maxBytes = VIEW_MAX_BYTES) {
   const s = statOf(path);
-  if (s.size < 0) {
+  if (s.size < 0 || !s.isFile) {
     cache.delete(path);
     return { text: null, ...s };
   }
   if (s.size > maxBytes) return { text: null, tooLarge: true, ...s };
   const key = `${s.ino}:${s.mtime}:${s.size}`;
   const hit = cache.get(path);
-  if (hit && hit.key === key) return { text: hit.text, ...s };
+  if (hit && hit.key === key) {
+    lruSet(cache, path, hit, 12);
+    return { text: hit.text, ...s };
+  }
   let text = null;
   try {
     text = readFileSync(path, 'utf-8');
@@ -148,7 +163,7 @@ function extractStrSpan(buf, start, end, keyBuf) {
  */
 function streamLinesIncremental(filePath, prevMeta, onReset, onLine, { rawSpan = false } = {}) {
   const s = statOf(filePath);
-  if (s.size < 0) return { exists: false, meta: null, changed: Boolean(prevMeta) };
+  if (s.size < 0 || !s.isFile) return { exists: false, meta: null, changed: Boolean(prevMeta) };
 
   if (prevMeta && prevMeta.ino === s.ino && prevMeta.size === s.size && prevMeta.mtime === s.mtime) {
     return { exists: true, meta: prevMeta, changed: false };
@@ -160,10 +175,16 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine, { rawSpan =
   if (!isAppend) onReset();
 
   if (s.size > offset) {
-    const fd = openSync(filePath, 'r');
+    let fd;
+    try {
+      fd = openSync(filePath, 'r');
+    } catch {
+      return { exists: false, meta: null, changed: Boolean(prevMeta) };
+    }
     try {
       let overflowCarry = carryBuf;
       let sharedCarryLen = 0;
+      let dropUntilNl = false;
       if (!overflowCarry.length) {
         sharedCarryLen = 0;
       } else if (overflowCarry.length < CHUNK_BYTES) {
@@ -192,6 +213,11 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine, { rawSpan =
 
         let pos = 0;
         for (let nl = activeBuf.indexOf(0x0a, pos); nl >= 0 && nl < totalLen; nl = activeBuf.indexOf(0x0a, pos)) {
+          if (dropUntilNl) {
+            dropUntilNl = false;
+            pos = nl + 1;
+            continue;
+          }
           let start = pos;
           let end = nl;
           if (end > start && activeBuf[end - 1] === 0x0d) end--;
@@ -205,21 +231,30 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine, { rawSpan =
           pos = nl + 1;
         }
         const remLen = totalLen - pos;
-        if (remLen <= 0) {
+        if (remLen <= 0 || dropUntilNl) {
           sharedCarryLen = 0;
           overflowCarry = Buffer.alloc(0);
         } else if (remLen < CHUNK_BYTES) {
           activeBuf.copy(SHARED_CHUNK_BUF, 0, pos, totalLen);
           sharedCarryLen = remLen;
           overflowCarry = Buffer.alloc(0);
+        } else if (remLen > MAX_LINE_BYTES) {
+          // Drop oversized unterminated line so corrupt multi-MB data cannot exhaust heap.
+          sharedCarryLen = 0;
+          overflowCarry = Buffer.alloc(0);
+          dropUntilNl = true;
         } else {
           sharedCarryLen = 0;
           overflowCarry = Buffer.from(activeBuf.subarray(pos, totalLen));
         }
       }
       carryBuf = sharedCarryLen > 0 ? Buffer.from(SHARED_CHUNK_BUF.subarray(0, sharedCarryLen)) : overflowCarry;
+    } catch {
+      return { exists: false, meta: null, changed: Boolean(prevMeta) };
     } finally {
-      closeSync(fd);
+      try {
+        closeSync(fd);
+      } catch {}
     }
   }
 
@@ -379,7 +414,13 @@ export function parseRoster(text) {
   try {
     const r = JSON.parse(text);
     if (!r || typeof r !== 'object' || Array.isArray(r)) return null;
-    return { title: typeof r.title === 'string' ? r.title : '', members: r.members && typeof r.members === 'object' ? r.members : {} };
+    const rawMembers = r.members && typeof r.members === 'object' && !Array.isArray(r.members) ? r.members : {};
+    const members = {};
+    for (const [k, v] of Object.entries(rawMembers)) {
+      if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+      if (v && typeof v === 'object' && !Array.isArray(v)) members[k] = v;
+    }
+    return { title: typeof r.title === 'string' ? r.title : '', members };
   } catch {
     return null;
   }
@@ -392,11 +433,11 @@ const BOARD_ACTIVITY = {
 };
 
 function unquote(v) {
-  if (typeof v !== 'string') return v == null ? '' : String(v);
+  if (typeof v !== 'string') return safeStr(v);
   const s = v.trim();
   if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
     try {
-      return String(JSON.parse(s));
+      return safeStr(JSON.parse(s));
     } catch {
       return s.slice(1, -1);
     }
@@ -405,7 +446,7 @@ function unquote(v) {
 }
 
 export function oneLine(s, maxLen = 96) {
-  const out = String(s || '')
+  const out = safeStr(s)
     .replace(/`([^`]+)`/g, '$1')
     .replace(/\*\*([^*]+)\*\*/g, '$1')
     .replace(/\s+/g, ' ')
@@ -413,10 +454,10 @@ export function oneLine(s, maxLen = 96) {
   return out.length > maxLen ? `${out.slice(0, maxLen - 1).trimEnd()}…` : out;
 }
 
-const maskHomePath = (s) => String(s || '').replace(/\/(?:home|Users)\/[^/\s"'`]+(\/|$)/g, (_, sepCh) => `~${sepCh}`);
+const maskHomePath = (s) => safeStr(s).replace(/\/(?:home|Users)\/[^/\s"'`]+(\/|$)/g, (_, sepCh) => `~${sepCh}`);
 
 function describeToolCall(tc) {
-  const name = tc?.name || '';
+  const name = safeStr(tc?.name);
   if (!name) return '';
   if (BOARD_ACTIVITY[name]) return BOARD_ACTIVITY[name];
   const args = tc.args && typeof tc.args === 'object' ? tc.args : {};
@@ -467,7 +508,7 @@ function finalReply(tailSteps) {
   const step = tailSteps[tailSteps.length - 1];
   if (!step) return null;
   const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
-  return step.type === 'PLANNER_RESPONSE' && calls.length === 0 ? String(step.content || '') : null;
+  return step.type === 'PLANNER_RESPONSE' && calls.length === 0 ? safeStr(step.content) : null;
 }
 
 function replyQuestion(text) {
@@ -525,26 +566,41 @@ function parseTailActivitySteps(buf, len, partialStart) {
  * with `/home/` and `/Users/` paths masked as `~/`.
  */
 export function readTranscriptActivityTail(appData, conv) {
-  if (!appData || !conv || !ID_RE.test(conv)) return null;
+  if (typeof appData !== 'string' || !appData || typeof conv !== 'string' || !conv || !ID_RE.test(conv)) return null;
   const path = transcriptPath(appData, conv);
   let st;
   try {
     st = statSync(path);
+    if (!st.isFile()) {
+      activityTailCache.delete(path);
+      return null;
+    }
   } catch {
     activityTailCache.delete(path);
     return null;
   }
   const key = `${st.ino}:${st.mtimeMs}:${st.size}`;
   const cached = activityTailCache.get(path);
-  if (cached && cached.key === key) return cached.peek;
+  if (cached && cached.key === key) {
+    lruSet(activityTailCache, path, cached, 32);
+    return cached.peek;
+  }
 
   let bytesRead = 0;
   const offset = Math.max(0, st.size - TAIL_PEEK_BYTES);
-  const fd = openSync(path, 'r');
+  let fd;
   try {
+    fd = openSync(path, 'r');
     bytesRead = readSync(fd, SHARED_CHUNK_BUF, 0, Math.min(TAIL_PEEK_BYTES, st.size), offset);
+  } catch {
+    activityTailCache.delete(path);
+    return null;
   } finally {
-    closeSync(fd);
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {}
+    }
   }
 
   const steps = parseTailActivitySteps(SHARED_CHUNK_BUF, bytesRead, offset > 0);
@@ -557,7 +613,7 @@ export function readTranscriptActivityTail(appData, conv) {
     if (step.type === 'ERROR_MESSAGE') {
       peek = {
         status: 'waiting',
-        label: oneLine(maskHomePath(step.error || 'Model error'), 96),
+        label: oneLine(maskHomePath(safeStr(step.error, 'Model error') || 'Model error'), 96),
         tool: 'error',
         ts: stepTs,
       };
@@ -567,7 +623,7 @@ export function readTranscriptActivityTail(appData, conv) {
     const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
     const labeledCall = [...calls].reverse().find((c) => describeToolCall(c));
     if (labeledCall) {
-      const name = String(labeledCall.name || '');
+      const name = safeStr(labeledCall.name);
       const isWaiting = name === 'swarm_wait' || Boolean(labeledCall.args?.IsDaemon);
       peek = {
         status: isWaiting ? 'waiting' : 'working',
@@ -607,7 +663,7 @@ function num(v) {
  *   `activity`, `turnEnded`, `finalReply`, and `lastContextTokens`.
  */
 export function summarizeTranscript(appData, conv) {
-  if (!appData || !conv || !ID_RE.test(conv)) return NO_TRANSCRIPT;
+  if (typeof appData !== 'string' || !appData || typeof conv !== 'string' || !conv || !ID_RE.test(conv)) return NO_TRANSCRIPT;
   const path = transcriptPath(appData, conv);
   let state = transcriptCache.get(path);
   if (!state) {
@@ -724,7 +780,10 @@ export function summarizeTranscript(appData, conv) {
     transcriptCache.delete(path);
     return NO_TRANSCRIPT;
   }
-  if (!res.changed) return state.result;
+  if (!res.changed) {
+    lruSet(transcriptCache, path, state, 24);
+    return state.result;
+  }
 
   state.meta = res.meta;
   const a = state.acc;
@@ -749,15 +808,17 @@ export function summarizeTranscript(appData, conv) {
       continue;
     }
     if (typeof step.model === 'string' && step.model) a.model = step.model;
-    const th = step.type === 'PLANNER_RESPONSE' ? thinkingHeading(step.thinking) : '';
+    const stepType = typeof step.type === 'string' ? step.type : '';
+    const th = stepType === 'PLANNER_RESPONSE' ? thinkingHeading(step.thinking) : '';
     if (th) a.latestThinking = th;
     const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
     const compactCalls = [];
     for (const tc of calls) {
+      if (!tc || typeof tc !== 'object') continue;
       const summary = describeToolCall(tc);
-      const name = String(tc?.name || '');
+      const name = safeStr(tc.name);
       compactCalls.push({ name, summary });
-      if (step.type === 'PLANNER_RESPONSE' && summary) {
+      if (stepType === 'PLANNER_RESPONSE' && summary) {
         a.recentTools.push({
           name: name || 'tool',
           summary,
@@ -767,12 +828,12 @@ export function summarizeTranscript(appData, conv) {
       }
     }
     a.tailSteps[ti % TAIL_CAP] = {
-      type: String(step.type || ''),
-      status: String(step.status || ''),
+      type: stepType,
+      status: safeStr(step.status),
       error: typeof step.error === 'string' ? oneLine(step.error, 240) : '',
       tool_calls: compactCalls,
       thinkingHeading: th,
-      content: step.type === 'PLANNER_RESPONSE' && calls.length === 0 ? String(step.content || '').slice(0, 1200) : '',
+      content: stepType === 'PLANNER_RESPONSE' && calls.length === 0 ? safeStr(step.content).slice(0, 1200) : '',
     };
   }
   a.parsedTailCursor = a.tailCursor;
@@ -855,7 +916,8 @@ function statusOf(m, tr) {
 }
 
 function boardTimeMs(t) {
-  const ms = t ? Date.parse(String(t).replace(' ', 'T')) : NaN;
+  const s = safeStr(t);
+  const ms = s ? Date.parse(s.replace(' ', 'T')) : NaN;
   return Number.isFinite(ms) ? ms : null;
 }
 
@@ -900,13 +962,15 @@ function systemAttention(members, now) {
 function postedFrames(roster, msgs) {
   const out = new Map();
   for (const m of msgs) {
-    const who = roster?.members?.[m.agent];
-    if (!who || who.role === 'coordinator' || isRoleWorker(m.agent, who)) continue;
-    const txt = String(m.text ?? '');
+    if (!m || typeof m !== 'object') continue;
+    const agent = safeStr(m.agent);
+    const who = agent && roster?.members && Object.hasOwn(roster.members, agent) ? roster.members[agent] : null;
+    if (!who || who.role === 'coordinator' || isRoleWorker(agent, who)) continue;
+    const txt = safeStr(m.text);
     if (!/screenshot:/i.test(txt)) continue;
     for (const g of txt.matchAll(SHOT_RE)) {
       out.delete(g[1]);
-      out.set(g[1], { path: g[1], seq: Number(m.seq) || 0, caption: String(g[2] || '').slice(0, 80) });
+      out.set(g[1], { path: g[1], seq: safeSeq(m.seq), caption: String(g[2] || '').slice(0, 80) });
     }
   }
   return [...out.values()].slice(-MAX_POSTED_FRAMES);
@@ -940,7 +1004,10 @@ function parseViewJson(id, f) {
   return { json: c.good?.json || null, mtime: c.good?.mtime || 0, error: c.error };
 }
 
-const PLAN_CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/;
+const PLAN_CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/;
+const PLAN_CTRL_ALL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g;
+const PLAN_SINGLE_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+const MAX_PLAN_ITEMS = 512;
 const WS_STATUSES = new Set(['pending', 'running', 'done', 'verified', 'blocked']);
 const MS_STATUSES = new Set(['pending', 'in_progress', 'done', 'blocked']);
 const RISK_SEVERITIES = new Set(['low', 'med', 'high']);
@@ -963,6 +1030,36 @@ const PLAN_KNOWN_KEYS = new Set([
 
 function isPlainObj(v) {
   return Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+}
+
+function cleanPlanStr(v, singleLine = false) {
+  const s = safeStr(v);
+  if (!s) return '';
+  if (singleLine) {
+    return s
+      .replace(PLAN_CTRL_ALL_RE, '')
+      .replace(/[\r\n\t\u2028\u2029]+/g, ' ')
+      .trim();
+  }
+  return s.replace(PLAN_CTRL_ALL_RE, '');
+}
+
+function planContentHash(text) {
+  const s = typeof text === 'string' ? text : '';
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b1 ^ s.length;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ (c >>> 8 ^ (c & 0xff)), 0x85ebca6b);
+  }
+  return `${(h1 >>> 0).toString(16).padStart(8, '0')}${(h2 >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+function computePlanEtag(stat, text = null) {
+  if (!stat || stat.size < 0) return '';
+  if (typeof text === 'string') return `${stat.mtime}:${stat.size}:${planContentHash(text)}`;
+  return `${stat.mtime}:${stat.size}`;
 }
 
 function normalizeWsStatus(s) {
@@ -995,90 +1092,102 @@ export function normalizePlan(raw, etag = '') {
 
   const goalTitle = hasNativeGoal
     ? typeof raw.goal.title === 'string'
-      ? raw.goal.title
+      ? cleanPlanStr(raw.goal.title, true)
       : typeof raw.goalTitle === 'string'
-        ? raw.goalTitle
+        ? cleanPlanStr(raw.goalTitle, true)
         : undefined
     : typeof raw.goalTitle === 'string'
-      ? raw.goalTitle
+      ? cleanPlanStr(raw.goalTitle, true)
       : undefined;
   const goalLine = hasNativeGoal
     ? typeof raw.goal.line === 'string'
-      ? raw.goal.line
+      ? cleanPlanStr(raw.goal.line)
       : typeof raw.goalLine === 'string'
-        ? raw.goalLine
+        ? cleanPlanStr(raw.goalLine)
         : undefined
     : typeof raw.goalLine === 'string'
-      ? raw.goalLine
+      ? cleanPlanStr(raw.goalLine)
       : undefined;
   const goal = hasNativeGoal
     ? goalLine || goalTitle || ''
     : typeof raw.goal === 'string'
-      ? raw.goal
+      ? cleanPlanStr(raw.goal)
       : goalLine || goalTitle || '';
   const title =
-    typeof raw.title === 'string' && raw.title
-      ? raw.title
+    typeof raw.title === 'string' && cleanPlanStr(raw.title, true)
+      ? cleanPlanStr(raw.title, true)
       : goalTitle || goalLine || '';
-  const gate = typeof raw.gate === 'string' ? raw.gate : '';
-  const repo = typeof raw.repo === 'string' && raw.repo ? raw.repo : undefined;
+  const gate = typeof raw.gate === 'string' ? cleanPlanStr(raw.gate, true) : '';
+  const repo = typeof raw.repo === 'string' && cleanPlanStr(raw.repo, true) ? cleanPlanStr(raw.repo, true) : undefined;
 
   const threads = hasNativeThreads
     ? raw.threads
+        .slice(0, MAX_PLAN_ITEMS)
         .filter((t) => isPlainObj(t))
         .map((t, idx) => ({
-          id: typeof t.id === 'string' && t.id ? t.id : `t-${idx + 1}`,
-          title: typeof t.title === 'string' ? t.title : '',
+          id: typeof t.id === 'string' && cleanPlanStr(t.id, true) ? cleanPlanStr(t.id, true) : `t-${idx + 1}`,
+          title: typeof t.title === 'string' ? cleanPlanStr(t.title, true) : '',
           goal:
             typeof t.goal === 'string'
-              ? t.goal
+              ? cleanPlanStr(t.goal)
               : isPlainObj(t.goal)
-                ? String(t.goal.line || t.goal.title || '')
+                ? cleanPlanStr(t.goal.line || t.goal.title)
                 : '',
-          tasks: Array.isArray(t.tasks) ? t.tasks.filter((x) => typeof x === 'string') : [],
+          tasks: Array.isArray(t.tasks) ? t.tasks.filter((x) => typeof x === 'string').map((x) => cleanPlanStr(x, true)) : [],
         }))
     : [];
 
   const tasks = {};
   if (hasNativeTasks) {
+    let n = 0;
     for (const [k, v] of Object.entries(raw.tasks)) {
       if (FORBIDDEN_KEYS.has(k)) continue;
-      tasks[k] = typeof v === 'string' ? v : v == null ? '' : String(v);
+      if (++n > MAX_PLAN_ITEMS) break;
+      const ck = cleanPlanStr(k, true);
+      if (!ck) continue;
+      tasks[ck] = typeof v === 'string' ? cleanPlanStr(v) : safeStr(v);
     }
   }
 
   const workstreams = Array.isArray(raw.workstreams)
     ? raw.workstreams
+        .slice(0, MAX_PLAN_ITEMS)
         .filter((w) => isPlainObj(w))
-        .map((w, idx) => ({
-          id: typeof w.id === 'string' && w.id ? w.id : `ws-${idx + 1}`,
-          title: typeof w.title === 'string' ? w.title : '',
-          owner: typeof w.owner === 'string' ? w.owner : '',
-          status: normalizeWsStatus(w.status),
-          ...(typeof w.note === 'string' && w.note ? { note: w.note } : {}),
-          ...(typeof w.threadId === 'string' && w.threadId ? { threadId: w.threadId } : {}),
-        }))
+        .map((w, idx) => {
+          const note = typeof w.note === 'string' ? cleanPlanStr(w.note) : '';
+          const threadId = typeof w.threadId === 'string' ? cleanPlanStr(w.threadId, true) : '';
+          return {
+            id: typeof w.id === 'string' && cleanPlanStr(w.id, true) ? cleanPlanStr(w.id, true) : `ws-${idx + 1}`,
+            title: typeof w.title === 'string' ? cleanPlanStr(w.title, true) : '',
+            owner: typeof w.owner === 'string' ? cleanPlanStr(w.owner, true) : '',
+            status: normalizeWsStatus(w.status),
+            ...(note ? { note } : {}),
+            ...(threadId ? { threadId } : {}),
+          };
+        })
     : [];
 
   const milestones = Array.isArray(raw.milestones)
     ? raw.milestones
+        .slice(0, MAX_PLAN_ITEMS)
         .filter((m) => isPlainObj(m))
         .map((m) => ({
-          title: typeof m.title === 'string' ? m.title : '',
+          title: typeof m.title === 'string' ? cleanPlanStr(m.title, true) : '',
           status: normalizeMsStatus(m.status),
         }))
     : [];
 
   const risks = Array.isArray(raw.risks)
     ? raw.risks
+        .slice(0, MAX_PLAN_ITEMS)
         .map((r) => {
-          if (typeof r === 'string') return { title: r };
+          if (typeof r === 'string') return { title: cleanPlanStr(r, true) };
           if (!isPlainObj(r)) return null;
           const rTitle =
             typeof r.title === 'string'
-              ? r.title
+              ? cleanPlanStr(r.title, true)
               : typeof r.description === 'string'
-                ? r.description
+                ? cleanPlanStr(r.description, true)
                 : '';
           const out = { title: rTitle };
           if (RISK_SEVERITIES.has(r.severity)) out.severity = r.severity;
@@ -1157,7 +1266,11 @@ export function validatePlanPatch(patch) {
     if (!isPlainObj(patch.tasks)) {
       return { ok: false, status: 400, error: 'tasks must be an object map of strings' };
     }
-    for (const v of Object.values(patch.tasks)) {
+    const taskEntries = Object.entries(patch.tasks);
+    if (taskEntries.length > MAX_PLAN_ITEMS) {
+      return { ok: false, status: 400, error: `tasks exceeds maximum entries (${MAX_PLAN_ITEMS})` };
+    }
+    for (const [, v] of taskEntries) {
       if (typeof v !== 'string') {
         return { ok: false, status: 400, error: 'tasks values must be strings' };
       }
@@ -1166,6 +1279,9 @@ export function validatePlanPatch(patch) {
   if (patch.threads !== undefined) {
     if (!Array.isArray(patch.threads)) {
       return { ok: false, status: 400, error: 'threads must be an array' };
+    }
+    if (patch.threads.length > MAX_PLAN_ITEMS) {
+      return { ok: false, status: 400, error: `threads exceeds maximum items (${MAX_PLAN_ITEMS})` };
     }
     for (const t of patch.threads) {
       if (!isPlainObj(t)) return { ok: false, status: 400, error: 'each thread must be an object' };
@@ -1183,6 +1299,9 @@ export function validatePlanPatch(patch) {
     if (!Array.isArray(patch.workstreams)) {
       return { ok: false, status: 400, error: 'workstreams must be an array' };
     }
+    if (patch.workstreams.length > MAX_PLAN_ITEMS) {
+      return { ok: false, status: 400, error: `workstreams exceeds maximum items (${MAX_PLAN_ITEMS})` };
+    }
     for (const w of patch.workstreams) {
       if (!isPlainObj(w)) return { ok: false, status: 400, error: 'each workstream must be an object' };
       for (const f of ['id', 'title', 'owner', 'note', 'threadId']) {
@@ -1199,6 +1318,9 @@ export function validatePlanPatch(patch) {
     if (!Array.isArray(patch.milestones)) {
       return { ok: false, status: 400, error: 'milestones must be an array' };
     }
+    if (patch.milestones.length > MAX_PLAN_ITEMS) {
+      return { ok: false, status: 400, error: `milestones exceeds maximum items (${MAX_PLAN_ITEMS})` };
+    }
     for (const m of patch.milestones) {
       if (!isPlainObj(m)) return { ok: false, status: 400, error: 'each milestone must be an object' };
       if (m.title !== undefined && typeof m.title !== 'string') {
@@ -1212,6 +1334,9 @@ export function validatePlanPatch(patch) {
   if (patch.risks !== undefined) {
     if (!Array.isArray(patch.risks)) {
       return { ok: false, status: 400, error: 'risks must be an array' };
+    }
+    if (patch.risks.length > MAX_PLAN_ITEMS) {
+      return { ok: false, status: 400, error: `risks exceeds maximum items (${MAX_PLAN_ITEMS})` };
     }
     for (const r of patch.risks) {
       if (typeof r === 'string') continue;
@@ -1267,9 +1392,9 @@ function readPlan(dir) {
       raw = null;
     }
   }
-  const etag = pf.size >= 0 ? `${pf.mtime}:${pf.size}` : '';
+  const etag = computePlanEtag(pf, pf.text);
   const plan = raw ? normalizePlan(raw, etag) : null;
-  return { plan, etag, key: `${pf.mtime}:${pf.size}` };
+  return { plan, etag, key: etag || `${pf.mtime}:${pf.size}` };
 }
 
 /**
@@ -1286,7 +1411,7 @@ export function writeSwarmPlan(appData, swarmId, { ifMatch = '', mode = 'patch',
   if (ifMatch !== undefined && typeof ifMatch !== 'string') {
     return { ok: false, status: 400, error: 'ifMatch must be a string' };
   }
-  if (PLAN_CTRL_RE.test(ifMatch || '')) {
+  if (PLAN_SINGLE_CTRL_RE.test(ifMatch || '')) {
     return { ok: false, status: 400, error: 'Control characters are not permitted in ifMatch' };
   }
   const validPatch = validatePlanPatch(patch);
@@ -1324,16 +1449,18 @@ export function writeSwarmPlan(appData, swarmId, { ifMatch = '', mode = 'patch',
   smallFileCache.delete(join(dir, 'plan.json'));
   smallFileCache.delete(planPath);
   const pfStat = statOf(planPath);
-  const currentEtag = pfStat.size >= 0 ? `${pfStat.mtime}:${pfStat.size}` : '';
+  let existingText = null;
   let existingRaw = null;
-  if (pfStat.size >= 0 && pfStat.size <= VIEW_MAX_BYTES) {
+  if (pfStat.isFile && pfStat.size >= 0 && pfStat.size <= VIEW_MAX_BYTES) {
     try {
-      const v = JSON.parse(readFileSync(planPath, 'utf-8'));
+      existingText = readFileSync(planPath, 'utf-8');
+      const v = JSON.parse(existingText);
       if (isPlainObj(v)) existingRaw = v;
     } catch {
       existingRaw = null;
     }
   }
+  const currentEtag = computePlanEtag(pfStat, existingText);
 
   const expected = (ifMatch || '').trim();
   if (expected !== currentEtag) {
@@ -1358,7 +1485,10 @@ export function writeSwarmPlan(appData, swarmId, { ifMatch = '', mode = 'patch',
   const next = {};
   if (mode === 'patch') {
     for (const [k, v] of Object.entries(base)) {
-      if (!FORBIDDEN_KEYS.has(k)) next[k] = v;
+      if (FORBIDDEN_KEYS.has(k)) continue;
+      if ((k === 'workstreams' || k === 'milestones' || k === 'risks' || k === 'threads') && !Array.isArray(v)) continue;
+      if (k === 'tasks' && !isPlainObj(v)) continue;
+      next[k] = v;
     }
   } else if (existingHasNative) {
     for (const [k, v] of Object.entries(base)) {
@@ -1373,36 +1503,43 @@ export function writeSwarmPlan(appData, swarmId, { ifMatch = '', mode = 'patch',
       goalObj.line = base.goal;
     }
     if (isPlainObj(patch.goal)) {
-      if (typeof patch.goal.title === 'string') goalObj.title = patch.goal.title;
-      if (typeof patch.goal.line === 'string') goalObj.line = patch.goal.line;
+      if (typeof patch.goal.title === 'string') goalObj.title = cleanPlanStr(patch.goal.title, true);
+      if (typeof patch.goal.line === 'string') goalObj.line = cleanPlanStr(patch.goal.line);
     } else if (typeof patch.goal === 'string') {
-      goalObj.line = patch.goal;
+      goalObj.line = cleanPlanStr(patch.goal);
     }
-    if (typeof patch.goalTitle === 'string') goalObj.title = patch.goalTitle;
-    if (typeof patch.goalLine === 'string') goalObj.line = patch.goalLine;
+    if (typeof patch.goalTitle === 'string') goalObj.title = cleanPlanStr(patch.goalTitle, true);
+    if (typeof patch.goalLine === 'string') goalObj.line = cleanPlanStr(patch.goalLine);
     if (typeof patch.title === 'string') {
+      const cleanTitle = cleanPlanStr(patch.title, true);
       if (typeof patch.goalTitle !== 'string' && (existingHasNativeGoal || !goalObj.title)) {
-        goalObj.title = patch.title;
+        goalObj.title = cleanTitle;
       }
-      if (base.title !== undefined || !existingHasNative || (typeof patch.goalTitle === 'string' && patch.title !== patch.goalTitle)) {
-        next.title = patch.title;
+      if (
+        base.title !== undefined ||
+        !existingHasNative ||
+        (typeof patch.goalTitle === 'string' && cleanTitle !== cleanPlanStr(patch.goalTitle, true))
+      ) {
+        next.title = cleanTitle;
       }
     }
     if (goalObj.title === undefined) goalObj.title = typeof next.title === 'string' ? next.title : '';
     if (goalObj.line === undefined) goalObj.line = '';
     next.goal = goalObj;
   } else {
-    if (typeof patch.title === 'string') next.title = patch.title;
-    if (typeof patch.goal === 'string') next.goal = patch.goal;
+    if (typeof patch.title === 'string') next.title = cleanPlanStr(patch.title, true);
+    if (typeof patch.goal === 'string') next.goal = cleanPlanStr(patch.goal);
   }
 
-  if (typeof patch.gate === 'string') next.gate = patch.gate;
-  if (typeof patch.repo === 'string') next.repo = patch.repo;
+  if (typeof patch.gate === 'string') next.gate = cleanPlanStr(patch.gate, true);
+  if (typeof patch.repo === 'string') next.repo = cleanPlanStr(patch.repo, true);
 
   if (patch.tasks !== undefined) {
     const cleanTasks = {};
     for (const [k, v] of Object.entries(patch.tasks)) {
-      if (!FORBIDDEN_KEYS.has(k)) cleanTasks[k] = v;
+      if (FORBIDDEN_KEYS.has(k)) continue;
+      const ck = cleanPlanStr(k, true);
+      if (ck) cleanTasks[ck] = cleanPlanStr(v);
     }
     next.tasks = cleanTasks;
   } else if (mode === 'replace' && existingHasNative && isPlainObj(base.tasks)) {
@@ -1415,12 +1552,13 @@ export function writeSwarmPlan(appData, swarmId, { ifMatch = '', mode = 'patch',
       for (const [k, v] of Object.entries(t)) {
         if (!FORBIDDEN_KEYS.has(k)) clean[k] = v;
       }
+      const tid = typeof t.id === 'string' ? cleanPlanStr(t.id, true) : '';
       return {
         ...clean,
-        id: typeof t.id === 'string' && t.id ? t.id : `t-${idx + 1}`,
-        title: typeof t.title === 'string' ? t.title : '',
-        goal: typeof t.goal === 'string' ? t.goal : '',
-        tasks: Array.isArray(t.tasks) ? [...t.tasks] : [],
+        id: tid || `t-${idx + 1}`,
+        title: typeof t.title === 'string' ? cleanPlanStr(t.title, true) : '',
+        goal: typeof t.goal === 'string' ? cleanPlanStr(t.goal) : '',
+        tasks: Array.isArray(t.tasks) ? t.tasks.map((x) => cleanPlanStr(x, true)).filter(Boolean) : [],
       };
     });
   } else if (mode === 'replace' && existingHasNative && Array.isArray(base.threads)) {
@@ -1428,27 +1566,32 @@ export function writeSwarmPlan(appData, swarmId, { ifMatch = '', mode = 'patch',
   }
 
   if (patch.workstreams !== undefined) {
-    next.workstreams = patch.workstreams.map((w, idx) => ({
-      id: typeof w.id === 'string' && w.id ? w.id : `ws-${idx + 1}`,
-      title: typeof w.title === 'string' ? w.title : '',
-      owner: typeof w.owner === 'string' ? w.owner : '',
-      status: normalizeWsStatus(w.status),
-      ...(typeof w.note === 'string' && w.note ? { note: w.note } : {}),
-      ...(typeof w.threadId === 'string' && w.threadId ? { threadId: w.threadId } : {}),
-    }));
+    next.workstreams = patch.workstreams.map((w, idx) => {
+      const wid = typeof w.id === 'string' ? cleanPlanStr(w.id, true) : '';
+      const note = typeof w.note === 'string' ? cleanPlanStr(w.note) : '';
+      const threadId = typeof w.threadId === 'string' ? cleanPlanStr(w.threadId, true) : '';
+      return {
+        id: wid || `ws-${idx + 1}`,
+        title: typeof w.title === 'string' ? cleanPlanStr(w.title, true) : '',
+        owner: typeof w.owner === 'string' ? cleanPlanStr(w.owner, true) : '',
+        status: normalizeWsStatus(w.status),
+        ...(note ? { note } : {}),
+        ...(threadId ? { threadId } : {}),
+      };
+    });
   }
   if (patch.milestones !== undefined) {
     next.milestones = patch.milestones.map((m) => ({
-      title: typeof m.title === 'string' ? m.title : '',
+      title: typeof m.title === 'string' ? cleanPlanStr(m.title, true) : '',
       status: normalizeMsStatus(m.status),
     }));
   }
   if (patch.risks !== undefined) {
     next.risks = patch.risks.map((r) =>
       typeof r === 'string'
-        ? { title: r }
+        ? { title: cleanPlanStr(r, true) }
         : {
-            title: typeof r.title === 'string' ? r.title : '',
+            title: typeof r.title === 'string' ? cleanPlanStr(r.title, true) : '',
             ...(RISK_SEVERITIES.has(r.severity) ? { severity: r.severity } : {}),
           },
     );
@@ -1474,7 +1617,7 @@ export function writeSwarmPlan(appData, swarmId, { ifMatch = '', mode = 'patch',
   summaryMetaCache.delete(`${appData}\0${swarmId}`);
 
   const afterStat = statOf(planPath);
-  const newEtag = afterStat.size >= 0 ? `${afterStat.mtime}:${afterStat.size}` : '';
+  const newEtag = computePlanEtag(afterStat, serialized);
   return { ok: true, plan: normalizePlan(next, newEtag), etag: newEtag };
 }
 
@@ -1932,7 +2075,8 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
   const etag = `${membersKey}|${boardKey}|${title}|${trKeys}|${vf.etag}|${planKey}|${stuckKeys}`;
 
   const msgs = boardStat.size > 0 ? streamAllJsonLines(boardPath) : [];
-  const head = msgs.length ? Number(msgs[msgs.length - 1].seq) || msgs.length : 0;
+  const lastSeq = msgs.length ? safeSeq(msgs[msgs.length - 1].seq) : 0;
+  const head = lastSeq || msgs.length;
   const frames = postedFrames(roster, msgs);
   const posts = new Map();
   const edges = new Map();
@@ -1944,7 +2088,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
   const seen = new Set();
   const validSeqs = new Set();
   for (let i = 0; i < msgs.length; i++) {
-    const s = Number(msgs[i].seq) || 0;
+    const s = safeSeq(msgs[i].seq);
     if (s > 0 && !controlOf(msgs[i])) validSeqs.add(s);
   }
   const replyRefsMap = new Map();
@@ -1961,10 +2105,10 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
   const gateAcc = { doneC: 0, doneSeq: 0, doneText: '', verC: 0, verSeq: 0, verText: '', scaleC: 0, scaleSeq: 0, scaleText: '', blkC: 0, blkSeq: 0, blkAgent: '', shipC: 0, shipSeq: 0, firstTs: 0, lastTs: 0 };
   for (let i = 0; i < msgs.length; i++) {
     const m = msgs[i];
-    const seq = Number(m.seq) || 0;
-    const agent = String(m.agent ?? '');
-    const text = String(m.text ?? '');
-    const time = m.time || '';
+    const seq = safeSeq(m.seq);
+    const agent = safeStr(m.agent);
+    const text = safeStr(m.text);
+    const time = safeStr(m.time);
     const ts = boardTimeMs(time);
     const channel = channelOf(m);
     const control = controlOf(m);
@@ -2081,18 +2225,20 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
 
   const members = names.map((name) => {
     const m = roster.members[name];
-    const last = Number(m.last_read_seq) || 0;
+    const convId = typeof m.conversation_id === 'string' ? m.conversation_id : '';
+    const last = safeSeq(m.last_read_seq);
     const tr = transcripts.get(name).summary;
     const role = roleOf(name, m);
     let unread = Math.max(0, head - last);
     let chanFields = {};
     if (channels.length) {
       const storedRole = typeof m.role === 'string' ? m.role : '';
-      const current = currentChannels(name, Array.isArray(m.channels) ? m.channels : null, msgs);
+      const rawChans = Array.isArray(m.channels) ? m.channels.filter((c) => typeof c === 'string') : null;
+      const current = currentChannels(name, rawChans, msgs);
       unread = visibleUnread(name, storedRole, current, msgs, last, channels);
       chanFields = { channels: effectiveChannels(storedRole, current, name).filter((c) => typeof c === 'string') };
     }
-    const tailPeek = !m.killed ? readTranscriptActivityTail(appData, m.conversation_id) : null;
+    const tailPeek = !m.killed ? readTranscriptActivityTail(appData, convId) : null;
     const status = statusOf(m, tr);
     const activityPeek = !m.killed
       ? tailPeek
@@ -2113,7 +2259,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
 
     return {
       name,
-      conversation_id: m.conversation_id || '',
+      conversation_id: convId,
       model: m.model || tr?.model || '',
       role,
       wake_mode: m.wake_mode || '',
@@ -2246,13 +2392,13 @@ function scanSwarmIds(appDataDirs) {
       }
     }
   }
-  swarmIdsScanCache.set(rootKey, { at: now, entries });
+  lruSet(swarmIdsScanCache, rootKey, { at: now, entries }, 16);
   return entries;
 }
 
 /** Resolve which swarm a conversation belongs to (coordinator dir or member roster). */
 export function resolveConversationSwarm(appDataDirs, conv) {
-  if (!conv || !ID_RE.test(conv)) return { appData: null, swarm: null, member: null };
+  if (typeof conv !== 'string' || !conv || !ID_RE.test(conv)) return { appData: null, swarm: null, member: null };
   for (const appData of appDataDirs) {
     const membersFile = readSmallCached(join(swarmDir(appData, conv), 'members.json'), smallFileCache, 1024 * 1024);
     if (membersFile.text != null) {

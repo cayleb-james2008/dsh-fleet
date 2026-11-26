@@ -1132,3 +1132,208 @@ test('GET /api/swarm serves swarms with channel control records without Referenc
     rmSync(fx.dir, { recursive: true, force: true });
   }
 });
+
+test('POST /api/plan enforces concurrent CAS 409 conflict, corrupt plan recovery, and control-char guards', async () => {
+  const fx = setupFixtureAppData();
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+  });
+
+  try {
+    const postPlan = (body) =>
+      fetch(`${srv.url}/api/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    // Seed initial plan
+    const initRes = await postPlan({
+      confirm: true,
+      conversationId: fx.coord,
+      ifMatch: '',
+      mode: 'patch',
+      patch: { title: 'Concurrent Seed', gate: 'npm test' },
+    });
+    assert.equal(initRes.status, 200);
+    const { etag } = await initRes.json();
+
+    // Fire 5 concurrent updates holding the same etag -> strictly 1 wins (200), 4 conflict (409)
+    const results = await Promise.all(
+      Array.from({ length: 5 }, (_, i) =>
+        postPlan({
+          confirm: true,
+          conversationId: fx.coord,
+          ifMatch: etag,
+          mode: 'patch',
+          patch: { title: `Winner-${i}` },
+        }),
+      ),
+    );
+    const statuses = results.map((r) => r.status).sort((a, b) => a - b);
+    assert.deepEqual(statuses, [200, 409, 409, 409, 409]);
+
+    for (const r of results) {
+      if (r.status === 409) {
+        const j = await r.json();
+        assert.equal(j.error, 'plan changed on disk');
+        assert.ok(j.etag && j.etag !== etag);
+        assert.equal(j.plan?.etag, j.etag);
+      }
+    }
+
+    // Corrupt plan.json on disk -> 409 returns current etag so caller can recover cleanly
+    const planPath = join(fx.appData, 'brain', fx.coord, '.system_generated', 'swarm', 'plan.json');
+    writeFileSync(planPath, '{corrupt json');
+    const staleRes = await postPlan({
+      confirm: true,
+      conversationId: fx.coord,
+      ifMatch: '',
+      mode: 'patch',
+      patch: { title: 'Recovered' },
+    });
+    assert.equal(staleRes.status, 409);
+    const staleJson = await staleRes.json();
+    assert.equal(staleJson.plan, null);
+    assert.ok(staleJson.etag && staleJson.etag.includes(':'));
+
+    const recoverRes = await postPlan({
+      confirm: true,
+      conversationId: fx.coord,
+      ifMatch: staleJson.etag,
+      mode: 'replace',
+      patch: { title: 'Recovered Plan', gate: 'node --test' },
+    });
+    assert.equal(recoverRes.status, 200);
+
+    // Reject newline / Unicode line separator in ifMatch
+    assert.equal(
+      (await postPlan({ confirm: true, conversationId: fx.coord, ifMatch: 'abc\ndef', patch: { title: 'X' } })).status,
+      400,
+    );
+    assert.equal(
+      (await postPlan({ confirm: true, conversationId: fx.coord, ifMatch: 'abc\u2028def', patch: { title: 'X' } })).status,
+      400,
+    );
+  } finally {
+    await srv.close();
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test('POST /api/control rejects adversarial fuzz payloads and protects coordinator/missing/killed members', async () => {
+  const fx = setupFixtureAppData();
+  const swDir = join(fx.appData, 'brain', fx.coord, '.system_generated', 'swarm');
+  writeFileSync(
+    join(swDir, 'members.json'),
+    JSON.stringify({
+      title: 'Fuzz Control Swarm',
+      members: {
+        coordinator: { conversation_id: fx.coord, role: 'coordinator' },
+        worker: { conversation_id: fx.worker, role: 'worker' },
+        dead: { conversation_id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', role: 'worker', killed: true },
+        monitor: { conversation_id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', role: 'monitor' },
+      },
+    }),
+  );
+
+  const delivered = [];
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+    sendMessageFn: async (conv, msg) => {
+      delivered.push({ conv, msg });
+      return { ok: true };
+    },
+  });
+
+  try {
+    const postControl = (body) =>
+      fetch(`${srv.url}/api/control`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    const badPayloads = [
+      // Newlines & Unicode line separators in single-line header fields
+      { confirm: true, conversationId: fx.coord, op: 'spawn_worker', name: 'qa-bot', brief: 'ok', model: 'gemini\ninjected' },
+      { confirm: true, conversationId: fx.coord, op: 'spawn_worker', name: 'qa-bot', brief: 'ok', model: 'gemini\u2028injected' },
+      { confirm: true, conversationId: fx.coord, op: 'spawn_worker', name: 'qa-bot', brief: 'ok', forkFrom: 'worker\u2029bad' },
+      { confirm: true, conversationId: fx.coord, op: 'switch_model', member: 'worker', model: 'gemini\r\nheader' },
+      { confirm: true, conversationId: fx.coord, op: 'switch_model', member: 'worker', model: 'gemini-3', reason: 'quota\u0085nel' },
+      { confirm: true, conversationId: fx.coord, op: 'channel_op', action: 'create', channel: 'ops', topic: 'line1\nline2' },
+      { confirm: true, conversationId: fx.coord, op: 'gate_verdict', verdict: 'verified', seq: 1, targetMember: 'worker\n', note: 'ok' },
+      // Oversized fields
+      { confirm: true, conversationId: fx.coord, op: 'switch_model', member: 'worker', model: 'm'.repeat(257) },
+      { confirm: true, conversationId: fx.coord, op: 'spawn_worker', name: 'qa-bot', brief: 'b'.repeat(4001) },
+      { confirm: true, conversationId: fx.coord, op: 'gate_verdict', verdict: 'verified', seq: 1, note: 'n'.repeat(4001) },
+      // Invalid / reserved channel & member names & out-of-range seq
+      { confirm: true, conversationId: fx.coord, op: 'board_post', channel: 'MAIN', text: 'hi' },
+      { confirm: true, conversationId: fx.coord, op: 'board_post', channel: 'here', text: 'hi' },
+      { confirm: true, conversationId: fx.coord, op: 'board_post', text: 'hi', replyToSeq: 1e30 },
+      { confirm: true, conversationId: fx.coord, op: 'gate_verdict', verdict: 'verified', seq: 1e30, note: 'ok' },
+      { confirm: true, conversationId: fx.coord, op: 'spawn_worker', name: 'here', brief: 'hi' },
+      { confirm: true, conversationId: fx.coord, op: 'spawn_worker', name: 'coordinator-2', brief: 'hi' },
+      { confirm: true, conversationId: fx.coord, op: 'switch_model', member: 'all', model: 'gemini-3' },
+      { confirm: true, conversationId: fx.coord, op: 'switch_model', member: '__proto__', model: 'gemini-3' },
+      { confirm: true, conversationId: fx.coord, op: 'channel_op', action: 'subscribe', channel: 'ops', member: 'here' },
+      // Protected coordinator even with explicit=true + forceUnmerged=true
+      { confirm: true, conversationId: fx.coord, op: 'kill_worker', member: 'coordinator', explicit: true, allowProtected: true, forceProtected: true, forceUnmerged: true },
+      { confirm: true, conversationId: fx.coord, op: 'kill_worker', member: 'constructor' },
+    ];
+
+    for (const p of badPayloads) {
+      const r = await postControl(p);
+      assert.equal(r.status, 400, `Expected 400 for payload ${JSON.stringify(p)}`);
+    }
+
+    // Missing and already-killed worker return 404 and 409 respectively
+    assert.equal(
+      (await postControl({ confirm: true, conversationId: fx.coord, op: 'kill_worker', member: 'ghost' })).status,
+      404,
+    );
+    assert.equal(
+      (await postControl({ confirm: true, conversationId: fx.coord, op: 'kill_worker', member: 'dead' })).status,
+      409,
+    );
+    assert.equal(delivered.length, 0);
+  } finally {
+    await srv.close();
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test('HTTP caches stay bounded under query and root churn', async () => {
+  const fx = setupFixtureAppData();
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+  });
+
+  try {
+    // Churn /api/worktrees with oversized and varying roots queries
+    const hugeRoots = 'a'.repeat(9000);
+    const hugeRes = await fetch(`${srv.url}/api/worktrees?roots=${hugeRoots}`);
+    assert.equal(hugeRes.status, 200);
+    const hugeJson = await hugeRes.json();
+    assert.deepEqual(hugeJson.rejected, ['roots parameter too large']);
+
+    for (let i = 0; i < 40; i++) {
+      const r = await fetch(`${srv.url}/api/worktrees?roots=${encodeURIComponent(`/nonexistent-root-${i}`)}`);
+      assert.equal(r.status, 200);
+      const s = await fetch(`${srv.url}/api/swarm?conversationId=unknown-conv-${i}`);
+      assert.equal(s.status, 200);
+    }
+  } finally {
+    await srv.close();
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});

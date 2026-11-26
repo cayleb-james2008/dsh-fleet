@@ -9,6 +9,12 @@ export const ALL = '*';
 
 const NAME_RUNE = /[\p{L}\p{Nd}_-]/u;
 
+function safeStr(v) {
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  return '';
+}
+
 function isNameCharAt(s, idx) {
   const code = s.charCodeAt(idx);
   if (code < 128) {
@@ -55,7 +61,7 @@ export function createMentionsMatcher(names) {
     return { name: n, lo, prefix: m ? m[1] : null };
   });
   return (text) => {
-    const s = typeof text === 'string' ? text : String(text || '');
+    const s = safeStr(text);
     if (!s || s.indexOf('@') === -1) return { mentions: EMPTY_MENTIONS, all: false };
     const lower = s.toLowerCase();
     const mentions = [];
@@ -71,19 +77,19 @@ export function createMentionsMatcher(names) {
 
 /** Return `{ mentions, all }` addressed by `text` among known member `names`. */
 export function mentionsOf(text, names) {
-  const s = typeof text === 'string' ? text : String(text || '');
+  const s = safeStr(text);
   if (!s || s.indexOf('@') === -1) return { mentions: [], all: false };
   const lower = s.toLowerCase();
   return {
-    mentions: names.filter((n) => named(lower, String(n).toLowerCase())),
+    mentions: names.filter((n) => named(lower, safeStr(n).toLowerCase())),
     all: named(lower, 'all'),
   };
 }
 
 /** Whether `text` calls on `name` directly, by `<prefix>-N` prefix, or `@all`. */
 export function mentions(text, name) {
-  const lower = String(text || '').toLowerCase();
-  return named(lower, String(name || '').toLowerCase()) || named(lower, 'all');
+  const lower = safeStr(text).toLowerCase();
+  return named(lower, safeStr(name).toLowerCase()) || named(lower, 'all');
 }
 
 export const channelOf = (m) => (typeof m?.channel === 'string' && m.channel ? m.channel : MAIN);
@@ -95,9 +101,9 @@ const ALL_BY_ROLE = new Set(['coordinator', 'narrator', 'monitor']);
 const ROLE_WORKER_NAME = /^(?:narrator|monitor)(?:-\d+)?$/;
 
 export function effectiveChannels(role, set, name) {
-  if (Array.isArray(set)) return set;
+  if (Array.isArray(set)) return set.filter((x) => typeof x === 'string');
   if (ALL_BY_ROLE.has(role)) return [ALL];
-  if ((!role || role === 'worker') && ROLE_WORKER_NAME.test(String(name ?? ''))) return [ALL];
+  if ((!role || role === 'worker') && ROLE_WORKER_NAME.test(safeStr(name))) return [ALL];
   return [];
 }
 
@@ -107,8 +113,8 @@ function touches(m, name) {
 }
 
 const storedSet = (map, name) => {
-  const v = map && typeof map === 'object' ? map[name] : null;
-  return Array.isArray(v) ? v : null;
+  const v = map && typeof map === 'object' && Object.hasOwn(map, name) ? map[name] : null;
+  return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : null;
 };
 
 export function channelsAt(name, current, msgs) {
@@ -125,7 +131,7 @@ const CHANNEL_NAME = /^[a-z][a-z0-9-]{0,23}$/;
 const RESERVED = new Set(['main', 'all', 'here']);
 
 export function channelMentions(text) {
-  const lower = String(text || '').toLowerCase();
+  const lower = safeStr(text).toLowerCase();
   const out = [];
   for (let i = lower.indexOf('@#'); i >= 0; i = lower.indexOf('@#', i + 1)) {
     if (i > 0 && NAME_RUNE.test([...lower.slice(Math.max(0, i - 2), i)].pop())) continue;
@@ -155,8 +161,9 @@ export function activeAt(registry, msgs) {
   const archived = new Map();
   for (const m of msgs) {
     const c = controlOf(m);
-    if (c?.op === 'create') created.set(c.channel, Number(m.seq) || 0);
-    if (c?.op === 'archive') archived.set(c.channel, Number(m.seq) || 0);
+    if (!c || typeof c.channel !== 'string' || !c.channel) continue;
+    if (c.op === 'create') created.set(c.channel, Number(m.seq) || 0);
+    if (c.op === 'archive') archived.set(c.channel, Number(m.seq) || 0);
   }
   return msgs.map((m) => {
     const seq = Number(m.seq) || 0;
@@ -195,7 +202,7 @@ export function channelRegistry(msgs) {
       byName.set(c.channel, {
         name: c.channel,
         topic: typeof c.topic === 'string' ? c.topic : '',
-        created_by: String(m.agent ?? ''),
+        created_by: safeStr(m?.agent),
         archived: false,
       });
     } else if (c.op === 'archive') {
