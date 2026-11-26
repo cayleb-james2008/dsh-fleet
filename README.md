@@ -95,14 +95,14 @@ flowchart LR
 
 Measured under `#154` CPU isolation (`taskset -c 24-31`, 16 concurrent polling clients) on a 2,000-board-post and 50,000-transcript-line stress fixture:
 
-| Metric | v1.17.0 | v1.18.0 | **v1.19.0** |
+| Metric | v1.18.0 | v1.19.0 | **v1.20.0** |
 | --- | --- | --- | --- |
-| Embedded sidecar UI (`/`) | `308,802 B` raw / `96,193 B` gz | `309,310 B` raw / `96,345 B` gz | **`311,474 B` raw (`304.2 KiB`) / `97,019 B` gz (`94.7 KiB`)** |
-| Peak RSS (`VmHWM`, `--jitless` 2k/50k) | `64.56 MB` (`66,108 KB`) | `63.61 MB` (`65,136 KB`) | **`63.74 MB` (`65,268 KB`)** |
-| Throughput (`--jitless` keep-alive) | `3,456.5 req/s` | `4,764.6 req/s` | **`4,584.3 req/s` (`2k/50k`, `taskset`)** |
-| Cold audit HTTP (`16w` close) | `1,487.4 req/s` / `13.83 ms` p95 | `1,839.4 req/s` / `11.90 ms` p95 | **`1,833.4 req/s` / `14.11 ms` p95 (`0` errors)** |
+| Embedded sidecar UI (`/`) | `309,310 B` raw / `96,345 B` gz | `311,474 B` raw (`304.2 KiB`) / `97,019 B` gz (`94.7 KiB`) | **`326,845 B` raw (`319.2 KiB`) / `100,977 B` gz (`98.6 KiB`)** |
+| Cold boot & RSS (`16w` audit) | `53.28 ms` / `105.57 MB` | `51.01 ms` / `107.46 MB` (`68.02 MB` `--jitless`) | **`64.59 ms` / `100.02 MB` (`ETag 304`)** |
+| Cold audit HTTP (`16w` close) | `1,839.4 req/s` / `11.90 ms` p95 | `1,833.4 req/s` / `14.11 ms` p95 | **`1,588.3 req/s` / `12.14 ms` p95 (`0/3,979` errors)** |
 | Simultaneous SSE (`x5` streams) | `5/5` (`0` drops) | `5/5` (`0` drops) | **`5/5` (`0` drops)** |
-| E2E gate, replay, and Sloplint | `50/50` + `8/8` + `0 FAIL` | `51/51` + `8/8` + `0 FAIL` | **`52/52` + `8/8` + `0 FAIL / 0 REFLEX / 0 WARN`** |
+| Raw-TCP fuzz & backend tests | `30/30` fuzz + `12/12` unit | `30/30` fuzz + `13/13` unit | **`30/30` fuzz + `16/16` unit (incl. CAS `POST /api/plan`)** |
+| E2E gate, replay, and Sloplint | `51/51` + `8/8` + `0 FAIL` | `52/52` + `8/8` + `0 FAIL` | **`52/52` + `8/8` + `16/16` live-web + `0 FAIL / 0 WARN`** |
 
 ---
 
