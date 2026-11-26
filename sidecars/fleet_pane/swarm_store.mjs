@@ -1829,6 +1829,9 @@ function buildTriageItems({ members, messages, sysAttention }) {
 
 // Stores ONLY compact metadata (never 2k+ message arrays or raw file strings).
 const summaryMetaCache = new Map(); // `${appData}\0${id}` -> { checkedAt, membersKey, boardKey, etag, summary }
+const boardTailCache = new Map(); // swarmDir -> { meta, rosterSig, acc }
+const BOARD_RECENT_CAP = 64;
+const BOARD_TAIL_CACHE_LIMIT = 16;
 const SNAPSHOT_TRANSCRIPT_TTL_MS = 250;
 
 /**
@@ -2036,19 +2039,12 @@ export function computeBurnSummary(members, totalTokens = 0) {
   return { totalTokens: total, topWorker, highBurnCount, workers: rows.slice(0, 6) };
 }
 
-/**
- * Build full snapshot of a swarm WITHOUT retaining large message arrays in JS heap cache.
- * Stores compact swarm summary in `summaryMetaCache` for `listSwarms()`.
- */
-export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
-  const cacheKey = `${appData}\0${id}`;
-  const now = Date.now();
+const REF_SEQ_RE = /(?:^|[^A-Za-z0-9_@#&])#(\d+)\b/g;
+
+function readSwarmMeta(appData, id, now = Date.now()) {
   const dir = swarmDir(appData, id);
   const membersFile = readSmallCached(join(dir, 'members.json'), smallFileCache, 1024 * 1024);
-  if (membersFile.text == null) {
-    summaryMetaCache.delete(cacheKey);
-    return null;
-  }
+  if (membersFile.text == null) return null;
   const boardPath = join(dir, 'board.jsonl');
   const boardStat = statOf(boardPath);
   const membersKey = `${membersFile.ino}:${membersFile.mtime}:${membersFile.size}`;
@@ -2057,12 +2053,12 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
   const roster = parseRoster(membersFile.text) || { title: '', members: {} };
   const title = roster.title || id;
   const names = Object.keys(roster.members).filter((n) => roster.members[n] && typeof roster.members[n] === 'object');
+  const rosterSig = names.map((n) => `${n}:${roleOf(n, roster.members[n])}:${isRoleWorker(n, roster.members[n]) ? 1 : 0}`).join('\0');
   const transcripts = new Map(names.map((n) => [n, summarizeTranscript(appData, roster.members[n].conversation_id)]));
   const trKeys = names.map((n) => `${n}:${transcripts.get(n).key}`).join(',');
   const narratorName = pickNarrator(roster);
   const vf = readView(appData, id, dir, narratorName ? roster.members[narratorName] : null);
   const { plan, key: planKey } = readPlan(dir);
-  const allowedFiles = allowedFilesOf(appData, vf.view.json);
   const failures = new Map(names.map((n) => [n, stepFailure(transcripts.get(n).summary, now)]));
   const stuckKeys = names
     .map((n) => {
@@ -2073,38 +2069,75 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     .join(',');
 
   const etag = `${membersKey}|${boardKey}|${title}|${trKeys}|${vf.etag}|${planKey}|${stuckKeys}`;
-
-  const msgs = boardStat.size > 0 ? streamAllJsonLines(boardPath) : [];
-  const lastSeq = msgs.length ? safeSeq(msgs[msgs.length - 1].seq) : 0;
-  const head = lastSeq || msgs.length;
-  const frames = postedFrames(roster, msgs);
-  const posts = new Map();
-  const edges = new Map();
-  const channels = channelRegistry(msgs);
-  const byChannel = channelAddressees(roster, names, msgs, channels);
-  const matchMentions = createMentionsMatcher(names);
-
-  // Transform board messages in-place so peak heap does not hold 2x 2k-object graphs
-  const seen = new Set();
-  const validSeqs = new Set();
-  for (let i = 0; i < msgs.length; i++) {
-    const s = safeSeq(msgs[i].seq);
-    if (s > 0 && !controlOf(msgs[i])) validSeqs.add(s);
-  }
-  const replyRefsMap = new Map();
-  const refSeqRe = /(?:^|[^A-Za-z0-9_@#&])#(\d+)\b/g;
-  const addReplyRef = (targetSeq, childSeq) => {
-    if (targetSeq <= 0 || targetSeq === childSeq || !validSeqs.has(targetSeq)) return;
-    let children = replyRefsMap.get(targetSeq);
-    if (!children) {
-      children = [];
-      replyRefsMap.set(targetSeq, children);
-    }
-    if (!children.includes(childSeq)) children.push(childSeq);
+  const member = names.find((n) => roster.members[n]?.conversation_id === id) || null;
+  return {
+    dir,
+    boardPath,
+    boardStat,
+    membersFile,
+    membersKey,
+    boardKey,
+    roster,
+    title,
+    names,
+    rosterSig,
+    transcripts,
+    trKeys,
+    vf,
+    plan,
+    planKey,
+    failures,
+    etag,
+    member,
   };
-  const gateAcc = { doneC: 0, doneSeq: 0, doneText: '', verC: 0, verSeq: 0, verText: '', scaleC: 0, scaleSeq: 0, scaleText: '', blkC: 0, blkSeq: 0, blkAgent: '', shipC: 0, shipSeq: 0, firstTs: 0, lastTs: 0 };
-  for (let i = 0; i < msgs.length; i++) {
-    const m = msgs[i];
+}
+
+function createBoardAcc() {
+  return {
+    lineCount: 0,
+    lastSeq: 0,
+    head: 0,
+    posts: new Map(),
+    edges: new Map(),
+    validSeqs: new Set(),
+    replyRefsMap: new Map(),
+    gateAcc: {
+      doneC: 0,
+      doneSeq: 0,
+      doneText: '',
+      verC: 0,
+      verSeq: 0,
+      verText: '',
+      scaleC: 0,
+      scaleSeq: 0,
+      scaleText: '',
+      blkC: 0,
+      blkSeq: 0,
+      blkAgent: '',
+      shipC: 0,
+      shipSeq: 0,
+      firstTs: 0,
+      lastTs: 0,
+    },
+    lastVerifiedSeq: 0,
+    latestBlockedByAgent: new Map(),
+    latestDoneByAgent: new Map(),
+    channelMsgMeta: [],
+    trackChannels: false,
+    recentMsgs: [],
+    evictedMaxSeq: 0,
+  };
+}
+
+function applyBoardBatch(acc, rawObjs, roster, names, matchMentions) {
+  const touchedReplyTargets = new Set();
+  const touchedEdgeKeys = new Set();
+  let seqReset = false;
+  let sawChannelRecord = false;
+  const prevLastSeq = acc.lastSeq;
+
+  for (let i = 0; i < rawObjs.length; i++) {
+    const m = rawObjs[i];
     const seq = safeSeq(m.seq);
     const agent = safeStr(m.agent);
     const text = safeStr(m.text);
@@ -2118,106 +2151,180 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     m.time = time;
     m.ts = ts;
     if (channel !== MAIN) m.channel = channel;
+    if (control) m.control = control;
+    if (prevLastSeq > 0 && seq > 0 && seq <= prevLastSeq) seqReset = true;
+    if (seq > 0 && !control) acc.validSeqs.add(seq);
+    if (control || channel !== MAIN) sawChannelRecord = true;
+  }
+
+  if (seqReset) return { seqReset: true, needChannelRescan: false, touchedReplyTargets, touchedEdgeKeys };
+
+  if (!acc.trackChannels && sawChannelRecord) {
+    if (acc.lineCount > 0) {
+      return { seqReset: false, needChannelRescan: true, touchedReplyTargets, touchedEdgeKeys };
+    }
+    acc.trackChannels = true;
+  }
+
+  let startIdx = 0;
+  let byChannel = null;
+  if (acc.trackChannels) {
+    startIdx = acc.channelMsgMeta.length;
+    for (let i = 0; i < rawObjs.length; i++) {
+      const m = rawObjs[i];
+      acc.channelMsgMeta.push({
+        seq: m.seq,
+        agent: m.agent,
+        ...(m.channel ? { channel: m.channel, text: m.text } : {}),
+        ...(m.control ? { control: m.control } : {}),
+      });
+    }
+    const chReg = channelRegistry(acc.channelMsgMeta);
+    byChannel = channelAddressees(roster, names, acc.channelMsgMeta, chReg);
+  }
+
+  const addReplyRef = (targetSeq, childSeq) => {
+    if (targetSeq <= 0 || targetSeq === childSeq || !acc.validSeqs.has(targetSeq)) return;
+    let children = acc.replyRefsMap.get(targetSeq);
+    if (!children) {
+      children = [];
+      acc.replyRefsMap.set(targetSeq, children);
+    }
+    if (!children.includes(childSeq)) {
+      children.push(childSeq);
+      touchedReplyTargets.add(targetSeq);
+    }
+  };
+
+  const seen = new Set();
+  for (let i = 0; i < rawObjs.length; i++) {
+    const m = rawObjs[i];
+    const { seq, agent, text, time, ts, control } = m;
+    acc.lineCount++;
+    if (seq > acc.lastSeq) acc.lastSeq = seq;
+    acc.head = acc.lastSeq || acc.lineCount;
+
     if (control) {
       m.mentions = [];
       m.all = false;
-      m.control = control;
+      acc.recentMsgs.push(m);
       continue;
     }
+
     if (seq > 0) {
       const explicitReply = Number(m.replyToSeq ?? m.reply_to) || 0;
       if (explicitReply > 0) addReplyRef(explicitReply, seq);
       if (text.indexOf('#') >= 0) {
-        refSeqRe.lastIndex = 0;
+        REF_SEQ_RE.lastIndex = 0;
         let match;
-        while ((match = refSeqRe.exec(text)) !== null) {
+        while ((match = REF_SEQ_RE.exec(text)) !== null) {
           addReplyRef(Number(match[1]), seq);
         }
       }
     }
+
     const hasBrk = text.indexOf('[') >= 0;
     const hasShip = text.indexOf('shipped') >= 0 || text.indexOf('Shipped') >= 0 || text.indexOf('SHIPPED') >= 0;
     if (hasBrk || hasShip) {
       let hit = false;
+      const g = acc.gateAcc;
       if (hasBrk) {
-        if (/\[scale-verified\]/i.test(text)) { gateAcc.scaleC++; if (seq >= gateAcc.scaleSeq) { gateAcc.scaleSeq = seq; gateAcc.scaleText = text; } hit = true; }
-        else if (/\[verified\]/i.test(text)) { gateAcc.verC++; if (seq >= gateAcc.verSeq) { gateAcc.verSeq = seq; gateAcc.verText = text; } hit = true; }
-        else if (/\[done\]/i.test(text)) { gateAcc.doneC++; if (seq >= gateAcc.doneSeq) { gateAcc.doneSeq = seq; gateAcc.doneText = text; } hit = true; }
-        if (/\[blocked\]/i.test(text)) { gateAcc.blkC++; if (seq >= gateAcc.blkSeq) { gateAcc.blkSeq = seq; gateAcc.blkAgent = agent; } hit = true; }
+        if (/\[scale-verified\]/i.test(text)) { g.scaleC++; if (seq >= g.scaleSeq) { g.scaleSeq = seq; g.scaleText = text; } hit = true; }
+        else if (/\[verified\]/i.test(text)) { g.verC++; if (seq >= g.verSeq) { g.verSeq = seq; g.verText = text; } hit = true; }
+        else if (/\[done\]/i.test(text)) { g.doneC++; if (seq >= g.doneSeq) { g.doneSeq = seq; g.doneText = text; } hit = true; }
+        if (/\[blocked\]/i.test(text)) { g.blkC++; if (seq >= g.blkSeq) { g.blkSeq = seq; g.blkAgent = agent; } hit = true; }
       }
       if (hasShip && /\bshipped\b/i.test(text)) {
-        gateAcc.shipC++;
-        if (seq >= gateAcc.shipSeq) gateAcc.shipSeq = seq;
+        g.shipC++;
+        if (seq >= g.shipSeq) g.shipSeq = seq;
         hit = true;
       }
       if (hit && ts > 0) {
-        if (!gateAcc.firstTs || ts < gateAcc.firstTs) gateAcc.firstTs = ts;
-        if (ts > gateAcc.lastTs) gateAcc.lastTs = ts;
+        if (!g.firstTs || ts < g.firstTs) g.firstTs = ts;
+        if (ts > g.lastTs) g.lastTs = ts;
       }
     }
+
+    const trimmed = text.trim();
+    if (trimmed.toLowerCase().includes('[verified]')) {
+      acc.lastVerifiedSeq = Math.max(acc.lastVerifiedSeq, seq);
+    }
+    if (/\[blocked\]/i.test(trimmed)) {
+      acc.latestBlockedByAgent.set(agent, { seq, agent, text: trimmed, ts, control: null });
+    } else if (/^@\S+\s+\[done\]|\[done\]/i.test(trimmed)) {
+      acc.latestDoneByAgent.set(agent, { seq, agent, text: trimmed, ts, control: null });
+    }
+
     const { mentions, all } = matchMentions(text);
-    const ch = byChannel ? byChannel(i, text) : null;
+    const ch = byChannel ? byChannel(startIdx + i, text) : null;
     const viaChannel = ch ? ch.members.filter((n) => n !== agent && !mentions.includes(n)) : [];
-    let p = posts.get(agent);
+    let p = acc.posts.get(agent);
     if (!p) {
       p = { posts: 0, lastPostSeq: 0, lastPostTime: '', lastPostTs: null };
-      posts.set(agent, p);
+      acc.posts.set(agent, p);
     }
     p.posts++;
     p.lastPostSeq = seq;
     p.lastPostTime = time;
     p.lastPostTs = ts;
+
     if (!isRoleWorker(agent, roster.members[agent]) && (all || mentions.length || viaChannel.length)) {
       seen.clear();
+      const bumpEdge = (to, isDirect) => {
+        const key = `${agent}\0${to}`;
+        let e = acc.edges.get(key);
+        if (!e) {
+          e = { from: agent, to, count: 0, direct: 0, viaAll: 0 };
+          acc.edges.set(key, e);
+        }
+        e.count++;
+        if (isDirect) e.direct++;
+        else e.viaAll++;
+        touchedEdgeKeys.add(key);
+      };
       if (all) {
         for (const to of names) {
           if (to === agent || isRoleWorker(to, roster.members[to]) || seen.has(to)) continue;
           seen.add(to);
-          const key = `${agent}\0${to}`;
-          let e = edges.get(key);
-          if (!e) {
-            e = { from: agent, to, count: 0, direct: 0, viaAll: 0 };
-            edges.set(key, e);
-          }
-          e.count++;
-          if (mentions.includes(to) || viaChannel.includes(to)) e.direct++;
-          else e.viaAll++;
+          bumpEdge(to, mentions.includes(to) || viaChannel.includes(to));
         }
       } else {
         for (const to of mentions) {
           if (to === agent || isRoleWorker(to, roster.members[to]) || seen.has(to)) continue;
           seen.add(to);
-          const key = `${agent}\0${to}`;
-          let e = edges.get(key);
-          if (!e) {
-            e = { from: agent, to, count: 0, direct: 0, viaAll: 0 };
-            edges.set(key, e);
-          }
-          e.count++;
-          e.direct++;
+          bumpEdge(to, true);
         }
         for (const to of viaChannel) {
           if (to === agent || isRoleWorker(to, roster.members[to]) || seen.has(to)) continue;
           seen.add(to);
-          const key = `${agent}\0${to}`;
-          let e = edges.get(key);
-          if (!e) {
-            e = { from: agent, to, count: 0, direct: 0, viaAll: 0 };
-            edges.set(key, e);
-          }
-          e.count++;
-          e.direct++;
+          bumpEdge(to, true);
         }
       }
     }
+
     m.mentions = mentions;
     m.all = all;
     if (ch?.channels.length) {
       m.channel_mentions = ch.channels;
       m.via_channel = viaChannel;
     }
+    acc.recentMsgs.push(m);
   }
-  const messages = msgs;
+
+  return { seqReset: false, needChannelRescan: false, touchedReplyTargets, touchedEdgeKeys };
+}
+
+function trimRecentMsgs(acc) {
+  while (acc.recentMsgs.length > BOARD_RECENT_CAP) {
+    const oldest = acc.recentMsgs.shift();
+    if (oldest && oldest.seq > acc.evictedMaxSeq) acc.evictedMaxSeq = oldest.seq;
+  }
+}
+
+function buildMembersAndTelemetry(appData, id, meta, acc, now) {
+  const { roster, names, transcripts, failures, title, boardStat, membersFile, vf, plan } = meta;
+  const channels = acc.trackChannels ? channelRegistry(acc.channelMsgMeta) : [];
+  const head = acc.head;
 
   let totalInputTokens = 0;
   let totalCacheReadTokens = 0;
@@ -2234,8 +2341,8 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     if (channels.length) {
       const storedRole = typeof m.role === 'string' ? m.role : '';
       const rawChans = Array.isArray(m.channels) ? m.channels.filter((c) => typeof c === 'string') : null;
-      const current = currentChannels(name, rawChans, msgs);
-      unread = visibleUnread(name, storedRole, current, msgs, last, channels);
+      const current = currentChannels(name, rawChans, acc.channelMsgMeta);
+      unread = visibleUnread(name, storedRole, current, acc.channelMsgMeta, last, channels);
       chanFields = { channels: effectiveChannels(storedRole, current, name).filter((c) => typeof c === 'string') };
     }
     const tailPeek = !m.killed ? readTranscriptActivityTail(appData, convId) : null;
@@ -2286,7 +2393,7 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
       usage,
       ...(typeof m.workspace_mode === 'string' && m.workspace_mode ? { workspace_mode: m.workspace_mode } : {}),
       ...(typeof m.workspace === 'string' && m.workspace ? { workspace: m.workspace } : {}),
-      ...(posts.get(name) || { posts: 0, lastPostSeq: 0, lastPostTime: '', lastPostTs: null }),
+      ...(acc.posts.get(name) || { posts: 0, lastPostSeq: 0, lastPostTime: '', lastPostTs: null }),
       ...chanFields,
     };
   });
@@ -2294,24 +2401,31 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     (a, b) => (a.role === 'coordinator' ? 0 : 1) - (b.role === 'coordinator' ? 0 : 1) || a.name.localeCompare(b.name),
   );
 
+  const triageMsgs = [];
+  if (acc.lastVerifiedSeq > 0) {
+    triageMsgs.push({ seq: acc.lastVerifiedSeq, agent: '', text: '[verified]', ts: 0, control: null });
+  }
+  for (const msg of acc.latestDoneByAgent.values()) triageMsgs.push(msg);
+  for (const msg of acc.latestBlockedByAgent.values()) triageMsgs.push(msg);
+
   const sysAttention = systemAttention(members, now);
-  const triage = buildTriageItems({ members, messages, sysAttention });
+  const triage = buildTriageItems({ members, messages: triageMsgs, sysAttention });
   const totalTokens = totalInputTokens + totalCacheReadTokens + totalOutputTokens;
   const burnSummary = computeBurnSummary(members, totalTokens);
-  const gateReadiness = computeGateReadiness(messages, triage, { precomputed: gateAcc, members, title });
+  const gateReadiness = computeGateReadiness(triageMsgs, triage, { precomputed: acc.gateAcc, members, title });
 
   const activeCount = members.filter((m) => !m.killed && m.status === 'working').length;
   const waitingCount = members.filter((m) => !m.killed && m.status === 'waiting').length;
   const killedCount = members.filter((m) => m.killed).length;
   const lastActivityTs = Math.max(boardStat.mtime || 0, membersFile.mtime || 0, ...members.map((m) => m.transcriptMtime || 0));
 
-  lruSet(summaryMetaCache, cacheKey, {
+  lruSet(summaryMetaCache, `${appData}\0${id}`, {
     checkedAt: now,
-    membersKey,
-    boardKey,
-    planKey,
-    trKeys,
-    etag,
+    membersKey: meta.membersKey,
+    boardKey: meta.boardKey,
+    planKey: meta.planKey,
+    trKeys: meta.trKeys,
+    etag: meta.etag,
     summary: {
       id,
       title,
@@ -2328,29 +2442,10 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
     },
   }, 8);
 
-  const replyRefs = {};
-  for (const [targetSeq, children] of replyRefsMap.entries()) {
-    children.sort((a, b) => a - b);
-    replyRefs[targetSeq] = children;
-  }
-
-  const snap = {
-    id,
-    title,
-    appData,
-    dir,
-    etag,
-    head,
+  return {
     members,
-    messages,
-    replyRefs,
-    ...(channels.length ? { channels } : {}),
-    edges: [...edges.values()],
-    view: vf.view,
-    plan,
-    frames,
-    allowedFiles,
-    systemAttention: sysAttention,
+    channels,
+    sysAttention,
     triage,
     burnSummary,
     gateReadiness,
@@ -2360,6 +2455,93 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
       outputTokens: totalOutputTokens,
       totalTokens,
     },
+    view: vf.view,
+    plan,
+  };
+}
+
+function streamBoardLines(boardPath, prevMeta) {
+  const parsed = [];
+  let wasReset = !prevMeta;
+  const res = streamLinesIncremental(
+    boardPath,
+    prevMeta,
+    () => {
+      wasReset = true;
+      parsed.length = 0;
+    },
+    (line, preParsed) => {
+      if (preParsed) {
+        parsed.push(preParsed);
+        return;
+      }
+      try {
+        const obj = JSON.parse(line);
+        if (obj && typeof obj === 'object' && !Array.isArray(obj)) parsed.push(obj);
+      } catch {
+        // ignore torn line
+      }
+    },
+  );
+  return { res, parsed, wasReset };
+}
+
+/**
+ * Build full snapshot of a swarm WITHOUT retaining large message arrays in JS heap cache.
+ * Stores compact swarm summary in `summaryMetaCache` for `listSwarms()`.
+ */
+export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
+  const cacheKey = `${appData}\0${id}`;
+  const now = Date.now();
+  const meta = readSwarmMeta(appData, id, now);
+  if (!meta) {
+    summaryMetaCache.delete(cacheKey);
+    boardTailCache.delete(swarmDir(appData, id));
+    return null;
+  }
+
+  const { dir, boardPath, boardStat, membersFile, roster, title, names, rosterSig, vf, etag } = meta;
+  const allowedFiles = allowedFilesOf(appData, vf.view.json);
+  const { res, parsed: msgs } = boardStat.size > 0 ? streamBoardLines(boardPath, null) : { res: { exists: false, meta: null }, parsed: [] };
+  const frames = postedFrames(roster, msgs);
+  const matchMentions = createMentionsMatcher(names);
+  const acc = createBoardAcc();
+  applyBoardBatch(acc, msgs, roster, names, matchMentions);
+
+  const telemetry = buildMembersAndTelemetry(appData, id, meta, acc, now);
+
+  const replyRefs = {};
+  for (const [targetSeq, children] of acc.replyRefsMap.entries()) {
+    children.sort((a, b) => a - b);
+    replyRefs[targetSeq] = children;
+  }
+  const edges = [...acc.edges.values()];
+
+  // Retain only bounded tail state in boardTailCache (never full 2k+ message arrays)
+  trimRecentMsgs(acc);
+  lruSet(boardTailCache, dir, { meta: res.meta, rosterSig, acc }, BOARD_TAIL_CACHE_LIMIT);
+
+  const snap = {
+    id,
+    title,
+    appData,
+    dir,
+    etag,
+    head: acc.head,
+    members: telemetry.members,
+    messages: msgs,
+    replyRefs,
+    ...(telemetry.channels.length ? { channels: telemetry.channels } : {}),
+    edges,
+    view: telemetry.view,
+    plan: telemetry.plan,
+    frames,
+    allowedFiles,
+    systemAttention: telemetry.sysAttention,
+    triage: telemetry.triage,
+    burnSummary: telemetry.burnSummary,
+    gateReadiness: telemetry.gateReadiness,
+    usage: telemetry.usage,
   };
 
   if (includeRaw) {
@@ -2371,6 +2553,226 @@ export function buildSwarmSnapshot(appData, id, { includeRaw = false } = {}) {
   }
 
   return snap;
+}
+
+/** Return cached incremental board tail metadata for diagnostics/tests. */
+export function getBoardTailStats(appData, id) {
+  const entry = boardTailCache.get(swarmDir(appData, id));
+  if (!entry) return null;
+  return {
+    ino: entry.meta?.ino || 0,
+    size: entry.meta?.size ?? -1,
+    mtime: entry.meta?.mtime || 0,
+    head: entry.acc.head,
+    lineCount: entry.acc.lineCount,
+    recentCount: entry.acc.recentMsgs.length,
+    evictedMaxSeq: entry.acc.evictedMaxSeq,
+  };
+}
+
+/**
+ * Build incremental swarm delta or full snapshot using byte-offset `board.jsonl` tail caching.
+ */
+export function buildSwarmDelta({ appData, conversationId, since = 0, prevEtag = '' } = {}) {
+  if (!appData || typeof conversationId !== 'string' || !ID_RE.test(conversationId)) return null;
+
+  let swarmId = conversationId;
+  let resolvedMember = null;
+  let now = Date.now();
+  let meta = readSwarmMeta(appData, swarmId, now);
+  if (!meta) {
+    const resolved = resolveConversationSwarm([appData], conversationId);
+    if (!resolved.swarm || !resolved.appData) return null;
+    swarmId = resolved.swarm;
+    resolvedMember = resolved.member;
+    meta = readSwarmMeta(appData, swarmId, now);
+    if (!meta) return null;
+  } else {
+    resolvedMember = meta.member;
+  }
+
+  const { dir, boardPath, boardStat, roster, names, rosterSig, etag } = meta;
+  const fullCompositeEtag = `${swarmId}|${resolvedMember || ''}|${etag}`;
+  const etagMatched = Boolean(prevEtag && (prevEtag === etag || prevEtag === fullCompositeEtag));
+
+  const sinceNum = Number.isSafeInteger(Number(since)) && Number(since) > 0 ? Number(since) : 0;
+  let cached = boardTailCache.get(dir);
+  const canUseCachedTail = Boolean(
+    cached &&
+    cached.rosterSig === rosterSig &&
+    cached.meta &&
+    boardStat.isFile &&
+    boardStat.ino === cached.meta.ino &&
+    boardStat.size >= cached.meta.size,
+  );
+
+  if (etagMatched) {
+    if (canUseCachedTail && cached.meta.mtime === boardStat.mtime && cached.meta.size === boardStat.size) {
+      return {
+        ok: true,
+        unchanged: true,
+        conversationId,
+        swarm: swarmId,
+        member: resolvedMember,
+        etag,
+        head: cached.acc.head,
+      };
+    }
+    if (!boardStat.isFile || boardStat.size <= 0) {
+      return {
+        ok: true,
+        unchanged: true,
+        conversationId,
+        swarm: swarmId,
+        member: resolvedMember,
+        etag,
+        head: 0,
+      };
+    }
+    // Cold cache with matching etag: populate tail cache once to obtain exact head
+    const snap = buildSwarmSnapshot(appData, swarmId);
+    if (!snap) return null;
+    return {
+      ok: true,
+      unchanged: true,
+      conversationId,
+      swarm: swarmId,
+      member: resolvedMember,
+      etag: snap.etag,
+      head: snap.head,
+    };
+  }
+
+  const returnFull = () => {
+    const snap = buildSwarmSnapshot(appData, swarmId);
+    if (!snap) return null;
+    return {
+      ok: true,
+      mode: 'full',
+      unchanged: false,
+      conversationId,
+      swarm: swarmId,
+      member: resolvedMember,
+      ...snap,
+    };
+  };
+
+  if (sinceNum <= 0) {
+    return returnFull();
+  }
+
+  // Detect file deletion, rotation, or truncation against cached tail state
+  if (cached && (!boardStat.isFile || !cached.meta || boardStat.ino !== cached.meta.ino || boardStat.size < cached.meta.size)) {
+    return returnFull();
+  }
+
+  const matchMentions = createMentionsMatcher(names);
+  let acc;
+  let prevEvictedMaxSeq = 0;
+  let batchResult = { seqReset: false, needChannelRescan: false, touchedReplyTargets: new Set(), touchedEdgeKeys: new Set() };
+  let streamMeta = null;
+
+  if (canUseCachedTail) {
+    acc = cached.acc;
+    prevEvictedMaxSeq = acc.evictedMaxSeq;
+    if (boardStat.size === cached.meta.size && boardStat.mtime === cached.meta.mtime) {
+      streamMeta = cached.meta;
+    } else {
+      const { res, parsed, wasReset } = streamBoardLines(boardPath, cached.meta);
+      if (wasReset || !res.exists) return returnFull();
+      streamMeta = res.meta;
+      if (parsed.length > 0) {
+        batchResult = applyBoardBatch(acc, parsed, roster, names, matchMentions);
+        if (batchResult.seqReset || batchResult.needChannelRescan) return returnFull();
+      }
+    }
+  } else {
+    if (boardStat.size <= 0) return returnFull();
+    const { res, parsed } = streamBoardLines(boardPath, null);
+    if (!res.exists) return returnFull();
+    streamMeta = res.meta;
+    acc = createBoardAcc();
+    batchResult = applyBoardBatch(acc, parsed, roster, names, matchMentions);
+  }
+
+  // If client's since is ahead of board head or older than retained recent window, fall back to full snapshot
+  if (sinceNum > acc.head || sinceNum < prevEvictedMaxSeq) {
+    trimRecentMsgs(acc);
+    lruSet(boardTailCache, dir, { meta: streamMeta, rosterSig, acc }, BOARD_TAIL_CACHE_LIMIT);
+    return returnFull();
+  }
+
+  const messagesDelta = acc.recentMsgs.filter((m) => m.seq > sinceNum);
+  const replyRefsDelta = {};
+  if (messagesDelta.length > 0) {
+    if (canUseCachedTail) {
+      for (const targetSeq of batchResult.touchedReplyTargets) {
+        const children = acc.replyRefsMap.get(targetSeq);
+        if (children) replyRefsDelta[targetSeq] = children.slice().sort((a, b) => a - b);
+      }
+    } else {
+      for (const m of messagesDelta) {
+        if (m.control || m.seq <= 0) continue;
+        const explicitReply = Number(m.replyToSeq ?? m.reply_to) || 0;
+        if (explicitReply > 0 && acc.replyRefsMap.has(explicitReply)) {
+          replyRefsDelta[explicitReply] = acc.replyRefsMap.get(explicitReply).slice().sort((a, b) => a - b);
+        }
+        if (m.text.indexOf('#') >= 0) {
+          REF_SEQ_RE.lastIndex = 0;
+          let match;
+          while ((match = REF_SEQ_RE.exec(m.text)) !== null) {
+            const t = Number(match[1]);
+            if (acc.replyRefsMap.has(t)) replyRefsDelta[t] = acc.replyRefsMap.get(t).slice().sort((a, b) => a - b);
+          }
+        }
+      }
+    }
+  }
+
+  let edgesDelta = [];
+  if (messagesDelta.length > 0) {
+    if (canUseCachedTail) {
+      edgesDelta = [...batchResult.touchedEdgeKeys].map((k) => ({ ...acc.edges.get(k) }));
+    } else {
+      const touched = new Set();
+      for (const m of messagesDelta) {
+        if (m.control || isRoleWorker(m.agent, roster.members[m.agent])) continue;
+        const targets = m.all
+          ? names.filter((to) => to !== m.agent && !isRoleWorker(to, roster.members[to]))
+          : [...(m.mentions || []), ...(m.via_channel || [])].filter((to) => to !== m.agent && !isRoleWorker(to, roster.members[to]));
+        for (const to of targets) touched.add(`${m.agent}\0${to}`);
+      }
+      edgesDelta = [...touched].map((k) => acc.edges.get(k)).filter(Boolean).map((e) => ({ ...e }));
+    }
+  }
+
+  trimRecentMsgs(acc);
+  lruSet(boardTailCache, dir, { meta: streamMeta, rosterSig, acc }, BOARD_TAIL_CACHE_LIMIT);
+
+  const telemetry = buildMembersAndTelemetry(appData, swarmId, meta, acc, now);
+
+  return {
+    ok: true,
+    mode: 'delta',
+    unchanged: false,
+    conversationId,
+    swarm: swarmId,
+    member: resolvedMember,
+    etag,
+    since: sinceNum,
+    head: acc.head,
+    messagesDelta,
+    replyRefsDelta,
+    edgesDelta,
+    members: telemetry.members,
+    channels: telemetry.channels,
+    plan: telemetry.plan,
+    view: telemetry.view,
+    triage: telemetry.triage,
+    burnSummary: telemetry.burnSummary,
+    gateReadiness: telemetry.gateReadiness,
+    usage: telemetry.usage,
+  };
 }
 
 const swarmIdsScanCache = new Map(); // rootKey -> { at, entries }

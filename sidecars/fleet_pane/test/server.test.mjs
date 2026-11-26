@@ -7,6 +7,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { startStandaloneServer } from '../main.mjs';
+import { createFleetHandlers } from '../server_core.mjs';
+import * as store from '../swarm_store.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, '..', '..', '..');
@@ -1332,6 +1334,179 @@ test('HTTP caches stay bounded under query and root churn', async () => {
       const s = await fetch(`${srv.url}/api/swarm?conversationId=unknown-conv-${i}`);
       assert.equal(s.status, 200);
     }
+  } finally {
+    await srv.close();
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test('GET /api/swarm/delta supports full, incremental append, fs.watch wakeup (<300ms), timeout, truncation, abort cleanup, and 400/404 validation', async () => {
+  const fx = setupFixtureAppData();
+  const swDir = join(fx.appData, 'brain', fx.coord, '.system_generated', 'swarm');
+  const boardPath = join(swDir, 'board.jsonl');
+  const workerLogs = join(fx.appData, 'brain', fx.worker, '.system_generated', 'logs');
+  mkdirSync(workerLogs, { recursive: true });
+  const trPath = join(workerLogs, 'transcript.jsonl');
+  writeFileSync(
+    trPath,
+    JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', input_tokens: 100, output_tokens: 20 }) + '\n',
+  );
+
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+  });
+
+  try {
+    // 1. Capabilities advertised in /api/health and /api/swarm
+    const health = await (await fetch(`${srv.url}/api/health`)).json();
+    assert.equal(health.deltaStream, true);
+    assert.equal(health.capabilities?.deltaStream, true);
+
+    const snap0 = await (await fetch(`${srv.url}/api/swarm?conversationId=${fx.coord}`)).json();
+    assert.equal(snap0.capabilities?.deltaStream, true);
+
+    // 2. Validation errors (400 / 404)
+    const badQueries = [
+      `conversationId=${encodeURIComponent('../evil')}`,
+      `conversationId=ab`,
+      `conversationId=${fx.coord}&since=-1`,
+      `conversationId=${fx.coord}&since=abc`,
+      `conversationId=${fx.coord}&since=1.5`,
+      `conversationId=${fx.coord}&waitMs=-5`,
+      `conversationId=${fx.coord}&waitMs=25001`,
+      `conversationId=${fx.coord}&waitMs=nope`,
+    ];
+    for (const qs of badQueries) {
+      const r = await fetch(`${srv.url}/api/swarm/delta?${qs}`);
+      assert.equal(r.status, 400, `Expected 400 for ?${qs}`);
+    }
+    const notFound = await fetch(`${srv.url}/api/swarm/delta?conversationId=00000000-0000-4000-8000-000000000000`);
+    assert.equal(notFound.status, 404);
+
+    // 3. since=0 returns mode: "full"
+    const fullRes = await fetch(`${srv.url}/api/swarm/delta?conversationId=${fx.coord}&since=0`);
+    assert.equal(fullRes.status, 200);
+    const fullJson = await fullRes.json();
+    assert.equal(fullJson.ok, true);
+    assert.equal(fullJson.mode, 'full');
+    assert.equal(fullJson.unchanged, false);
+    assert.equal(fullJson.head, 1);
+    assert.equal(fullJson.etag, snap0.etag);
+
+    // 4. Unchanged timeout with waitMs=120 resolves unchanged: true and leaves zero leaked watchers
+    const t0 = Date.now();
+    const timeoutRes = await fetch(
+      `${srv.url}/api/swarm/delta?conversationId=${fx.coord}&since=1&etag=${encodeURIComponent(fullJson.etag)}&waitMs=120`,
+    );
+    const elapsedTimeout = Date.now() - t0;
+    assert.equal(timeoutRes.status, 200);
+    const timeoutJson = await timeoutRes.json();
+    assert.equal(timeoutJson.ok, true);
+    assert.equal(timeoutJson.unchanged, true);
+    assert.equal(timeoutJson.head, 1);
+    assert.ok(elapsedTimeout >= 90, `Expected >=90ms wait before timeout, got ${elapsedTimeout}ms`);
+    assert.deepEqual(srv.getDeltaStats(), { activeWaiters: 0, activeSwarmWatchers: 0, activeFsWatchers: 0 });
+
+    // 5. Live fs.watch wakeup (<300ms) on board.jsonl append while parked on waitMs=5000
+    let appendAt = 0;
+    setTimeout(() => {
+      appendAt = Date.now();
+      appendFileSync(
+        boardPath,
+        JSON.stringify({ seq: 2, agent: 'coordinator', text: '@worker Re #1: live delta push' }) + '\n',
+      );
+    }, 50);
+
+    const delta1Res = await fetch(
+      `${srv.url}/api/swarm/delta?conversationId=${fx.coord}&since=1&etag=${encodeURIComponent(fullJson.etag)}&waitMs=5000`,
+    );
+    const wakeLatency = Date.now() - appendAt;
+    assert.equal(delta1Res.status, 200);
+    const delta1 = await delta1Res.json();
+    assert.equal(delta1.ok, true);
+    assert.equal(delta1.mode, 'delta');
+    assert.equal(delta1.unchanged, false);
+    assert.equal(delta1.head, 2);
+    assert.equal(delta1.messagesDelta.length, 1);
+    assert.equal(delta1.messagesDelta[0].seq, 2);
+    assert.deepEqual(delta1.replyRefsDelta, { 1: [2] });
+    assert.equal(delta1.edgesDelta.length, 1);
+    assert.ok(wakeLatency < 300, `Expected <300ms fs.watch wakeup on board append, got ${wakeLatency}ms`);
+    assert.deepEqual(srv.getDeltaStats(), { activeWaiters: 0, activeSwarmWatchers: 0, activeFsWatchers: 0 });
+
+    // 6. Live fs.watch wakeup (<300ms) on transcript.jsonl append while parked
+    let trAppendAt = 0;
+    setTimeout(() => {
+      trAppendAt = Date.now();
+      appendFileSync(
+        trPath,
+        JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', input_tokens: 250, output_tokens: 50 }) + '\n',
+      );
+    }, 50);
+
+    const delta2Res = await fetch(
+      `${srv.url}/api/swarm/delta?conversationId=${fx.coord}&since=2&etag=${encodeURIComponent(delta1.etag)}&waitMs=5000`,
+    );
+    const trWakeLatency = Date.now() - trAppendAt;
+    assert.equal(delta2Res.status, 200);
+    const delta2 = await delta2Res.json();
+    assert.equal(delta2.mode, 'delta');
+    assert.equal(delta2.messagesDelta.length, 0);
+    assert.equal(delta2.usage.totalTokens, 420);
+    assert.ok(trWakeLatency < 300, `Expected <300ms wakeup on transcript append, got ${trWakeLatency}ms`);
+    assert.deepEqual(srv.getDeltaStats(), { activeWaiters: 0, activeSwarmWatchers: 0, activeFsWatchers: 0 });
+
+    // 7. Client abort cleans up active waiter and fs.watch immediately
+    const ac = new AbortController();
+    const parkedPromise = fetch(
+      `${srv.url}/api/swarm/delta?conversationId=${fx.coord}&since=2&etag=${encodeURIComponent(delta2.etag)}&waitMs=10000`,
+      { signal: ac.signal },
+    ).catch((err) => err);
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(srv.getDeltaStats().activeWaiters, 1);
+    assert.ok(srv.getDeltaStats().activeFsWatchers >= 1);
+    ac.abort();
+    await parkedPromise;
+    await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(srv.getDeltaStats(), { activeWaiters: 0, activeSwarmWatchers: 0, activeFsWatchers: 0 });
+
+    // 8. Truncation falls back to mode: "full"
+    writeFileSync(
+      boardPath,
+      JSON.stringify({ seq: 1, agent: 'coordinator', text: '@worker reset board' }) + '\n',
+    );
+    const truncRes = await fetch(
+      `${srv.url}/api/swarm/delta?conversationId=${fx.coord}&since=2&etag=${encodeURIComponent(delta2.etag)}&waitMs=0`,
+    );
+    assert.equal(truncRes.status, 200);
+    const truncJson = await truncRes.json();
+    assert.equal(truncJson.mode, 'full');
+    assert.equal(truncJson.head, 1);
+    assert.equal(truncJson.messages.length, 1);
+
+    // 9. Sidecar handler mode (isSidecar: true) advertises sseStream: false and deltaStream: true and serves /api/swarm/delta
+    const sidecarHandlers = createFleetHandlers({
+      store,
+      distDir: fx.distDir,
+      appDataDir: fx.appData,
+      defaultConversationId: fx.coord,
+      isSidecar: true,
+    });
+    const sidecarHealth = JSON.parse(sidecarHandlers.getHealthPacked().raw.toString('utf8'));
+    assert.equal(sidecarHealth.sseStream, false);
+    assert.equal(sidecarHealth.deltaStream, true);
+    assert.equal(sidecarHealth.capabilities?.sseStream, false);
+    assert.equal(sidecarHealth.capabilities?.deltaStream, true);
+
+    const sidecarDelta = await sidecarHandlers.getSwarmDelta({ conversationId: fx.coord, since: '0', waitMs: '0' });
+    assert.equal(sidecarDelta.status, 200);
+    const sidecarDeltaJson = JSON.parse(sidecarDelta.packed.raw.toString('utf8'));
+    assert.equal(sidecarDeltaJson.mode, 'full');
+    assert.equal(sidecarDeltaJson.capabilities?.isSidecar, true);
+    assert.equal(sidecarDeltaJson.capabilities?.deltaStream, true);
   } finally {
     await srv.close();
     rmSync(fx.dir, { recursive: true, force: true });
