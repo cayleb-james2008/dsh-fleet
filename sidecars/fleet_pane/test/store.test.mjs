@@ -21,6 +21,7 @@ import {
   listSwarms,
   normalizePlan,
   readTranscriptActivityTail,
+  readTranscriptSteps,
   summarizeTranscript,
   writeSwarmPlan,
 } from '../swarm_store.mjs';
@@ -1240,6 +1241,262 @@ test('buildSwarmDelta handles full, unchanged, append-only incremental delta, to
     assert.equal(rotFull.mode, 'full');
     assert.equal(rotFull.head, 2);
     assert.equal(rotFull.messages.length, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('readTranscriptSteps handles backwards pagination, filters, correlation, scrubbing, truncation, and symlink/traversal confinement', () => {
+  const dir = makeScratchDir('tr-inspector-');
+  try {
+    const coordId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+    const workerId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+    const evilId = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
+    const swDir = join(dir, 'brain', coordId, '.system_generated', 'swarm');
+    const workerLogs = join(dir, 'brain', workerId, '.system_generated', 'logs');
+    const evilLogs = join(dir, 'brain', evilId, '.system_generated', 'logs');
+    mkdirSync(swDir, { recursive: true });
+    mkdirSync(workerLogs, { recursive: true });
+    mkdirSync(evilLogs, { recursive: true });
+
+    writeFileSync(
+      join(swDir, 'members.json'),
+      JSON.stringify({
+        title: 'Inspector Test',
+        members: {
+          coordinator: { conversation_id: coordId, role: 'coordinator' },
+          builder: { conversation_id: workerId, role: 'worker' },
+          evil_symlink: { conversation_id: evilId, role: 'worker' },
+          evil_trav: { conversation_id: '../../etc', role: 'worker' },
+        },
+      }),
+    );
+
+    const outsideSecret = join(dir, 'outside-secret.jsonl');
+    writeFileSync(outsideSecret, JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: 'SECRET' }) + '\n');
+    symlinkSync(outsideSecret, join(evilLogs, 'transcript.jsonl'));
+
+    const bigArgsVal = 'A'.repeat(2600);
+    const bigStderr = 'STDERR_LINE\n' + 'X'.repeat(2800);
+    const bigText = 'T'.repeat(1600);
+    const secretBlock = [
+      'Path /home/cayleb/Work/repo/file.ts and /Users/alice/.ssh/id_rsa',
+      'Authorization: Bearer my-super-secret-jwt-token-12345',
+      'OPENAI_API_KEY=sk-proj-abc1234567890xyz',
+      'ghp_1234567890abcdef1234',
+      'gho_abcdef1234567890abcd',
+      'AIzaSyDummyGoogleApiKey123456',
+      'xoxb-1234567890-abcdef1234',
+      'AKIAIOSFODNN7EXAMPLE',
+      '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAtestkeydata\n-----END RSA PRIVATE KEY-----',
+    ].join(' | ');
+
+    const lines = [
+      JSON.stringify({
+        step_index: 0,
+        type: 'USER_INPUT',
+        status: 'DONE',
+        created_at: '2026-11-26T10:00:00Z',
+        content: `Investigate ${secretBlock}`,
+      }),
+      JSON.stringify({
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-11-26T10:00:01Z',
+        model: 'gemini-3-pro',
+        input_tokens: 1000,
+        cache_read_tokens: 200,
+        output_tokens: 80,
+        thinking: `Thinking ${bigText}`,
+        content: '',
+        tool_calls: [
+          {
+            name: 'run_command',
+            args: {
+              CommandLine: `cat /home/cayleb/.env && curl -H "Authorization: Bearer tok_987654321" https://example.com`,
+              extra: bigArgsVal,
+            },
+          },
+        ],
+      }),
+      JSON.stringify({
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'ERROR',
+        created_at: '2026-11-26T10:00:04Z',
+        content: `Created At: 2026-11-26T10:00:01Z\nCompleted At: 2026-11-26T10:00:04Z\nCommand exited with code 1\n${secretBlock}\n${bigStderr}`,
+      }),
+      JSON.stringify({
+        step_index: 3,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-11-26T10:00:05Z',
+        model: 'gemini-3-pro',
+        input_tokens: 1500,
+        cache_read_tokens: 500,
+        output_tokens: 60,
+        thinking: `Checking /Users/bob/app/main.ts ${secretBlock}`,
+        tool_calls: [{ name: 'read_file', args: { Path: '/home/cayleb/Work/app.ts' } }],
+      }),
+      JSON.stringify({
+        step_index: 4,
+        type: 'GENERIC',
+        status: 'DONE',
+        created_at: '2026-11-26T10:00:06Z',
+        content: 'Created At: 2026-11-26T10:00:05Z\nCompleted At: 2026-11-26T10:00:06Z\nFile contents OK',
+      }),
+      JSON.stringify({
+        step_index: 5,
+        type: 'ERROR_MESSAGE',
+        status: 'ERROR',
+        created_at: '2026-11-26T10:00:08Z',
+        error: `Model failure: Bearer abcdef123456 sk-live-9876543210 /home/cayleb/secret`,
+      }),
+      JSON.stringify({
+        step_index: 6,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-11-26T10:00:10Z',
+        model: 'gemini-3-pro',
+        input_tokens: 1800,
+        cache_read_tokens: 600,
+        output_tokens: 120,
+        content: `Done ${bigText}`,
+        tool_calls: [],
+      }),
+    ];
+    writeFileSync(join(workerLogs, 'transcript.jsonl'), lines.join('\n') + '\n');
+
+    // 1. Page 1 (limit=2, filter=all) -> steps [6, 5], hasMore=true, nextBefore=5
+    const p1 = readTranscriptSteps([dir], { conversationId: coordId, member: 'builder', limit: 2, filter: 'all' });
+    assert.equal(p1.ok, true);
+    assert.equal(p1.member, 'builder');
+    assert.equal(p1.conversationId, workerId);
+    assert.equal(p1.totalSteps, 7);
+    assert.equal(p1.hasMore, true);
+    assert.equal(p1.nextBefore, 5);
+    assert.deepEqual(p1.steps.map((s) => s.stepIndex), [6, 5]);
+    assert.ok(p1.steps[0].content.length <= 1200);
+    assert.equal(p1.steps[1].type, 'ERROR_MESSAGE');
+    assert.ok(!p1.steps[1].error.includes('abcdef123456'));
+    assert.ok(!p1.steps[1].error.includes('sk-live-9876543210'));
+    assert.ok(!p1.steps[1].error.includes('/home/cayleb'));
+    assert.ok(p1.steps[1].error.includes('~/secret'));
+
+    // 2. Page 2 (before=5, limit=2) -> steps [3, 1] (GENERIC 4 & 2 correlated into 3 & 1!)
+    const p2 = readTranscriptSteps([dir], { conversationId: coordId, member: 'builder', before: p1.nextBefore, limit: 2 });
+    assert.equal(p2.ok, true);
+    assert.equal(p2.hasMore, true);
+    assert.equal(p2.nextBefore, 1);
+    assert.deepEqual(p2.steps.map((s) => s.stepIndex), [3, 1]);
+
+    // Verify paired GENERIC correlation on step 3 and step 1
+    const s3 = p2.steps[0];
+    assert.equal(s3.durationMs, 1000);
+    assert.equal(s3.usage.inputTokens, 1500);
+    assert.equal(s3.usage.cacheReadTokens, 500);
+    assert.equal(s3.usage.outputTokens, 60);
+    assert.equal(s3.toolCalls[0].status, 'DONE');
+    assert.ok(s3.toolCalls[0].outputPreview.includes('File contents OK'));
+    assert.equal(s3.toolCalls[0].args.Path, '~/Work/app.ts');
+
+    const s1 = p2.steps[1];
+    assert.equal(s1.durationMs, 3000);
+    assert.ok(s1.thinking.length <= 1200);
+    assert.equal(s1.toolCalls[0].status, 'ERROR');
+    assert.ok(Buffer.byteLength(JSON.stringify(s1.toolCalls[0].args), 'utf8') <= 2048);
+    assert.ok(Buffer.byteLength(s1.toolCalls[0].outputPreview, 'utf8') <= 2048);
+    for (const leaked of [
+      '/home/cayleb',
+      '/Users/alice',
+      '/Users/bob',
+      'my-super-secret-jwt-token-12345',
+      'tok_987654321',
+      'sk-proj-abc1234567890xyz',
+      'ghp_1234567890abcdef1234',
+      'gho_abcdef1234567890abcd',
+      'AIzaSyDummyGoogleApiKey123456',
+      'xoxb-1234567890-abcdef1234',
+      'AKIAIOSFODNN7EXAMPLE',
+      'MIIEowIBAAKCAQEAtestkeydata',
+    ]) {
+      assert.ok(!s1.toolCalls[0].outputPreview.includes(leaked), `Secret leaked in outputPreview: ${leaked}`);
+      assert.ok(!JSON.stringify(s1.toolCalls[0].args).includes(leaked), `Secret leaked in args: ${leaked}`);
+      assert.ok(!s3.thinking.includes(leaked), `Secret leaked in thinking: ${leaked}`);
+    }
+
+    // 3. Page 3 (before=1, limit=2) -> step [0], hasMore=false, nextBefore=null
+    const p3 = readTranscriptSteps([dir], { conversationId: coordId, member: 'builder', before: p2.nextBefore, limit: 2 });
+    assert.equal(p3.ok, true);
+    assert.equal(p3.hasMore, false);
+    assert.equal(p3.nextBefore, null);
+    assert.deepEqual(p3.steps.map((s) => s.stepIndex), [0]);
+    assert.ok(!p3.steps[0].content.includes('/home/cayleb'));
+    assert.ok(!p3.steps[0].content.includes('AKIAIOSFODNN7EXAMPLE'));
+
+    // 4. filter=errors -> [5, 1] (both ERROR_MESSAGE and PLANNER_RESPONSE with failed GENERIC tool)
+    const errRes = readTranscriptSteps([dir], { conversationId: coordId, member: 'builder', filter: 'errors' });
+    assert.equal(errRes.ok, true);
+    assert.deepEqual(errRes.steps.map((s) => s.stepIndex), [5, 1]);
+
+    // 5. filter=tools -> [3, 1]
+    const toolsRes = readTranscriptSteps([dir], { conversationId: coordId, member: 'builder', filter: 'tools' });
+    assert.equal(toolsRes.ok, true);
+    assert.deepEqual(toolsRes.steps.map((s) => s.stepIndex), [3, 1]);
+
+    // 6. CWE-22 / CWE-59 rejections & invalid inputs
+    assert.equal(readTranscriptSteps([dir], { conversationId: '../evil', member: 'builder' }).status, 400);
+    assert.equal(readTranscriptSteps([dir], { conversationId: coordId, member: '../evil' }).status, 400);
+    assert.equal(readTranscriptSteps([dir], { conversationId: coordId, member: 'unknown' }).status, 404);
+    assert.equal(readTranscriptSteps([dir], { conversationId: coordId, member: 'evil_symlink' }).status, 400);
+    assert.equal(readTranscriptSteps([dir], { conversationId: coordId, member: 'evil_trav' }).status, 400);
+    assert.equal(readTranscriptSteps([dir], { conversationId: coordId, member: 'builder', filter: 'bogus' }).status, 400);
+    assert.equal(readTranscriptSteps([dir], { conversationId: coordId, member: 'builder', before: -1 }).status, 400);
+
+    // 7. Bounded >512 KiB multi-page scan + oversized (>2 MiB) line drop safety
+    const bigLines = [];
+    for (let i = 0; i < 600; i++) {
+      bigLines.push(
+        JSON.stringify({
+          step_index: i,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-26T10:00:00Z',
+          content: `Step ${i} ` + 'z'.repeat(1100),
+          tool_calls: [],
+        }),
+      );
+    }
+    writeFileSync(join(workerLogs, 'transcript.jsonl'), bigLines.join('\n') + '\n');
+    const bigP1 = readTranscriptSteps([dir], { conversationId: coordId, member: 'builder', limit: 50 });
+    assert.equal(bigP1.ok, true);
+    assert.equal(bigP1.steps.length, 50);
+    assert.equal(bigP1.hasMore, true);
+    assert.equal(bigP1.steps[0].stepIndex, 599);
+    assert.equal(bigP1.nextBefore, 550);
+
+    // Walk backwards through multiple pages past 512 KiB boundary
+    let cursor = bigP1.nextBefore;
+    let totalCollected = bigP1.steps.length;
+    let pages = 1;
+    while (cursor !== null && pages < 20) {
+      const next = readTranscriptSteps([dir], { conversationId: coordId, member: 'builder', before: cursor, limit: 50 });
+      assert.equal(next.ok, true);
+      totalCollected += next.steps.length;
+      cursor = next.nextBefore;
+      pages++;
+    }
+    assert.equal(totalCollected, 600);
+    assert.equal(cursor, null);
+
+    // 8. Oversized (>2 MiB) corrupt line is safely dropped without crashing or heap exhaustion
+    const hugeLine = JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', content: 'H'.repeat(2 * 1024 * 1024 + 512) });
+    const normalLine = JSON.stringify({ step_index: 1, type: 'USER_INPUT', content: 'after oversized line' });
+    writeFileSync(join(workerLogs, 'transcript.jsonl'), hugeLine + '\n' + normalLine + '\n');
+    const overRes = readTranscriptSteps([dir], { conversationId: coordId, member: 'builder', limit: 10 });
+    assert.equal(overRes.ok, true);
+    assert.deepEqual(overRes.steps.map((s) => s.stepIndex), [1]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
