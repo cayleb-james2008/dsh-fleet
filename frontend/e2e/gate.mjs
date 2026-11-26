@@ -71,11 +71,169 @@ await runChecks("gate", async (check) => {
 
   await check("plan.json goal, workstreams, and humanized statuses render", async () => {
     const txt = await page.locator("#panel-triage").textContent();
+    if (
+      !txt.includes("Verify Antigravity-native sidebar UX") ||
+      !txt.includes("Sidecar Node store & routes") ||
+      !txt.includes("In progress") ||
+      txt.includes("in_progress")
+    ) {
+      return false;
+    }
+
+    // Verify raw native Antigravity plan.json {goal:{title,line},tasks,threads} + narrator view.json + POST /api/plan
+    const nativePage = await ctx.newPage();
+    const nativeErrors = [];
+    nativePage.on("pageerror", (err) => nativeErrors.push(err.message));
+    nativePage.on("console", (msg) => {
+      if (msg.type() === "error") nativeErrors.push(msg.text());
+    });
+
+    let mockPlan = {
+      goal: {
+        title: "Native Goal Title",
+        line: "Ship zero-crash native plan view",
+      },
+      tasks: {
+        builder: "Verify /home/demo/sidecar.mjs CAS",
+      },
+      threads: [
+        {
+          id: "t-1",
+          title: "Native Thread 1",
+          goal: "Render threads cleanly",
+          tasks: ["builder"],
+        },
+      ],
+    };
+    let mockEtag = "native-v1";
+    let capturedPlanPost = null;
+
+    await nativePage.route("**/api/swarm*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversationId: "11111111-1111-1111-1111-111111111111",
+          swarm: "11111111-1111-1111-1111-111111111111",
+          member: "coordinator",
+          etag: mockEtag,
+          id: "11111111-1111-1111-1111-111111111111",
+          title: "Native Plan Gate",
+          head: 1,
+          members: [
+            {
+              name: "coordinator",
+              conversation_id: "11111111-1111-1111-1111-111111111111",
+              model: "gemini-3-pro",
+              role: "coordinator",
+              wake_mode: "mentions",
+              wait_since: 1,
+              last_read_seq: 1,
+              unread: 0,
+              killed: false,
+              status: "waiting",
+              steps: 1,
+              activity: "",
+              activityKind: "",
+              replied: false,
+              replyAsk: "",
+              narrator: false,
+              roleWorker: false,
+              failure: null,
+              transcriptMtime: Date.now(),
+              startedAt: new Date().toISOString(),
+              lastStepAt: new Date().toISOString(),
+              usage: { inputTokens: 100, cacheReadTokens: 0, outputTokens: 20, totalTokens: 120 },
+              posts: 1,
+              lastPostSeq: 1,
+              lastPostTime: "12:00:00",
+              lastPostTs: Date.now(),
+            },
+          ],
+          messages: [{ seq: 1, agent: "coordinator", text: "@all Native fixture", time: "12:00:00", ts: Date.now(), mentions: [], all: true }],
+          edges: [],
+          view: {
+            exists: true,
+            source: "narrator",
+            json: {
+              headline: "Narrator live check",
+              phase: "verifying",
+              running_summary: "Checking native plan schema",
+              now: { builder: "Testing /home/demo/plan.json" },
+              attention: ["Verify 409 conflict banner"],
+            },
+          },
+          plan: mockPlan,
+          frames: [],
+          triage: [],
+          usage: { inputTokens: 100, cacheReadTokens: 0, outputTokens: 20, totalTokens: 120 },
+          capabilities: { canSendMessage: false, isSidecar: false, sseStream: false },
+        }),
+      });
+    });
+
+    await nativePage.route("**/api/plan", async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      capturedPlanPost = body;
+      mockPlan = {
+        ...mockPlan,
+        goal: {
+          title: body.patch?.goalTitle || mockPlan.goal.title,
+          line: body.patch?.goalLine || body.patch?.goal || mockPlan.goal.line,
+        },
+        tasks: body.patch?.tasks || mockPlan.tasks,
+      };
+      mockEtag = "native-v2";
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, plan: mockPlan, etag: mockEtag, notified: false }),
+      });
+    });
+
+    await nativePage.goto(BASE, { waitUntil: "networkidle" });
+    await nativePage.waitForSelector('[data-testid="narrator-view-card"]');
+    const nTxt = await nativePage.locator("#panel-triage").textContent();
+    const renderOk =
+      nTxt.includes("Native Goal Title") &&
+      nTxt.includes("Ship zero-crash native plan view") &&
+      nTxt.includes("Native Thread 1") &&
+      nTxt.includes("~/sidecar.mjs") &&
+      nTxt.includes("Narrator live check") &&
+      nTxt.includes("Verifying") &&
+      nTxt.includes("~/plan.json") &&
+      nTxt.includes("Verify 409 conflict banner") &&
+      !nTxt.includes("/home/");
+
+    await nativePage.evaluate(() => {
+      window.__nativeDigest = "";
+      try {
+        Object.defineProperty(navigator, "clipboard", {
+          configurable: true,
+          value: { writeText: async (t) => { window.__nativeDigest = String(t); } },
+        });
+      } catch {}
+    });
+    await nativePage.locator('[data-testid="copy-handoff-digest"]').click();
+    await nativePage.waitForFunction(() => Boolean(window.__nativeDigest));
+    const nDigest = await nativePage.evaluate(() => window.__nativeDigest);
+    const digestOk = nDigest.includes("Ship zero-crash native plan view") && !nDigest.includes("/home/");
+
+    await nativePage.locator('[data-testid="edit-plan-btn"]').click();
+    await nativePage.fill('[data-testid="plan-goal-input"]', "Updated native goal line");
+    await nativePage.locator('[data-testid="plan-save-btn"]').click();
+    await nativePage.waitForSelector('[data-testid="swarm-plan-card"]');
+    await nativePage.waitForFunction(
+      () => (document.querySelector('[data-testid="swarm-plan-card"]')?.textContent || "").includes("Updated native goal line"),
+    );
+    await nativePage.close();
+
     return (
-      txt.includes("Verify Antigravity-native sidebar UX") &&
-      txt.includes("Sidecar Node store & routes") &&
-      txt.includes("In progress") &&
-      !txt.includes("in_progress")
+      renderOk &&
+      digestOk &&
+      nativeErrors.length === 0 &&
+      Boolean(capturedPlanPost?.confirm) &&
+      capturedPlanPost?.patch?.goal === "Updated native goal line"
     );
   });
 

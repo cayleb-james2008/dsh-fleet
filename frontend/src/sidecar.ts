@@ -1,4 +1,16 @@
-import type { SwarmSnapshot, SwarmSummary, ThemeMode, WorktreeDiffPayload, WorktreesPayload } from "./types";
+import type {
+  NormalizedPlan,
+  PlanMilestone,
+  PlanRisk,
+  PlanThread,
+  PlanWorkstream,
+  SwarmPlan,
+  SwarmSnapshot,
+  SwarmSummary,
+  ThemeMode,
+  WorktreeDiffPayload,
+  WorktreesPayload,
+} from "./types";
 
 interface AntigravitySidecarBridge {
   conversationId?: string | null;
@@ -87,6 +99,69 @@ export async function sendConfirmedNudge(target: string | string[], message: str
     const err = await res.json().catch(() => ({}));
     throw new Error(err.error || `Nudge failed (${res.status})`);
   }
+}
+
+export interface PlanPatchPayload {
+  title?: string;
+  goal?: string;
+  goalTitle?: string;
+  goalLine?: string;
+  gate?: string;
+  tasks?: Record<string, string>;
+  threads?: PlanThread[];
+  workstreams?: PlanWorkstream[];
+  milestones?: PlanMilestone[];
+  risks?: PlanRisk[];
+}
+
+export interface SavePlanRequest {
+  conversationId: string;
+  ifMatch: string;
+  mode?: "patch" | "replace";
+  notifyCoordinator?: boolean;
+  patch: PlanPatchPayload;
+}
+
+export interface SavePlanResponse {
+  ok: boolean;
+  plan?: NormalizedPlan | SwarmPlan;
+  etag?: string;
+  notified?: boolean;
+  error?: string;
+}
+
+export class PlanConflictError extends Error {
+  latestPlan?: NormalizedPlan | SwarmPlan;
+
+  constructor(message: string, latestPlan?: NormalizedPlan | SwarmPlan) {
+    super(message);
+    this.name = "PlanConflictError";
+    this.latestPlan = latestPlan;
+  }
+}
+
+export async function saveSwarmPlan(req: SavePlanRequest): Promise<SavePlanResponse> {
+  if (!req.conversationId) throw new Error("No active swarm");
+  const res = await sidecarFetch("/api/plan", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      confirm: true,
+      conversationId: req.conversationId,
+      ifMatch: req.ifMatch ?? "",
+      mode: req.mode || "patch",
+      notifyCoordinator: Boolean(req.notifyCoordinator),
+      patch: req.patch,
+    }),
+  });
+  const data = (await res.json().catch(() => ({}))) as Partial<SavePlanResponse>;
+  if (res.status === 409) {
+    throw new PlanConflictError(data.error || "Plan changed on disk", data.plan);
+  }
+  if (!res.ok) {
+    throw new Error(data.error || `Save plan failed (${res.status})`);
+  }
+  return data as SavePlanResponse;
 }
 
 export async function startSwarmPreset(prompt: string, title: string): Promise<boolean> {

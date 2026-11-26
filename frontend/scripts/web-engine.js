@@ -1,5 +1,5 @@
 // Pure client-side Antigravity Swarm Sidecar simulator for `dist-live-web/index.html`.
-// Zero external calls; provides stateful /api/swarms, /api/swarm, /api/worktrees, /api/nudge, /api/frame.
+// Zero external calls; provides stateful /api/swarms, /api/swarm, /api/plan, /api/worktrees, /api/nudge, /api/frame.
 (function () {
   window.__FLEET_LIVE_WEB__ = true;
 
@@ -8,6 +8,7 @@
   var VERIFIER_ID = "demo-verifier-0003";
   var UI_ID = "demo-ui-0004";
   var AUDIT_COORD_ID = "demo-audit-0009";
+  var NATIVE_COORD_ID = "demo-native-0011";
 
   var now = Date.now();
   var t = function (secAgo) {
@@ -300,6 +301,124 @@
         ],
         frames: [],
       },
+      [NATIVE_COORD_ID]: {
+        id: NATIVE_COORD_ID,
+        title: "Native Antigravity Swarm",
+        head: 2,
+        member: "coordinator",
+        planVersion: 1,
+        plan: {
+          goal: {
+            title: "Native Plan Schema Support",
+            line: "Render native goal.{title,line}, tasks, threads, and narrator view.json cleanly.",
+          },
+          tasks: {
+            "api-worker": "Implement POST /api/plan atomic CAS writes",
+            "ui-worker": "Normalize plan.json and render live editor in /home/demo/fleet",
+          },
+          threads: [
+            {
+              id: "gap-1",
+              title: "Plan Normalization Thread",
+              goal: "Support Antigravity native goal object, tasks map, and threads",
+              tasks: ["api-worker", "ui-worker"],
+            },
+          ],
+        },
+        view: {
+          exists: true,
+          source: "narrator",
+          json: {
+            headline: "Narrator tracking native plan normalization",
+            phase: "executing",
+            running_summary: "Two workers active on plan normalization and live editing.",
+            now: {
+              "api-worker": "Testing CAS write path in /home/demo/swarm_store.mjs",
+              "ui-worker": "Verifying 380px plan editor layout",
+            },
+            attention: ["Confirm native schema compatibility before merge"],
+          },
+        },
+        members: [
+          {
+            name: "coordinator",
+            conversation_id: NATIVE_COORD_ID,
+            model: "gemini-3-pro",
+            role: "coordinator",
+            wake_mode: "mentions",
+            wait_since: 2,
+            last_read_seq: 2,
+            unread: 0,
+            killed: false,
+            status: "waiting",
+            steps: 6,
+            activity: "",
+            activityKind: "",
+            replied: false,
+            replyAsk: "",
+            narrator: false,
+            roleWorker: false,
+            failure: null,
+            transcriptMtime: t(120),
+            startedAt: new Date(t(600)).toISOString(),
+            lastStepAt: new Date(t(120)).toISOString(),
+            usage: { inputTokens: 8200, cacheReadTokens: 3100, outputTokens: 640, totalTokens: 11940 },
+            posts: 1,
+            lastPostSeq: 1,
+            lastPostTime: "14:00:00",
+            lastPostTs: t(300),
+          },
+          {
+            name: "ui-worker",
+            conversation_id: "demo-ui-worker-0012",
+            model: "gemini-3-pro",
+            role: "worker",
+            wake_mode: "working",
+            wait_since: 0,
+            last_read_seq: 2,
+            unread: 0,
+            killed: false,
+            status: "working",
+            steps: 10,
+            activity: "Building Live Plan Editor",
+            activityKind: "tool",
+            replied: false,
+            replyAsk: "",
+            narrator: false,
+            roleWorker: false,
+            failure: null,
+            transcriptMtime: t(15),
+            startedAt: new Date(t(450)).toISOString(),
+            lastStepAt: new Date(t(15)).toISOString(),
+            usage: { inputTokens: 11400, cacheReadTokens: 4200, outputTokens: 980, totalTokens: 16580 },
+            posts: 1,
+            lastPostSeq: 2,
+            lastPostTime: "14:04:12",
+            lastPostTs: t(40),
+          },
+        ],
+        messages: [
+          {
+            seq: 1,
+            agent: "coordinator",
+            text: "@all Native swarm started with goal.{title,line} plan.json.",
+            time: "14:00:00",
+            ts: t(300),
+            mentions: [],
+            all: true,
+          },
+          {
+            seq: 2,
+            agent: "ui-worker",
+            text: "@coordinator Normalized plan.json and narrator view.json in Triage.",
+            time: "14:04:12",
+            ts: t(40),
+            mentions: ["coordinator"],
+            all: false,
+          },
+        ],
+        frames: [],
+      },
     },
     worktrees: [
       {
@@ -382,6 +501,83 @@
       },
     ],
   };
+
+  function planEtagOf(sw) {
+    return sw && sw.plan ? "plan-v" + (sw.planVersion || 1) : "";
+  }
+
+  function normalizePlanForSnapshot(raw, etag) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    var goalTitle = typeof raw.goalTitle === "string" ? raw.goalTitle : undefined;
+    var goalLine = typeof raw.goalLine === "string" ? raw.goalLine : undefined;
+    var goal = "";
+    if (typeof raw.goal === "string") {
+      goal = raw.goal;
+    } else if (raw.goal && typeof raw.goal === "object") {
+      goalTitle = typeof raw.goal.title === "string" ? raw.goal.title : goalTitle;
+      goalLine = typeof raw.goal.line === "string" ? raw.goal.line : goalLine;
+      goal = goalLine || goalTitle || "";
+    }
+    var threads = Array.isArray(raw.threads) ? raw.threads.map(function (th, idx) {
+      return {
+        id: String((th && th.id) || ("thread-" + (idx + 1))),
+        title: String((th && th.title) || ""),
+        goal: String((th && th.goal) || ""),
+        tasks: Array.isArray(th && th.tasks) ? th.tasks.map(String) : [],
+      };
+    }) : [];
+    var tasks = {};
+    if (raw.tasks && typeof raw.tasks === "object" && !Array.isArray(raw.tasks)) {
+      Object.keys(raw.tasks).forEach(function (k) {
+        if (raw.tasks[k]) tasks[k] = String(raw.tasks[k]);
+      });
+    }
+    var workstreams = Array.isArray(raw.workstreams) ? raw.workstreams.map(function (ws, idx) {
+      return {
+        id: String((ws && ws.id) || ("ws-" + (idx + 1))),
+        title: String((ws && ws.title) || ""),
+        owner: String((ws && ws.owner) || ""),
+        status: String((ws && ws.status) || "pending"),
+      };
+    }) : [];
+    var milestones = Array.isArray(raw.milestones) ? raw.milestones.map(function (ms) {
+      return { title: String((ms && ms.title) || ""), status: String((ms && ms.status) || "pending") };
+    }) : [];
+    var risks = Array.isArray(raw.risks) ? raw.risks.map(function (r) {
+      return typeof r === "string" ? { title: r } : { title: String((r && r.title) || ""), severity: r && r.severity ? String(r.severity) : undefined };
+    }) : [];
+    var hasNative = Boolean(threads.length || Object.keys(tasks).length || goalTitle || goalLine);
+    var hasFleet = Boolean(workstreams.length || milestones.length || raw.gate);
+    var schema = hasNative && hasFleet ? "hybrid" : hasNative ? "native" : "fleet";
+    return Object.assign(
+      {
+        schema: schema,
+        etag: etag || "",
+        title: String(raw.title || goalTitle || ""),
+        goal: goal,
+        gate: String(raw.gate || ""),
+        threads: threads,
+        tasks: tasks,
+        workstreams: workstreams,
+        milestones: milestones,
+        risks: risks,
+      },
+      goalTitle ? { goalTitle: goalTitle } : {},
+      goalLine ? { goalLine: goalLine } : {},
+    );
+  }
+
+  function findSwarmByConvId(convId) {
+    if (!convId) return null;
+    if (state.swarms[convId]) return state.swarms[convId];
+    var all = Object.values(state.swarms);
+    for (var i = 0; i < all.length; i++) {
+      if ((all[i].members || []).some(function (m) { return m.conversation_id === convId; })) {
+        return all[i];
+      }
+    }
+    return null;
+  }
 
   function computeSnapshot(id) {
     var sw = state.swarms[id];
@@ -544,7 +740,7 @@
       conversationId: sw.id,
       swarm: sw.id,
       member: sw.member,
-      etag: "liveweb-" + sw.head + "-" + triage.length,
+      etag: "liveweb-" + sw.head + "-" + triage.length + "-" + (sw.planVersion || 1),
       id: sw.id,
       title: sw.title,
       head: sw.head,
@@ -565,7 +761,8 @@
       }),
       messages: sw.messages,
       edges: [],
-      plan: sw.plan,
+      view: sw.view || null,
+      plan: normalizePlanForSnapshot(sw.plan, planEtagOf(sw)),
       frames: sw.frames,
       triage: triage,
       burnSummary: burnSummary,
@@ -646,6 +843,65 @@
       });
     };
 
+    if (url.pathname === "/api/plan" && init && String(init.method || "").toUpperCase() === "POST") {
+      var rawPlanBody = String(init.body || "{}");
+      if (rawPlanBody.length > 65536) {
+        return jsonResp({ error: "Payload too large" }, 413);
+      }
+      var planBody = {};
+      try { planBody = JSON.parse(rawPlanBody); } catch { return jsonResp({ error: "Invalid JSON" }, 400); }
+      if (!planBody.confirm || !planBody.patch || typeof planBody.patch !== "object") {
+        return jsonResp({ error: "confirm and patch required" }, 400);
+      }
+      if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(rawPlanBody)) {
+        return jsonResp({ error: "Control characters not permitted" }, 400);
+      }
+      var targetSw = findSwarmByConvId(planBody.conversationId);
+      if (!targetSw) {
+        return jsonResp({ error: "Unknown swarm" }, 404);
+      }
+      var curPlanEtag = planEtagOf(targetSw);
+      if (typeof planBody.ifMatch === "string" && targetSw.plan && planBody.ifMatch !== curPlanEtag) {
+        return jsonResp({ error: "plan changed on disk", plan: normalizePlanForSnapshot(targetSw.plan, curPlanEtag) }, 409);
+      }
+      var basePlan = planBody.mode === "replace" || !targetSw.plan ? {} : Object.assign({}, targetSw.plan);
+      var patch = planBody.patch;
+      var isNativeObj = (basePlan.goal && typeof basePlan.goal === "object") || patch.goalTitle !== undefined || patch.goalLine !== undefined;
+      if (isNativeObj) {
+        var prevObj = basePlan.goal && typeof basePlan.goal === "object" ? basePlan.goal : {};
+        basePlan.goal = {
+          title: patch.goalTitle !== undefined ? String(patch.goalTitle) : String(prevObj.title || basePlan.title || ""),
+          line: patch.goalLine !== undefined ? String(patch.goalLine) : patch.goal !== undefined ? String(patch.goal) : String(prevObj.line || ""),
+        };
+      } else if (patch.goal !== undefined) {
+        basePlan.goal = String(patch.goal);
+      }
+      if (patch.title !== undefined) basePlan.title = String(patch.title);
+      if (patch.gate !== undefined) basePlan.gate = String(patch.gate);
+      if (patch.tasks !== undefined && patch.tasks && typeof patch.tasks === "object") basePlan.tasks = patch.tasks;
+      if (Array.isArray(patch.threads)) basePlan.threads = patch.threads;
+      if (Array.isArray(patch.workstreams)) basePlan.workstreams = patch.workstreams;
+      if (Array.isArray(patch.milestones)) basePlan.milestones = patch.milestones;
+      if (Array.isArray(patch.risks)) basePlan.risks = patch.risks;
+      targetSw.plan = basePlan;
+      targetSw.planVersion = (targetSw.planVersion || 1) + 1;
+      var nextEtag = planEtagOf(targetSw);
+      var notified = false;
+      if (planBody.notifyCoordinator) {
+        notified = true;
+        targetSw.head += 1;
+        targetSw.messages.push({
+          seq: targetSw.head,
+          agent: "coordinator",
+          text: "@coordinator Plan updated: " + (typeof basePlan.goal === "object" ? basePlan.goal.line || basePlan.goal.title : basePlan.goal || basePlan.title || "updated"),
+          time: new Date().toTimeString().slice(0, 8),
+          ts: Date.now(),
+          mentions: ["coordinator"],
+          all: false,
+        });
+      }
+      return jsonResp({ ok: true, plan: normalizePlanForSnapshot(targetSw.plan, nextEtag), etag: nextEtag, notified: notified });
+    }
     if (url.pathname === "/api/nudge" && init && String(init.method || "").toUpperCase() === "POST") {
       var body = {};
       try { body = JSON.parse(String(init.body || "{}")); } catch {}
