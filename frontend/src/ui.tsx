@@ -13,12 +13,17 @@ import type {
 } from "react";
 import { AlertTriangle, ArrowUpRight, CheckCircle2, ChevronDown, ChevronUp, ClipboardCopy, FileCode2, Image as ImageIcon, Pin, PinOff, RefreshCw, Send, X } from "./icons";
 import { animatePanelEnter } from "./motion";
-import { fetchMemberTranscript, openFileInAuxPane, parseScreenshotLines, sendConfirmedNudge, sendSwarmControl } from "./sidecar";
+import { fetchMemberTranscript, openFileInAuxPane, parseScreenshotLines, postOpAction, sendConfirmedNudge, sendSwarmControl } from "./sidecar";
 import type {
   BoardMessage,
   BurnSummary,
+  ControlDispatchResponse,
+  CoordinatorDispatchState,
   CostSummary,
   NormalizedPlan,
+  OpActionResponse,
+  OperatorCommand,
+  OperatorOpAction,
   PlanGoalObject,
   PlanMilestoneStatus,
   PlanRisk,
@@ -81,12 +86,61 @@ export const copyText = (text: string, okMsg = "Copied"): Promise<void> =>
 
 export const hasControlChars = (s: string): boolean => /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(s);
 
+export function isCoordinatorUnhealthy(state?: CoordinatorDispatchState | null): boolean {
+  if (!state) return false;
+  if (state.failure) return true;
+  const st = String(state.status || "").trim().toLowerCase();
+  return Boolean(st && st !== "working" && st !== "waiting");
+}
+
+export function formatCoordinatorWarning(state?: CoordinatorDispatchState | null): string {
+  if (!state) return "";
+  if (state.failure) {
+    const kind = state.failure.kind || "error";
+    const txt = maskHome(state.failure.text || "").trim();
+    return txt ? `coordinator ${kind}: ${txt}` : `coordinator ${kind}`;
+  }
+  const st = String(state.status || "").trim();
+  return st ? `coordinator ${st}` : "coordinator unavailable";
+}
+
+export function notifyDispatch(res: ControlDispatchResponse | undefined, fallbackLabel: string): void {
+  const opId = res?.opId ? String(res.opId).trim() : "";
+  const base = opId
+    ? `Dispatched ${opId} (awaiting coordinator)`
+    : `Dispatched ${fallbackLabel} (awaiting coordinator)`;
+  if (isCoordinatorUnhealthy(res?.coordinatorState)) {
+    toast.error(`${base} — warning: ${formatCoordinatorWarning(res?.coordinatorState)}`);
+    return;
+  }
+  toast.message(base);
+}
+
+export function toDispatchedOp(
+  res: ControlDispatchResponse | undefined,
+  op: string,
+  target?: string,
+): OperatorCommand | null {
+  const opId = res?.opId ? String(res.opId).trim() : "";
+  if (!opId) return null;
+  const now = Date.now();
+  return {
+    opId,
+    op,
+    ...(target ? { target } : {}),
+    status: "dispatched",
+    createdAt: now,
+    updatedAt: now,
+    ...(res?.coordinatorId ? { coordinatorId: res.coordinatorId } : {}),
+  };
+}
+
 export async function submitNudge(
   target: string | string[],
   text: string,
   okMsg: string,
   setSending: (b: boolean) => void,
-  onDone: () => void,
+  onDone: (res?: ControlDispatchResponse) => void,
 ): Promise<void> {
   if (hasControlChars(text)) {
     toast.error("Control characters not permitted");
@@ -97,9 +151,9 @@ export async function submitNudge(
   if (!msg || msg.length > 4000 || !hasTarget) return;
   setSending(true);
   try {
-    await sendConfirmedNudge(target, msg);
-    toast.success(okMsg);
-    onDone();
+    const res = await sendConfirmedNudge(target, msg);
+    notifyDispatch(res, okMsg);
+    onDone(res);
   } catch (err) {
     toast.error(err instanceof Error ? err.message : "Send failed");
   } finally {
@@ -1270,7 +1324,245 @@ export function buildRecoverPrompt(m: Pick<SwarmMember, "name" | "lastPostSeq" |
   return `@${m.name}${ref} No update; post status or [blocked].`;
 }
 
-export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnapshot; onJump: (seq: number, agent?: string) => void; onRefresh?: () => void }) {
+const OP_LABELS: Record<string, string> = {
+  board_post: "Board post",
+  spawn_worker: "Spawn worker",
+  switch_model: "Switch model",
+  kill_worker: "Kill worker",
+  channel_op: "Channel op",
+  gate_verdict: "Gate verdict",
+  nudge: "Nudge",
+};
+
+/** Compact operator command queue strip showing pending, verified, and failed dispatches. */
+export function OperatorOpsStrip({
+  snap,
+  onJumpToBoardSeq,
+  onRefresh,
+  onOpsUpdate,
+  onRefreshOps,
+}: {
+  snap: SwarmSnapshot;
+  onJumpToBoardSeq?: (seq: number, agent?: string) => void;
+  onRefresh?: () => void;
+  onOpsUpdate?: (ops: OperatorCommand[]) => void;
+  onRefreshOps?: () => void | Promise<void>;
+}) {
+  const [busyOpId, setBusyOpId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState("");
+  const [showAll, setShowAll] = useState(false);
+  const lockRef = useRef<string | null>(null);
+
+  const swarmConvId = snap.swarm || snap.conversationId || "";
+  const allOps = Array.isArray(snap.ops) ? snap.ops : [];
+  const activeOps = allOps
+    .filter((o) => o && o.opId && o.status !== "dismissed")
+    .slice()
+    .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+
+  if (activeOps.length === 0) return null;
+
+  const pendingCount = activeOps.filter((o) => o.status === "dispatched").length;
+  const issueCount = activeOps.filter((o) => o.status === "failed" || o.status === "timed_out").length;
+  const visibleOps = showAll ? activeOps : activeOps.slice(0, 5);
+
+  const runAction = async (op: OperatorCommand, action: OperatorOpAction) => {
+    if (!swarmConvId || lockRef.current === op.opId) return;
+    lockRef.current = op.opId;
+    setBusyOpId(op.opId);
+    setActionError("");
+    try {
+      const res: OpActionResponse = await postOpAction({
+        conversationId: swarmConvId,
+        opId: op.opId,
+        action,
+      });
+      if (Array.isArray(res.ops)) {
+        onOpsUpdate?.(res.ops);
+      } else {
+        const nextStatus = action === "retry" ? "dispatched" : action === "mark_verified" ? "verified" : "dismissed";
+        const nextOp: OperatorCommand = res.op || {
+          ...op,
+          status: nextStatus,
+          updatedAt: Date.now(),
+          ...(action === "retry" || action === "mark_verified" ? { error: undefined } : {}),
+        };
+        onOpsUpdate?.(allOps.map((item) => (item.opId === op.opId ? nextOp : item)));
+      }
+      if (action === "retry") {
+        toast.message(`Retried ${op.opId} (awaiting coordinator)`);
+      } else if (action === "mark_verified") {
+        toast.success(`Marked ${op.opId} verified`);
+      } else {
+        toast.message(`Dismissed ${op.opId}`);
+      }
+      onRefresh?.();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Op action failed";
+      setActionError(msg);
+      toast.error(msg);
+    } finally {
+      lockRef.current = null;
+      setBusyOpId(null);
+    }
+  };
+
+  return (
+    <Card className="p-2 space-y-1.5 min-w-0" data-testid="operator-ops-strip">
+      <div className="row flex-wrap gap-1.5 t2 min-w-0">
+        <div className="wrap gap-1.5 min-w-0">
+          <span className="font-semibold text-ink">Command queue</span>
+          {pendingCount > 0 && <Badge tone="info">{pendingCount} pending</Badge>}
+          {issueCount > 0 && <Badge tone="danger">{issueCount} issue</Badge>}
+          {pendingCount === 0 && issueCount === 0 && <Badge tone="neutral">{activeOps.length}</Badge>}
+        </div>
+        {onRefreshOps && (
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Refresh command queue"
+            data-testid="ops-refresh-btn"
+            onClick={() => void onRefreshOps()}
+            className="h-7 w-7 min-w-7 min-h-7"
+          >
+            <RefreshCw />
+          </Button>
+        )}
+      </div>
+
+      {actionError && (
+        <p role="alert" className="rounded-chip border border-danger bg-bad-soft px-2 py-1 text-[12px] text-danger break-words">
+          {maskHome(actionError)}
+        </p>
+      )}
+
+      <div className="space-y-1.5 min-w-0">
+        {visibleOps.map((op) => {
+          const isPending = op.status === "dispatched";
+          const isVerified = op.status === "verified";
+          const isFailed = op.status === "failed";
+          const isTimedOut = op.status === "timed_out";
+          const isIssue = isFailed || isTimedOut;
+          const busy = busyOpId === op.opId;
+          const opLabel = OP_LABELS[op.op] || humanizeStatus(op.op);
+
+          return (
+            <div
+              key={op.opId}
+              data-testid={`op-row-${op.opId}`}
+              data-op-status={op.status}
+              className={cn(
+                "rounded-chip border px-2 py-1.5 space-y-1 min-w-0",
+                isIssue ? "border-danger bg-bad-soft" : "border-hairline bg-board",
+              )}
+            >
+              <div className="row flex-wrap gap-1.5 min-w-0">
+                <div className="wrap gap-1.5 min-w-0">
+                  {isPending && (
+                    <RefreshCw
+                      className="h-3.5 w-3.5 text-info motion-safe:animate-spin shrink-0"
+                      aria-hidden="true"
+                      data-testid={`op-spinner-${op.opId}`}
+                    />
+                  )}
+                  {isVerified && <CheckCircle2 className="h-3.5 w-3.5 text-ok shrink-0" aria-hidden="true" />}
+                  {isIssue && (
+                    <AlertTriangle
+                      className={cn("h-3.5 w-3.5 shrink-0", isFailed ? "text-danger" : "text-warn")}
+                      aria-hidden="true"
+                    />
+                  )}
+                  <Badge
+                    tone={isVerified ? "success" : isPending ? "info" : isFailed ? "danger" : "warning"}
+                    data-testid={`op-status-${op.opId}`}
+                  >
+                    {isPending ? "Pending" : isVerified ? "Verified" : isFailed ? "Failed" : "Timed out"}
+                  </Badge>
+                  <span className="text-[12px] font-medium text-ink truncate">{opLabel}</span>
+                  {op.target && <span className="text-[12px] text-ink-2 truncate max-w-full">@{op.target}</span>}
+                  <span className="t3 mono truncate max-w-[110px]" title={op.opId}>{op.opId}</span>
+                </div>
+
+                {op.resolvedSeq && op.resolvedSeq > 0 && onJumpToBoardSeq ? (
+                  <Button
+                    variant="ghost"
+                    data-testid={`op-seq-${op.opId}`}
+                    onClick={() => onJumpToBoardSeq(op.resolvedSeq!)}
+                    className="h-7 px-2 bg-surface num text-info shrink-0"
+                  >
+                    #{op.resolvedSeq}
+                    <ArrowUpRight className="h-3 w-3" />
+                  </Button>
+                ) : null}
+              </div>
+
+              {isIssue && (
+                <p role="alert" data-testid={`op-error-${op.opId}`} className="text-[12px] text-danger break-words">
+                  {maskHome(op.error || (isTimedOut ? "Timed out waiting for coordinator confirmation." : "Command execution failed."))}
+                </p>
+              )}
+
+              <div className="wrap gap-1 pt-0.5">
+                {isIssue && (
+                  <Button
+                    variant="info"
+                    data-testid={`op-retry-${op.opId}`}
+                    disabled={busy}
+                    onClick={() => void runAction(op, "retry")}
+                    className="h-7 px-2"
+                  >
+                    <RefreshCw />
+                    Retry
+                  </Button>
+                )}
+                {!isVerified && (
+                  <Button
+                    variant="outline"
+                    data-testid={`op-verify-${op.opId}`}
+                    disabled={busy}
+                    onClick={() => void runAction(op, "mark_verified")}
+                    className="h-7 px-2"
+                  >
+                    <CheckCircle2 />
+                    Mark Verified
+                  </Button>
+                )}
+                <Button
+                  variant="ghost"
+                  data-testid={`op-dismiss-${op.opId}`}
+                  disabled={busy}
+                  onClick={() => void runAction(op, "dismiss")}
+                  className="h-7 px-2"
+                >
+                  <X />
+                  Dismiss
+                </Button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {activeOps.length > 5 && (
+        <Button variant="ghost" onClick={() => setShowAll((v) => !v)} className="h-7 px-2 w-full">
+          {showAll ? "Show recent 5" : `Show all ${activeOps.length} commands`}
+        </Button>
+      )}
+    </Card>
+  );
+}
+
+export function GateReadinessCard({
+  snap,
+  onJump,
+  onRefresh,
+  onOpDispatched,
+}: {
+  snap: SwarmSnapshot;
+  onJump: (seq: number, agent?: string) => void;
+  onRefresh?: () => void;
+  onOpDispatched?: (op: OperatorCommand) => void;
+}) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -1291,7 +1583,9 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
   const swarmConvId = snap.swarm || snap.conversationId || "";
   const canControl = Boolean(swarmConvId && canLiveNudge(snap));
   const members = snap.members || [];
-  const hasCoordinator = members.some((m) => !m.killed && m.role === "coordinator" && Boolean(m.conversation_id));
+  const coord = members.find((m) => !m.killed && m.role === "coordinator");
+  const hasCoordinator = Boolean(coord && coord.conversation_id);
+  const coordIssue = !hasCoordinator || Boolean(coord?.failure);
 
   const submitVerdict = async () => {
     const note = verdictNote.trim();
@@ -1300,7 +1594,7 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
     setVerdictSending(true);
     setVerdictError("");
     try {
-      await sendSwarmControl({
+      const res = await sendSwarmControl({
         op: "gate_verdict",
         conversationId: swarmConvId,
         verdict: verdictKind,
@@ -1308,7 +1602,9 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
         targetMember: next?.target,
         note,
       });
-      toast.success(`Recorded ${verdictKind} verdict`);
+      notifyDispatch(res, `${verdictKind} verdict`);
+      const dispatched = toDispatchedOp(res, "gate_verdict", next?.target);
+      if (dispatched) onOpDispatched?.(dispatched);
       setVerdictOpen(false);
       setVerdictNote("");
       onRefresh?.();
@@ -1417,7 +1713,9 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
             if (gateNudgeLockRef.current) return;
             gateNudgeLockRef.current = true;
             try {
-              await submitNudge(next.conversationId, draft, `Nudged @${next.target}`, setSending, () => {
+              await submitNudge(next.conversationId, draft, `nudge to @${next.target}`, setSending, (res) => {
+                const dispatched = toDispatchedOp(res, "nudge", next.target);
+                if (dispatched) onOpDispatched?.(dispatched);
                 setOpen(false);
                 onRefresh?.();
               });
@@ -1431,9 +1729,11 @@ export function GateReadinessCard({ snap, onJump, onRefresh }: { snap: SwarmSnap
       )}
       {verdictOpen && (
         <div className="pt-2 border-t border-hairline space-y-2" data-testid="gate-verdict-drawer">
-          {members.length > 0 && !hasCoordinator && (
+          {members.length > 0 && coordIssue && (
             <p role="alert" className="rounded-chip border border-warn bg-warn-soft px-2 py-1 text-[12px] text-warn" data-testid="gate-missing-coordinator">
-              No active coordinator in roster. Verdict delivery may fail.
+              {coord?.failure
+                ? `Coordinator ${coord.failure.kind}: ${maskHome(coord.failure.text)}. Verdict delivery may fail.`
+                : "No active coordinator in roster. Verdict delivery may fail."}
             </p>
           )}
           {verdictError && (

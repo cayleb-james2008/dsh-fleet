@@ -25,6 +25,7 @@ import {
   fetchSwarmSnapshot,
   fetchSwarms,
   fetchWorktrees,
+  getOps,
   inferThemeFromCssColor,
   isEmbeddedHost,
   mergeSwarmDelta,
@@ -32,7 +33,7 @@ import {
   readStoredTheme,
   startSwarmPreset,
 } from "./sidecar";
-import type { SwarmSnapshot, SwarmSummary, TabId, ThemeMode, WorktreesPayload } from "./types";
+import type { OperatorCommand, SwarmSnapshot, SwarmSummary, TabId, ThemeMode, WorktreesPayload } from "./types";
 import {
   Badge,
   Button,
@@ -189,9 +190,15 @@ export function App() {
           lastSwarmsFetchRef.current = Date.now();
         }
         if (data && !data.unchanged) {
-          etagRef.current = data.etag || "";
-          snapRef.current = data;
-          setSnap(data);
+          const prevSnap = snapRef.current;
+          const sameSwarm = Boolean(prevSnap && (prevSnap.swarm === data.swarm || prevSnap.conversationId === data.conversationId));
+          const mergedSnap =
+            sameSwarm && data.ops === undefined && prevSnap?.ops !== undefined
+              ? { ...data, ops: prevSnap.ops }
+              : data;
+          etagRef.current = mergedSnap.etag || "";
+          snapRef.current = mergedSnap;
+          setSnap(mergedSnap);
         }
         setLastSyncAt(Date.now());
         setError("");
@@ -238,6 +245,7 @@ export function App() {
         (Boolean(delta.etag) &&
           delta.etag === prevEtag &&
           delta.mode !== "full" &&
+          delta.ops === undefined &&
           !(delta.messagesDelta && delta.messagesDelta.length > 0));
       if (isNoop) {
         maybeRefreshSwarmsList(false);
@@ -363,6 +371,7 @@ export function App() {
             (Boolean(delta.etag) &&
               delta.etag === reqEtag &&
               delta.mode !== "full" &&
+              delta.ops === undefined &&
               !(delta.messagesDelta && delta.messagesDelta.length > 0));
           if (isNoop) {
             maybeRefreshSwarmsList(false);
@@ -378,7 +387,7 @@ export function App() {
           }
           const prevHead = latestSnap?.head ?? 0;
           const prevMembersSig = membersSigOf(latestSnap);
-          if (delta.etag && delta.etag === etagRef.current) {
+          if (delta.etag && delta.etag === etagRef.current && delta.ops === undefined) {
             maybeRefreshSwarmsList(false);
             if (elapsed < 250) {
               await sleepAbortable(ms);
@@ -574,6 +583,39 @@ export function App() {
     },
     [activeSwarmKey],
   );
+
+  const handleOpsChange = useCallback((nextOps: OperatorCommand[]) => {
+    setSnap((prev) => {
+      if (!prev) return prev;
+      const updated = { ...prev, ops: nextOps };
+      snapRef.current = updated;
+      return updated;
+    });
+  }, []);
+
+  const handleOpDispatched = useCallback((op: OperatorCommand) => {
+    setSnap((prev) => {
+      if (!prev) return prev;
+      const existing = prev.ops || [];
+      if (existing.some((x) => x.opId === op.opId)) return prev;
+      const updated = { ...prev, ops: [op, ...existing].slice(0, 50) };
+      snapRef.current = updated;
+      return updated;
+    });
+  }, []);
+
+  const refreshOps = useCallback(async () => {
+    const convId = snapRef.current?.swarm || snapRef.current?.conversationId || selectedSwarmIdRef.current || "";
+    if (!convId) return;
+    try {
+      const res = await getOps(convId);
+      if (res && Array.isArray(res.ops)) {
+        handleOpsChange(res.ops);
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to refresh command queue");
+    }
+  }, [handleOpsChange]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -912,6 +954,7 @@ export function App() {
                 onCopyHandoffDigest={handleCopyDigest}
                 onExportArchive={handleExportArchive}
                 onRefresh={() => refreshSwarm(true)}
+                onOpDispatched={handleOpDispatched}
               />
             )}
             {tab === "board" && (
@@ -928,6 +971,9 @@ export function App() {
                 onTogglePin={handleTogglePin}
                 onClearHighlight={() => setHighlightSeq(null)}
                 onRefresh={() => refreshSwarm(true)}
+                onOpsUpdate={handleOpsChange}
+                onOpDispatched={handleOpDispatched}
+                onRefreshOps={refreshOps}
               />
             )}
             {tab === "roster" && (
@@ -936,6 +982,9 @@ export function App() {
                 spawnNonce={rosterSpawnNonce}
                 onJumpToBoardSeq={handleJumpToBoard}
                 onRefresh={() => refreshSwarm(true)}
+                onOpsUpdate={handleOpsChange}
+                onOpDispatched={handleOpDispatched}
+                onRefreshOps={refreshOps}
               />
             )}
             {tab === "graph" && <GraphView snap={snap!} />}

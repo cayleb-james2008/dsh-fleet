@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "../hooks";
 import { AlertTriangle, ChevronDown, ChevronUp, ClipboardCopy, Cpu, Eye, EyeOff, FileCode2, MessageSquare, Plus, Radio, Send, Trash2, X } from "../icons";
 import { SwarmControlError, openWorkerConversation, sendSwarmControl } from "../sidecar";
-import type { SwarmMember, SwarmSnapshot, SwarmWorkspaceMode } from "../types";
-import { ActivityPeek, Badge, Button, Card, ForensicTranscriptDrawer, InlineComposer, Input, MemberActivityLine, Pill, StatusDot, Textarea, TokenBurnStrip, type TraceTarget, buildRecoverPrompt, canLiveNudge, cn, copyText, fmtContextCap, fmtTokens, fmtUsd, hasControlChars, memberMeta, safeFiniteNonNeg, safePct, submitNudge, toast, useNowMs } from "../ui";
+import type { OperatorCommand, SwarmMember, SwarmSnapshot, SwarmWorkspaceMode } from "../types";
+import { ActivityPeek, Badge, Button, Card, ForensicTranscriptDrawer, InlineComposer, Input, MemberActivityLine, OperatorOpsStrip, Pill, StatusDot, Textarea, TokenBurnStrip, type TraceTarget, buildRecoverPrompt, canLiveNudge, cn, copyText, fmtContextCap, fmtTokens, fmtUsd, hasControlChars, maskHome, memberMeta, notifyDispatch, safeFiniteNonNeg, safePct, submitNudge, toDispatchedOp, toast, useNowMs } from "../ui";
 
 const ORDER: Record<SwarmMember["status"], number> = { working: 0, waiting: 1, killed: 2 };
 const STALL_MS = 10 * 60 * 1000;
@@ -48,11 +48,17 @@ export function RosterView({
   spawnNonce = 0,
   onJumpToBoardSeq,
   onRefresh,
+  onOpsUpdate,
+  onOpDispatched,
+  onRefreshOps,
 }: {
   snap: SwarmSnapshot;
   spawnNonce?: number;
   onJumpToBoardSeq?: (seq: number, agent?: string) => void;
   onRefresh: () => void;
+  onOpsUpdate?: (ops: OperatorCommand[]) => void;
+  onOpDispatched?: (op: OperatorCommand) => void;
+  onRefreshOps?: () => void | Promise<void>;
 }) {
   const [showKilled, setShowKilled] = useState(false);
   const [peekMember, setPeekMember] = useState<string | null>(null);
@@ -77,6 +83,7 @@ export function RosterView({
   const [switchMember, setSwitchMember] = useState<string | null>(null);
   const [switchModelVal, setSwitchModelVal] = useState("");
   const [switchReason, setSwitchReason] = useState("");
+  const [switchAllowWorking, setSwitchAllowWorking] = useState(false);
   const [switching, setSwitching] = useState(false);
   const [switchError, setSwitchError] = useState("");
 
@@ -101,7 +108,12 @@ export function RosterView({
   const canNudge = canLiveNudge(snap);
   const swarmConvId = snap.swarm || snap.conversationId || "";
   const activeChannels = (snap.channels || []).filter((c) => !c.archived);
-  const hasCoordinator = members.some((m) => !m.killed && m.role === "coordinator" && Boolean(m.conversation_id));
+  const coordMember = members.find((m) => !m.killed && m.role === "coordinator");
+  const hasCoordinator = Boolean(coordMember && coordMember.conversation_id);
+  const coordIssue = !hasCoordinator || Boolean(coordMember?.failure);
+  const coordWarnMsg = coordMember?.failure
+    ? `Coordinator ${coordMember.failure.kind}: ${maskHome(coordMember.failure.text)}.`
+    : "No active coordinator in roster.";
 
   useEffect(() => {
     if (!spawnNonce) return;
@@ -138,7 +150,7 @@ export function RosterView({
     setSpawning(true);
     setSpawnError("");
     try {
-      await sendSwarmControl({
+      const res = await sendSwarmControl({
         op: "spawn_worker",
         conversationId: swarmConvId,
         name: cleanSpawnName,
@@ -146,7 +158,9 @@ export function RosterView({
         workspaceMode: spawnWorkspace,
         ...(spawnChannel ? { channel: spawnChannel } : {}),
       });
-      toast.success(`Requested spawn for @${cleanSpawnName}`);
+      notifyDispatch(res, `spawn @${cleanSpawnName}`);
+      const dispatched = toDispatchedOp(res, "spawn_worker", cleanSpawnName);
+      if (dispatched) onOpDispatched?.(dispatched);
       setSpawnName("");
       setSpawnBrief("");
       setSpawnChannel("");
@@ -164,6 +178,7 @@ export function RosterView({
 
   const openSwitchModel = (m: SwarmMember) => {
     setSwitchError("");
+    setSwitchAllowWorking(false);
     if (switchMember === m.name) {
       setSwitchMember(null);
       return;
@@ -179,28 +194,49 @@ export function RosterView({
     );
   };
 
-  const handleSwitchModelSubmit = async (memberName: string) => {
+  const handleSwitchModelSubmit = async (m: SwarmMember) => {
+    const memberName = m.name;
     const model = switchModelVal.trim();
-    if (switchLockRef.current || !swarmConvId || !model || hasControlChars(model) || hasControlChars(switchReason)) return;
+    const isWorking = m.status === "working";
+    if (
+      switchLockRef.current ||
+      !swarmConvId ||
+      !model ||
+      hasControlChars(model) ||
+      hasControlChars(switchReason) ||
+      (isWorking && !switchAllowWorking)
+    ) {
+      return;
+    }
     switchLockRef.current = true;
     setSwitching(true);
     setSwitchError("");
     try {
-      await sendSwarmControl({
+      const res = await sendSwarmControl({
         op: "switch_model",
         conversationId: swarmConvId,
         member: memberName,
         model,
         ...(switchReason.trim() ? { reason: switchReason.trim() } : {}),
+        ...(switchAllowWorking ? { allowWorking: true } : {}),
       });
-      toast.success(`Switched @${memberName} to ${model}`);
+      notifyDispatch(res, `switch @${memberName} to ${model}`);
+      const dispatched = toDispatchedOp(res, "switch_model", memberName);
+      if (dispatched) onOpDispatched?.(dispatched);
       setSwitchMember(null);
       setSwitchReason("");
+      setSwitchAllowWorking(false);
       onRefresh();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Switch model failed";
-      setSwitchError(msg);
-      toast.error(msg);
+      if (err instanceof SwarmControlError && err.status === 409 && err.code === "worker_not_waiting") {
+        setSwitchError(err.message);
+        toast.error(err.message);
+        onRefresh();
+      } else {
+        const msg = err instanceof Error ? err.message : "Switch model failed";
+        setSwitchError(msg);
+        toast.error(msg);
+      }
     } finally {
       switchLockRef.current = false;
       setSwitching(false);
@@ -225,14 +261,16 @@ export function RosterView({
     setKilling(true);
     setKillError("");
     try {
-      await sendSwarmControl({
+      const res = await sendSwarmControl({
         op: "kill_worker",
         conversationId: swarmConvId,
         member: memberName,
         forceUnmerged,
         ...(killReason.trim() ? { reason: killReason.trim() } : {}),
       });
-      toast.success(`Killed @${memberName}`);
+      notifyDispatch(res, `kill @${memberName}`);
+      const dispatched = toDispatchedOp(res, "kill_worker", memberName);
+      if (dispatched) onOpDispatched?.(dispatched);
       setKillMember(null);
       setKillReason("");
       setKill409(null);
@@ -288,7 +326,9 @@ export function RosterView({
     }
     nudgeLockRef.current = true;
     try {
-      await submitNudge(broadcastConvs, broadcastText, `Broadcast sent (${broadcastConvs.length})`, setSending, () => {
+      await submitNudge(broadcastConvs, broadcastText, `broadcast (${broadcastConvs.length})`, setSending, (res) => {
+        const dispatched = toDispatchedOp(res, "nudge", "all");
+        if (dispatched) onOpDispatched?.(dispatched);
         setBroadcastOpen(false);
         setBroadcastText("@all ");
         onRefresh();
@@ -314,7 +354,9 @@ export function RosterView({
     if (nudgeLockRef.current) return;
     nudgeLockRef.current = true;
     try {
-      await submitNudge(member.conversation_id, nudgeText, `Message sent to ${member.name}`, setSending, () => {
+      await submitNudge(member.conversation_id, nudgeText, `nudge to @${member.name}`, setSending, (res) => {
+        const dispatched = toDispatchedOp(res, "nudge", member.name);
+        if (dispatched) onOpDispatched?.(dispatched);
         setNudgeMember(null);
         setNudgeText("");
         onRefresh();
@@ -374,9 +416,9 @@ export function RosterView({
               <X />
             </Button>
           </div>
-          {canNudge && members.length > 0 && !hasCoordinator && (
+          {canNudge && members.length > 0 && coordIssue && (
             <p role="alert" className="rounded-chip border border-warn bg-warn-soft px-2 py-1 text-[12px] text-warn" data-testid="roster-missing-coordinator">
-              No active coordinator in roster. Spawn directives may fail.
+              {coordWarnMsg} Spawn directives may fail.
             </p>
           )}
           {spawnError && (
@@ -514,6 +556,14 @@ export function RosterView({
           />
         </Card>
       )}
+
+      <OperatorOpsStrip
+        snap={snap}
+        onJumpToBoardSeq={onJumpToBoardSeq}
+        onRefresh={onRefresh}
+        onOpsUpdate={onOpsUpdate}
+        onRefreshOps={onRefreshOps}
+      />
 
       <TokenBurnStrip snap={snap} />
 
@@ -714,75 +764,111 @@ export function RosterView({
                 {/* Expandable Worker Activity Peek */}
                 {peeking && <ActivityPeek member={m} mode="roster" />}
 
-                {switchMember === m.name && (
-                  <div className="pt-2 border-t border-hairline space-y-2" data-testid={`switch-model-drawer-${m.name}`}>
-                    <div className="row">
-                      <span className="text-[12px] font-semibold text-ink">Switch model for @{m.name}</span>
-                      <Button variant="ghost" size="icon" aria-label={`Close switch model for ${m.name}`} onClick={() => setSwitchMember(null)}>
-                        <X />
-                      </Button>
-                    </div>
-                    {canNudge && members.length > 0 && !hasCoordinator && (
-                      <p role="alert" className="rounded-chip border border-warn bg-warn-soft px-2 py-1 text-[12px] text-warn" data-testid="roster-missing-coordinator">
-                        No active coordinator in roster. Switch directives may fail.
-                      </p>
-                    )}
-                    {switchError && (
-                      <p role="alert" className="rounded-chip border border-danger bg-bad-soft px-2 py-1 text-[12px] text-danger" data-testid="switch-model-error">
-                        {switchError}
-                      </p>
-                    )}
-                    <div className="wrap gap-1">
-                      {MODEL_SUGGESTIONS.map((mdl) => (
-                        <Pill
-                          key={mdl}
-                          active={switchModelVal === mdl}
-                          onClick={() => setSwitchModelVal(mdl)}
-                        >
-                          {mdl}
-                        </Pill>
-                      ))}
-                    </div>
-                    <Input
-                      aria-label={`Model for ${m.name}`}
-                      data-testid={`switch-model-input-${m.name}`}
-                      value={switchModelVal}
-                      onChange={(e) => setSwitchModelVal(e.target.value)}
-                      placeholder="Model identifier"
-                    />
-                    <Input
-                      aria-label={`Switch reason for ${m.name}`}
-                      data-testid={`switch-model-reason-${m.name}`}
-                      value={switchReason}
-                      onChange={(e) => setSwitchReason(e.target.value)}
-                      placeholder="Reason (optional)"
-                    />
-                    <div className="row">
-                      <span className="t3">Current: {m.model || "default"}</span>
-                      <div className="f1">
-                        <Button variant="ghost" onClick={() => setSwitchMember(null)}>Cancel</Button>
-                        <Button
-                          variant="primary"
-                          data-testid={`switch-model-submit-${m.name}`}
-                          disabled={switching || !switchModelVal.trim() || hasControlChars(switchModelVal) || hasControlChars(switchReason)}
-                          onClick={() => handleSwitchModelSubmit(m.name)}
-                        >
-                          <Cpu />
-                          {switching ? "Switching..." : "Confirm switch"}
+                {switchMember === m.name && (() => {
+                  const isWorking = m.status === "working";
+                  const switchDisabled =
+                    switching ||
+                    !switchModelVal.trim() ||
+                    hasControlChars(switchModelVal) ||
+                    hasControlChars(switchReason) ||
+                    (isWorking && !switchAllowWorking);
+                  return (
+                    <div className="pt-2 border-t border-hairline space-y-2" data-testid={`switch-model-drawer-${m.name}`}>
+                      <div className="row">
+                        <span className="text-[12px] font-semibold text-ink">Switch model for @{m.name}</span>
+                        <Button variant="ghost" size="icon" aria-label={`Close switch model for ${m.name}`} onClick={() => setSwitchMember(null)}>
+                          <X />
                         </Button>
                       </div>
+                      {canNudge && members.length > 0 && coordIssue && (
+                        <p role="alert" className="rounded-chip border border-warn bg-warn-soft px-2 py-1 text-[12px] text-warn" data-testid="roster-missing-coordinator">
+                          {coordWarnMsg} Switch directives may fail.
+                        </p>
+                      )}
+                      {isWorking && (
+                        <div
+                          role="alert"
+                          data-testid={`switch-model-working-warn-${m.name}`}
+                          className="rounded-chip border border-warn bg-warn-soft p-2 space-y-1.5 text-[12px]"
+                        >
+                          <div className="flex items-start gap-1.5 text-warn font-medium">
+                            <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                            <span>
+                              @{m.name} is currently working. Wait for waiting status or enable explicit override.
+                            </span>
+                          </div>
+                          <label className="flex items-center gap-2 text-ink cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              data-testid={`switch-model-override-${m.name}`}
+                              checked={switchAllowWorking}
+                              onChange={(e) => {
+                                setSwitchAllowWorking(e.target.checked);
+                                setSwitchError("");
+                              }}
+                              className="h-3.5 w-3.5 accent-[var(--blue)] cursor-pointer"
+                            />
+                            <span>Allow switch while working</span>
+                          </label>
+                        </div>
+                      )}
+                      {switchError && (
+                        <p role="alert" className="rounded-chip border border-danger bg-bad-soft px-2 py-1 text-[12px] text-danger" data-testid="switch-model-error">
+                          {switchError}
+                        </p>
+                      )}
+                      <div className="wrap gap-1">
+                        {MODEL_SUGGESTIONS.map((mdl) => (
+                          <Pill
+                            key={mdl}
+                            active={switchModelVal === mdl}
+                            onClick={() => setSwitchModelVal(mdl)}
+                          >
+                            {mdl}
+                          </Pill>
+                        ))}
+                      </div>
+                      <Input
+                        aria-label={`Model for ${m.name}`}
+                        data-testid={`switch-model-input-${m.name}`}
+                        value={switchModelVal}
+                        onChange={(e) => setSwitchModelVal(e.target.value)}
+                        placeholder="Model identifier"
+                      />
+                      <Input
+                        aria-label={`Switch reason for ${m.name}`}
+                        data-testid={`switch-model-reason-${m.name}`}
+                        value={switchReason}
+                        onChange={(e) => setSwitchReason(e.target.value)}
+                        placeholder="Reason (optional)"
+                      />
+                      <div className="row flex-wrap gap-2">
+                        <span className="t3">Current: {m.model || "default"}</span>
+                        <div className="f1">
+                          <Button variant="ghost" onClick={() => setSwitchMember(null)}>Cancel</Button>
+                          <Button
+                            variant="primary"
+                            data-testid={`switch-model-submit-${m.name}`}
+                            disabled={switchDisabled}
+                            onClick={() => handleSwitchModelSubmit(m)}
+                          >
+                            <Cpu />
+                            {switching ? "Dispatching..." : "Confirm switch"}
+                          </Button>
+                        </div>
+                      </div>
                     </div>
-                  </div>
-                )}
+                  );
+                })()}
 
                 {killMember === m.name && (
                   <div className="pt-2 border-t border-hairline space-y-2" data-testid={`kill-worker-confirm-${m.name}`}>
                     <p className="text-[12px] text-ink">
                       Permanently stop @{m.name} and clean up its workspace.
                     </p>
-                    {canNudge && members.length > 0 && !hasCoordinator && (
+                    {canNudge && members.length > 0 && coordIssue && (
                       <p role="alert" className="rounded-chip border border-warn bg-warn-soft px-2 py-1 text-[12px] text-warn" data-testid="roster-missing-coordinator">
-                        No active coordinator in roster. Kill directives may fail.
+                        {coordWarnMsg} Kill directives may fail.
                       </p>
                     )}
                     {killError && (
