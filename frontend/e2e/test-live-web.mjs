@@ -54,6 +54,8 @@ await page.waitForSelector('h1:has-text("Fleet v1.0 Antigravity Sidecar")');
 await check("loads simulated Antigravity swarm, Token Burn, and Gate Readiness Next-Gate Action in 380px sidebar", async () => {
   const txt = await page.locator("#panel-triage").textContent();
   const burn = await page.locator('#panel-triage [data-testid="token-burn-strip"]').textContent();
+  const burnUsd = await page.locator('#panel-triage [data-testid="burn-total-usd"]').textContent();
+  const burnCache = await page.locator('#panel-triage [data-testid="burn-cache-hit"]').textContent();
   const card = page.locator('#panel-triage [data-testid="gate-readiness-card"]');
   const gateTxt = await card.textContent();
   const velTxt = await card.locator('[data-testid="wave-velocity-pill"]').textContent();
@@ -61,7 +63,7 @@ await check("loads simulated Antigravity swarm, Token Burn, and Gate Readiness N
   await card.locator('[data-testid="gate-next-action"]').click();
   const prefilled = await card.locator("#gate-next-nudge").inputValue();
   await card.locator('button:has-text("Cancel")').click();
-  return txt.includes("Needs you") && txt.includes("builder asked a question") && burn.includes("Token burn") && /\d+%/.test(burn) && gateTxt.includes("Gate readiness") && /\d+% pass/.test(velTxt || "") && Boolean(recTxt?.includes("verifier")) && prefilled.includes("Re #");
+  return txt.includes("Needs you") && txt.includes("builder asked a question") && burn.includes("Token burn") && /\d+%/.test(burn) && /\$\d+\.\d+/.test(burnUsd || "") && /\d+% cache hit/.test(burnCache || "") && gateTxt.includes("Gate readiness") && /\d+% pass/.test(velTxt || "") && Boolean(recTxt?.includes("verifier")) && prefilled.includes("Re #");
 });
 
 await check("plan.json goal & humanized workstreams visible", async () => {
@@ -538,6 +540,76 @@ await check("live-web exercises GET /api/swarm/delta (unchanged, delta, full) wi
     Array.isArray(apiProbe.deltaJson.messagesDelta) &&
     apiProbe.deltaJson.messagesDelta.some((m) => m.text.includes("Live web delta sync check")) &&
     apiProbe.wakeMs < 200
+  );
+});
+
+await check("1M Gemini context ceiling (300k = 30%, NOT 100% danger), 200k Claude ceiling, $ spend & cache-hit % render cleanly at 380px Light & Dark", async () => {
+  await page.setViewportSize({ width: 380, height: 900 });
+  await page.locator('button[aria-label="Open settings"]').click();
+  await page.locator('div[role="dialog"] button[role="radio"]:has-text("Light")').click();
+  await page.locator('button[aria-label="Close dialog"]').click();
+
+  await page.selectOption('select[aria-label="Active swarm"]', "demo-native-0011");
+  await page.locator("#tab-triage").click();
+  await page.waitForSelector('#panel-triage [data-testid="token-burn-strip"]');
+  const burnUsd = await page.locator('#panel-triage [data-testid="burn-total-usd"]').textContent();
+  const burnCache = await page.locator('#panel-triage [data-testid="burn-cache-hit"]').textContent();
+
+  await page.evaluate(() => {
+    window.__costNativeClip = "";
+    try {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: async (t) => { window.__costNativeClip = String(t); } },
+      });
+    } catch {}
+  });
+  await page.locator('[data-testid="copy-handoff-digest"]').click();
+  await page.waitForFunction(() => Boolean(window.__costNativeClip));
+  const digest = await page.evaluate(() => window.__costNativeClip);
+
+  await page.locator("#tab-roster").click();
+  await page.waitForSelector('[data-testid="roster-ctx-badge-ui-worker"]');
+  const gemBadge = await page.locator('[data-testid="roster-ctx-badge-ui-worker"]').textContent();
+  const gemClass = await page.locator('[data-testid="roster-ctx-badge-ui-worker"]').getAttribute("class");
+  const gemCap = await page.locator('[data-testid="roster-ctx-cap-ui-worker"]').textContent();
+  const gemCost = await page.locator('[data-testid="roster-cost-ui-worker"]').textContent();
+  const gemCache = await page.locator('[data-testid="roster-cache-hit-ui-worker"]').textContent();
+  const cldBadge = await page.locator('[data-testid="roster-ctx-badge-coordinator"]').textContent();
+  const cldClass = await page.locator('[data-testid="roster-ctx-badge-coordinator"]').getAttribute("class");
+  const cldCap = await page.locator('[data-testid="roster-ctx-cap-coordinator"]').textContent();
+  const cldCost = await page.locator('[data-testid="roster-cost-coordinator"]').textContent();
+  const ovLight = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+  await page.locator('button[aria-label="Open settings"]').click();
+  await page.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();
+  await page.locator('button[aria-label="Close dialog"]').click();
+  const ovDark = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  const isDark = await page.evaluate(() => document.documentElement.getAttribute("data-theme") === "dark");
+
+  await page.locator('button[aria-label="Open settings"]').click();
+  await page.locator('div[role="dialog"] button[role="radio"]:has-text("Light")').click();
+  await page.locator('button[aria-label="Close dialog"]').click();
+
+  return (
+    /\$\d+\.\d+/.test(burnUsd || "") &&
+    /\d+% cache hit/.test(burnCache || "") &&
+    digest.includes("spend") &&
+    digest.includes("cache hit") &&
+    digest.includes("30% of 1M ctx") &&
+    !digest.includes("/home/") &&
+    gemBadge === "30% ctx" &&
+    !gemClass?.includes("text-danger") &&
+    gemCap === "cap 1M" &&
+    /\$\d+\.\d+/.test(gemCost || "") &&
+    gemCache === "40% cache hit" &&
+    cldBadge === "80% ctx" &&
+    Boolean(cldClass?.includes("text-danger")) &&
+    cldCap === "cap 200k" &&
+    /\$\d+\.\d+/.test(cldCost || "") &&
+    ovLight <= 0 &&
+    ovDark <= 0 &&
+    isDark
   );
 });
 

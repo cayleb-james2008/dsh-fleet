@@ -2,10 +2,9 @@ import { useEffect, useMemo, useRef, useState } from "../hooks";
 import { AlertTriangle, ChevronDown, ChevronUp, ClipboardCopy, Cpu, Eye, EyeOff, FileCode2, MessageSquare, Plus, Radio, Send, Trash2, X } from "../icons";
 import { SwarmControlError, openWorkerConversation, sendSwarmControl } from "../sidecar";
 import type { SwarmMember, SwarmSnapshot, SwarmWorkspaceMode } from "../types";
-import { ActivityPeek, Badge, Button, Card, ForensicTranscriptDrawer, InlineComposer, Input, MemberActivityLine, Pill, StatusDot, Textarea, TokenBurnStrip, type TraceTarget, buildRecoverPrompt, canLiveNudge, cn, copyText, fmtTokens, hasControlChars, memberMeta, submitNudge, toast, useNowMs } from "../ui";
+import { ActivityPeek, Badge, Button, Card, ForensicTranscriptDrawer, InlineComposer, Input, MemberActivityLine, Pill, StatusDot, Textarea, TokenBurnStrip, type TraceTarget, buildRecoverPrompt, canLiveNudge, cn, copyText, fmtContextCap, fmtTokens, fmtUsd, hasControlChars, memberMeta, submitNudge, toast, useNowMs } from "../ui";
 
 const ORDER: Record<SwarmMember["status"], number> = { working: 0, waiting: 1, killed: 2 };
-const CONTEXT_BUDGET_TOKENS = 200_000;
 const STALL_MS = 10 * 60 * 1000;
 const WORKER_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const MODEL_SUGGESTIONS = ["gemini-3-pro", "gemini-3-flash", "claude-sonnet-4-6", "claude-opus-4-6"];
@@ -17,16 +16,24 @@ function pickAltModel(current: string): string {
   return "gemini-3-pro";
 }
 
-function contextPressure(m: SwarmMember): { pct: number; tone: "neutral" | "info" | "warning" | "danger"; label: string } {
+function contextPressure(m: SwarmMember): { pct: number; limit: number; capLabel: string; tone: "neutral" | "info" | "warning" | "danger"; label: string } {
+  const limit = m.contextLimit && m.contextLimit > 0 ? m.contextLimit : 200_000;
+  const capLabel = fmtContextCap(limit);
   const ctx = m.lastContextTokens || m.usage.inputTokens + m.usage.cacheReadTokens;
-  const pct = Math.min(100, Math.round((ctx / CONTEXT_BUDGET_TOKENS) * 100));
-  if (m.failure?.kind === "quota") return { pct, tone: "danger", label: "Quota" };
-  if (m.failure) return { pct, tone: "danger", label: "Error" };
+  const computedPct = Math.min(100, Math.round((ctx / limit) * 100));
+  const pct = typeof m.contextPct === "number" && Number.isFinite(m.contextPct)
+    ? Math.min(100, Math.max(0, Math.round(m.contextPct)))
+    : computedPct;
+  if (m.failure?.kind === "quota") return { pct, limit, capLabel, tone: "danger", label: "Quota" };
+  if (m.failure) return { pct, limit, capLabel, tone: "danger", label: "Error" };
   if (m.status === "working" && m.transcriptMtime && Date.now() - m.transcriptMtime > STALL_MS) {
-    return { pct, tone: "warning", label: "Stalled" };
+    return { pct, limit, capLabel, tone: "warning", label: "Stalled" };
   }
-  if (ctx > 0) return { pct, tone: ctx >= 140_000 ? "danger" : ctx >= 90_000 ? "warning" : "info", label: `${pct}% ctx` };
-  return { pct: 0, tone: "neutral", label: "Idle" };
+  if (ctx > 0 || pct > 0) {
+    const tone = pct >= 70 ? "danger" : pct >= 45 ? "warning" : "info";
+    return { pct, limit, capLabel, tone, label: `${pct}% ctx` };
+  }
+  return { pct: 0, limit, capLabel, tone: "neutral", label: "Idle" };
 }
 
 export function RosterView({
@@ -553,7 +560,7 @@ export function RosterView({
                 <div className="wrap gap-1 text-[12px] text-ink-2">
                   <Badge tone={m.status === "working" ? "success" : "neutral"}>{statusText}</Badge>
                   {isStalled && <Badge tone="danger">stalled</Badge>}
-                  {!m.killed && <Badge tone={pressure.tone}>{pressure.label}</Badge>}
+                  {!m.killed && <Badge tone={pressure.tone} data-testid={`roster-ctx-badge-${m.name}`}>{pressure.label}</Badge>}
                   <Badge>{m.steps} steps</Badge>
                   <Badge>{m.posts} posts</Badge>
                   {m.unread > 0 && <Badge tone="danger">{m.unread} unread</Badge>}
@@ -637,13 +644,38 @@ export function RosterView({
                   </div>
                 )}
 
-                {/* Line 3: Token telemetry & Context saturation bar */}
+                {/* Line 3: Token telemetry, cost & Context saturation bar */}
                 <div className="rounded-chip bg-board px-2 py-1 space-y-1">
-                  <div className="flex flex-wrap items-center gap-2 text-[12px] text-ink-2 num">
-                    <span className="font-semibold text-ink">{fmtTokens(m.usage.totalTokens)} tok</span>
-                    {([["in", m.usage.inputTokens], ["cache", m.usage.cacheReadTokens], ["out", m.usage.outputTokens]] as const).map(([k, v]) => (
-                      <span key={k}>{k} {fmtTokens(v)}</span>
-                    ))}
+                  <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-[12px] text-ink-2">
+                    <div className="flex flex-wrap items-center gap-2 tabular-nums">
+                      <span className="font-semibold text-ink">{fmtTokens(m.usage.totalTokens)} tok</span>
+                      {([["in", m.usage.inputTokens], ["cache", m.usage.cacheReadTokens], ["out", m.usage.outputTokens]] as const).map(([k, v]) => (
+                        <span key={k}>{k} {fmtTokens(v)}</span>
+                      ))}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 tabular-nums">
+                      <span className="text-ink-3" data-testid={`roster-ctx-cap-${m.name}`}>cap {pressure.capLabel}</span>
+                      {m.cost && (
+                        m.cost.pricingKnown ? (
+                          <>
+                            <span
+                              className="font-semibold text-ink"
+                              data-testid={`roster-cost-${m.name}`}
+                              title={m.byModel ? Object.entries(m.byModel).map(([mdl, u]) => `${mdl}: ${fmtTokens(u.inputTokens + u.cacheReadTokens + u.outputTokens)}`).join(", ") : undefined}
+                            >
+                              {fmtUsd(m.cost.totalUsd)}
+                            </span>
+                            {m.cost.cacheHitPct > 0 && (
+                              <span className="text-ok" data-testid={`roster-cache-hit-${m.name}`}>
+                                {Math.round(m.cost.cacheHitPct)}% cache hit
+                              </span>
+                            )}
+                          </>
+                        ) : (
+                          <span className="text-ink-3" data-testid={`roster-cost-${m.name}`}>Unpriced</span>
+                        )
+                      )}
+                    </div>
                   </div>
                   {!m.killed && pressure.pct > 0 && (
                     <div className="h-1 w-full overflow-hidden rounded-full bg-track" aria-hidden="true">

@@ -379,7 +379,7 @@
           {
             name: "coordinator",
             conversation_id: NATIVE_COORD_ID,
-            model: "gemini-3-pro",
+            model: "claude-sonnet-4-6",
             role: "coordinator",
             wake_mode: "mentions",
             wait_since: 2,
@@ -398,7 +398,8 @@
             transcriptMtime: t(120),
             startedAt: new Date(t(600)).toISOString(),
             lastStepAt: new Date(t(120)).toISOString(),
-            usage: { inputTokens: 8200, cacheReadTokens: 3100, outputTokens: 640, totalTokens: 11940 },
+            lastContextTokens: 160000,
+            usage: { inputTokens: 100000, cacheReadTokens: 60000, outputTokens: 1800, totalTokens: 161800 },
             posts: 1,
             lastPostSeq: 1,
             lastPostTime: "14:00:00",
@@ -426,7 +427,8 @@
             transcriptMtime: t(15),
             startedAt: new Date(t(450)).toISOString(),
             lastStepAt: new Date(t(15)).toISOString(),
-            usage: { inputTokens: 11400, cacheReadTokens: 4200, outputTokens: 980, totalTokens: 16580 },
+            lastContextTokens: 300000,
+            usage: { inputTokens: 180000, cacheReadTokens: 120000, outputTokens: 4200, totalTokens: 304200 },
             posts: 1,
             lastPostSeq: 2,
             lastPostTime: "14:04:12",
@@ -722,6 +724,100 @@
     return null;
   }
 
+  function getModelSpec(modelId) {
+    var id = String(modelId || "").trim().toLowerCase();
+    if (!id) {
+      return { family: "unknown", contextLimit: 200000, inPer1M: 0, cacheReadPer1M: 0, outPer1M: 0, pricingKnown: false };
+    }
+    if (id.indexOf("gemini") >= 0) {
+      var isFlash = id.indexOf("flash") >= 0;
+      return isFlash
+        ? { family: "gemini-flash", contextLimit: 1000000, inPer1M: 0.30, cacheReadPer1M: 0.03, outPer1M: 2.50, pricingKnown: true }
+        : { family: "gemini-pro", contextLimit: 1000000, inPer1M: 1.25, cacheReadPer1M: 0.125, outPer1M: 10.0, pricingKnown: true };
+    }
+    if (id.indexOf("claude") >= 0 || id.indexOf("opus") >= 0 || id.indexOf("sonnet") >= 0 || id.indexOf("haiku") >= 0) {
+      var is1m = /(?:^|[^a-z0-9])1m(?:[^a-z0-9]|$)|\[1m\]|-1m\b/.test(id);
+      var ctx = is1m ? 1000000 : 200000;
+      if (id.indexOf("opus") >= 0) {
+        return { family: "claude-opus", contextLimit: ctx, inPer1M: 15.0, cacheReadPer1M: 1.5, outPer1M: 75.0, pricingKnown: true };
+      }
+      if (id.indexOf("haiku") >= 0) {
+        return { family: "claude-haiku", contextLimit: ctx, inPer1M: 0.8, cacheReadPer1M: 0.08, outPer1M: 4.0, pricingKnown: true };
+      }
+      return { family: "claude-sonnet", contextLimit: ctx, inPer1M: 3.0, cacheReadPer1M: 0.3, outPer1M: 15.0, pricingKnown: true };
+    }
+    if (id.indexOf("gpt-") >= 0 || /^o[134](?:-|$)/.test(id)) {
+      if (id.indexOf("gpt-4.1") >= 0) {
+        return { family: "openai-gpt", contextLimit: 1000000, inPer1M: 2.0, cacheReadPer1M: 0.5, outPer1M: 8.0, pricingKnown: true };
+      }
+      if (id.indexOf("gpt-4o") >= 0) {
+        return { family: "openai-gpt", contextLimit: 128000, inPer1M: 2.5, cacheReadPer1M: 1.25, outPer1M: 10.0, pricingKnown: true };
+      }
+      if (id.indexOf("gpt-5") >= 0) {
+        return { family: "openai-gpt", contextLimit: 400000, inPer1M: 1.25, cacheReadPer1M: 0.125, outPer1M: 10.0, pricingKnown: true };
+      }
+      return { family: "openai-o", contextLimit: 200000, inPer1M: 2.0, cacheReadPer1M: 0.5, outPer1M: 8.0, pricingKnown: true };
+    }
+    return { family: "unknown", contextLimit: 200000, inPer1M: 0, cacheReadPer1M: 0, outPer1M: 0, pricingKnown: false };
+  }
+
+  function memberByModel(m) {
+    if (m.byModel && Object.keys(m.byModel).length > 0) return m.byModel;
+    var mdl = m.model || "unknown";
+    var res = {};
+    res[mdl] = {
+      inputTokens: m.usage.inputTokens || 0,
+      cacheReadTokens: m.usage.cacheReadTokens || 0,
+      outputTokens: m.usage.outputTokens || 0,
+      steps: m.steps || 0,
+    };
+    return res;
+  }
+
+  function computeCostFromByModel(byModel, activeModel) {
+    var inputUsd = 0;
+    var cacheReadUsd = 0;
+    var outputUsd = 0;
+    var cacheSavingsUsd = 0;
+    var totalIn = 0;
+    var totalCache = 0;
+    var anyKnown = false;
+    var keys = Object.keys(byModel || {});
+    for (var i = 0; i < keys.length; i++) {
+      var mdl = keys[i];
+      var e = byModel[mdl];
+      if (!e) continue;
+      var inp = Number(e.inputTokens) || 0;
+      var cac = Number(e.cacheReadTokens) || 0;
+      var out = Number(e.outputTokens) || 0;
+      totalIn += inp;
+      totalCache += cac;
+      var spec = getModelSpec(mdl);
+      if (spec.pricingKnown) {
+        anyKnown = true;
+        inputUsd += (inp * spec.inPer1M) / 1e6;
+        cacheReadUsd += (cac * spec.cacheReadPer1M) / 1e6;
+        outputUsd += (out * spec.outPer1M) / 1e6;
+        cacheSavingsUsd += (cac * Math.max(0, spec.inPer1M - spec.cacheReadPer1M)) / 1e6;
+      }
+    }
+    if (!anyKnown && activeModel) {
+      anyKnown = getModelSpec(activeModel).pricingKnown;
+    }
+    var totalUsd = inputUsd + cacheReadUsd + outputUsd;
+    var denom = totalIn + totalCache;
+    var cacheHitPct = denom > 0 ? Math.round((totalCache / denom) * 1000) / 10 : 0;
+    return {
+      totalUsd: totalUsd,
+      inputUsd: inputUsd,
+      cacheReadUsd: cacheReadUsd,
+      outputUsd: outputUsd,
+      cacheSavingsUsd: cacheSavingsUsd,
+      cacheHitPct: cacheHitPct,
+      pricingKnown: anyKnown,
+    };
+  }
+
   function computeSnapshot(id) {
     var sw = state.swarms[id];
     if (!sw) return { conversationId: id || null, swarm: null, member: null, swarms: listSwarms(), capabilities: { canSendMessage: true, isSidecar: false } };
@@ -789,24 +885,94 @@
       },
       { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, totalTokens: 0 },
     );
-    var burnRows = sw.members
+    var swarmByModel = {};
+    var maxContextLimit = 200000;
+    var maxContextPct = 0;
+    var enrichedMembers = sw.members.map(function (m) {
+      var bm = memberByModel(m);
+      Object.keys(bm).forEach(function (mdl) {
+        var e = bm[mdl];
+        if (!swarmByModel[mdl]) swarmByModel[mdl] = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
+        swarmByModel[mdl].inputTokens += e.inputTokens || 0;
+        swarmByModel[mdl].cacheReadTokens += e.cacheReadTokens || 0;
+        swarmByModel[mdl].outputTokens += e.outputTokens || 0;
+        swarmByModel[mdl].steps += e.steps || 0;
+      });
+      var spec = getModelSpec(m.model);
+      var contextLimit = spec.contextLimit;
+      var ctxTok = m.lastContextTokens || (m.usage.inputTokens + m.usage.cacheReadTokens);
+      var contextPct = Math.min(100, Math.round((ctxTok / contextLimit) * 100));
+      var cost = computeCostFromByModel(bm, m.model);
+      if (contextLimit > maxContextLimit) maxContextLimit = contextLimit;
+      if (!m.killed && contextPct > maxContextPct) maxContextPct = contextPct;
+      var label = !m.killed && !m.activityPeek
+        ? (m.activity || (m.recentTools && m.recentTools[0] && m.recentTools[0].summary) || m.thinkingHeading || (m.status === "waiting" ? "Waiting on board" : ""))
+            .replace(/\/(?:home|Users)\/[^/\s]+(\/|$)/g, function (_m, sep) { return "~" + sep; })
+        : "";
+      return Object.assign({}, m, {
+        contextLimit: contextLimit,
+        contextPct: contextPct,
+        cost: cost,
+        byModel: bm,
+      }, !m.killed && !m.activityPeek ? {
+        activityPeek: label
+          ? {
+              status: m.status === "working" ? "working" : "waiting",
+              label: label,
+              tool: m.activityKind || (m.recentTools && m.recentTools[0] && m.recentTools[0].name) || "tool",
+              ts: m.transcriptMtime || 0,
+            }
+          : null,
+      } : {});
+    });
+    var swarmCost = computeCostFromByModel(swarmByModel, "");
+    var burnRows = enrichedMembers
       .filter(function (m) { return !m.roleWorker && m.usage.totalTokens > 0; })
       .map(function (m) {
         var tok = m.usage.totalTokens;
-        var sharePct = usage.totalTokens > 0 ? Math.round((tok / usage.totalTokens) * 100) : 0;
-        var level = tok >= 400000 || (usage.totalTokens >= 20000 && sharePct >= 65 && sw.members.length >= 2)
-          ? "critical"
-          : tok >= 150000 || (usage.totalTokens >= 10000 && sharePct >= 45 && sw.members.length >= 2)
-            ? "warn"
-            : "normal";
-        return { name: m.name, totalTokens: tok, sharePct: sharePct, level: level, killed: Boolean(m.killed) };
+        var mCost = m.cost || { totalUsd: 0, cacheHitPct: 0, cacheSavingsUsd: 0, pricingKnown: false };
+        var sharePct = swarmCost.pricingKnown && swarmCost.totalUsd > 0 && mCost.pricingKnown
+          ? Math.round((mCost.totalUsd / swarmCost.totalUsd) * 100)
+          : (usage.totalTokens > 0 ? Math.round((tok / usage.totalTokens) * 100) : 0);
+        var level = mCost.pricingKnown
+          ? (mCost.totalUsd >= 5.0 || (swarmCost.totalUsd >= 0.05 && sharePct >= 65 && enrichedMembers.length >= 2)
+            ? "critical"
+            : mCost.totalUsd >= 1.5 || (swarmCost.totalUsd >= 0.02 && sharePct >= 45 && enrichedMembers.length >= 2)
+              ? "warn"
+              : "normal")
+          : (tok >= 400000 || (usage.totalTokens >= 20000 && sharePct >= 65 && enrichedMembers.length >= 2)
+            ? "critical"
+            : tok >= 150000 || (usage.totalTokens >= 10000 && sharePct >= 45 && enrichedMembers.length >= 2)
+              ? "warn"
+              : "normal");
+        return {
+          name: m.name,
+          totalTokens: tok,
+          sharePct: sharePct,
+          level: level,
+          killed: Boolean(m.killed),
+          costUsd: mCost.totalUsd,
+          cacheHitPct: mCost.cacheHitPct,
+          cacheSavingsUsd: mCost.cacheSavingsUsd,
+          pricingKnown: mCost.pricingKnown,
+        };
       })
-      .sort(function (a, b) { return b.totalTokens - a.totalTokens || a.name.localeCompare(b.name); });
+      .sort(function (a, b) {
+        if (swarmCost.pricingKnown) {
+          var diff = (b.costUsd || 0) - (a.costUsd || 0);
+          if (Math.abs(diff) > 1e-9) return diff;
+        }
+        return b.totalTokens - a.totalTokens || a.name.localeCompare(b.name);
+      });
     var burnSummary = {
       totalTokens: usage.totalTokens,
       topWorker: burnRows[0] || null,
       highBurnCount: burnRows.filter(function (r) { return r.level !== "normal"; }).length,
       workers: burnRows.slice(0, 6),
+      costUsd: swarmCost.totalUsd,
+      cacheHitPct: swarmCost.cacheHitPct,
+      cacheSavingsUsd: swarmCost.cacheSavingsUsd,
+      pricingKnown: swarmCost.pricingKnown,
     };
     var dC = 0, dS = 0, vC = 0, vS = 0, sC = 0, sS = 0, bC = 0, bS = 0, bAgent = "", shC = 0, shS = 0, fTs = 0, lTs = 0;
     sw.messages.forEach(function (m) {
@@ -906,25 +1072,11 @@
       id: sw.id,
       title: sw.title,
       head: sw.head,
-      members: sw.members.map(function (m) {
-        if (m.killed || m.activityPeek) return m;
-        var label = (m.activity || (m.recentTools && m.recentTools[0] && m.recentTools[0].summary) || m.thinkingHeading || (m.status === "waiting" ? "Waiting on board" : ""))
-          .replace(/\/(?:home|Users)\/[^/\s]+(\/|$)/g, function (_m, sep) { return "~" + sep; });
-        return Object.assign({}, m, {
-          activityPeek: label
-            ? {
-                status: m.status === "working" ? "working" : "waiting",
-                label: label,
-                tool: m.activityKind || (m.recentTools && m.recentTools[0] && m.recentTools[0].name) || "tool",
-                ts: m.transcriptMtime || 0,
-              }
-            : null,
-        });
-      }),
+      members: enrichedMembers,
       messages: sw.messages,
       replyRefs: replyRefs,
       channels: sw.channels || [],
-      edges: computeEdgesForMessages(sw.members, sw.messages),
+      edges: computeEdgesForMessages(enrichedMembers, sw.messages),
       view: sw.view || null,
       plan: normalizePlanForSnapshot(sw.plan, planEtagOf(sw)),
       frames: sw.frames,
@@ -932,6 +1084,10 @@
       burnSummary: burnSummary,
       gateReadiness: gateReadiness,
       usage: usage,
+      contextLimit: maxContextLimit,
+      contextPct: maxContextPct,
+      cost: swarmCost,
+      byModel: swarmByModel,
       capabilities: { canSendMessage: true, isSidecar: false, sseStream: false, deltaStream: true },
     };
   }
@@ -1022,6 +1178,10 @@
           burnSummary: full.burnSummary,
           gateReadiness: full.gateReadiness,
           usage: full.usage,
+          contextLimit: full.contextLimit,
+          contextPct: full.contextPct,
+          cost: full.cost,
+          byModel: full.byModel,
           capabilities: full.capabilities,
         },
       };
@@ -1241,6 +1401,10 @@
         if (!smTarget || !smModel || smModel.length > 120) return jsonResp({ error: "member and model required" }, 400);
         var smMember = cSw.members.find(function (m) { return !m.killed && m.name === smTarget; });
         if (!smMember) return jsonResp({ error: "Member not found" }, 404);
+        smMember.byModel = memberByModel(smMember);
+        if (!smMember.byModel[smModel]) {
+          smMember.byModel[smModel] = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
+        }
         smMember.model = smModel;
         smMember.failure = null;
         smMember.status = "working";

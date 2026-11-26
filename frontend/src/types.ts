@@ -8,6 +8,23 @@ export interface TokenUsage {
   totalTokens: number;
 }
 
+export interface CostSummary {
+  totalUsd: number;
+  inputUsd: number;
+  cacheReadUsd: number;
+  outputUsd: number;
+  cacheSavingsUsd: number;
+  cacheHitPct: number;
+  pricingKnown: boolean;
+}
+
+export interface ModelUsageEntry {
+  inputTokens: number;
+  cacheReadTokens: number;
+  outputTokens: number;
+  steps: number;
+}
+
 export interface MemberFailure {
   kind: "quota" | "error";
   text: string;
@@ -46,7 +63,11 @@ export interface SwarmMember {
   thinkingHeading?: string;
   recentTools?: Array<{ name: string; summary: string; time: string }>;
   lastContextTokens?: number;
+  contextLimit?: number;
+  contextPct?: number;
   usage: TokenUsage;
+  cost?: CostSummary;
+  byModel?: Record<string, ModelUsageEntry>;
   workspace_mode?: string;
   workspace?: string;
   posts: number;
@@ -219,6 +240,10 @@ export interface BurnWorker {
   sharePct: number;
   level: "normal" | "warn" | "critical";
   killed?: boolean;
+  costUsd?: number;
+  cacheHitPct?: number;
+  cacheSavingsUsd?: number;
+  pricingKnown?: boolean;
 }
 
 export interface BurnSummary {
@@ -226,6 +251,10 @@ export interface BurnSummary {
   topWorker: BurnWorker | null;
   highBurnCount: number;
   workers: BurnWorker[];
+  costUsd?: number;
+  cacheHitPct?: number;
+  cacheSavingsUsd?: number;
+  pricingKnown?: boolean;
 }
 
 export interface GateNextAction {
@@ -352,6 +381,10 @@ export interface SwarmSnapshot {
   burnSummary?: BurnSummary;
   gateReadiness?: GateReadiness | null;
   usage?: TokenUsage;
+  contextLimit?: number;
+  contextPct?: number;
+  cost?: CostSummary;
+  byModel?: Record<string, ModelUsageEntry>;
   unseen?: number[];
   swarms?: SwarmSummary[];
   capabilities?: {
@@ -391,6 +424,10 @@ export interface SwarmDeltaPayload {
   burnSummary?: BurnSummary;
   gateReadiness?: GateReadiness | null;
   usage?: TokenUsage;
+  contextLimit?: number;
+  contextPct?: number;
+  cost?: CostSummary;
+  byModel?: Record<string, ModelUsageEntry>;
   unseen?: number[];
   swarms?: SwarmSummary[];
   capabilities?: SwarmSnapshot["capabilities"];

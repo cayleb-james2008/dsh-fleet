@@ -401,9 +401,19 @@ export function formatSwarmDigest(
   const gate = snap.gateReadiness;
   const vel = gate?.velocity;
   const plan = normalizePlan(snap.plan);
+  const b = snap.burnSummary;
+  const totalUsd = snap.cost?.totalUsd ?? b?.costUsd;
+  const pricingKnown = snap.cost?.pricingKnown ?? b?.pricingKnown;
+  const cacheHitPct = snap.cost?.cacheHitPct ?? b?.cacheHitPct;
+  const cacheSavingsUsd = snap.cost?.cacheSavingsUsd ?? b?.cacheSavingsUsd;
+  const spendSummary = pricingKnown && typeof totalUsd === "number"
+    ? `, ${fmtUsd(totalUsd)} spend${typeof cacheHitPct === "number" && cacheHitPct > 0 ? `, ${Math.round(cacheHitPct)}% cache hit` : ""}${typeof cacheSavingsUsd === "number" && cacheSavingsUsd >= 0.005 ? ` (${fmtUsd(cacheSavingsUsd)} saved)` : ""}`
+    : pricingKnown === false
+      ? ", Unpriced"
+      : "";
   const lines = [
     `# ${maskHome(snap.title || "Fleet")} Handoff Digest`,
-    `- Status: ${cnt("working")} working, ${cnt("waiting")} waiting, ${members.length} members, #${snap.head || 0}, ${fmtTokens(snap.usage?.totalTokens)} tok`,
+    `- Status: ${cnt("working")} working, ${cnt("waiting")} waiting, ${members.length} members, #${snap.head || 0}, ${fmtTokens(snap.usage?.totalTokens)} tok${spendSummary}`,
     plan?.goal && `- Active goal: ${cleanDigestLine(plan.goal, 220)}`,
     plan?.gate && `- Verification gate: \`${maskHome(plan.gate)}\``,
     gate &&
@@ -422,7 +432,17 @@ export function formatSwarmDigest(
     live.map((m) => {
       const ts = memberLastTs(m);
       const err = m.failure ? `, issue: ${cleanDigestLine(m.failure.kind, 40)}` : "";
-      return `- @${m.name}: ${m.status}${ts ? ` ${fmtElapsed(ts)}` : ""} (${m.steps} steps, ${fmtTokens(m.usage.totalTokens)} tok${err})`;
+      const limit = m.contextLimit && m.contextLimit > 0 ? m.contextLimit : 0;
+      const ctxTok = m.lastContextTokens || m.usage.inputTokens + m.usage.cacheReadTokens;
+      const cap = limit
+        ? `, ${typeof m.contextPct === "number" ? Math.min(100, Math.max(0, Math.round(m.contextPct))) : Math.min(100, Math.round((ctxTok / limit) * 100))}% of ${fmtContextCap(limit)} ctx`
+        : "";
+      const spend = m.cost
+        ? m.cost.pricingKnown
+          ? `, ${fmtUsd(m.cost.totalUsd)}${m.cost.cacheHitPct > 0 ? `, ${Math.round(m.cost.cacheHitPct)}% cache hit` : ""}`
+          : ", Unpriced"
+        : "";
+      return `- @${m.name}: ${m.status}${ts ? ` ${fmtElapsed(ts)}` : ""} (${m.steps} steps, ${fmtTokens(m.usage.totalTokens)} tok${cap}${spend}${err})`;
     }),
   );
   sec(
@@ -483,6 +503,10 @@ export function formatSwarmArchive(
           head: snap.head || 0,
           pinnedSeqs,
           usage: snap.usage || null,
+          contextLimit: snap.contextLimit ?? null,
+          contextPct: snap.contextPct ?? null,
+          cost: snap.cost || null,
+          byModel: snap.byModel || null,
           plan: plan
             ? {
                 ...plan,
@@ -526,6 +550,10 @@ export function formatSwarmArchive(
             steps: m.steps,
             unread: m.unread,
             usage: m.usage,
+            contextLimit: m.contextLimit ?? null,
+            contextPct: m.contextPct ?? null,
+            cost: m.cost || null,
+            byModel: m.byModel || null,
             activityPeek: m.activityPeek ? { ...m.activityPeek, label: maskHome(m.activityPeek.label) } : null,
             failure: m.failure ? { ...m.failure, text: maskHome(m.failure.text) } : null,
           })),
@@ -580,6 +608,25 @@ export function fmtTokens(n: number | undefined): string {
   const v = Number(n) || 0;
   if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(2)}M`;
   if (v >= 1_000) return `${(v / 1_000).toFixed(1)}k`;
+  return String(v);
+}
+
+export function fmtUsd(n: number | undefined): string {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v <= 0) return "$0.00";
+  if (v < 0.001) return "<$0.01";
+  if (v < 0.01) return `$${v.toFixed(3)}`;
+  return `$${v.toFixed(2)}`;
+}
+
+export function fmtContextCap(limit: number | undefined): string {
+  const v = Number(limit);
+  if (!Number.isFinite(v) || v <= 0) return "200k";
+  if (v >= 1_000_000) {
+    const m = v / 1_000_000;
+    return Number.isInteger(m) ? `${m}M` : `${m.toFixed(1)}M`;
+  }
+  if (v >= 1_000) return `${Math.round(v / 1_000)}k`;
   return String(v);
 }
 
@@ -1058,32 +1105,66 @@ export function TokenBurnStrip({ snap }: { snap: SwarmSnapshot }) {
   const top = b.topWorker || b.workers[0];
   const shown = b.workers.slice(0, 4);
   const restPct = Math.max(0, 100 - shown.reduce((s, r) => s + r.sharePct, 0));
+
+  const memberCosts = (snap.members || []).filter((m) => m.cost);
+  const fallbackTotalUsd = memberCosts.length
+    ? memberCosts.reduce((sum, m) => sum + (m.cost?.pricingKnown ? m.cost.totalUsd : 0), 0)
+    : undefined;
+  const fallbackSavingsUsd = memberCosts.length
+    ? memberCosts.reduce((sum, m) => sum + (m.cost?.pricingKnown ? m.cost.cacheSavingsUsd : 0), 0)
+    : undefined;
+  const fallbackKnown = memberCosts.length ? memberCosts.some((m) => m.cost?.pricingKnown) : undefined;
+  const totalUsd = typeof b.costUsd === "number" ? b.costUsd : snap.cost?.totalUsd ?? fallbackTotalUsd;
+  const pricingKnown = b.pricingKnown ?? snap.cost?.pricingKnown ?? fallbackKnown;
+  const cacheHitPct = typeof b.cacheHitPct === "number" ? b.cacheHitPct : snap.cost?.cacheHitPct;
+  const cacheSavingsUsd = typeof b.cacheSavingsUsd === "number" ? b.cacheSavingsUsd : snap.cost?.cacheSavingsUsd ?? fallbackSavingsUsd;
+  const topCostText = top.pricingKnown && typeof top.costUsd === "number" ? ` · ${fmtUsd(top.costUsd)}` : "";
+
   const segs = [
-    ...shown.map((w, i) => ({ key: w.name, pct: w.sharePct, cls: BURN_COLS[i % 4], title: `@${w.name}: ${fmtTokens(w.totalTokens)} (${w.sharePct}%)` })),
+    ...shown.map((w, i) => ({
+      key: w.name,
+      pct: w.sharePct,
+      cls: BURN_COLS[i % 4],
+      title: `@${w.name}: ${w.pricingKnown && typeof w.costUsd === "number" ? `${fmtUsd(w.costUsd)} · ` : ""}${fmtTokens(w.totalTokens)} (${w.sharePct}%)`,
+    })),
     ...(restPct > 0 ? [{ key: "rest", pct: restPct, cls: "bg-[var(--edge)]" }] : []),
   ];
 
   return (
-    <Card className="p-2 space-y-1" data-testid="token-burn-strip">
-      <div className="row flex-wrap t2">
-        <div className="wrap gap-1">
+    <Card className="p-2 space-y-1.5" data-testid="token-burn-strip">
+      <div className="row flex-wrap gap-1.5 t2">
+        <div className="wrap gap-1.5">
           <span className="font-semibold text-ink">Token burn</span>
-          <span className="num">{fmtTokens(b.totalTokens)} tok</span>
+          {pricingKnown && typeof totalUsd === "number" ? (
+            <span className="font-semibold text-ink tabular-nums" data-testid="burn-total-usd">{fmtUsd(totalUsd)}</span>
+          ) : pricingKnown === false ? (
+            <span className="text-ink-3" data-testid="burn-total-usd">Unpriced</span>
+          ) : null}
+          <span className="tabular-nums">{fmtTokens(b.totalTokens)} tok</span>
+          {typeof cacheHitPct === "number" && cacheHitPct > 0 && (
+            <span className="text-ok tabular-nums" data-testid="burn-cache-hit">
+              {Math.round(cacheHitPct)}% cache hit{typeof cacheSavingsUsd === "number" && cacheSavingsUsd >= 0.005 ? ` (${fmtUsd(cacheSavingsUsd)} saved)` : ""}
+            </span>
+          )}
         </div>
         {top.level !== "normal" ? (
           <Badge tone={top.level === "critical" ? "danger" : "warning"} data-testid="high-burn-badge">
-            High burn · @{top.name} {top.sharePct}%
+            High burn · @{top.name} {top.sharePct}%{topCostText}
           </Badge>
         ) : (
-          <Badge tone="neutral">Top @{top.name} {top.sharePct}%</Badge>
+          <Badge tone="neutral">Top @{top.name} {top.sharePct}%{topCostText}</Badge>
         )}
       </div>
       <SegBar segments={segs} label={`Token share led by ${top.name} (${top.sharePct}%)`} />
-      <div className="wrap gap-2 t2 num">
+      <div className="wrap gap-x-2 gap-y-1 t2">
         {b.workers.slice(0, 3).map((w, i) => (
           <span key={w.name} className="inline-flex items-center gap-1">
-            <span className={cn("h-2 w-2 rounded-full", BURN_COLS[i % 4])} aria-hidden="true" />
-            <span className="text-ink font-medium">{w.name}</span> {fmtTokens(w.totalTokens)} ({w.sharePct}%)
+            <span className={cn("h-2 w-2 rounded-full shrink-0", BURN_COLS[i % 4])} aria-hidden="true" />
+            <span className="text-ink font-medium">{w.name}</span>
+            <span className="tabular-nums">
+              {w.pricingKnown && typeof w.costUsd === "number" ? `${fmtUsd(w.costUsd)} · ` : ""}
+              {fmtTokens(w.totalTokens)} ({w.sharePct}%)
+            </span>
           </span>
         ))}
       </div>
