@@ -12,7 +12,7 @@ const outDir = process.env.LIVE_WEB_OUT_DIR || path.join(root, "dist-live-web");
 const outFile = path.join(outDir, "index.html");
 
 if (!fs.existsSync(srcHtml)) {
-  console.error(`Missing ${srcHtml} — run npm run build first.`);
+  console.error(`Missing ${srcHtml}: run npm run build first.`);
   process.exit(1);
 }
 

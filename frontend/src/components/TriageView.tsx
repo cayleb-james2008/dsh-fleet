@@ -919,49 +919,87 @@ function SwarmCheckpointsSection({
   const swarmId = snap.swarm || snap.conversationId || "";
   const [checkpoints, setCheckpoints] = useState<SwarmCheckpoint[]>(checkpointsProp || snap.checkpoints || []);
   const [loading, setLoading] = useState(false);
+  const [listError, setListError] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
   const [labelDraft, setLabelDraft] = useState("");
   const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState("");
   const [compareId, setCompareId] = useState<string | null>(null);
-  const [busyId, setBusyId] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<{ cpId: string; mode: "plan" | "resume_prompt" } | null>(null);
+  const [cpErrorById, setCpErrorById] = useState<Record<string, { mode: "plan" | "resume_prompt"; message: string }>>({});
   const [resumeDrawer, setResumeDrawer] = useState<{ cpId: string; prompt: string } | null>(null);
   const [sendingResume, setSendingResume] = useState(false);
   const sectionRef = useRef<HTMLElement>(null);
   const createLockRef = useRef(false);
+  const actionLockRef = useRef(false);
+  const cpAbortRef = useRef<AbortController | null>(null);
+  const cpEpochRef = useRef(0);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      cpAbortRef.current?.abort();
+    };
+  }, []);
 
   useEffect(() => {
     if (Array.isArray(checkpointsProp)) setCheckpoints(checkpointsProp);
   }, [checkpointsProp]);
 
-  const loadCheckpoints = async () => {
+  const loadCheckpoints = async (explicit = false) => {
     if (!swarmId) return;
+    cpAbortRef.current?.abort();
+    const ac = new AbortController();
+    cpAbortRef.current = ac;
+    const reqEpoch = cpEpochRef.current;
     setLoading(true);
+    if (explicit) setListError("");
     try {
-      const res = await fetchCheckpoints(swarmId);
+      const res = await fetchCheckpoints(swarmId, ac.signal);
+      if (!mountedRef.current || ac.signal.aborted || cpEpochRef.current !== reqEpoch) return;
       const list = Array.isArray(res.checkpoints) ? res.checkpoints : [];
       setCheckpoints(list);
+      setListError("");
       onCheckpointsChange?.(list);
-    } catch {
-      // Non-fatal if endpoint unavailable in partial mock
+    } catch (err) {
+      if (!mountedRef.current || ac.signal.aborted || cpEpochRef.current !== reqEpoch) return;
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      const msg = err instanceof Error ? err.message : "Failed to load checkpoints";
+      if (explicit || !msg.includes("(404)")) {
+        setListError(msg);
+      }
     } finally {
-      setLoading(false);
+      if (cpAbortRef.current === ac) cpAbortRef.current = null;
+      if (mountedRef.current && cpEpochRef.current === reqEpoch) setLoading(false);
     }
   };
 
   useEffect(() => {
+    cpEpochRef.current += 1;
+    cpAbortRef.current?.abort();
+    cpAbortRef.current = null;
+    actionLockRef.current = false;
+    createLockRef.current = false;
     setCompareId(null);
     setResumeDrawer(null);
     setCreateOpen(false);
+    setCreateError("");
+    setListError("");
+    setBusyAction(null);
+    setCpErrorById({});
     if (Array.isArray(snap.checkpoints)) {
       setCheckpoints(snap.checkpoints);
     } else if (!checkpointsProp) {
-      void loadCheckpoints();
+      void loadCheckpoints(false);
     }
   }, [swarmId]);
 
   useEffect(() => {
     if (!createNonce) return;
     setLabelDraft((cur) => cur || `Checkpoint #${snap.head || 0}`);
+    setCreateError("");
     setCreateOpen(true);
     sectionRef.current?.scrollIntoView({ block: "nearest" });
   }, [createNonce]);
@@ -975,14 +1013,23 @@ function SwarmCheckpointsSection({
   const handleCreate = async () => {
     const clean = labelDraft.trim();
     if (createLockRef.current || !clean || hasControlChars(clean)) {
-      if (hasControlChars(clean)) toast.error("Control characters not permitted");
+      if (hasControlChars(clean)) {
+        setCreateError("Control characters are not allowed.");
+        toast.error("Control characters not permitted");
+      }
       return;
     }
+    cpAbortRef.current?.abort();
+    const ac = new AbortController();
+    cpAbortRef.current = ac;
+    const reqEpoch = cpEpochRef.current;
     createLockRef.current = true;
     setCreating(true);
+    setCreateError("");
     try {
       const roots = (worktrees?.roots || []).map((r) => r.path).filter(Boolean);
-      const res = await createCheckpoint({ conversationId: swarmId, label: clean, roots });
+      const res = await createCheckpoint({ conversationId: swarmId, label: clean, roots }, ac.signal);
+      if (!mountedRef.current || ac.signal.aborted || cpEpochRef.current !== reqEpoch) return;
       const nextList = Array.isArray(res.checkpoints)
         ? res.checkpoints
         : res.checkpoint
@@ -993,34 +1040,69 @@ function SwarmCheckpointsSection({
       setCreateOpen(false);
       setLabelDraft("");
       toast.success(`Saved checkpoint "${clean}"`);
-      if (!Array.isArray(res.checkpoints)) void loadCheckpoints();
+      if (!Array.isArray(res.checkpoints)) void loadCheckpoints(false);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to create checkpoint");
+      if (!mountedRef.current || ac.signal.aborted || cpEpochRef.current !== reqEpoch) return;
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      const msg = err instanceof Error ? err.message : "Failed to create checkpoint";
+      setCreateError(msg);
+      toast.error(msg);
     } finally {
+      if (cpAbortRef.current === ac) cpAbortRef.current = null;
       createLockRef.current = false;
-      setCreating(false);
+      if (mountedRef.current) setCreating(false);
     }
   };
 
   const handleRestorePlan = async (cp: SwarmCheckpoint) => {
-    if (busyId) return;
-    setBusyId(cp.id);
+    if (actionLockRef.current || busyAction) return;
+    cpAbortRef.current?.abort();
+    const ac = new AbortController();
+    cpAbortRef.current = ac;
+    const reqEpoch = cpEpochRef.current;
+    actionLockRef.current = true;
+    setBusyAction({ cpId: cp.id, mode: "plan" });
+    setCpErrorById((prev) => {
+      if (!(cp.id in prev)) return prev;
+      const next = { ...prev };
+      delete next[cp.id];
+      return next;
+    });
     try {
-      await restoreCheckpoint({ conversationId: swarmId, checkpointId: cp.id, mode: "plan" });
+      await restoreCheckpoint({ conversationId: swarmId, checkpointId: cp.id, mode: "plan" }, ac.signal);
+      if (!mountedRef.current || ac.signal.aborted || cpEpochRef.current !== reqEpoch) return;
       toast.success(`Restored plan from "${maskHome(cp.label)}"`);
       onRefresh();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Restore plan failed");
+      if (!mountedRef.current || ac.signal.aborted || cpEpochRef.current !== reqEpoch) return;
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      const msg = err instanceof Error ? err.message : "Restore plan failed";
+      setCpErrorById((prev) => ({ ...prev, [cp.id]: { mode: "plan", message: msg } }));
+      toast.error(msg);
     } finally {
-      setBusyId(null);
+      if (cpAbortRef.current === ac) cpAbortRef.current = null;
+      actionLockRef.current = false;
+      if (mountedRef.current) setBusyAction(null);
     }
   };
 
   const handleResumePrompt = async (cp: SwarmCheckpoint) => {
-    if (busyId) return;
-    setBusyId(cp.id);
+    if (actionLockRef.current || busyAction) return;
+    cpAbortRef.current?.abort();
+    const ac = new AbortController();
+    cpAbortRef.current = ac;
+    const reqEpoch = cpEpochRef.current;
+    actionLockRef.current = true;
+    setBusyAction({ cpId: cp.id, mode: "resume_prompt" });
+    setCpErrorById((prev) => {
+      if (!(cp.id in prev)) return prev;
+      const next = { ...prev };
+      delete next[cp.id];
+      return next;
+    });
     try {
-      const res = await restoreCheckpoint({ conversationId: swarmId, checkpointId: cp.id, mode: "resume_prompt" });
+      const res = await restoreCheckpoint({ conversationId: swarmId, checkpointId: cp.id, mode: "resume_prompt" }, ac.signal);
+      if (!mountedRef.current || ac.signal.aborted || cpEpochRef.current !== reqEpoch) return;
       const text = maskHome(
         res.resumePrompt ||
           res.prompt ||
@@ -1028,9 +1110,15 @@ function SwarmCheckpointsSection({
       );
       setResumeDrawer({ cpId: cp.id, prompt: text });
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to generate resume prompt");
+      if (!mountedRef.current || ac.signal.aborted || cpEpochRef.current !== reqEpoch) return;
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      const msg = err instanceof Error ? err.message : "Failed to generate resume prompt";
+      setCpErrorById((prev) => ({ ...prev, [cp.id]: { mode: "resume_prompt", message: msg } }));
+      toast.error(msg);
     } finally {
-      setBusyId(null);
+      if (cpAbortRef.current === ac) cpAbortRef.current = null;
+      actionLockRef.current = false;
+      if (mountedRef.current) setBusyAction(null);
     }
   };
 
@@ -1057,7 +1145,8 @@ function SwarmCheckpointsSection({
             size="icon"
             aria-label="Refresh checkpoints"
             data-testid="checkpoints-refresh-btn"
-            onClick={() => void loadCheckpoints()}
+            disabled={loading}
+            onClick={() => void loadCheckpoints(true)}
           >
             <RefreshCw className={cn(loading && "motion-safe:animate-spin")} />
           </Button>
@@ -1066,6 +1155,7 @@ function SwarmCheckpointsSection({
             data-testid="create-checkpoint-btn"
             onClick={() => {
               setLabelDraft((cur) => cur || `Checkpoint #${snap.head || 0}`);
+              setCreateError("");
               setCreateOpen((v) => !v);
             }}
           >
@@ -1075,8 +1165,23 @@ function SwarmCheckpointsSection({
         </div>
       </div>
 
+      {listError && (
+        <Card role="alert" data-testid="checkpoints-error-banner" className="border-danger bg-bad-soft p-2.5 space-y-2 text-[12px] text-danger">
+          <p className="break-words">{maskHome(listError)}</p>
+          <Button variant="outline" data-testid="checkpoints-retry-btn" disabled={loading} onClick={() => void loadCheckpoints(true)} className="h-7 px-2">
+            <RefreshCw className={cn(loading && "motion-safe:animate-spin")} />
+            Retry
+          </Button>
+        </Card>
+      )}
+
       {createOpen && (
         <Card className="p-3 space-y-2" data-testid="checkpoint-create-form">
+          {createError && (
+            <p role="alert" data-testid="checkpoint-create-error" className="rounded-chip border border-danger bg-bad-soft px-2 py-1 text-[12px] text-danger break-words">
+              {maskHome(createError)}
+            </p>
+          )}
           <label htmlFor="checkpoint-label-input" className="text-[12px] font-medium text-ink-2">
             Checkpoint label
           </label>
@@ -1085,11 +1190,21 @@ function SwarmCheckpointsSection({
             data-testid="checkpoint-label-input"
             maxLength={120}
             value={labelDraft}
-            onChange={(e) => setLabelDraft(e.target.value)}
+            onChange={(e) => {
+              setLabelDraft(e.target.value);
+              setCreateError("");
+            }}
             placeholder="Pre-merge Wave E2"
           />
           <div className="row justify-end gap-2">
-            <Button variant="ghost" data-testid="checkpoint-create-cancel" onClick={() => setCreateOpen(false)}>
+            <Button
+              variant="ghost"
+              data-testid="checkpoint-create-cancel"
+              onClick={() => {
+                setCreateOpen(false);
+                setCreateError("");
+              }}
+            >
               Cancel
             </Button>
             <Button
@@ -1117,19 +1232,20 @@ function SwarmCheckpointsSection({
             const comparing = compareId === cp.id;
             const diff = comparing ? computeCheckpointDiff(cp, snap, plan, worktrees) : null;
             const showingResume = resumeDrawer?.cpId === cp.id;
-            const busy = busyId === cp.id;
+            const busy = busyAction?.cpId === cp.id;
+            const cpErr = cpErrorById[cp.id];
             const cpGoal = checkpointGoalOf(cp);
             return (
               <Card key={cp.id} className="p-3 space-y-2 min-w-0" data-testid={`checkpoint-card-${cp.id}`}>
                 <div className="row flex-wrap gap-1.5 min-w-0">
-                  <div className="wrap gap-1.5 min-w-0">
+                  <div className="wrap gap-1.5 min-w-0 flex-1">
                     <span className="text-[13px] font-semibold text-ink break-words">{maskHome(cp.label)}</span>
                     <Badge tone="neutral" className="num">#{cp.head}</Badge>
                     {Array.isArray(cp.worktrees) && cp.worktrees.length > 0 && (
                       <Badge tone="neutral" className="num">{cp.worktrees.length} worktrees</Badge>
                     )}
                   </div>
-                  {cp.createdAt && <span className="t3 num">{fmtTimeAgo(cp.createdAt)}</span>}
+                  {cp.createdAt && <span className="t3 num shrink-0">{fmtTimeAgo(cp.createdAt)}</span>}
                 </div>
 
                 {cpGoal && (
@@ -1148,23 +1264,61 @@ function SwarmCheckpointsSection({
                   </Button>
                   <Button
                     variant="outline"
-                    disabled={busy}
+                    disabled={busy || Boolean(busyAction)}
                     data-testid={`checkpoint-restore-plan-${cp.id}`}
                     onClick={() => void handleRestorePlan(cp)}
                   >
                     <SkipBack />
-                    Restore plan
+                    {busy && busyAction?.mode === "plan" ? "Restoring..." : "Restore plan"}
                   </Button>
                   <Button
                     variant="outline"
-                    disabled={busy}
+                    disabled={busy || Boolean(busyAction)}
                     data-testid={`checkpoint-resume-prompt-${cp.id}`}
                     onClick={() => void handleResumePrompt(cp)}
                   >
                     <ClipboardCopy />
-                    Resume prompt
+                    {busy && busyAction?.mode === "resume_prompt" ? "Generating..." : "Resume prompt"}
                   </Button>
                 </div>
+
+                {cpErr && (
+                  <div
+                    role="alert"
+                    data-testid={`checkpoint-error-${cp.id}`}
+                    className="rounded-chip border border-danger bg-bad-soft px-2 py-1.5 space-y-1.5 text-[12px] text-danger min-w-0"
+                  >
+                    <div className="flex items-start justify-between gap-1.5">
+                      <span className="break-words min-w-0 flex-1">{maskHome(cpErr.message)}</span>
+                      <button
+                        type="button"
+                        aria-label={`Dismiss ${cp.label} error`}
+                        onClick={() =>
+                          setCpErrorById((prev) => {
+                            const next = { ...prev };
+                            delete next[cp.id];
+                            return next;
+                          })
+                        }
+                        className="shrink-0 rounded p-0.5 text-danger hover:opacity-80 cursor-pointer"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                    <Button
+                      variant="outline"
+                      disabled={Boolean(busyAction)}
+                      data-testid={`checkpoint-retry-${cp.id}`}
+                      onClick={() =>
+                        void (cpErr.mode === "plan" ? handleRestorePlan(cp) : handleResumePrompt(cp))
+                      }
+                      className="h-7 px-2"
+                    >
+                      <RefreshCw />
+                      Retry
+                    </Button>
+                  </div>
+                )}
 
                 {comparing && diff && (
                   <div
@@ -1291,7 +1445,8 @@ export function TriageView({
   const [peekId, setPeekId] = useState<string | null>(null);
   const [traceTarget, setTraceTarget] = useState<TraceTarget | null>(null);
   const [showAcked, setShowAcked] = useState(false);
-  const [ackBusyId, setAckBusyId] = useState<string | null>(null);
+  const [ackBusy, setAckBusy] = useState<{ id: string; action: TriageAckAction } | null>(null);
+  const ackLockRef = useRef<string | null>(null);
   const nudgeLockRef = useRef(false);
   const nowMs = useNowMs();
   const cardRefs = useRef<Array<HTMLDivElement | null>>([]);
@@ -1331,12 +1486,14 @@ export function TriageView({
   }, [replyNonce]);
 
   const handleAckClick = async (item: TriageItem, action: TriageAckAction) => {
-    if (!onAckTriage || ackBusyId === item.id) return;
-    setAckBusyId(item.id);
+    if (!onAckTriage || ackLockRef.current === item.id) return;
+    ackLockRef.current = item.id;
+    setAckBusy({ id: item.id, action });
     try {
       await onAckTriage(item, action);
     } finally {
-      setAckBusyId(null);
+      if (ackLockRef.current === item.id) ackLockRef.current = null;
+      setAckBusy((cur) => (cur?.id === item.id ? null : cur));
     }
   };
 
@@ -1582,7 +1739,7 @@ export function TriageView({
                   ackRec?.action === "snooze" ||
                   (typeof ackUntil === "number" && ackUntil > 0),
               );
-              const ackBusy = ackBusyId === item.id;
+              const isItemAckBusy = ackBusy?.id === item.id;
               const sev = SEVERITY_BADGE[item.severity] || SEVERITY_BADGE.attention;
               const editingThis = nudgeTarget?.id === item.id;
               const worker: SwarmMember | undefined = memberByName.get(item.member);
@@ -1604,7 +1761,7 @@ export function TriageView({
                   data-testid={`triage-card-${item.id}`}
                   data-selected={isSelected ? "true" : undefined}
                   onClick={() => onSelectIdx?.(idx)}
-                  className={cn("p-3 space-y-2", isSelected && "border-blue outline-1 outline-blue", isAcked && "opacity-80")}
+                  className={cn("p-3 space-y-2 min-w-0", isSelected && "border-blue outline-1 outline-blue", isAcked && "opacity-80")}
                 >
                   <div className="space-y-1">
                     <div className="wrap">
@@ -1656,7 +1813,7 @@ export function TriageView({
                       <>
                         <Button
                           variant="outline"
-                          disabled={ackBusy}
+                          disabled={isItemAckBusy}
                           data-testid={`triage-ack-${item.id}`}
                           onClick={(e) => {
                             e.stopPropagation();
@@ -1664,11 +1821,11 @@ export function TriageView({
                           }}
                         >
                           <CheckCircle2 />
-                          Ack
+                          {isItemAckBusy && ackBusy?.action === "ack" ? "Acking..." : "Ack"}
                         </Button>
                         <Button
                           variant="ghost"
-                          disabled={ackBusy}
+                          disabled={isItemAckBusy}
                           data-testid={`triage-snooze-${item.id}`}
                           onClick={(e) => {
                             e.stopPropagation();
@@ -1676,21 +1833,21 @@ export function TriageView({
                           }}
                         >
                           <Pause />
-                          Snooze
+                          {isItemAckBusy && ackBusy?.action === "snooze" ? "Snoozing..." : "Snooze"}
                         </Button>
                       </>
                     )}
                     {onAckTriage && isAcked && (
                       <Button
                         variant="outline"
-                        disabled={ackBusy}
+                        disabled={isItemAckBusy}
                         data-testid={`triage-unack-${item.id}`}
                         onClick={(e) => {
                           e.stopPropagation();
                           void handleAckClick(item, "unack");
                         }}
                       >
-                        Unack
+                        {isItemAckBusy && ackBusy?.action === "unack" ? "Restoring..." : "Unack"}
                       </Button>
                     )}
                     {isForensicItem && traceConvId && (
@@ -1797,7 +1954,7 @@ export function TriageView({
                     className="w-full h-full object-cover"
                   />
                 </div>
-                <div className="row px-2 py-2">
+                <div className="row flex-wrap gap-1.5 px-2 py-2">
                   <span className="text-[12px] text-ink-2 truncate">{frame.caption || frame.path.split("/").pop()}</span>
                   <div className="f1 shrink-0">
                     <Button aria-label={`Open ${frame.caption || "capture"} file`} onClick={() => openOrCopyPath(frame.path, frame.path)}>

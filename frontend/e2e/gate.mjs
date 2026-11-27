@@ -30,7 +30,7 @@ await runChecks("gate", async (check) => {
   page.on("pageerror", (err) => pageErrors.push(err.message));
   page.on("requestfailed", (req) => {
     const errText = req.failure()?.errorText || "";
-    if (errText === "net::ERR_ABORTED" && /\/api\/swarm(s|\/stream|\/delta)?(\?|$)/.test(req.url())) return;
+    if (errText === "net::ERR_ABORTED" && /\/api\/(?:swarm(?:s|\/stream|\/delta)?|worktrees|portfolio|checkpoints)(\?|$)/.test(req.url())) return;
     failedRequests.push(`${req.url()} (${errText})`);
   });
   page.on("request", (req) => {
@@ -4184,6 +4184,357 @@ await runChecks("gate", async (check) => {
       ov380 <= 0 &&
       cErrors.length === 0
     );
+  });
+
+  await check("Wave H1 worktree action buttons have crisp non-transparent borders in Light & Dark at 380x844 and 1440x900, and abort/retry/diff-pagination-retry work cleanly", async () => {
+    const hPage = await newMockPage();
+    await hPage.setViewportSize({ width: 380, height: 844 });
+    const hErrors = [];
+    let allow500 = false;
+    let wtListFailOnce = false;
+    let diffChunk2FailOnce = true;
+    let stallRebase = true;
+    hPage.on("pageerror", (e) => hErrors.push(e.message));
+    hPage.on("console", (msg) => {
+      if (msg.type() === "error") {
+        if (allow500 && (msg.text().includes("status of 500") || msg.text().includes("Failed to fetch"))) return;
+        hErrors.push(msg.text());
+      }
+    });
+
+    await hPage.route("**/api/swarms*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          swarms: [{ id: "h1-wt", title: "H1 Hardening", appData: "gate", head: 1, memberCount: 1, activeCount: 0, waitingCount: 1, killedCount: 0, triageCount: 0, totalTokens: 100, hasPlan: false, lastActivityTs: Date.now() }],
+          defaultConversationId: "h1-wt",
+        }),
+      });
+    });
+
+    await hPage.route(/\/api\/swarm(\?.*)?$/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversationId: "h1-wt",
+          swarm: "h1-wt",
+          member: "coordinator",
+          etag: "h1-wt-1",
+          id: "h1-wt",
+          title: "H1 Hardening",
+          head: 1,
+          members: [{ name: "coordinator", conversation_id: "h1-wt", model: "gemini-3-pro", role: "coordinator", wake_mode: "mentions", wait_since: 1, last_read_seq: 1, unread: 0, killed: false, status: "waiting", steps: 1, activity: "", activityKind: "", replied: false, replyAsk: "", narrator: false, roleWorker: false, failure: null, transcriptMtime: Date.now(), startedAt: new Date().toISOString(), lastStepAt: new Date().toISOString(), usage: { inputTokens: 80, cacheReadTokens: 0, outputTokens: 20, totalTokens: 100 }, posts: 1, lastPostSeq: 1, lastPostTime: "12:00:00", lastPostTs: Date.now() }],
+          messages: [{ seq: 1, agent: "coordinator", text: "@all H1 check", time: "12:00:00", ts: Date.now(), mentions: [], all: true }],
+          replyRefs: {},
+          edges: [],
+          triage: [],
+          ops: [],
+          usage: { inputTokens: 80, cacheReadTokens: 0, outputTokens: 20, totalTokens: 100 },
+          capabilities: { canSendMessage: false, isSidecar: false, sseStream: false, deltaStream: false },
+        }),
+      });
+    });
+
+    await hPage.route(/\/api\/worktrees(\?.*)?$/, async (route) => {
+      if (wtListFailOnce) {
+        wtListFailOnce = false;
+        await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Worktree probe timeout" }) });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          roots: [{ path: "/mock/h1", uri: "file:///mock/h1", isGit: true, count: 3, error: "" }],
+          collisions: [],
+          worktrees: [
+            {
+              id: "w-dirty",
+              root: "/mock/h1",
+              name: "dirty",
+              path: "/mock/h1-dirty",
+              uri: "file:///mock/h1-dirty",
+              isMain: false,
+              exists: true,
+              bare: false,
+              detached: false,
+              locked: false,
+              prunable: false,
+              branch: "feat/dirty-lane",
+              head: "aaaa111",
+              clean: false,
+              baseBranch: "main",
+              ahead: 1,
+              behind: 1,
+              landStatus: "dirty",
+              mergeability: "dirty",
+              dirtyFiles: 1,
+              untrackedFiles: 0,
+              stagedFiles: 0,
+              conflictFiles: ["src/index.ts"],
+              files: [{ path: "src/index.ts", state: "M", uri: "file:///mock/h1-dirty/src/index.ts" }],
+              branchFiles: [],
+              commits: [],
+              lastCommitSha: "aaaa111",
+              lastCommitSubject: "wip: dirty",
+              lastCommitAt: Date.now(),
+            },
+            {
+              id: "w-clean",
+              root: "/mock/h1",
+              name: "clean",
+              path: "/mock/h1-clean",
+              uri: "file:///mock/h1-clean",
+              isMain: false,
+              exists: true,
+              bare: false,
+              detached: false,
+              locked: false,
+              prunable: false,
+              branch: "feat/clean-lane",
+              head: "bbbb222",
+              clean: true,
+              baseBranch: "main",
+              ahead: 1,
+              behind: 0,
+              landStatus: "ready",
+              mergeability: "clean",
+              dirtyFiles: 0,
+              untrackedFiles: 0,
+              stagedFiles: 0,
+              files: [],
+              branchFiles: ["src/app.ts"],
+              commits: [],
+              lastCommitSha: "bbbb222",
+              lastCommitSubject: "feat: clean",
+              lastCommitAt: Date.now(),
+            },
+          ],
+          rejected: [],
+        }),
+      });
+    });
+
+    await hPage.route(/\/api\/worktrees\/diff(\?.*)?$/, async (route) => {
+      const u = new URL(route.request().url());
+      const offset = Number(u.searchParams.get("offset") || 0);
+      if (offset > 0 && diffChunk2FailOnce) {
+        diffChunk2FailOnce = false;
+        await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Chunk read failed" }) });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(
+          offset === 0
+            ? { ok: true, worktree: "/mock/h1-dirty", file: "src/index.ts", mode: "conflict", diff: "@@ -1 +1 @@\n+<<<<<<< HEAD", truncated: true, untracked: false, added: 1, removed: 0, offset: 0, nextOffset: 32768, hasMore: true, totalBytes: 49152 }
+            : { ok: true, worktree: "/mock/h1-dirty", file: "src/index.ts", mode: "conflict", diff: "@@ -2 +2 @@\n+chunk2Ok", truncated: false, untracked: false, added: 1, removed: 0, offset: 32768, nextOffset: null, hasMore: false, totalBytes: 49152 },
+        ),
+      });
+    });
+
+    await hPage.route(/\/api\/worktrees\/action(\?.*)?$/, async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      if (body.action === "rebase" && stallRebase) {
+        stallRebase = false;
+        await new Promise((r) => setTimeout(r, 4000));
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, action: "rebase", status: "rebased" }) }).catch(() => {});
+        return;
+      }
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, action: body.action, status: "rebased", message: "Rebased cleanly" }) });
+    });
+
+    await hPage.goto(BASE, { waitUntil: "domcontentloaded" });
+    await hPage.locator("#tab-worktrees").click();
+    await hPage.waitForSelector('[data-testid="wt-card-feat/dirty-lane"]');
+    allow500 = true;
+    wtListFailOnce = true;
+    await hPage.locator('#panel-worktrees button:has-text("Refresh")').click();
+    await hPage.waitForSelector('[data-testid="worktrees-retry-btn"]');
+    await hPage.locator('[data-testid="worktrees-retry-btn"]').click();
+    await hPage.waitForSelector('[data-testid="wt-card-feat/dirty-lane"]');
+
+    const checkActionBorders = async () =>
+      hPage.evaluate(() => {
+        const cleanIds = [
+          "wt-action-dry-run-feat/clean-lane",
+          "wt-action-ff-merge-feat/clean-lane",
+          "wt-action-rebase-feat/clean-lane",
+          "wt-action-squash-merge-feat/clean-lane",
+          "wt-action-merge-commit-feat/clean-lane",
+          "wt-action-remove-feat/clean-lane",
+        ];
+        const dirtyRebase = document.querySelector('[data-testid="wt-action-rebase-feat/dirty-lane"]');
+        if (!dirtyRebase) return false;
+        const els = [dirtyRebase, ...cleanIds.map((id) => document.querySelector(`[data-testid="${id}"]`))];
+        return els.every((el) => {
+          if (!el) return false;
+          const st = getComputedStyle(el);
+          return (
+            st.borderTopWidth === "1px" &&
+            st.borderTopStyle === "solid" &&
+            st.borderTopColor !== "rgba(0, 0, 0, 0)" &&
+            st.borderTopColor !== "transparent" &&
+            st.borderTopColor !== st.backgroundColor
+          );
+        });
+      });
+
+    const bordersLight380 = await checkActionBorders();
+    const ovLight380 = await hPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    // Conflict diff pagination failure + retry
+    await hPage.locator('[data-testid="wt-conflict-diff-btn-feat/dirty-lane-src/index.ts"]').click();
+    await hPage.waitForSelector('[data-testid="wt-diff-load-more-feat/dirty-lane"]');
+    await hPage.locator('[data-testid="wt-diff-load-more-feat/dirty-lane"]').click();
+    await hPage.waitForSelector('[data-testid="wt-diff-error-feat/dirty-lane"]');
+    const retryBtnTxt = await hPage.locator('[data-testid="wt-diff-load-more-feat/dirty-lane"]').textContent();
+    await hPage.locator('[data-testid="wt-diff-load-more-feat/dirty-lane"]').click();
+    await hPage.waitForFunction(() => (document.querySelector('[data-testid="wt-card-feat/dirty-lane"] pre')?.textContent || "").includes("chunk2Ok"));
+
+    // Abort stalled Rebase request -> verify cancelled status + Retry
+    await hPage.locator('[data-testid="wt-action-rebase-feat/dirty-lane"]').click();
+    await hPage.locator('[data-testid="wt-confirm-submit-feat/dirty-lane"]').click();
+    await hPage.waitForSelector('[data-testid="wt-action-abort-feat/dirty-lane"]');
+    await hPage.locator('[data-testid="wt-action-abort-feat/dirty-lane"]').click();
+    await hPage.waitForSelector('[data-testid="wt-action-retry-feat/dirty-lane"]');
+    await hPage.locator('[data-testid="wt-action-retry-feat/dirty-lane"]').click();
+    await hPage.locator('[data-testid="wt-confirm-submit-feat/dirty-lane"]').click();
+    await hPage.waitForFunction(() => (document.querySelector('[data-testid="wt-action-result-feat/dirty-lane"]')?.textContent || "").includes("Rebased cleanly"));
+
+    // Dark theme at 380x844 & 1440x900
+    await hPage.locator('button[aria-label="Open settings"]').click();
+    await hPage.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();
+    await hPage.locator('button[aria-label="Close dialog"]').click();
+    const bordersDark380 = await checkActionBorders();
+    const ovDark380 = await hPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    await hPage.setViewportSize({ width: 1440, height: 900 });
+    const bordersDark1440 = await checkActionBorders();
+    const ovDark1440 = await hPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    await hPage.close();
+    return (
+      bordersLight380 &&
+      bordersDark380 &&
+      bordersDark1440 &&
+      retryBtnTxt === "Retry next 32 KiB" &&
+      ovLight380 <= 0 &&
+      ovDark380 <= 0 &&
+      ovDark1440 <= 0 &&
+      hErrors.length === 0
+    );
+  });
+
+  await check("Wave H1 checkpoint restore error/retry and portfolio error/retry recover cleanly at 380x844 Light & Dark", async () => {
+    const rPage = await newMockPage();
+    await rPage.setViewportSize({ width: 380, height: 844 });
+    const rErrors = [];
+    let allow500 = true;
+    let portfolioShouldFail = false;
+    let restoreFailOnce = true;
+    rPage.on("pageerror", (e) => rErrors.push(e.message));
+    rPage.on("console", (msg) => {
+      if (msg.type() === "error") {
+        if (allow500 && msg.text().includes("status of 500")) return;
+        rErrors.push(msg.text());
+      }
+    });
+
+    await rPage.route("**/api/swarms*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          swarms: [{ id: "h1-cp", title: "H1 Retry Gate", appData: "gate", head: 2, memberCount: 1, activeCount: 0, waitingCount: 1, killedCount: 0, triageCount: 0, totalTokens: 100, hasPlan: true, lastActivityTs: Date.now() }],
+          defaultConversationId: "h1-cp",
+        }),
+      });
+    });
+
+    await rPage.route("**/api/portfolio*", async (route) => {
+      if (portfolioShouldFail) {
+        await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Portfolio store error" }) });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, totalCostUsd: 0.12, totalTokens: 100, activeSwarms: 1, urgentCount: 0, urgentTriage: [], swarms: [{ id: "h1-cp", title: "H1 Retry Gate", appData: "gate", head: 2, memberCount: 1, activeCount: 0, waitingCount: 1, killedCount: 0, triageCount: 0, totalTokens: 100, hasPlan: true, lastActivityTs: Date.now() }] }),
+      });
+    });
+
+    await rPage.route(/\/api\/swarm(\?.*)?$/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversationId: "h1-cp",
+          swarm: "h1-cp",
+          member: "coordinator",
+          etag: "h1-cp-1",
+          id: "h1-cp",
+          title: "H1 Retry Gate",
+          head: 2,
+          members: [{ name: "coordinator", conversation_id: "h1-cp", model: "gemini-3-pro", role: "coordinator", wake_mode: "mentions", wait_since: 2, last_read_seq: 2, unread: 0, killed: false, status: "waiting", steps: 1, activity: "", activityKind: "", replied: false, replyAsk: "", narrator: false, roleWorker: false, failure: null, transcriptMtime: Date.now(), startedAt: new Date().toISOString(), lastStepAt: new Date().toISOString(), usage: { inputTokens: 80, cacheReadTokens: 0, outputTokens: 20, totalTokens: 100 }, posts: 1, lastPostSeq: 1, lastPostTime: "12:00:00", lastPostTs: Date.now() }],
+          messages: [{ seq: 1, agent: "coordinator", text: "@all CP retry", time: "12:00:00", ts: Date.now(), mentions: [], all: true }],
+          plan: { etag: "pl-live", goal: "Current goal", workstreams: [] },
+          replyRefs: {},
+          edges: [],
+          triage: [],
+          ops: [],
+          usage: { inputTokens: 80, cacheReadTokens: 0, outputTokens: 20, totalTokens: 100 },
+          capabilities: { canSendMessage: true, isSidecar: false, sseStream: false, deltaStream: false },
+        }),
+      });
+    });
+
+    await rPage.route("**/api/checkpoints/restore", async (route) => {
+      if (restoreFailOnce) {
+        restoreFailOnce = false;
+        await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Disk lock busy" }) });
+        return;
+      }
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, mode: "plan", checkpointId: "cp-r1" }) });
+    });
+
+    await rPage.route("**/api/checkpoints*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ok: true,
+          checkpoints: [{ id: "cp-r1", conversationId: "h1-cp", label: "Baseline CP", createdAt: Date.now() - 10000, head: 1, planGoal: "Saved goal" }],
+        }),
+      });
+    });
+
+    await rPage.goto(BASE, { waitUntil: "domcontentloaded" });
+    await rPage.waitForSelector('[data-testid="checkpoint-restore-plan-cp-r1"]');
+
+    await rPage.locator('[data-testid="checkpoint-restore-plan-cp-r1"]').click();
+    await rPage.waitForSelector('[data-testid="checkpoint-error-cp-r1"]');
+    await rPage.locator('[data-testid="checkpoint-retry-cp-r1"]').click();
+    await rPage.waitForFunction(() => !document.querySelector('[data-testid="checkpoint-error-cp-r1"]'));
+
+    portfolioShouldFail = true;
+    await rPage.locator('[data-testid="portfolio-pill-btn"]').click();
+    await rPage.waitForSelector('[data-testid="portfolio-retry-btn"]');
+    portfolioShouldFail = false;
+    await rPage.locator('[data-testid="portfolio-retry-btn"]').click();
+    await rPage.waitForFunction(() => !document.querySelector('[data-testid="portfolio-error-banner"]'));
+    const ov380 = await rPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    await rPage.locator('[data-testid="portfolio-close-btn"]').click();
+    await rPage.locator('button[aria-label="Open settings"]').click();
+    await rPage.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();
+    await rPage.locator('button[aria-label="Close dialog"]').click();
+    const ovDark380 = await rPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    await rPage.close();
+    return ov380 <= 0 && ovDark380 <= 0 && rErrors.length === 0;
   });
 
   // 26-28: Clean runtime guarantees
