@@ -8,34 +8,47 @@ import {
   ChevronUp,
   ClipboardCopy,
   ExternalLink,
+  Eye,
+  EyeOff,
   FileCode2,
+  GitBranch,
   Image as ImageIcon,
   Layers,
   MessageSquare,
+  Pause,
   Pin,
   PinOff,
   Radio,
   RefreshCw,
   Send,
   ShieldAlert,
+  SkipBack,
   Wrench,
   X,
 } from "../icons";
 import {
   PlanConflictError,
+  createCheckpoint,
   extractLocalFilePaths,
+  fetchCheckpoints,
+  isTriageItemAcked,
   openWorkerConversation,
   parseScreenshotLines,
+  restoreCheckpoint,
   saveSwarmPlan,
 } from "../sidecar";
 import type {
+  CheckpointWorktreeDiff,
   NormalizedPlan,
   OperatorCommand,
   PlanMilestoneStatus,
   PlanWorkstreamStatus,
+  SwarmCheckpoint,
   SwarmMember,
   SwarmSnapshot,
+  TriageAckAction,
   TriageItem,
+  WorktreesPayload,
 } from "../types";
 import {
   ActivityPeek,
@@ -807,13 +820,426 @@ function unstickPresetFor(item: TriageItem): Array<{ label: string; prompt: stri
   ];
 }
 
+function computeCheckpointDiff(
+  cp: SwarmCheckpoint,
+  snap: SwarmSnapshot,
+  plan: NormalizedPlan | null,
+  worktrees?: WorktreesPayload | null,
+) {
+  const srv = cp.diff || cp.diffVsLive || null;
+  const liveHead = snap.head || 0;
+  const headDelta = typeof srv?.headDelta === "number" ? srv.headDelta : liveHead - cp.head;
+  const liveGoal = plan?.goalLine || plan?.goal || "";
+  const planChanged =
+    typeof srv?.planChanged === "boolean"
+      ? srv.planChanged
+      : Boolean(
+          (cp.planEtag && plan?.etag && cp.planEtag !== plan.etag) ||
+            (cp.planGoal && liveGoal && cp.planGoal !== liveGoal),
+        );
+
+  let changedWorktrees: CheckpointWorktreeDiff[] = Array.isArray(srv?.changedWorktrees) ? srv.changedWorktrees : [];
+  if (!changedWorktrees.length && Array.isArray(cp.worktrees) && Array.isArray(worktrees?.worktrees)) {
+    const liveByPath = new Map(worktrees.worktrees.map((w) => [w.path, w]));
+    const liveByBranch = new Map(worktrees.worktrees.map((w) => [w.branch, w]));
+    changedWorktrees = cp.worktrees
+      .map<CheckpointWorktreeDiff | null>((cwt) => {
+        const lwt = liveByPath.get(cwt.path) || liveByBranch.get(cwt.branch);
+        if (!lwt) {
+          return { path: cwt.path, branch: cwt.branch, prevHead: cwt.head, head: "removed", changed: true, status: "removed" };
+        }
+        const liveDirty = (lwt.dirtyFiles || 0) + (lwt.untrackedFiles || 0);
+        const cpDirty = cwt.dirtyFiles || 0;
+        const headChanged = Boolean(cwt.head && lwt.head && cwt.head !== lwt.head);
+        const dirtyChanged = liveDirty !== cpDirty;
+        if (!headChanged && !dirtyChanged) return null;
+        return {
+          path: cwt.path,
+          branch: cwt.branch,
+          prevHead: cwt.head,
+          head: lwt.head,
+          dirtyFiles: liveDirty,
+          changed: true,
+          status: headChanged ? "head_moved" : "dirty_changed",
+        };
+      })
+      .filter((x): x is CheckpointWorktreeDiff => Boolean(x));
+  }
+  const worktreeChanges = typeof srv?.worktreeChanges === "number" ? srv.worktreeChanges : changedWorktrees.length;
+  return {
+    headDelta,
+    liveHead,
+    planChanged,
+    worktreeChanges,
+    changedWorktrees,
+    summary: srv?.summary ? maskHome(srv.summary) : "",
+  };
+}
+
+function SwarmCheckpointsSection({
+  snap,
+  plan,
+  worktrees,
+  checkpointsProp,
+  createNonce = 0,
+  onCheckpointsChange,
+  onRefresh,
+  onOpDispatched,
+}: {
+  snap: SwarmSnapshot;
+  plan: NormalizedPlan | null;
+  worktrees?: WorktreesPayload | null;
+  checkpointsProp?: SwarmCheckpoint[];
+  createNonce?: number;
+  onCheckpointsChange?: (cps: SwarmCheckpoint[]) => void;
+  onRefresh: () => void;
+  onOpDispatched?: (op: OperatorCommand) => void;
+}) {
+  const swarmId = snap.swarm || snap.conversationId || "";
+  const [checkpoints, setCheckpoints] = useState<SwarmCheckpoint[]>(checkpointsProp || snap.checkpoints || []);
+  const [loading, setLoading] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [labelDraft, setLabelDraft] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [compareId, setCompareId] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [resumeDrawer, setResumeDrawer] = useState<{ cpId: string; prompt: string } | null>(null);
+  const [sendingResume, setSendingResume] = useState(false);
+  const sectionRef = useRef<HTMLElement>(null);
+  const createLockRef = useRef(false);
+
+  useEffect(() => {
+    if (Array.isArray(checkpointsProp)) setCheckpoints(checkpointsProp);
+  }, [checkpointsProp]);
+
+  const loadCheckpoints = async () => {
+    if (!swarmId) return;
+    setLoading(true);
+    try {
+      const res = await fetchCheckpoints(swarmId);
+      const list = Array.isArray(res.checkpoints) ? res.checkpoints : [];
+      setCheckpoints(list);
+      onCheckpointsChange?.(list);
+    } catch {
+      // Non-fatal if endpoint unavailable in partial mock
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    setCompareId(null);
+    setResumeDrawer(null);
+    setCreateOpen(false);
+    if (Array.isArray(snap.checkpoints)) {
+      setCheckpoints(snap.checkpoints);
+    } else if (!checkpointsProp) {
+      void loadCheckpoints();
+    }
+  }, [swarmId]);
+
+  useEffect(() => {
+    if (!createNonce) return;
+    setLabelDraft((cur) => cur || `Checkpoint #${snap.head || 0}`);
+    setCreateOpen(true);
+    sectionRef.current?.scrollIntoView({ block: "nearest" });
+  }, [createNonce]);
+
+  if (!swarmId) return null;
+
+  const coord = (snap.members || []).find((m) => !m.killed && m.role === "coordinator");
+  const coordConvId = coord?.conversation_id || swarmId;
+  const canNudge = canLiveNudge(snap) && Boolean(coordConvId);
+
+  const handleCreate = async () => {
+    const clean = labelDraft.trim();
+    if (createLockRef.current || !clean || hasControlChars(clean)) {
+      if (hasControlChars(clean)) toast.error("Control characters not permitted");
+      return;
+    }
+    createLockRef.current = true;
+    setCreating(true);
+    try {
+      const roots = (worktrees?.roots || []).map((r) => r.path).filter(Boolean);
+      const res = await createCheckpoint({ conversationId: swarmId, label: clean, roots });
+      const nextList = Array.isArray(res.checkpoints)
+        ? res.checkpoints
+        : res.checkpoint
+          ? [res.checkpoint, ...checkpoints.filter((c) => c.id !== res.checkpoint?.id)]
+          : checkpoints;
+      setCheckpoints(nextList);
+      onCheckpointsChange?.(nextList);
+      setCreateOpen(false);
+      setLabelDraft("");
+      toast.success(`Saved checkpoint "${clean}"`);
+      if (!Array.isArray(res.checkpoints)) void loadCheckpoints();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to create checkpoint");
+    } finally {
+      createLockRef.current = false;
+      setCreating(false);
+    }
+  };
+
+  const handleRestorePlan = async (cp: SwarmCheckpoint) => {
+    if (busyId) return;
+    setBusyId(cp.id);
+    try {
+      await restoreCheckpoint({ conversationId: swarmId, checkpointId: cp.id, mode: "plan" });
+      toast.success(`Restored plan from "${maskHome(cp.label)}"`);
+      onRefresh();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Restore plan failed");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleResumePrompt = async (cp: SwarmCheckpoint) => {
+    if (busyId) return;
+    setBusyId(cp.id);
+    try {
+      const res = await restoreCheckpoint({ conversationId: swarmId, checkpointId: cp.id, mode: "resume_prompt" });
+      const text = maskHome(
+        res.resumePrompt ||
+          res.prompt ||
+          `Resume swarm from checkpoint "${cp.label}" (#${cp.head}): verify workstreams and post updated [done].`,
+      );
+      setResumeDrawer({ cpId: cp.id, prompt: text });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to generate resume prompt");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleSendResume = async () => {
+    if (!resumeDrawer || !coordConvId) return;
+    await submitNudge(coordConvId, resumeDrawer.prompt, "resume prompt to coordinator", setSendingResume, (res) => {
+      const dispatched = toDispatchedOp(res, "nudge", coord?.name || "coordinator");
+      if (dispatched) onOpDispatched?.(dispatched);
+      setResumeDrawer(null);
+      onRefresh();
+    });
+  };
+
+  return (
+    <section ref={sectionRef} aria-labelledby="checkpoints-heading" className="space-y-2" data-testid="checkpoints-section">
+      <div className="row flex-wrap gap-2">
+        <div className="f1">
+          <GitBranch className="text-ink-3" />
+          <h2 id="checkpoints-heading" className="h2">Checkpoints ({checkpoints.length})</h2>
+        </div>
+        <div className="f1">
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Refresh checkpoints"
+            data-testid="checkpoints-refresh-btn"
+            onClick={() => void loadCheckpoints()}
+          >
+            <RefreshCw className={cn(loading && "motion-safe:animate-spin")} />
+          </Button>
+          <Button
+            variant="outline"
+            data-testid="create-checkpoint-btn"
+            onClick={() => {
+              setLabelDraft((cur) => cur || `Checkpoint #${snap.head || 0}`);
+              setCreateOpen((v) => !v);
+            }}
+          >
+            <SkipBack />
+            Create checkpoint
+          </Button>
+        </div>
+      </div>
+
+      {createOpen && (
+        <Card className="p-3 space-y-2" data-testid="checkpoint-create-form">
+          <label htmlFor="checkpoint-label-input" className="text-[12px] font-medium text-ink-2">
+            Checkpoint label
+          </label>
+          <Input
+            id="checkpoint-label-input"
+            data-testid="checkpoint-label-input"
+            maxLength={120}
+            value={labelDraft}
+            onChange={(e) => setLabelDraft(e.target.value)}
+            placeholder="Pre-merge Wave E2"
+          />
+          <div className="row justify-end gap-2">
+            <Button variant="ghost" data-testid="checkpoint-create-cancel" onClick={() => setCreateOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              data-testid="checkpoint-create-submit"
+              disabled={creating || !labelDraft.trim() || hasControlChars(labelDraft)}
+              onClick={() => void handleCreate()}
+            >
+              <CheckCircle2 />
+              {creating ? "Saving..." : "Save checkpoint"}
+            </Button>
+          </div>
+        </Card>
+      )}
+
+      {checkpoints.length === 0 ? (
+        <Card className="p-3 bg-board">
+          <p className="text-[13px] text-ink-2">
+            {loading ? "Loading checkpoints..." : "No checkpoints saved yet. Capture plan, board head, and worktrees before risky edits."}
+          </p>
+        </Card>
+      ) : (
+        <div className="space-y-2">
+          {checkpoints.map((cp) => {
+            const comparing = compareId === cp.id;
+            const diff = comparing ? computeCheckpointDiff(cp, snap, plan, worktrees) : null;
+            const showingResume = resumeDrawer?.cpId === cp.id;
+            const busy = busyId === cp.id;
+            return (
+              <Card key={cp.id} className="p-3 space-y-2 min-w-0" data-testid={`checkpoint-card-${cp.id}`}>
+                <div className="row flex-wrap gap-1.5 min-w-0">
+                  <div className="wrap gap-1.5 min-w-0">
+                    <span className="text-[13px] font-semibold text-ink break-words">{maskHome(cp.label)}</span>
+                    <Badge tone="neutral" className="num">#{cp.head}</Badge>
+                    {Array.isArray(cp.worktrees) && cp.worktrees.length > 0 && (
+                      <Badge tone="neutral" className="num">{cp.worktrees.length} worktrees</Badge>
+                    )}
+                  </div>
+                  {cp.createdAt && <span className="t3 num">{fmtTimeAgo(cp.createdAt)}</span>}
+                </div>
+
+                {cp.planGoal && (
+                  <p className="text-[12px] text-ink-2 break-words">{maskHome(cp.planGoal)}</p>
+                )}
+
+                <div className="wrap gap-1.5">
+                  <Button
+                    variant={comparing ? "secondary" : "outline"}
+                    aria-expanded={comparing}
+                    data-testid={`checkpoint-compare-${cp.id}`}
+                    onClick={() => setCompareId(comparing ? null : cp.id)}
+                  >
+                    {comparing ? <ChevronUp /> : <ChevronDown />}
+                    Compare vs live
+                  </Button>
+                  <Button
+                    variant="outline"
+                    disabled={busy}
+                    data-testid={`checkpoint-restore-plan-${cp.id}`}
+                    onClick={() => void handleRestorePlan(cp)}
+                  >
+                    <SkipBack />
+                    Restore plan
+                  </Button>
+                  <Button
+                    variant="outline"
+                    disabled={busy}
+                    data-testid={`checkpoint-resume-prompt-${cp.id}`}
+                    onClick={() => void handleResumePrompt(cp)}
+                  >
+                    <ClipboardCopy />
+                    Resume prompt
+                  </Button>
+                </div>
+
+                {comparing && diff && (
+                  <div
+                    data-testid={`checkpoint-diff-${cp.id}`}
+                    className="rounded-chip border border-hairline bg-board p-2.5 space-y-1.5 text-[12px] min-w-0"
+                  >
+                    <p className="font-medium text-ink">Live diff summary</p>
+                    <ul className="space-y-1 text-ink-2">
+                      <li className="num">
+                        {diff.headDelta === 0
+                          ? `Board head unchanged (#${diff.liveHead})`
+                          : `Board moved ${diff.headDelta > 0 ? `+${diff.headDelta}` : diff.headDelta} posts (#${cp.head} to #${diff.liveHead})`}
+                      </li>
+                      <li>{diff.planChanged ? "Plan changed since checkpoint" : "Plan matches checkpoint"}</li>
+                      <li>
+                        {diff.worktreeChanges === 0
+                          ? "Worktrees match checkpoint"
+                          : `${diff.worktreeChanges} worktree ${diff.worktreeChanges === 1 ? "change" : "changes"}`}
+                      </li>
+                    </ul>
+                    {diff.summary && <p className="text-ink-2 break-words">{diff.summary}</p>}
+                    {diff.changedWorktrees.length > 0 && (
+                      <ul className="space-y-1 pt-1 border-t border-hairline">
+                        {diff.changedWorktrees.map((cw, idx) => (
+                          <li key={`${cw.branch || cw.path}-${idx}`} className="mono text-[12px] text-ink-2 break-all">
+                            {cw.branch || maskHome(cw.path)}: {cw.prevHead || "?"} to {cw.head || "?"}
+                            {typeof cw.dirtyFiles === "number" && cw.dirtyFiles > 0 ? ` (${cw.dirtyFiles} dirty)` : ""}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+
+                {showingResume && resumeDrawer && (
+                  <div
+                    data-testid={`checkpoint-resume-drawer-${cp.id}`}
+                    className="rounded-chip border border-hairline bg-board p-2.5 space-y-2 min-w-0"
+                  >
+                    <div className="row">
+                      <span className="text-[12px] font-medium text-ink">Resume prompt</span>
+                      <Button variant="ghost" size="icon" aria-label="Close resume prompt" onClick={() => setResumeDrawer(null)}>
+                        <X />
+                      </Button>
+                    </div>
+                    <Textarea
+                      aria-label="Checkpoint resume prompt"
+                      data-testid={`checkpoint-resume-textarea-${cp.id}`}
+                      rows={3}
+                      maxLength={4000}
+                      value={resumeDrawer.prompt}
+                      onChange={(e) => setResumeDrawer({ ...resumeDrawer, prompt: e.target.value })}
+                    />
+                    <div className="wrap justify-end gap-1.5">
+                      <Button
+                        variant="outline"
+                        data-testid={`checkpoint-copy-resume-${cp.id}`}
+                        onClick={() => void copyText(resumeDrawer.prompt, "Resume prompt copied")}
+                      >
+                        <ClipboardCopy />
+                        Copy prompt
+                      </Button>
+                      {canNudge && (
+                        <Button
+                          variant="primary"
+                          disabled={sendingResume || !resumeDrawer.prompt.trim() || hasControlChars(resumeDrawer.prompt)}
+                          data-testid={`checkpoint-send-resume-${cp.id}`}
+                          onClick={() => void handleSendResume()}
+                        >
+                          <Send />
+                          {sendingResume ? "Sending..." : "Send Resume Prompt"}
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </Card>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
 export function TriageView({
   snap,
   pinnedSeqs,
+  worktrees,
+  checkpoints,
+  createCheckpointNonce = 0,
   selectedIdx = 0,
   replyNonce = 0,
   onSelectIdx,
   onTogglePin,
+  onAckTriage,
+  onCheckpointsChange,
   onJumpToBoardSeq,
   onCopyHandoffDigest,
   onExportArchive,
@@ -822,10 +1248,15 @@ export function TriageView({
 }: {
   snap: SwarmSnapshot;
   pinnedSeqs: number[];
+  worktrees?: WorktreesPayload | null;
+  checkpoints?: SwarmCheckpoint[];
+  createCheckpointNonce?: number;
   selectedIdx?: number;
   replyNonce?: number;
   onSelectIdx?: (idx: number) => void;
   onTogglePin: (seq: number) => void;
+  onAckTriage?: (item: TriageItem, action: TriageAckAction, note?: string) => void | Promise<void>;
+  onCheckpointsChange?: (cps: SwarmCheckpoint[]) => void;
   onJumpToBoardSeq: (seq: number, agent?: string) => void;
   onCopyHandoffDigest?: () => void;
   onExportArchive?: (format: "md" | "json") => void;
@@ -837,12 +1268,17 @@ export function TriageView({
   const [sending, setSending] = useState(false);
   const [peekId, setPeekId] = useState<string | null>(null);
   const [traceTarget, setTraceTarget] = useState<TraceTarget | null>(null);
+  const [showAcked, setShowAcked] = useState(false);
+  const [ackBusyId, setAckBusyId] = useState<string | null>(null);
   const nudgeLockRef = useRef(false);
   const nowMs = useNowMs();
   const cardRefs = useRef<Array<HTMLDivElement | null>>([]);
 
   const swarmId = snap.swarm || snap.conversationId || "";
   const triage = snap.triage || [];
+  const unackedTriage = triage.filter((it) => !isTriageItemAcked(it, snap));
+  const ackedCount = triage.length - unackedTriage.length;
+  const visibleTriage = showAcked ? triage : unackedTriage;
   const plan = normalizePlan(snap.plan);
   const frames = snap.frames || [];
   const pinnedSet = new Set(pinnedSeqs);
@@ -861,7 +1297,7 @@ export function TriageView({
 
   useEffect(() => {
     if (!replyNonce) return;
-    const item = triage[selectedIdx];
+    const item = visibleTriage[selectedIdx];
     if (!item) return;
     const prefix = `@${item.member}${item.seq > 0 ? ` Re #${item.seq}` : ""}: `;
     if (canNudge && item.conversationId) {
@@ -871,6 +1307,16 @@ export function TriageView({
       handleCopy(prefix, `Copied reply prefix for @${item.member}`);
     }
   }, [replyNonce]);
+
+  const handleAckClick = async (item: TriageItem, action: TriageAckAction) => {
+    if (!onAckTriage || ackBusyId === item.id) return;
+    setAckBusyId(item.id);
+    try {
+      await onAckTriage(item, action);
+    } finally {
+      setAckBusyId(null);
+    }
+  };
 
   const renderComposer = (headerRight?: React.ReactNode) =>
     nudgeTarget ? (
@@ -914,13 +1360,13 @@ export function TriageView({
 
   const liveMembers = (snap.members || []).filter((m) => !m.killed);
   const blockedNames = new Set(
-    triage.filter((t) => t.severity === "urgent" || t.kind === "blocked" || t.kind === "stuck").map((t) => t.member),
+    unackedTriage.filter((t) => t.severity === "urgent" || t.kind === "blocked" || t.kind === "stuck").map((t) => t.member),
   );
-  const blockedCount = Math.max(blockedNames.size, triage.filter((t) => t.severity === "urgent" || t.kind === "blocked").length);
+  const blockedCount = Math.max(blockedNames.size, unackedTriage.filter((t) => t.severity === "urgent" || t.kind === "blocked").length);
   const workingCount = liveMembers.filter((m) => m.status === "working" && !blockedNames.has(m.name)).length;
   const waitingCount = liveMembers.filter((m) => m.status === "waiting" && !blockedNames.has(m.name)).length;
   const heatTotal = Math.max(1, workingCount + waitingCount + blockedCount);
-  const topBlocker = triage.find((t) => (t.severity === "urgent" || t.kind === "blocked") && t.seq > 0) || triage.find((t) => t.seq > 0);
+  const topBlocker = unackedTriage.find((t) => (t.severity === "urgent" || t.kind === "blocked") && t.seq > 0) || unackedTriage.find((t) => t.seq > 0);
   const buckets = [
     { label: "working", count: workingCount, cls: "bg-blue" },
     { label: "waiting", count: waitingCount, cls: "bg-warn" },
@@ -949,18 +1395,31 @@ export function TriageView({
       <section aria-labelledby="triage-heading" className="space-y-2">
         <div className="space-y-1.5">
           <div className="row flex-wrap gap-2">
-            <h2 id="triage-heading" className="h2">
-              Needs you ({triage.length})
-            </h2>
-            {triage.length === 0 ? (
-              <Badge tone="success">
-                <CheckCircle2 />
-                All clear
-              </Badge>
-            ) : (
-              <div className="hidden sm:flex items-center gap-2 t3 mono">
-                {["j/k move", "o chat", "p pin", "r reply", "? help"].map((k) => <span key={k}>{k}</span>)}
-              </div>
+            <div className="f1 flex-wrap gap-2">
+              <h2 id="triage-heading" className="h2">
+                Needs you ({unackedTriage.length})
+              </h2>
+              {unackedTriage.length === 0 ? (
+                <Badge tone="success">
+                  <CheckCircle2 />
+                  All clear
+                </Badge>
+              ) : (
+                <div className="hidden sm:flex items-center gap-2 t3 mono">
+                  {["j/k move", "o chat", "p pin", "r reply", "? help"].map((k) => <span key={k}>{k}</span>)}
+                </div>
+              )}
+            </div>
+            {(ackedCount > 0 || showAcked) && (
+              <Button
+                variant={showAcked ? "secondary" : "outline"}
+                aria-pressed={showAcked}
+                data-testid="toggle-show-acked"
+                onClick={() => setShowAcked((v) => !v)}
+              >
+                {showAcked ? <EyeOff /> : <Eye />}
+                {showAcked ? "Hide acked" : `Show acked (${ackedCount})`}
+              </Button>
             )}
           </div>
           {(onCopyHandoffDigest || onExportArchive) && (
@@ -1068,15 +1527,35 @@ export function TriageView({
 
         <GateReadinessCard snap={snap} onJump={onJumpToBoardSeq} onRefresh={onRefresh} onOpDispatched={onOpDispatched} />
 
-        {triage.length === 0 ? (
-          <Card className="p-3 bg-board">
-            <p className="text-[14px] text-ink-2">No blockers or unverified items.</p>
+        {visibleTriage.length === 0 ? (
+          <Card className="p-3 bg-board space-y-2">
+            <p className="text-[14px] text-ink-2">
+              {triage.length === 0
+                ? "No blockers or unverified items."
+                : `All ${triage.length} triage items are acknowledged or snoozed.`}
+            </p>
+            {triage.length > 0 && !showAcked && (
+              <Button variant="outline" onClick={() => setShowAcked(true)}>
+                <Eye />
+                Show acked ({ackedCount})
+              </Button>
+            )}
           </Card>
         ) : (
           <div className="space-y-2">
-            {triage.map((item, idx) => {
+            {visibleTriage.map((item, idx) => {
               const isSelected = idx === selectedIdx;
               const isPinned = item.seq > 0 && pinnedSet.has(item.seq);
+              const isAcked = isTriageItemAcked(item, snap);
+              const isSnoozed = Boolean(
+                item.snoozed ||
+                  item.ackAction === "snooze" ||
+                  item.ackState === "snooze" ||
+                  item.ackState === "snoozed" ||
+                  snap.triageAcks?.[item.id]?.action === "snooze",
+              );
+              const ackUntil = item.untilSeq ?? snap.triageAcks?.[item.id]?.untilSeq;
+              const ackBusy = ackBusyId === item.id;
               const sev = SEVERITY_BADGE[item.severity] || SEVERITY_BADGE.attention;
               const editingThis = nudgeTarget?.id === item.id;
               const worker: SwarmMember | undefined = memberByName.get(item.member);
@@ -1095,9 +1574,10 @@ export function TriageView({
                   ref={(el) => {
                     cardRefs.current[idx] = el;
                   }}
+                  data-testid={`triage-card-${item.id}`}
                   data-selected={isSelected ? "true" : undefined}
                   onClick={() => onSelectIdx?.(idx)}
-                  className={cn("p-3 space-y-2", isSelected && "border-blue outline-1 outline-blue")}
+                  className={cn("p-3 space-y-2", isSelected && "border-blue outline-1 outline-blue", isAcked && "opacity-80")}
                 >
                   <div className="space-y-1">
                     <div className="wrap">
@@ -1105,6 +1585,11 @@ export function TriageView({
                         <sev.Icon />
                         {sev.label}
                       </Badge>
+                      {isAcked && (
+                        <Badge tone="neutral" data-testid={`triage-ack-badge-${item.id}`}>
+                          {isSnoozed ? (ackUntil ? `Snoozed until #${ackUntil}` : "Snoozed") : "Acked"}
+                        </Badge>
+                      )}
                       {worker && !worker.killed && (
                         <Badge tone={worker.status === "working" ? "success" : "neutral"}>
                           {worker.status}{elapsed ? ` ${elapsed}` : ""}
@@ -1140,6 +1625,47 @@ export function TriageView({
                     <Button variant="ghost" onClick={() => live ? openNudge(item, askStatusPrompt) : handleCopy(askStatusPrompt, "Status prompt copied")}>
                       Ask status
                     </Button>
+                    {onAckTriage && !isAcked && (
+                      <>
+                        <Button
+                          variant="outline"
+                          disabled={ackBusy}
+                          data-testid={`triage-ack-${item.id}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void handleAckClick(item, "ack");
+                          }}
+                        >
+                          <CheckCircle2 />
+                          Ack
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          disabled={ackBusy}
+                          data-testid={`triage-snooze-${item.id}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void handleAckClick(item, "snooze");
+                          }}
+                        >
+                          <Pause />
+                          Snooze
+                        </Button>
+                      </>
+                    )}
+                    {onAckTriage && isAcked && (
+                      <Button
+                        variant="outline"
+                        disabled={ackBusy}
+                        data-testid={`triage-unack-${item.id}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void handleAckClick(item, "unack");
+                        }}
+                      >
+                        Unack
+                      </Button>
+                    )}
                     {isForensicItem && traceConvId && (
                       <Button
                         variant="outline"
@@ -1213,6 +1739,18 @@ export function TriageView({
 
       {/* Coordinator Plan, Threads, Tasks & Live Editor */}
       <SwarmPlanSection snap={snap} plan={plan} onRefresh={onRefresh} />
+
+      {/* Swarm Checkpoints & Resume */}
+      <SwarmCheckpointsSection
+        snap={snap}
+        plan={plan}
+        worktrees={worktrees}
+        checkpointsProp={checkpoints}
+        createNonce={createCheckpointNonce}
+        onCheckpointsChange={onCheckpointsChange}
+        onRefresh={onRefresh}
+        onOpDispatched={onOpDispatched}
+      />
 
       {/* Screenshot Reel */}
       {frames.length > 0 && (

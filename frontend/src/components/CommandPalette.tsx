@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "../hooks";
 import { Search } from "../icons";
-import { openWorkerConversation } from "../sidecar";
-import type { SwarmSnapshot, SwarmSummary, TabId, WorktreesPayload } from "../types";
-import { cn, maskHome } from "../ui";
+import { isTriageItemAcked, openWorkerConversation } from "../sidecar";
+import type { SwarmCheckpoint, SwarmSnapshot, SwarmSummary, TabId, TriageAckAction, TriageItem, WorktreesPayload } from "../types";
+import { cn, fmtUsd, maskHome } from "../ui";
 
 interface PaletteItem {
   id: string;
@@ -18,6 +18,7 @@ export function CommandPalette({
   snap,
   swarms,
   worktrees,
+  checkpoints = [],
   onSelectTab,
   onJumpToBoard,
   onSelectSwarm,
@@ -25,6 +26,9 @@ export function CommandPalette({
   onOpenSettings,
   onOpenShortcuts,
   onOpenLauncher,
+  onOpenPortfolio,
+  onCreateCheckpoint,
+  onAckTriage,
   onOpenBoardPost,
   onOpenSpawnWorker,
 }: {
@@ -33,6 +37,7 @@ export function CommandPalette({
   snap: SwarmSnapshot | null;
   swarms: SwarmSummary[];
   worktrees?: WorktreesPayload | null;
+  checkpoints?: SwarmCheckpoint[];
   onSelectTab: (tab: TabId) => void;
   onJumpToBoard: (seq: number, agent?: string) => void;
   onSelectSwarm: (id: string) => void;
@@ -40,6 +45,9 @@ export function CommandPalette({
   onOpenSettings: () => void;
   onOpenShortcuts: () => void;
   onOpenLauncher?: () => void;
+  onOpenPortfolio?: () => void;
+  onCreateCheckpoint?: () => void;
+  onAckTriage?: (item: TriageItem, action: TriageAckAction) => void | Promise<void>;
   onOpenBoardPost?: () => void;
   onOpenSpawnWorker?: () => void;
 }) {
@@ -81,9 +89,11 @@ export function CommandPalette({
         ["a-settings", "Settings", onOpenSettings],
         ["a-keys", "Keyboard shortcuts", onOpenShortcuts, "?"],
       ] as const).map(([id, label, onSelect, meta]) => ({ id, group: "Views", label, meta, onSelect })),
-      ...(onOpenLauncher || (snap?.swarm && (onOpenBoardPost || onOpenSpawnWorker))
+      ...(onOpenPortfolio || onOpenLauncher || (snap?.swarm && (onOpenBoardPost || onOpenSpawnWorker || onCreateCheckpoint))
         ? [
+            ...(onOpenPortfolio ? [{ id: "act-portfolio", group: "Actions", label: "Portfolio command drawer", meta: "Portfolio", onSelect: onOpenPortfolio }] : []),
             ...(onOpenLauncher ? [{ id: "act-new-swarm", group: "Actions", label: "New swarm", meta: "Launcher", onSelect: onOpenLauncher }] : []),
+            ...(snap?.swarm && onCreateCheckpoint ? [{ id: "act-checkpoint", group: "Actions", label: "Create checkpoint", meta: "Triage", onSelect: onCreateCheckpoint }] : []),
             ...(snap?.swarm && onOpenBoardPost ? [{ id: "act-board-post", group: "Actions", label: "Board post", meta: "Compose", onSelect: onOpenBoardPost }] : []),
             ...(snap?.swarm && onOpenSpawnWorker ? [{ id: "act-spawn-worker", group: "Actions", label: "Spawn worker", meta: "Roster", onSelect: onOpenSpawnWorker }] : []),
           ]
@@ -125,12 +135,43 @@ export function CommandPalette({
             onSelect: () => onJumpToBoard(snap.gateReadiness?.nextAction?.seq || snap.gateReadiness?.pendingSeq || 0),
           }]
         : []),
-      ...(snap?.triage || []).map((it) => ({
-        id: `tg-${it.id}`,
-        group: "Triage & gates",
-        label: it.title,
-        meta: it.seq > 0 ? `#${it.seq}` : it.severity,
-        onSelect: () => (it.seq > 0 ? onJumpToBoard(it.seq) : onSelectTab("triage")),
+      ...(snap?.triage || []).flatMap((it) => {
+        const acked = isTriageItemAcked(it, snap);
+        const rows: PaletteItem[] = [
+          {
+            id: `tg-${it.id}`,
+            group: "Triage & gates",
+            label: it.title,
+            meta: acked ? "acked" : it.seq > 0 ? `#${it.seq}` : it.severity,
+            onSelect: () => (it.seq > 0 ? onJumpToBoard(it.seq) : onSelectTab("triage")),
+          },
+        ];
+        if (onAckTriage && !acked) {
+          rows.push(
+            {
+              id: `tg-ack-${it.id}`,
+              group: "Triage & gates",
+              label: `Ack: ${it.title}`,
+              meta: "Triage",
+              onSelect: () => void onAckTriage(it, "ack"),
+            },
+            {
+              id: `tg-snooze-${it.id}`,
+              group: "Triage & gates",
+              label: `Snooze: ${it.title}`,
+              meta: "Triage",
+              onSelect: () => void onAckTriage(it, "snooze"),
+            },
+          );
+        }
+        return rows;
+      }),
+      ...checkpoints.map((cp) => ({
+        id: `cp-${cp.id}`,
+        group: "Checkpoints",
+        label: `Checkpoint: ${maskHome(cp.label)}`,
+        meta: `#${cp.head}`,
+        onSelect: () => onSelectTab("triage"),
       })),
       ...recentMsgs.map((m) => ({
         id: `bm-${m.seq}`,
@@ -149,7 +190,7 @@ export function CommandPalette({
         id: `sw-${sw.id}`,
         group: "Swarms",
         label: sw.title || sw.id,
-        meta: `${sw.activeCount}/${sw.memberCount} · #${sw.head}`,
+        meta: `${sw.activeCount}/${sw.memberCount} · #${sw.head}${typeof sw.costUsd === "number" ? ` · ${fmtUsd(sw.costUsd)}` : ""}${sw.archived ? " · archived" : ""}`,
         onSelect: () => onSelectSwarm(sw.id),
       })),
     ];
@@ -160,7 +201,7 @@ export function CommandPalette({
       const hay = `${it.group} ${it.label} ${it.meta || ""}`.toLowerCase();
       return terms.every((t) => hay.includes(t));
     });
-  }, [query, snap, swarms, worktrees, onSelectTab, onJumpToBoard, onCopyDigest, onOpenSettings, onOpenShortcuts, onSelectSwarm, onOpenLauncher, onOpenBoardPost, onOpenSpawnWorker]);
+  }, [query, snap, swarms, worktrees, checkpoints, onSelectTab, onJumpToBoard, onCopyDigest, onOpenSettings, onOpenShortcuts, onSelectSwarm, onOpenLauncher, onOpenPortfolio, onCreateCheckpoint, onAckTriage, onOpenBoardPost, onOpenSpawnWorker]);
 
   useEffect(() => {
     setActiveIdx((i) => (items.length ? Math.min(i, items.length - 1) : 0));

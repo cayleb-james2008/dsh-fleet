@@ -219,6 +219,39 @@
         ],
         frames: [],
         ops: [],
+        repo: "/workspace/fleet",
+        archived: false,
+        pinnedSeqs: [],
+        triageAcks: {},
+        checkpoints: [
+          {
+            id: "cp-seed-1",
+            conversationId: COORD_ID,
+            label: "Initial sidecar baseline",
+            createdAt: t(200),
+            head: 3,
+            planEtag: "plan-v1",
+            planGoal: "Deliver native aux-pane Swarm Command Center with live telemetry and worktrees.",
+            planSnapshot: {
+              title: "Fleet Antigravity Plugin",
+              goal: "Deliver native aux-pane Swarm Command Center with live telemetry and worktrees.",
+              gate: "npm test && npm run check:ui",
+              workstreams: [
+                { id: "ws-backend", title: "Sidecar Node backend + frame security", owner: "builder", status: "done" },
+                { id: "ws-ui", title: "Sidebar-first Aux Pane UI (380px + 1440px)", owner: "ui-dev", status: "running" },
+                { id: "ws-verify", title: "Cold Playwright & sloplint verification", owner: "verifier", status: "pending" },
+              ],
+              milestones: [
+                { title: "Plugin Manifest & Skill", status: "done" },
+                { title: "Sidecar Tests Pass", status: "done" },
+                { title: "Cold Verification", status: "in_progress" },
+              ],
+            },
+            worktrees: [
+              { path: "/workspace/scratch/fleet-ui", branch: "lane/sidebar-ui", head: "b102f8a1", clean: true, dirtyFiles: 0 },
+            ],
+          },
+        ],
       },
       [AUDIT_COORD_ID]: {
         id: AUDIT_COORD_ID,
@@ -896,6 +929,47 @@
         }
       });
     }
+    sw.messages.forEach(function (msg) {
+      if (/\[blocked\]/i.test(msg.text || "")) {
+        var resolved = sw.messages.some(function (later) {
+          return later.seq > msg.seq && later.agent === msg.agent && /\[(done|verified|scale-verified)\]/i.test(later.text || "");
+        });
+        if (!resolved) {
+          var bSender = sw.members.find(function (m) { return m.name === msg.agent; });
+          triage.push({
+            id: "blocked-" + msg.agent + "-" + msg.seq,
+            kind: "blocked",
+            severity: "urgent",
+            member: msg.agent,
+            conversationId: bSender ? bSender.conversation_id : "",
+            seq: msg.seq,
+            title: msg.agent + " posted [blocked] (#" + msg.seq + ")",
+            detail: msg.text,
+            suggestedPrompt: "@" + msg.agent + " Re #" + msg.seq + ": Resolve blocker and post updated [done].",
+            timestamp: msg.ts || now,
+          });
+        }
+      }
+    });
+    var ackMap = sw.triageAcks || {};
+    triage = triage.map(function (it) {
+      var rec = ackMap[it.id];
+      var activeAck = Boolean(
+        rec &&
+          rec.action !== "unack" &&
+          !(rec.action === "snooze" && typeof rec.untilSeq === "number" && sw.head > rec.untilSeq),
+      );
+      if (!activeAck) return it;
+      return Object.assign({}, it, {
+        acked: true,
+        snoozed: rec.action === "snooze",
+        ackAction: rec.action,
+        ackState: rec.action,
+        ackedAt: rec.ackedAt || null,
+        untilSeq: rec.untilSeq || null,
+        ackNote: rec.note || null,
+      });
+    });
     var usage = sw.members.reduce(
       function (acc, m) {
         var u = m.usage || {};
@@ -1091,7 +1165,7 @@
       conversationId: sw.id,
       swarm: sw.id,
       member: sw.member,
-      etag: "liveweb-" + sw.head + "-" + triage.length + "-" + (sw.planVersion || 1) + "-" + (sw.controlVersion || 0) + "-" + (sw.opsVersion || 0),
+      etag: "liveweb-" + sw.head + "-" + triage.length + "-" + (sw.planVersion || 1) + "-" + (sw.controlVersion || 0) + "-" + (sw.opsVersion || 0) + "-" + (sw.pinsVersion || 0) + "-" + (sw.ackVersion || 0) + "-" + (sw.checkpointVersion || 0) + "-" + (sw.archived ? 1 : 0),
       id: sw.id,
       title: sw.title,
       head: sw.head,
@@ -1104,6 +1178,10 @@
       plan: normalizePlanForSnapshot(sw.plan, planEtagOf(sw)),
       frames: sw.frames,
       triage: triage,
+      pinnedSeqs: (sw.pinnedSeqs || []).slice(),
+      triageAcks: Object.assign({}, sw.triageAcks || {}),
+      archived: Boolean(sw.archived),
+      checkpoints: (sw.checkpoints || []).map(sanitizeCheckpoint),
       burnSummary: burnSummary,
       gateReadiness: gateReadiness,
       usage: usage,
@@ -1199,6 +1277,10 @@
           view: full.view,
           frames: full.frames,
           triage: full.triage,
+          pinnedSeqs: full.pinnedSeqs,
+          triageAcks: full.triageAcks,
+          archived: full.archived,
+          checkpoints: full.checkpoints,
           burnSummary: full.burnSummary,
           gateReadiness: full.gateReadiness,
           usage: full.usage,
@@ -1274,9 +1356,64 @@
     return opRec;
   }
 
+  function sanitizeCheckpoint(cp) {
+    if (!cp) return null;
+    return {
+      id: cp.id,
+      conversationId: cp.conversationId,
+      label: cp.label,
+      createdAt: cp.createdAt,
+      head: cp.head,
+      planEtag: cp.planEtag || "",
+      planGoal: cp.planGoal || "",
+      memberCount: cp.memberCount,
+      activeCount: cp.activeCount,
+      triageCount: cp.triageCount,
+      worktrees: (cp.worktrees || []).slice(),
+      diff: cp.diff || null,
+    };
+  }
+
+  function computeCheckpointDiffObj(sw, cp) {
+    var curPlan = normalizePlanForSnapshot(sw.plan, planEtagOf(sw));
+    var curGoal = (curPlan && (curPlan.goalLine || curPlan.goal)) || "";
+    var planChanged = Boolean((cp.planEtag && curPlan && cp.planEtag !== curPlan.etag) || (cp.planGoal && curGoal && cp.planGoal !== curGoal));
+    var changedWorktrees = [];
+    (cp.worktrees || []).forEach(function (cwt) {
+      var lwt = state.worktrees.find(function (w) { return w.path === cwt.path || w.branch === cwt.branch; });
+      if (!lwt) {
+        changedWorktrees.push({ path: cwt.path, branch: cwt.branch, prevHead: cwt.head, head: "removed", changed: true, status: "removed" });
+        return;
+      }
+      var liveDirty = (lwt.dirtyFiles || 0) + (lwt.untrackedFiles || 0);
+      if (lwt.head !== cwt.head || liveDirty !== (cwt.dirtyFiles || 0)) {
+        changedWorktrees.push({
+          path: cwt.path,
+          branch: cwt.branch,
+          prevHead: cwt.head,
+          head: lwt.head,
+          dirtyFiles: liveDirty,
+          changed: true,
+          status: lwt.head !== cwt.head ? "head_moved" : "dirty_changed",
+        });
+      }
+    });
+    return {
+      headDelta: (sw.head || 0) - (cp.head || 0),
+      newMessages: Math.max(0, (sw.head || 0) - (cp.head || 0)),
+      planChanged: planChanged,
+      worktreeChanges: changedWorktrees.length,
+      changedWorktrees: changedWorktrees,
+    };
+  }
+
   function listSwarms() {
     return Object.values(state.swarms).map(function (sw) {
       var snap = computeSnapshot(sw.id);
+      var unackedTriage = (snap.triage || []).filter(function (it) { return !it.acked; });
+      var blockedCount = unackedTriage.filter(function (it) { return it.kind === "blocked" || it.severity === "urgent"; }).length;
+      var failureCount = sw.members.filter(function (m) { return !m.killed && Boolean(m.failure); }).length;
+      var topUrgent = unackedTriage.find(function (it) { return it.severity === "urgent"; }) || unackedTriage[0] || null;
       return {
         id: sw.id,
         title: sw.title,
@@ -1286,12 +1423,42 @@
         activeCount: sw.members.filter(function (m) { return !m.killed && m.status === "working"; }).length,
         waitingCount: sw.members.filter(function (m) { return !m.killed && m.status === "waiting"; }).length,
         killedCount: sw.members.filter(function (m) { return m.killed; }).length,
-        triageCount: snap.triage.length,
+        triageCount: unackedTriage.length,
         totalTokens: snap.usage.totalTokens,
         hasPlan: Boolean(sw.plan),
         lastActivityTs: now,
+        costUsd: snap.cost ? snap.cost.totalUsd : 0,
+        gateState: snap.gateReadiness ? snap.gateReadiness.state : null,
+        blockedCount: blockedCount,
+        failureCount: failureCount,
+        repo: sw.repo || "/workspace/fleet",
+        archived: Boolean(sw.archived),
+        topUrgent: topUrgent,
       };
     });
+  }
+
+  function buildPortfolioPayload() {
+    var summaries = listSwarms();
+    var active = summaries.filter(function (s) { return !s.archived; });
+    var urgentTriage = [];
+    active.forEach(function (swSummary) {
+      var snap = computeSnapshot(swSummary.id);
+      (snap.triage || []).forEach(function (it) {
+        if (!it.acked && (it.severity === "urgent" || it.kind === "blocked" || it.kind === "quota" || it.kind === "error" || it.kind === "stuck")) {
+          urgentTriage.push(Object.assign({}, it, { swarmId: swSummary.id, swarmTitle: swSummary.title }));
+        }
+      });
+    });
+    return {
+      ok: true,
+      totalCostUsd: active.reduce(function (sum, s) { return sum + (s.costUsd || 0); }, 0),
+      totalTokens: active.reduce(function (sum, s) { return sum + (s.totalTokens || 0); }, 0),
+      activeSwarms: active.length,
+      urgentCount: urgentTriage.length,
+      urgentTriage: urgentTriage,
+      swarms: summaries,
+    };
   }
 
   window.sidecar = {
@@ -1739,6 +1906,165 @@
         action: actAction,
         op: Object.assign({}, targetOp),
         ops: actSw.ops.slice(),
+      });
+    }
+    if (url.pathname === "/api/portfolio") {
+      return jsonResp(buildPortfolioPayload());
+    }
+    if (url.pathname === "/api/triage/ack" && init && String(init.method || "").toUpperCase() === "POST") {
+      var ackBody = {};
+      try { ackBody = JSON.parse(String(init.body || "{}")); } catch { return jsonResp({ error: "Invalid JSON" }, 400); }
+      if (!ackBody || ackBody.confirm !== true || typeof ackBody.triageId !== "string") {
+        return jsonResp({ error: "confirm and triageId required" }, 400);
+      }
+      var ackAction = String(ackBody.action || "");
+      if (["ack", "snooze", "unack"].indexOf(ackAction) < 0) {
+        return jsonResp({ error: "Invalid ack action" }, 400);
+      }
+      var ackSw = findSwarmByConvId(ackBody.conversationId) || state.swarms[ackBody.conversationId];
+      if (!ackSw) return jsonResp({ error: "Swarm not found" }, 404);
+      ackSw.triageAcks = ackSw.triageAcks || {};
+      if (ackAction === "unack") {
+        delete ackSw.triageAcks[ackBody.triageId];
+      } else {
+        ackSw.triageAcks[ackBody.triageId] = {
+          triageId: ackBody.triageId,
+          action: ackAction,
+          untilSeq: typeof ackBody.untilSeq === "number" ? ackBody.untilSeq : (ackSw.head || 0) + 5,
+          note: typeof ackBody.note === "string" ? ackBody.note.slice(0, 400) : undefined,
+          ackedAt: Date.now(),
+        };
+      }
+      ackSw.ackVersion = (ackSw.ackVersion || 0) + 1;
+      notifyDeltaWaiters(ackSw.id);
+      return jsonResp({
+        ok: true,
+        conversationId: ackSw.id,
+        triageId: ackBody.triageId,
+        action: ackAction,
+        acks: Object.assign({}, ackSw.triageAcks),
+        triage: computeSnapshot(ackSw.id).triage,
+      });
+    }
+    if (url.pathname === "/api/pins" && init && String(init.method || "").toUpperCase() === "POST") {
+      var pinBody = {};
+      try { pinBody = JSON.parse(String(init.body || "{}")); } catch { return jsonResp({ error: "Invalid JSON" }, 400); }
+      if (!pinBody || pinBody.confirm !== true || typeof pinBody.seq !== "number" || pinBody.seq <= 0) {
+        return jsonResp({ error: "confirm and valid seq required" }, 400);
+      }
+      var pinSw = findSwarmByConvId(pinBody.conversationId) || state.swarms[pinBody.conversationId];
+      if (!pinSw) return jsonResp({ error: "Swarm not found" }, 404);
+      var curPins = Array.isArray(pinSw.pinnedSeqs) ? pinSw.pinnedSeqs.slice() : [];
+      var wantPinned = Boolean(pinBody.pinned);
+      if (wantPinned && curPins.indexOf(pinBody.seq) < 0) curPins.push(pinBody.seq);
+      if (!wantPinned) curPins = curPins.filter(function (x) { return x !== pinBody.seq; });
+      curPins.sort(function (a, b) { return a - b; });
+      pinSw.pinnedSeqs = curPins;
+      pinSw.pinsVersion = (pinSw.pinsVersion || 0) + 1;
+      notifyDeltaWaiters(pinSw.id);
+      return jsonResp({
+        ok: true,
+        conversationId: pinSw.id,
+        seq: pinBody.seq,
+        pinned: wantPinned,
+        pinnedSeqs: curPins.slice(),
+      });
+    }
+    if (url.pathname === "/api/swarm/archive" && init && String(init.method || "").toUpperCase() === "POST") {
+      var archBody = {};
+      try { archBody = JSON.parse(String(init.body || "{}")); } catch { return jsonResp({ error: "Invalid JSON" }, 400); }
+      if (!archBody || archBody.confirm !== true || typeof archBody.archived !== "boolean") {
+        return jsonResp({ error: "confirm and archived boolean required" }, 400);
+      }
+      var archSw = findSwarmByConvId(archBody.conversationId) || state.swarms[archBody.conversationId];
+      if (!archSw) return jsonResp({ error: "Swarm not found" }, 404);
+      archSw.archived = Boolean(archBody.archived);
+      notifyDeltaWaiters(archSw.id);
+      return jsonResp({ ok: true, conversationId: archSw.id, archived: archSw.archived });
+    }
+    if (url.pathname === "/api/checkpoints" && (!init || !init.method || String(init.method).toUpperCase() === "GET")) {
+      var cpConv = url.searchParams.get("conversationId") || COORD_ID;
+      var cpSw = findSwarmByConvId(cpConv) || state.swarms[cpConv];
+      if (!cpSw) return jsonResp({ error: "Swarm not found" }, 404);
+      var cpList = (cpSw.checkpoints || []).map(function (cp) {
+        return Object.assign({}, sanitizeCheckpoint(cp), { diff: computeCheckpointDiffObj(cpSw, cp) });
+      });
+      return jsonResp({ ok: true, conversationId: cpSw.id, checkpoints: cpList });
+    }
+    if (url.pathname === "/api/checkpoints" && init && String(init.method || "").toUpperCase() === "POST") {
+      var rawCpBody = String(init.body || "{}");
+      if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(rawCpBody)) {
+        return jsonResp({ error: "Control characters not permitted" }, 400);
+      }
+      var cpBody = {};
+      try { cpBody = JSON.parse(rawCpBody); } catch { return jsonResp({ error: "Invalid JSON" }, 400); }
+      var cpLabel = typeof cpBody.label === "string" ? cpBody.label.trim() : "";
+      if (!cpBody || cpBody.confirm !== true || !cpLabel || cpLabel.length > 120) {
+        return jsonResp({ error: "confirm and valid label required" }, 400);
+      }
+      var targetCpSw = findSwarmByConvId(cpBody.conversationId) || state.swarms[cpBody.conversationId];
+      if (!targetCpSw) return jsonResp({ error: "Swarm not found" }, 404);
+      var normPlan = normalizePlanForSnapshot(targetCpSw.plan, planEtagOf(targetCpSw));
+      var newCp = {
+        id: "cp-" + (++opCounter),
+        conversationId: targetCpSw.id,
+        label: cpLabel,
+        createdAt: Date.now(),
+        head: targetCpSw.head || 0,
+        planEtag: planEtagOf(targetCpSw),
+        planGoal: (normPlan && (normPlan.goalLine || normPlan.goal)) || "",
+        planSnapshot: targetCpSw.plan ? JSON.parse(JSON.stringify(targetCpSw.plan)) : null,
+        memberCount: targetCpSw.members.length,
+        activeCount: targetCpSw.members.filter(function (m) { return !m.killed && m.status === "working"; }).length,
+        triageCount: computeSnapshot(targetCpSw.id).triage.length,
+        worktrees: state.worktrees.map(function (w) {
+          return { path: w.path, branch: w.branch, head: w.head, clean: w.clean, dirtyFiles: (w.dirtyFiles || 0) + (w.untrackedFiles || 0) };
+        }),
+      };
+      targetCpSw.checkpoints = [newCp].concat(targetCpSw.checkpoints || []);
+      targetCpSw.checkpointVersion = (targetCpSw.checkpointVersion || 0) + 1;
+      notifyDeltaWaiters(targetCpSw.id);
+      var enrichedList = targetCpSw.checkpoints.map(function (cp) {
+        return Object.assign({}, sanitizeCheckpoint(cp), { diff: computeCheckpointDiffObj(targetCpSw, cp) });
+      });
+      return jsonResp({ ok: true, checkpoint: enrichedList[0], checkpoints: enrichedList });
+    }
+    if (url.pathname === "/api/checkpoints/restore" && init && String(init.method || "").toUpperCase() === "POST") {
+      var rstBody = {};
+      try { rstBody = JSON.parse(String(init.body || "{}")); } catch { return jsonResp({ error: "Invalid JSON" }, 400); }
+      if (!rstBody || rstBody.confirm !== true || typeof rstBody.checkpointId !== "string") {
+        return jsonResp({ error: "confirm and checkpointId required" }, 400);
+      }
+      var rstMode = String(rstBody.mode || "");
+      if (rstMode !== "plan" && rstMode !== "resume_prompt") {
+        return jsonResp({ error: "Invalid restore mode" }, 400);
+      }
+      var rstSw = findSwarmByConvId(rstBody.conversationId) || state.swarms[rstBody.conversationId];
+      if (!rstSw) return jsonResp({ error: "Swarm not found" }, 404);
+      var hitCp = (rstSw.checkpoints || []).find(function (c) { return c.id === rstBody.checkpointId; });
+      if (!hitCp) return jsonResp({ error: "Checkpoint not found" }, 404);
+      if (rstMode === "plan") {
+        if (hitCp.planSnapshot) {
+          rstSw.plan = JSON.parse(JSON.stringify(hitCp.planSnapshot));
+          rstSw.planVersion = (rstSw.planVersion || 1) + 1;
+        }
+        notifyDeltaWaiters(rstSw.id);
+        var nextPlEtag = planEtagOf(rstSw);
+        return jsonResp({
+          ok: true,
+          mode: "plan",
+          checkpointId: hitCp.id,
+          plan: normalizePlanForSnapshot(rstSw.plan, nextPlEtag),
+          etag: nextPlEtag,
+        });
+      }
+      var resumePrompt = "@coordinator Resume from checkpoint \"" + hitCp.label + "\" (#" + hitCp.head + "): " +
+        (hitCp.planGoal || rstSw.title) + ". Verify live worktrees and post updated [done].";
+      return jsonResp({
+        ok: true,
+        mode: "resume_prompt",
+        checkpointId: hitCp.id,
+        resumePrompt: resumePrompt,
       });
     }
     if (url.pathname === "/api/health") {

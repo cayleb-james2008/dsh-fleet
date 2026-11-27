@@ -780,6 +780,139 @@ await check("Working-worker Switch Model guard, 409 worker_not_waiting, honest d
   );
 });
 
+await check("Portfolio pill & Command Drawer show aggregated spend, urgent queue jump, gate badges, and Archive/Show archived at 340px Light & Dark", async () => {
+  await page.setViewportSize({ width: 340, height: 900 });
+  await page.evaluate(async () => {
+    await fetch("/api/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        confirm: true,
+        op: "board_post",
+        conversationId: "demo-audit-0009",
+        text: "[blocked] Portfolio urgent check on audit swarm",
+      }),
+    });
+  });
+  await page.selectOption('select[aria-label="Active swarm"]', "demo-coord-0001");
+  await page.locator('button[aria-label="Refresh swarm"]').click();
+  await page.waitForFunction(
+    () => (document.querySelector('[data-testid="portfolio-pill-btn"]')?.textContent || "").includes("1 urgent"),
+  );
+  const pillTxt = await page.locator('[data-testid="portfolio-pill-btn"]').textContent();
+  const ovHeader340 = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+  await page.locator('[data-testid="portfolio-pill-btn"]').click();
+  await page.waitForSelector('[data-testid="portfolio-drawer"]');
+  await page.waitForSelector('[data-testid^="portfolio-jump-urgent-blocked-"]');
+  const totalUsd = await page.locator('[data-testid="portfolio-total-usd"]').textContent();
+  const urgentTxt = await page.locator('[data-testid="portfolio-urgent-queue"]').textContent();
+  const gateBadgeTxt = await page.locator('[data-testid="portfolio-gate-demo-coord-0001"]').textContent();
+  const ovDrawer340 = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+  await page.locator('[data-testid="portfolio-archive-swarm-demo-native-0011"]').click();
+  await page.waitForFunction(() => !document.querySelector('[data-testid="portfolio-swarm-demo-native-0011"]'));
+  await page.locator('[data-testid="portfolio-show-archived"]').click();
+  await page.waitForSelector('[data-testid="portfolio-swarm-demo-native-0011"]');
+  await page.locator('[data-testid="portfolio-archive-swarm-demo-native-0011"]').click();
+  await page.waitForFunction(
+    () => (document.querySelector('[data-testid="portfolio-archive-swarm-demo-native-0011"]')?.textContent || "").trim() === "Archive",
+  );
+  await page.locator('[data-testid="portfolio-show-archived"]').click();
+
+  await page.locator('[data-testid^="portfolio-jump-urgent-blocked-"]').first().click();
+  await page.waitForFunction(() => !document.querySelector('[data-testid="portfolio-drawer"]'));
+  await page.waitForFunction(() => (document.querySelector('select[aria-label="Active swarm"]')?.value || "") === "demo-audit-0009");
+  const switchedVal = await page.locator('select[aria-label="Active swarm"]').inputValue();
+
+  await page.locator('button[aria-label="Open settings"]').click();
+  await page.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();
+  await page.locator('button[aria-label="Close dialog"]').click();
+  await page.locator('[data-testid="portfolio-pill-btn"]').click();
+  await page.waitForSelector('[data-testid="portfolio-drawer"]');
+  const ovDark340 = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  await page.locator('[data-testid="portfolio-close-btn"]').click();
+  await page.locator('button[aria-label="Open settings"]').click();
+  await page.locator('div[role="dialog"] button[role="radio"]:has-text("Light")').click();
+  await page.locator('button[aria-label="Close dialog"]').click();
+
+  return (
+    Boolean(/\d+\s+swarms?\s+·\s+1\s+urgent\s+·\s+\$\d+\.\d+/.test(pillTxt || "")) &&
+    Boolean(/\$\d+\.\d+/.test(totalUsd || "")) &&
+    Boolean(urgentTxt?.includes("Portfolio urgent check")) &&
+    Boolean(gateBadgeTxt?.includes("Gate:")) &&
+    switchedVal === "demo-audit-0009" &&
+    ovHeader340 <= 0 &&
+    ovDrawer340 <= 0 &&
+    ovDark340 <= 0
+  );
+});
+
+await check("Triage Ack/Snooze/Show acked, persistent /api/pins, and Checkpoints create/compare/restore/resume work at 380px", async () => {
+  await page.setViewportSize({ width: 380, height: 900 });
+  await page.selectOption('select[aria-label="Active swarm"]', "demo-coord-0001");
+  await page.locator("#tab-triage").click();
+  await page.waitForSelector('[data-testid="checkpoints-section"]');
+
+  // Verify persistent /api/pins across swarm switch
+  const pinOk = await page.evaluate(async () => {
+    const res = await fetch("/api/pins", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true, conversationId: "demo-coord-0001", seq: 4, pinned: true }),
+    });
+    const j = await res.json();
+    return Boolean(j.ok && Array.isArray(j.pinnedSeqs) && j.pinnedSeqs.includes(4));
+  });
+
+  // Triage Ack + Show acked + Unack
+  await page.waitForSelector('[data-testid="triage-ack-verify-builder-4"]');
+  await page.locator('[data-testid="triage-ack-verify-builder-4"]').click();
+  await page.waitForFunction(() => !document.querySelector('[data-testid="triage-card-verify-builder-4"]'));
+  await page.locator('[data-testid="toggle-show-acked"]').click();
+  await page.waitForSelector('[data-testid="triage-ack-badge-verify-builder-4"]');
+  await page.locator('[data-testid="triage-unack-verify-builder-4"]').click();
+  await page.locator('[data-testid="toggle-show-acked"]').click();
+  await page.waitForSelector('[data-testid="triage-card-verify-builder-4"]');
+
+  // Compare seeded checkpoint vs live, Create checkpoint, Restore plan, Copy/Send Resume Prompt
+  await page.locator('[data-testid="checkpoint-compare-cp-seed-1"]').click();
+  await page.waitForSelector('[data-testid="checkpoint-diff-cp-seed-1"]');
+  const diffTxt = await page.locator('[data-testid="checkpoint-diff-cp-seed-1"]').textContent();
+
+  await page.locator('[data-testid="create-checkpoint-btn"]').click();
+  await page.fill('[data-testid="checkpoint-label-input"]', "Live Web E2 Snap");
+  await page.locator('[data-testid="checkpoint-create-submit"]').click();
+  await page.waitForFunction(() => (document.querySelector('[data-testid="checkpoints-section"]')?.textContent || "").includes("Live Web E2 Snap"));
+
+  await page.locator('[data-testid="checkpoint-restore-plan-cp-seed-1"]').click();
+  await page.locator('[data-testid="checkpoint-resume-prompt-cp-seed-1"]').click();
+  await page.waitForSelector('[data-testid="checkpoint-resume-drawer-cp-seed-1"]');
+  await page.evaluate(() => {
+    window.__cpResumeClip = "";
+    try {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: async (t) => { window.__cpResumeClip = String(t); } },
+      });
+    } catch {}
+  });
+  await page.locator('[data-testid="checkpoint-copy-resume-cp-seed-1"]').click();
+  await page.waitForFunction(() => Boolean(window.__cpResumeClip));
+  const resumeClip = await page.evaluate(() => window.__cpResumeClip);
+
+  await page.locator('[data-testid="checkpoint-send-resume-cp-seed-1"]').click();
+  await page.waitForFunction(() => !document.querySelector('[data-testid="checkpoint-resume-drawer-cp-seed-1"]'));
+  const ov380 = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+  return (
+    pinOk &&
+    Boolean(diffTxt?.includes("Board moved") && diffTxt.includes("lane/sidebar-ui")) &&
+    Boolean(resumeClip?.includes("Initial sidecar baseline")) &&
+    ov380 <= 0
+  );
+});
+
 await check("zero external calls, console errors, or page errors", () => externalReqs.length === 0 && consoleErrs.length === 0 && pageErrs.length === 0);
 
 await browser.close();
