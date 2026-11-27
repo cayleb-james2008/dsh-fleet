@@ -820,6 +820,21 @@ function unstickPresetFor(item: TriageItem): Array<{ label: string; prompt: stri
   ];
 }
 
+function checkpointGoalOf(cp: SwarmCheckpoint): string {
+  if (cp.planGoal) return cp.planGoal;
+  const p = cp.plan as { goalLine?: unknown; goal?: unknown } | null | undefined;
+  if (!p || typeof p !== "object") return "";
+  if (typeof p.goalLine === "string" && p.goalLine) return p.goalLine;
+  if (typeof p.goal === "string" && p.goal) return p.goal;
+  return "";
+}
+
+function checkpointEtagOf(cp: SwarmCheckpoint): string {
+  if (cp.planEtag) return cp.planEtag;
+  const p = cp.plan as { etag?: unknown } | null | undefined;
+  return p && typeof p === "object" && typeof p.etag === "string" ? p.etag : "";
+}
+
 function computeCheckpointDiff(
   cp: SwarmCheckpoint,
   snap: SwarmSnapshot,
@@ -830,12 +845,14 @@ function computeCheckpointDiff(
   const liveHead = snap.head || 0;
   const headDelta = typeof srv?.headDelta === "number" ? srv.headDelta : liveHead - cp.head;
   const liveGoal = plan?.goalLine || plan?.goal || "";
+  const cpEtag = checkpointEtagOf(cp);
+  const cpGoal = checkpointGoalOf(cp);
   const planChanged =
     typeof srv?.planChanged === "boolean"
       ? srv.planChanged
       : Boolean(
-          (cp.planEtag && plan?.etag && cp.planEtag !== plan.etag) ||
-            (cp.planGoal && liveGoal && cp.planGoal !== liveGoal),
+          (cpEtag && plan?.etag && cpEtag !== plan.etag) ||
+            (cpGoal && liveGoal && cpGoal !== liveGoal),
         );
 
   let changedWorktrees: CheckpointWorktreeDiff[] = Array.isArray(srv?.changedWorktrees) ? srv.changedWorktrees : [];
@@ -849,9 +866,13 @@ function computeCheckpointDiff(
           return { path: cwt.path, branch: cwt.branch, prevHead: cwt.head, head: "removed", changed: true, status: "removed" };
         }
         const liveDirty = (lwt.dirtyFiles || 0) + (lwt.untrackedFiles || 0);
-        const cpDirty = cwt.dirtyFiles || 0;
         const headChanged = Boolean(cwt.head && lwt.head && cwt.head !== lwt.head);
-        const dirtyChanged = liveDirty !== cpDirty;
+        const dirtyChanged =
+          typeof cwt.dirtyFiles === "number"
+            ? liveDirty !== cwt.dirtyFiles
+            : typeof cwt.clean === "boolean"
+              ? cwt.clean !== Boolean(lwt.clean)
+              : false;
         if (!headChanged && !dirtyChanged) return null;
         return {
           path: cwt.path,
@@ -1097,6 +1118,7 @@ function SwarmCheckpointsSection({
             const diff = comparing ? computeCheckpointDiff(cp, snap, plan, worktrees) : null;
             const showingResume = resumeDrawer?.cpId === cp.id;
             const busy = busyId === cp.id;
+            const cpGoal = checkpointGoalOf(cp);
             return (
               <Card key={cp.id} className="p-3 space-y-2 min-w-0" data-testid={`checkpoint-card-${cp.id}`}>
                 <div className="row flex-wrap gap-1.5 min-w-0">
@@ -1110,8 +1132,8 @@ function SwarmCheckpointsSection({
                   {cp.createdAt && <span className="t3 num">{fmtTimeAgo(cp.createdAt)}</span>}
                 </div>
 
-                {cp.planGoal && (
-                  <p className="text-[12px] text-ink-2 break-words">{maskHome(cp.planGoal)}</p>
+                {cpGoal && (
+                  <p className="text-[12px] text-ink-2 break-words">{maskHome(cpGoal)}</p>
                 )}
 
                 <div className="wrap gap-1.5">
@@ -1547,14 +1569,19 @@ export function TriageView({
               const isSelected = idx === selectedIdx;
               const isPinned = item.seq > 0 && pinnedSet.has(item.seq);
               const isAcked = isTriageItemAcked(item, snap);
+              const ackRec = snap.triageAcks?.[item.id] ?? snap.ackedTriage?.[item.id];
+              const ackUntil =
+                item.untilSeq ??
+                item.ackUntilSeq ??
+                (ackRec && typeof ackRec.untilSeq === "number" && ackRec.untilSeq > 0 ? ackRec.untilSeq : undefined);
               const isSnoozed = Boolean(
                 item.snoozed ||
                   item.ackAction === "snooze" ||
                   item.ackState === "snooze" ||
                   item.ackState === "snoozed" ||
-                  snap.triageAcks?.[item.id]?.action === "snooze",
+                  ackRec?.action === "snooze" ||
+                  (typeof ackUntil === "number" && ackUntil > 0),
               );
-              const ackUntil = item.untilSeq ?? snap.triageAcks?.[item.id]?.untilSeq;
               const ackBusy = ackBusyId === item.id;
               const sev = SEVERITY_BADGE[item.severity] || SEVERITY_BADGE.attention;
               const editingThis = nudgeTarget?.id === item.id;

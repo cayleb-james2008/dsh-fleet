@@ -309,6 +309,7 @@ export function mergeSwarmDelta(
     ...(delta.pinnedSeqs !== undefined ? { pinnedSeqs: delta.pinnedSeqs } : {}),
     ...(delta.pins !== undefined ? { pins: delta.pins } : {}),
     ...(delta.triageAcks !== undefined ? { triageAcks: delta.triageAcks } : {}),
+    ...(delta.ackedTriage !== undefined ? { ackedTriage: delta.ackedTriage } : {}),
     ...(delta.archived !== undefined ? { archived: delta.archived } : {}),
     ...(delta.checkpoints !== undefined ? { checkpoints: delta.checkpoints } : {}),
     ...(delta.ops !== undefined ? { ops: delta.ops } : {}),
@@ -624,13 +625,16 @@ export function restoreCheckpoint(req: RestoreCheckpointRequest): Promise<Restor
   return postJsonConfirmed("/api/checkpoints/restore", { ...req }, "Restore checkpoint failed");
 }
 
-export function isTriageItemAcked(item: TriageItem, snap?: Pick<SwarmSnapshot, "triageAcks" | "head"> | null): boolean {
+export function isTriageItemAcked(
+  item: TriageItem,
+  snap?: Pick<SwarmSnapshot, "triageAcks" | "ackedTriage" | "head"> | null,
+): boolean {
   if (item.acked || item.snoozed) return true;
   const st = String(item.ackAction || item.ackState || "").toLowerCase();
   if (st === "ack" || st === "acked" || st === "snooze" || st === "snoozed") return true;
-  const rec = snap?.triageAcks?.[item.id];
+  const rec = snap?.triageAcks?.[item.id] ?? snap?.ackedTriage?.[item.id];
   if (!rec || rec.action === "unack") return false;
-  if (rec.action === "snooze" && typeof rec.untilSeq === "number" && (snap?.head || 0) > rec.untilSeq) {
+  if (typeof rec.untilSeq === "number" && rec.untilSeq > 0 && (snap?.head || 0) > rec.untilSeq) {
     return false;
   }
   return true;

@@ -217,6 +217,7 @@ export interface TriageItem {
   ackState?: "ack" | "snooze" | "acked" | "snoozed" | string | null;
   ackedAt?: number | null;
   untilSeq?: number | null;
+  ackUntilSeq?: number | null;
   ackNote?: string | null;
 }
 
@@ -267,11 +268,12 @@ export interface PortfolioResponse {
 export type TriageAckAction = "ack" | "snooze" | "unack";
 
 export interface TriageAckRecord {
-  triageId: string;
-  action: "ack" | "snooze" | string;
+  triageId?: string;
+  action?: "ack" | "snooze" | string;
   untilSeq?: number | null;
   note?: string;
   ackedAt?: number | string;
+  at?: number;
   seq?: number;
 }
 
@@ -289,6 +291,7 @@ export interface TriageAckResponse {
   triageId?: string;
   action?: TriageAckAction;
   acks?: Record<string, TriageAckRecord>;
+  ackedTriage?: Record<string, TriageAckRecord>;
   triage?: TriageItem[];
   error?: string;
 }
@@ -350,10 +353,12 @@ export interface CheckpointDiffSummary {
 
 export interface SwarmCheckpoint {
   id: string;
-  conversationId: string;
+  conversationId?: string;
   label: string;
   createdAt: number | string;
   head: number;
+  costUsd?: number;
+  plan?: SwarmPlan | NormalizedPlan | null;
   planEtag?: string;
   planGoal?: string;
   memberCount?: number;
@@ -617,6 +622,7 @@ export interface SwarmSnapshot {
   pinnedSeqs?: number[];
   pins?: number[];
   triageAcks?: Record<string, TriageAckRecord>;
+  ackedTriage?: Record<string, TriageAckRecord>;
   archived?: boolean;
   checkpoints?: SwarmCheckpoint[];
   ops?: OperatorCommand[];
@@ -666,6 +672,7 @@ export interface SwarmDeltaPayload {
   pinnedSeqs?: number[];
   pins?: number[];
   triageAcks?: Record<string, TriageAckRecord>;
+  ackedTriage?: Record<string, TriageAckRecord>;
   archived?: boolean;
   checkpoints?: SwarmCheckpoint[];
   ops?: OperatorCommand[];

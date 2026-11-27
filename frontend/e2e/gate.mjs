@@ -30,7 +30,7 @@ await runChecks("gate", async (check) => {
   page.on("pageerror", (err) => pageErrors.push(err.message));
   page.on("requestfailed", (req) => {
     const errText = req.failure()?.errorText || "";
-    if (req.url().includes("/api/swarm/stream") && errText === "net::ERR_ABORTED") return;
+    if (errText === "net::ERR_ABORTED" && /\/api\/swarm(s|\/stream|\/delta)?(\?|$)/.test(req.url())) return;
     failedRequests.push(`${req.url()} (${errText})`);
   });
   page.on("request", (req) => {

@@ -697,12 +697,13 @@ export function App() {
         });
         setSnap((prev) => {
           if (!prev) return prev;
-          const nextAcks = { ...(prev.triageAcks || {}) };
+          const nextAcks = { ...(prev.triageAcks || prev.ackedTriage || {}) };
           if (action === "unack") {
             delete nextAcks[item.id];
           } else {
             nextAcks[item.id] = { triageId: item.id, action, untilSeq: untilSeq ?? null, ackedAt: Date.now() };
           }
+          const serverAckMap = res.acks || res.ackedTriage || nextAcks;
           const nextTriage = Array.isArray(res.triage)
             ? res.triage
             : (prev.triage || []).map((t) =>
@@ -715,12 +716,14 @@ export function App() {
                       ackAction: action === "unack" ? null : action,
                       ackState: action === "unack" ? null : action,
                       untilSeq: action === "snooze" ? (untilSeq ?? null) : null,
+                      ackUntilSeq: action === "snooze" ? (untilSeq ?? null) : null,
                     },
               );
           const updated = {
             ...prev,
             triage: nextTriage,
-            triageAcks: res.acks || nextAcks,
+            triageAcks: serverAckMap,
+            ackedTriage: serverAckMap,
           };
           snapRef.current = updated;
           return updated;
@@ -1374,7 +1377,7 @@ export function App() {
           <div className="rounded-card bg-board p-3 text-[12px] text-ink-2 space-y-1">
             <div className="f1 font-medium text-ink">
               <CommandIcon />
-              <span>Fleet Antigravity Plugin v1.28.0</span>
+              <span>Fleet Antigravity Plugin v1.29.0</span>
             </div>
             <p>Reads local swarm files over loopback with no telemetry.</p>
           </div>
