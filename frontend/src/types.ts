@@ -211,6 +211,18 @@ export interface TriageItem {
   detail: string;
   suggestedPrompt: string;
   timestamp: number;
+  acked?: boolean;
+  snoozed?: boolean;
+  ackAction?: "ack" | "snooze" | string | null;
+  ackState?: "ack" | "snooze" | "acked" | "snoozed" | string | null;
+  ackedAt?: number | null;
+  untilSeq?: number | null;
+  ackNote?: string | null;
+}
+
+export interface PortfolioUrgentItem extends TriageItem {
+  swarmTitle?: string;
+  swarmId?: string;
 }
 
 export interface FrameAsset {
@@ -232,6 +244,164 @@ export interface SwarmSummary {
   totalTokens: number;
   hasPlan: boolean;
   lastActivityTs: number;
+  costUsd?: number;
+  gateState?: "blocked" | "ready" | "verifying" | string | null;
+  blockedCount?: number;
+  failureCount?: number;
+  repo?: string;
+  archived?: boolean;
+  topUrgent?: TriageItem | PortfolioUrgentItem | null;
+}
+
+export interface PortfolioResponse {
+  ok?: boolean;
+  totalCostUsd: number;
+  totalTokens: number;
+  activeSwarms: number;
+  urgentCount: number;
+  urgentTriage: PortfolioUrgentItem[];
+  swarms: SwarmSummary[];
+  error?: string;
+}
+
+export type TriageAckAction = "ack" | "snooze" | "unack";
+
+export interface TriageAckRecord {
+  triageId: string;
+  action: "ack" | "snooze" | string;
+  untilSeq?: number | null;
+  note?: string;
+  ackedAt?: number | string;
+  seq?: number;
+}
+
+export interface TriageAckRequest {
+  conversationId: string;
+  triageId: string;
+  action: TriageAckAction;
+  untilSeq?: number;
+  note?: string;
+}
+
+export interface TriageAckResponse {
+  ok: boolean;
+  conversationId?: string;
+  triageId?: string;
+  action?: TriageAckAction;
+  acks?: Record<string, TriageAckRecord>;
+  triage?: TriageItem[];
+  error?: string;
+}
+
+export interface PinPostRequest {
+  conversationId: string;
+  seq: number;
+  pinned: boolean;
+}
+
+export interface PinPostResponse {
+  ok: boolean;
+  conversationId?: string;
+  seq?: number;
+  pinned?: boolean;
+  pinnedSeqs?: number[];
+  pins?: number[];
+  error?: string;
+}
+
+export interface SwarmArchiveRequest {
+  conversationId: string;
+  archived: boolean;
+}
+
+export interface SwarmArchiveResponse {
+  ok: boolean;
+  conversationId?: string;
+  archived?: boolean;
+  error?: string;
+}
+
+export interface CheckpointWorktreeSnapshot {
+  path: string;
+  branch: string;
+  head: string;
+  clean?: boolean;
+  dirtyFiles?: number;
+}
+
+export interface CheckpointWorktreeDiff {
+  path?: string;
+  branch?: string;
+  head?: string;
+  prevHead?: string;
+  dirtyFiles?: number;
+  changed?: boolean;
+  status?: string;
+}
+
+export interface CheckpointDiffSummary {
+  headDelta?: number;
+  newMessages?: number;
+  planChanged?: boolean;
+  worktreeChanges?: number;
+  changedWorktrees?: CheckpointWorktreeDiff[];
+  summary?: string;
+}
+
+export interface SwarmCheckpoint {
+  id: string;
+  conversationId: string;
+  label: string;
+  createdAt: number | string;
+  head: number;
+  planEtag?: string;
+  planGoal?: string;
+  memberCount?: number;
+  activeCount?: number;
+  triageCount?: number;
+  worktrees?: CheckpointWorktreeSnapshot[];
+  diff?: CheckpointDiffSummary | null;
+  diffVsLive?: CheckpointDiffSummary | null;
+}
+
+export interface CheckpointsListResponse {
+  ok?: boolean;
+  conversationId?: string;
+  checkpoints: SwarmCheckpoint[];
+  error?: string;
+}
+
+export interface CreateCheckpointRequest {
+  conversationId: string;
+  label: string;
+  roots?: string[];
+}
+
+export interface CreateCheckpointResponse {
+  ok: boolean;
+  checkpoint?: SwarmCheckpoint;
+  checkpoints?: SwarmCheckpoint[];
+  error?: string;
+}
+
+export type CheckpointRestoreMode = "plan" | "resume_prompt";
+
+export interface RestoreCheckpointRequest {
+  conversationId: string;
+  checkpointId: string;
+  mode: CheckpointRestoreMode;
+}
+
+export interface RestoreCheckpointResponse {
+  ok: boolean;
+  mode: CheckpointRestoreMode;
+  checkpointId?: string;
+  plan?: SwarmPlan | NormalizedPlan;
+  etag?: string;
+  resumePrompt?: string;
+  prompt?: string;
+  message?: string;
+  error?: string;
 }
 
 export interface BurnWorker {
@@ -444,6 +614,11 @@ export interface SwarmSnapshot {
   cost?: CostSummary;
   byModel?: Record<string, ModelUsageEntry>;
   unseen?: number[];
+  pinnedSeqs?: number[];
+  pins?: number[];
+  triageAcks?: Record<string, TriageAckRecord>;
+  archived?: boolean;
+  checkpoints?: SwarmCheckpoint[];
   ops?: OperatorCommand[];
   swarms?: SwarmSummary[];
   capabilities?: {
@@ -488,6 +663,11 @@ export interface SwarmDeltaPayload {
   cost?: CostSummary;
   byModel?: Record<string, ModelUsageEntry>;
   unseen?: number[];
+  pinnedSeqs?: number[];
+  pins?: number[];
+  triageAcks?: Record<string, TriageAckRecord>;
+  archived?: boolean;
+  checkpoints?: SwarmCheckpoint[];
   ops?: OperatorCommand[];
   swarms?: SwarmSummary[];
   capabilities?: SwarmSnapshot["capabilities"];

@@ -7,6 +7,16 @@ const browser = await chromium.launch(CHROME_LAUNCH_OPTS);
 
 await runChecks("gate", async (check) => {
   const ctx = await browser.newContext({ viewport: { width: 380, height: 900 } });
+  const newMockPage = async () => {
+    const p = await ctx.newPage();
+    await p.route("**/api/portfolio*", async (route) => {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, totalCostUsd: 0, totalTokens: 0, activeSwarms: 0, urgentCount: 0, urgentTriage: [], swarms: [] }) });
+    });
+    await p.route("**/api/checkpoints*", async (route) => {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, checkpoints: [] }) });
+    });
+    return p;
+  };
   const page = await ctx.newPage();
 
   const consoleErrors = [];
@@ -81,7 +91,7 @@ await runChecks("gate", async (check) => {
     }
 
     // Verify raw native Antigravity plan.json {goal:{title,line},tasks,threads} + narrator view.json + POST /api/plan
-    const nativePage = await ctx.newPage();
+    const nativePage = await newMockPage();
     const nativeErrors = [];
     nativePage.on("pageerror", (err) => nativeErrors.push(err.message));
     nativePage.on("console", (msg) => {
@@ -544,7 +554,7 @@ await runChecks("gate", async (check) => {
       return false;
     }
 
-    const costPage = await ctx.newPage();
+    const costPage = await newMockPage();
     const costErrors = [];
     costPage.on("pageerror", (err) => costErrors.push(err.message));
     costPage.on("console", (msg) => {
@@ -950,7 +960,7 @@ await runChecks("gate", async (check) => {
     if (!preTxt.includes("(untracked)") || !preTxt.includes("+")) return false;
 
     // E2 Gap #2 verification: collisions banner, branchFiles/working toggle, dry_run_merge & rebase conflict feedback
-    const wtPage = await ctx.newPage();
+    const wtPage = await newMockPage();
     const wtErrors = [];
     const diffModesSeen = [];
     const actionsSeen = [];
@@ -1491,7 +1501,7 @@ await runChecks("gate", async (check) => {
   });
 
   await check("Board channel tabs, replyRefs backlinks, and sticky Board Composer work via /api/control", async () => {
-    const ctrlPage = await ctx.newPage();
+    const ctrlPage = await newMockPage();
     await ctrlPage.setViewportSize({ width: 360, height: 900 });
     const ctrlErrors = [];
     const controlCalls = [];
@@ -1633,7 +1643,7 @@ await runChecks("gate", async (check) => {
   });
 
   await check("Roster Spawn Worker, Switch Model on quota card, and Kill Worker 409 flow work via /api/control", async () => {
-    const rosterPage = await ctx.newPage();
+    const rosterPage = await newMockPage();
     await rosterPage.setViewportSize({ width: 360, height: 900 });
     const rosterErrors = [];
     const controlCalls = [];
@@ -1905,7 +1915,7 @@ await runChecks("gate", async (check) => {
   });
 
   await check("Triage 409 Conflict reload-and-merge preserves local edits and renders deeply nested plan/view fields safely", async () => {
-    const pPage = await ctx.newPage();
+    const pPage = await newMockPage();
     await pPage.setViewportSize({ width: 340, height: 900 });
     const pErrs = [];
     let allow409 = false;
@@ -2062,7 +2072,7 @@ await runChecks("gate", async (check) => {
   });
 
   await check("Worktrees 340px collision pill wrapping and ff_merge / remove_worktree / rebase / dry_run error banners work with 0px overflow", async () => {
-    const wtPage = await ctx.newPage();
+    const wtPage = await newMockPage();
     await wtPage.setViewportSize({ width: 340, height: 900 });
     const wtErrs = [];
     let allow409 = false;
@@ -2240,7 +2250,7 @@ await runChecks("gate", async (check) => {
   });
 
   await check("Board empty channel state, #seq backlink filter-recovery highlight, double-submit lock, and missing-coordinator error", async () => {
-    const bPage = await ctx.newPage();
+    const bPage = await newMockPage();
     await bPage.setViewportSize({ width: 340, height: 900 });
     const bErrs = [];
     const controlPosts = [];
@@ -2360,7 +2370,7 @@ await runChecks("gate", async (check) => {
   });
 
   await check("Roster double-submit locks and missing-coordinator inline error recovery", async () => {
-    const rPage = await ctx.newPage();
+    const rPage = await newMockPage();
     await rPage.setViewportSize({ width: 340, height: 900 });
     const rErrs = [];
     const controlPosts = [];
@@ -2476,7 +2486,7 @@ await runChecks("gate", async (check) => {
   });
 
   await check("SidecarApp !canSse delta long-poll merges incremental delta, deduplicates seq, and skips redundant /api/swarms", async () => {
-    const dPage = await ctx.newPage();
+    const dPage = await newMockPage();
     await dPage.setViewportSize({ width: 340, height: 900 });
     const dErrs = [];
     const deltaCalls = [];
@@ -2704,7 +2714,7 @@ await runChecks("gate", async (check) => {
   });
 
   await check("SSE ping consumes /api/swarm/delta (including mode full fallback) without re-fetching /api/swarm", async () => {
-    const sPage = await ctx.newPage();
+    const sPage = await newMockPage();
     const sErrs = [];
     let swarmHits = 0;
     const deltaCalls = [];
@@ -2888,7 +2898,7 @@ await runChecks("gate", async (check) => {
   });
 
   await check("E1 delta client deduplicates out-of-order/replayed seq, caps 5xx backoff, and aborts cleanly on swarm-switch", async () => {
-    const h1Page = await ctx.newPage();
+    const h1Page = await newMockPage();
     await h1Page.setViewportSize({ width: 380, height: 900 });
     const h1PageErrors = [];
     h1Page.on("pageerror", (e) => h1PageErrors.push(e.message));
@@ -3070,7 +3080,7 @@ await runChecks("gate", async (check) => {
   });
 
   await check("E2 ForensicTranscriptDrawer aborts slow older responses on filter/member/close, closes on Escape, and handles empty/error states at 380px Light & Dark", async () => {
-    const e2Page = await ctx.newPage();
+    const e2Page = await newMockPage();
     await e2Page.setViewportSize({ width: 380, height: 900 });
     const e2PageErrors = [];
     e2Page.on("pageerror", (e) => e2PageErrors.push(e.message));
@@ -3251,7 +3261,7 @@ await runChecks("gate", async (check) => {
   });
 
   await check("E3 guards 0-token, NaN/Infinity, negative savings, and unknown contextLimit across TokenBurnStrip, RosterView, digest, and archive at 380px Light & Dark", async () => {
-    const e3Page = await ctx.newPage();
+    const e3Page = await newMockPage();
     await e3Page.setViewportSize({ width: 380, height: 900 });
     const e3Errors = [];
     e3Page.on("pageerror", (e) => e3Errors.push(e.message));
@@ -3434,7 +3444,7 @@ await runChecks("gate", async (check) => {
   });
 
   await check("Wave E1 working-worker Switch Model guard blocks without override, allows allowWorking, and surfaces 409 + honest dispatch toast", async () => {
-    const gPage = await ctx.newPage();
+    const gPage = await newMockPage();
     await gPage.setViewportSize({ width: 340, height: 900 });
     const gErrors = [];
     const controlReqs = [];
@@ -3575,7 +3585,7 @@ await runChecks("gate", async (check) => {
   });
 
   await check("Wave E1 OperatorOpsStrip renders dispatched spinner, verified #seq link, failure/timeout alerts, and Retry/Mark Verified/Dismiss in Roster & Board at 340px", async () => {
-    const opsPage = await ctx.newPage();
+    const opsPage = await newMockPage();
     await opsPage.setViewportSize({ width: 340, height: 900 });
     const opsErrors = [];
     const actionCalls = [];
@@ -3702,6 +3712,414 @@ await runChecks("gate", async (check) => {
       ovBoard340 <= 0 &&
       ovBoardDark340 <= 0 &&
       opsErrors.length === 0
+    );
+  });
+
+  await check("Wave E2 Portfolio header pill & Command Drawer render aggregated spend, urgent jump, gate badges, and archive toggle at 340px Light & Dark", async () => {
+    const pPage = await newMockPage();
+    await pPage.setViewportSize({ width: 340, height: 900 });
+    const pErrors = [];
+    const archiveCalls = [];
+    pPage.on("pageerror", (e) => pErrors.push(e.message));
+    pPage.on("console", (msg) => {
+      if (msg.type() === "error") pErrors.push(msg.text());
+    });
+
+    let swList = [
+      { id: "p-sw-1", title: "Alpha Build", appData: "gate", head: 4, memberCount: 3, activeCount: 1, waitingCount: 2, killedCount: 0, triageCount: 1, totalTokens: 12000, hasPlan: true, lastActivityTs: Date.now(), costUsd: 0.45, gateState: "verifying", blockedCount: 0, failureCount: 0, repo: "/home/demo/alpha", archived: false },
+      { id: "p-sw-2", title: "Beta Audit", appData: "gate", head: 2, memberCount: 2, activeCount: 0, waitingCount: 2, killedCount: 0, triageCount: 1, totalTokens: 8000, hasPlan: false, lastActivityTs: Date.now(), costUsd: 0.30, gateState: "blocked", blockedCount: 1, failureCount: 1, repo: "/home/demo/beta", archived: false },
+    ];
+
+    await pPage.route("**/api/swarms*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ swarms: swList, defaultConversationId: "p-sw-1" }),
+      });
+    });
+
+    await pPage.route("**/api/portfolio*", async (route) => {
+      const active = swList.filter((s) => !s.archived);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ok: true,
+          totalCostUsd: active.reduce((sum, s) => sum + s.costUsd, 0),
+          totalTokens: active.reduce((sum, s) => sum + s.totalTokens, 0),
+          activeSwarms: active.length,
+          urgentCount: 1,
+          urgentTriage: [
+            {
+              id: "u-beta-1",
+              kind: "quota",
+              severity: "urgent",
+              member: "scanner",
+              conversationId: "p-sw-2",
+              swarmId: "p-sw-2",
+              swarmTitle: "Beta Audit",
+              seq: 2,
+              title: "scanner: quota exhausted",
+              detail: "429 in /home/demo/beta",
+              suggestedPrompt: "@scanner Resume.",
+              timestamp: Date.now() - 15000,
+            },
+          ],
+          swarms: swList,
+        }),
+      });
+    });
+
+    await pPage.route("**/api/swarm/archive", async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      archiveCalls.push(body);
+      swList = swList.map((s) => (s.id === body.conversationId ? { ...s, archived: body.archived } : s));
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, conversationId: body.conversationId, archived: body.archived }),
+      });
+    });
+
+    await pPage.route(/\/api\/swarm(\?.*)?$/, async (route) => {
+      const url = new URL(route.request().url());
+      const cid = url.searchParams.get("conversationId") || "p-sw-1";
+      const cur = swList.find((s) => s.id === cid) || swList[0];
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversationId: cur.id,
+          swarm: cur.id,
+          member: "coordinator",
+          etag: `p-${cur.id}`,
+          id: cur.id,
+          title: cur.title,
+          head: cur.head,
+          members: [
+            { name: "coordinator", conversation_id: cur.id, model: "gemini-3-pro", role: "coordinator", wake_mode: "mentions", wait_since: 1, last_read_seq: 1, unread: 0, killed: false, status: "waiting", steps: 2, activity: "", activityKind: "", replied: false, replyAsk: "", narrator: false, roleWorker: false, failure: null, transcriptMtime: Date.now(), startedAt: new Date().toISOString(), lastStepAt: new Date().toISOString(), usage: { inputTokens: 100, cacheReadTokens: 0, outputTokens: 20, totalTokens: 120 }, posts: 1, lastPostSeq: 1, lastPostTime: "12:00:00", lastPostTs: Date.now() },
+          ],
+          messages: [{ seq: 1, agent: "coordinator", text: `@all ${cur.title}`, time: "12:00:00", ts: Date.now(), mentions: [], all: true }],
+          replyRefs: {},
+          edges: [],
+          triage: [],
+          ops: [],
+          pinnedSeqs: [],
+          usage: { inputTokens: 100, cacheReadTokens: 0, outputTokens: 20, totalTokens: 120 },
+          capabilities: { canSendMessage: true, isSidecar: false, sseStream: false, deltaStream: false },
+        }),
+      });
+    });
+
+    await pPage.route("**/api/checkpoints*", async (route) => {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, checkpoints: [] }) });
+    });
+
+    await pPage.goto(BASE, { waitUntil: "domcontentloaded" });
+    await pPage.waitForSelector('[data-testid="portfolio-pill-btn"]');
+    const pillTxt = await pPage.locator('[data-testid="portfolio-pill-btn"]').textContent();
+    const ovPill340 = await pPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    await pPage.locator('[data-testid="portfolio-pill-btn"]').click();
+    await pPage.waitForSelector('[data-testid="portfolio-drawer"]');
+    const drawerTxt = await pPage.locator('[data-testid="portfolio-drawer"]').textContent();
+    const ovLight340 = await pPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    await pPage.locator('[data-testid="portfolio-archive-swarm-p-sw-2"]').click();
+    await pPage.waitForFunction(() => !document.querySelector('[data-testid="portfolio-swarm-p-sw-2"]'));
+    await pPage.locator('[data-testid="portfolio-show-archived"]').click();
+    await pPage.waitForSelector('[data-testid="portfolio-swarm-p-sw-2"]');
+    await pPage.locator('[data-testid="portfolio-archive-swarm-p-sw-2"]').click();
+    await pPage.waitForFunction(
+      () => (document.querySelector('[data-testid="portfolio-archive-swarm-p-sw-2"]')?.textContent || "").trim() === "Archive",
+    );
+
+    await pPage.locator('[data-testid="portfolio-jump-urgent-u-beta-1"]').click();
+    await pPage.waitForFunction(() => !document.querySelector('[data-testid="portfolio-drawer"]'));
+    await pPage.waitForFunction(() => (document.querySelector('select[aria-label="Active swarm"]')?.value || "") === "p-sw-2");
+    const jumpedVal = await pPage.locator('select[aria-label="Active swarm"]').inputValue();
+
+    await pPage.locator('button[aria-label="Open settings"]').click();
+    await pPage.locator('div[role="dialog"] button[role="radio"]:has-text("Dark")').click();
+    await pPage.locator('button[aria-label="Close dialog"]').click();
+    await pPage.locator('[data-testid="portfolio-pill-btn"]').click();
+    await pPage.waitForSelector('[data-testid="portfolio-drawer"]');
+    const ovDark340 = await pPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    await pPage.close();
+    return (
+      Boolean(pillTxt?.includes("2 swarms · 1 urgent · $0.75")) &&
+      Boolean(drawerTxt?.includes("~/beta") && !drawerTxt.includes("/home/") && drawerTxt.includes("Gate: Blocked")) &&
+      archiveCalls.some((c) => c.confirm === true && c.conversationId === "p-sw-2" && c.archived === true) &&
+      jumpedVal === "p-sw-2" &&
+      ovPill340 <= 0 &&
+      ovLight340 <= 0 &&
+      ovDark340 <= 0 &&
+      pErrors.length === 0
+    );
+  });
+
+  await check("Wave E2 Triage Ack/Snooze/Show acked and persistent /api/pins work cleanly at 340px", async () => {
+    const tPage = await newMockPage();
+    await tPage.setViewportSize({ width: 340, height: 900 });
+    const tErrors = [];
+    const ackCalls = [];
+    const pinCalls = [];
+    tPage.on("pageerror", (e) => tErrors.push(e.message));
+    tPage.on("console", (msg) => {
+      if (msg.type() === "error") tErrors.push(msg.text());
+    });
+
+    let serverPins = [];
+    let ackMap = {};
+
+    await tPage.route("**/api/swarms*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          swarms: [{ id: "e2-triage", title: "Triage Ack Gate", appData: "gate", head: 3, memberCount: 2, activeCount: 0, waitingCount: 2, killedCount: 0, triageCount: 2, totalTokens: 500, hasPlan: false, lastActivityTs: Date.now() }],
+          defaultConversationId: "e2-triage",
+        }),
+      });
+    });
+
+    await tPage.route("**/api/portfolio*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, totalCostUsd: 0.05, totalTokens: 500, activeSwarms: 1, urgentCount: 1, urgentTriage: [], swarms: [] }),
+      });
+    });
+
+    await tPage.route(/\/api\/swarm(\?.*)?$/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversationId: "e2-triage",
+          swarm: "e2-triage",
+          member: "coordinator",
+          etag: `e2-t-${serverPins.join(",")}-${Object.keys(ackMap).join(",")}`,
+          id: "e2-triage",
+          title: "Triage Ack Gate",
+          head: 3,
+          members: [
+            { name: "coordinator", conversation_id: "e2-triage", model: "gemini-3-pro", role: "coordinator", wake_mode: "mentions", wait_since: 3, last_read_seq: 3, unread: 0, killed: false, status: "waiting", steps: 2, activity: "", activityKind: "", replied: false, replyAsk: "", narrator: false, roleWorker: false, failure: null, transcriptMtime: Date.now(), startedAt: new Date().toISOString(), lastStepAt: new Date().toISOString(), usage: { inputTokens: 100, cacheReadTokens: 0, outputTokens: 20, totalTokens: 120 }, posts: 1, lastPostSeq: 1, lastPostTime: "12:00:00", lastPostTs: Date.now() },
+            { name: "builder", conversation_id: "e2-b", model: "gemini-3-pro", role: "worker", wake_mode: "mentions", wait_since: 3, last_read_seq: 3, unread: 0, killed: false, status: "waiting", steps: 4, activity: "", activityKind: "", replied: true, replyAsk: "Proceed with /api/pins?", narrator: false, roleWorker: false, failure: null, transcriptMtime: Date.now(), startedAt: new Date().toISOString(), lastStepAt: new Date().toISOString(), usage: { inputTokens: 200, cacheReadTokens: 0, outputTokens: 50, totalTokens: 250 }, posts: 1, lastPostSeq: 2, lastPostTime: "12:01:00", lastPostTs: Date.now() },
+          ],
+          messages: [
+            { seq: 1, agent: "coordinator", text: "@all Start", time: "12:00:00", ts: Date.now(), mentions: [], all: true },
+            { seq: 2, agent: "builder", text: "@coordinator Question on pins?", time: "12:01:00", ts: Date.now(), mentions: ["coordinator"], all: false },
+            { seq: 3, agent: "builder", text: "@verifier [done] Ready for check", time: "12:02:00", ts: Date.now(), mentions: ["verifier"], all: false },
+          ],
+          replyRefs: {},
+          edges: [],
+          pinnedSeqs: serverPins,
+          triageAcks: ackMap,
+          triage: [
+            { id: "ask-builder", kind: "question", severity: "attention", member: "builder", conversationId: "e2-b", seq: 2, title: "builder asked a question", detail: "Proceed with /api/pins?", suggestedPrompt: "@builder Yes.", timestamp: Date.now(), acked: Boolean(ackMap["ask-builder"]), ackAction: ackMap["ask-builder"]?.action || null },
+            { id: "verify-builder-3", kind: "verify", severity: "verify", member: "builder", conversationId: "e2-b", seq: 3, title: "builder awaits cold verification (#3)", detail: "[done] Ready for check", suggestedPrompt: "@verifier Verify #3.", timestamp: Date.now(), acked: Boolean(ackMap["verify-builder-3"]), snoozed: ackMap["verify-builder-3"]?.action === "snooze", untilSeq: ackMap["verify-builder-3"]?.untilSeq || null },
+          ],
+          ops: [],
+          usage: { inputTokens: 300, cacheReadTokens: 0, outputTokens: 70, totalTokens: 370 },
+          capabilities: { canSendMessage: true, isSidecar: false, sseStream: false, deltaStream: false },
+        }),
+      });
+    });
+
+    await tPage.route("**/api/triage/ack", async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      ackCalls.push(body);
+      if (body.action === "unack") delete ackMap[body.triageId];
+      else ackMap[body.triageId] = { triageId: body.triageId, action: body.action, untilSeq: body.untilSeq };
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, acks: ackMap }) });
+    });
+
+    await tPage.route("**/api/pins", async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      pinCalls.push(body);
+      if (body.pinned && !serverPins.includes(body.seq)) serverPins = [...serverPins, body.seq].sort((a, b) => a - b);
+      if (!body.pinned) serverPins = serverPins.filter((x) => x !== body.seq);
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, pinnedSeqs: serverPins }) });
+    });
+
+    await tPage.route("**/api/checkpoints*", async (route) => {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, checkpoints: [] }) });
+    });
+
+    await tPage.goto(BASE, { waitUntil: "domcontentloaded" });
+    await tPage.waitForSelector('[data-testid="triage-ack-ask-builder"]');
+    await tPage.locator('[data-testid="triage-ack-ask-builder"]').click();
+    await tPage.waitForFunction(() => !document.querySelector('[data-testid="triage-card-ask-builder"]'));
+
+    await tPage.locator('[data-testid="triage-snooze-verify-builder-3"]').click();
+    await tPage.waitForFunction(() => !document.querySelector('[data-testid="triage-card-verify-builder-3"]'));
+
+    await tPage.locator('[data-testid="toggle-show-acked"]').click();
+    await tPage.waitForSelector('[data-testid="triage-ack-badge-ask-builder"]');
+    await tPage.waitForSelector('[data-testid="triage-ack-badge-verify-builder-3"]');
+    const badgeSnooze = await tPage.locator('[data-testid="triage-ack-badge-verify-builder-3"]').textContent();
+
+    await tPage.locator('[data-testid="triage-unack-ask-builder"]').click();
+    await tPage.locator('[data-testid="toggle-show-acked"]').click();
+    await tPage.waitForSelector('[data-testid="triage-card-ask-builder"]');
+
+    await tPage.locator('button[aria-label="Pin #2"]').click();
+    await tPage.waitForSelector('#pinned-triage-heading');
+    const ov340 = await tPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    await tPage.close();
+    return (
+      ackCalls.some((c) => c.confirm === true && c.triageId === "ask-builder" && c.action === "ack") &&
+      ackCalls.some((c) => c.confirm === true && c.triageId === "verify-builder-3" && c.action === "snooze") &&
+      ackCalls.some((c) => c.confirm === true && c.triageId === "ask-builder" && c.action === "unack") &&
+      pinCalls.some((c) => c.confirm === true && c.seq === 2 && c.pinned === true) &&
+      Boolean(badgeSnooze?.includes("Snoozed")) &&
+      ov340 <= 0 &&
+      tErrors.length === 0
+    );
+  });
+
+  await check("Wave E2 Checkpoints create, Compare vs live diff, Restore plan, and Copy/Send Resume Prompt work cleanly in Triage & CommandPalette", async () => {
+    const cPage = await newMockPage();
+    await cPage.setViewportSize({ width: 380, height: 900 });
+    const cErrors = [];
+    const cpPosts = [];
+    const restoreCalls = [];
+    const nudgeCalls = [];
+    cPage.on("pageerror", (e) => cErrors.push(e.message));
+    cPage.on("console", (msg) => {
+      if (msg.type() === "error") cErrors.push(msg.text());
+    });
+
+    let cps = [
+      {
+        id: "cp-1",
+        conversationId: "e2-cp",
+        label: "Before Wave E2",
+        createdAt: Date.now() - 60000,
+        head: 2,
+        planEtag: "pl-1",
+        planGoal: "Initial checkpoint goal",
+        worktrees: [{ path: "/home/demo/wt", branch: "feat/e2", head: "aaa111", clean: true, dirtyFiles: 0 }],
+      },
+    ];
+    let liveGoal = "Live diverged goal";
+
+    await cPage.route("**/api/swarms*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          swarms: [{ id: "e2-cp", title: "Checkpoint Swarm", appData: "gate", head: 5, memberCount: 1, activeCount: 0, waitingCount: 1, killedCount: 0, triageCount: 0, totalTokens: 400, hasPlan: true, lastActivityTs: Date.now() }],
+          defaultConversationId: "e2-cp",
+        }),
+      });
+    });
+
+    await cPage.route("**/api/portfolio*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, totalCostUsd: 0.1, totalTokens: 400, activeSwarms: 1, urgentCount: 0, urgentTriage: [], swarms: [] }),
+      });
+    });
+
+    await cPage.route(/\/api\/swarm(\?.*)?$/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversationId: "e2-cp",
+          swarm: "e2-cp",
+          member: "coordinator",
+          etag: `cp-snap-${liveGoal}`,
+          id: "e2-cp",
+          title: "Checkpoint Swarm",
+          head: 5,
+          members: [
+            { name: "coordinator", conversation_id: "e2-cp", model: "gemini-3-pro", role: "coordinator", wake_mode: "mentions", wait_since: 5, last_read_seq: 5, unread: 0, killed: false, status: "waiting", steps: 2, activity: "", activityKind: "", replied: false, replyAsk: "", narrator: false, roleWorker: false, failure: null, transcriptMtime: Date.now(), startedAt: new Date().toISOString(), lastStepAt: new Date().toISOString(), usage: { inputTokens: 200, cacheReadTokens: 0, outputTokens: 40, totalTokens: 240 }, posts: 1, lastPostSeq: 1, lastPostTime: "12:00:00", lastPostTs: Date.now() },
+          ],
+          messages: [{ seq: 1, agent: "coordinator", text: "@all Checkpoint swarm", time: "12:00:00", ts: Date.now(), mentions: [], all: true }],
+          plan: { etag: liveGoal === "Initial checkpoint goal" ? "pl-1" : "pl-2", goal: liveGoal, workstreams: [] },
+          replyRefs: {},
+          edges: [],
+          triage: [],
+          ops: [],
+          usage: { inputTokens: 200, cacheReadTokens: 0, outputTokens: 40, totalTokens: 240 },
+          capabilities: { canSendMessage: true, isSidecar: false, sseStream: false, deltaStream: false },
+        }),
+      });
+    });
+
+    await cPage.route("**/api/checkpoints/restore", async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      restoreCalls.push(body);
+      if (body.mode === "plan") {
+        liveGoal = "Initial checkpoint goal";
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, mode: "plan", checkpointId: body.checkpointId, etag: "pl-1" }) });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, mode: "resume_prompt", checkpointId: body.checkpointId, resumePrompt: "@coordinator Resume from Before Wave E2 (#2) in ~/wt." }),
+      });
+    });
+
+    await cPage.route("**/api/checkpoints*", async (route) => {
+      if (route.request().method() === "POST") {
+        const body = JSON.parse(route.request().postData() || "{}");
+        cpPosts.push(body);
+        const created = { id: "cp-2", conversationId: "e2-cp", label: body.label, createdAt: Date.now(), head: 5, planEtag: "pl-2", planGoal: liveGoal, worktrees: [] };
+        cps = [created, ...cps];
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, checkpoint: created, checkpoints: cps }) });
+        return;
+      }
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, conversationId: "e2-cp", checkpoints: cps }) });
+    });
+
+    await cPage.route("**/api/nudge", async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      nudgeCalls.push(body);
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, opId: "op-cp-1", status: "dispatched" }) });
+    });
+
+    await cPage.goto(BASE, { waitUntil: "domcontentloaded" });
+    await cPage.waitForSelector('[data-testid="checkpoint-card-cp-1"]');
+
+    await cPage.locator('[data-testid="checkpoint-compare-cp-1"]').click();
+    await cPage.waitForSelector('[data-testid="checkpoint-diff-cp-1"]');
+    const diffTxt = await cPage.locator('[data-testid="checkpoint-diff-cp-1"]').textContent();
+
+    await cPage.locator('button[aria-label="Open command palette"]').click();
+    await cPage.waitForSelector('[cmdk-input]');
+    await cPage.fill('[cmdk-input]', 'Create checkpoint');
+    await cPage.keyboard.press('Enter');
+    await cPage.waitForSelector('[data-testid="checkpoint-create-form"]');
+    await cPage.fill('[data-testid="checkpoint-label-input"]', 'Gate CP 2');
+    await cPage.locator('[data-testid="checkpoint-create-submit"]').click();
+    await cPage.waitForSelector('[data-testid="checkpoint-card-cp-2"]');
+
+    await cPage.locator('[data-testid="checkpoint-restore-plan-cp-1"]').click();
+    await cPage.waitForFunction(() => (document.querySelector('[data-testid="swarm-plan-card"]')?.textContent || "").includes("Initial checkpoint goal"));
+
+    await cPage.locator('[data-testid="checkpoint-resume-prompt-cp-1"]').click();
+    await cPage.waitForSelector('[data-testid="checkpoint-resume-drawer-cp-1"]');
+    await cPage.locator('[data-testid="checkpoint-send-resume-cp-1"]').click();
+    await cPage.waitForFunction(() => !document.querySelector('[data-testid="checkpoint-resume-drawer-cp-1"]'));
+    const ov380 = await cPage.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+    await cPage.close();
+    return (
+      Boolean(diffTxt?.includes("+3 posts (#2 to #5)") && diffTxt.includes("Plan changed")) &&
+      cpPosts.some((c) => c.confirm === true && c.label === "Gate CP 2") &&
+      restoreCalls.some((c) => c.confirm === true && c.checkpointId === "cp-1" && c.mode === "plan") &&
+      restoreCalls.some((c) => c.confirm === true && c.checkpointId === "cp-1" && c.mode === "resume_prompt") &&
+      nudgeCalls.some((c) => c.confirm === true && String(c.message || "").includes("Before Wave E2")) &&
+      ov380 <= 0 &&
+      cErrors.length === 0
     );
   });
 

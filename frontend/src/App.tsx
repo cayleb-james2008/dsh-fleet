@@ -5,6 +5,7 @@ import {
   Command as CommandIcon,
   GitBranch,
   Inbox,
+  Layers,
   Network,
   Plus,
   RefreshCw,
@@ -20,7 +21,11 @@ import { RosterView } from "./components/RosterView";
 import { TriageView } from "./components/TriageView";
 import { WorktreesView } from "./components/WorktreesView";
 import {
+  ackTriageItem,
   applyTheme,
+  archiveSwarm,
+  fetchCheckpoints,
+  fetchPortfolio,
   fetchSwarmDelta,
   fetchSwarmSnapshot,
   fetchSwarms,
@@ -28,12 +33,14 @@ import {
   getOps,
   inferThemeFromCssColor,
   isEmbeddedHost,
+  isTriageItemAcked,
   mergeSwarmDelta,
   openWorkerConversation,
+  postPin,
   readStoredTheme,
   startSwarmPreset,
 } from "./sidecar";
-import type { OperatorCommand, SwarmSnapshot, SwarmSummary, TabId, ThemeMode, WorktreesPayload } from "./types";
+import type { OperatorCommand, PortfolioResponse, SwarmCheckpoint, SwarmSnapshot, SwarmSummary, TabId, ThemeMode, TriageAckAction, TriageItem, WorktreesPayload } from "./types";
 import {
   Badge,
   Button,
@@ -41,6 +48,7 @@ import {
   FleetToaster,
   Input,
   Modal,
+  PortfolioDrawer,
   SegmentControl,
   StatusDot,
   Textarea,
@@ -48,9 +56,11 @@ import {
   copyText,
   downloadTextFile,
   fmtTokens,
+  fmtUsd,
   formatSwarmArchive,
   formatSwarmDigest,
   hasControlChars,
+  safeFiniteNonNeg,
   toast,
 } from "./ui";
 
@@ -124,6 +134,12 @@ export function App() {
   const [launching, setLaunching] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [portfolio, setPortfolio] = useState<PortfolioResponse | null>(null);
+  const [portfolioOpen, setPortfolioOpen] = useState(false);
+  const [portfolioLoading, setPortfolioLoading] = useState(false);
+  const [portfolioError, setPortfolioError] = useState("");
+  const [checkpoints, setCheckpoints] = useState<SwarmCheckpoint[]>([]);
+  const [checkpointCreateNonce, setCheckpointCreateNonce] = useState(0);
 
   const embedded = isEmbeddedHost();
 
@@ -161,6 +177,23 @@ export function App() {
   const membersSigOf = (s: SwarmSnapshot | null) =>
     (s?.members || []).map((m) => `${m.name}:${m.status}:${m.killed ? 1 : 0}`).join(",");
 
+  const refreshPortfolio = useCallback(async (signal?: AbortSignal) => {
+    setPortfolioLoading(true);
+    try {
+      const p = await fetchPortfolio(signal);
+      if (signal?.aborted) return;
+      if (p && Array.isArray(p.swarms)) {
+        setPortfolio(p);
+        setPortfolioError("");
+      }
+    } catch (err) {
+      if (signal?.aborted || (err instanceof DOMException && err.name === "AbortError")) return;
+      setPortfolioError(err instanceof Error ? err.message : "Failed to load portfolio");
+    } finally {
+      if (!signal?.aborted) setPortfolioLoading(false);
+    }
+  }, []);
+
   const maybeRefreshSwarmsList = useCallback((force = false) => {
     const now = Date.now();
     if (!force && now - lastSwarmsFetchRef.current < 30000) return;
@@ -170,7 +203,8 @@ export function App() {
         if (listData?.swarms) setSwarms(listData.swarms);
       })
       .catch(() => {});
-  }, []);
+    void refreshPortfolio();
+  }, [refreshPortfolio]);
 
   const refreshSwarm = useCallback(
     async (force = false) => {
@@ -180,14 +214,19 @@ export function App() {
       const targetSwarmId = selectedSwarmId;
       try {
         if (force) etagRef.current = "";
-        const [data, listData] = await Promise.all([
+        const [data, listData, portfolioData] = await Promise.all([
           fetchSwarmSnapshot(targetSwarmId, force ? "" : etagRef.current, ac.signal),
           fetchSwarms(ac.signal).catch(() => null),
+          fetchPortfolio().catch(() => null),
         ]);
         if (ac.signal.aborted || selectedSwarmIdRef.current !== targetSwarmId) return;
         if (listData?.swarms) {
           setSwarms(listData.swarms);
           lastSwarmsFetchRef.current = Date.now();
+        }
+        if (portfolioData && Array.isArray(portfolioData.swarms)) {
+          setPortfolio(portfolioData);
+          setPortfolioError("");
         }
         if (data && !data.unchanged) {
           const prevSnap = snapRef.current;
@@ -558,30 +597,172 @@ export function App() {
   const members = snap?.members || [];
   const activeCount = members.filter((m) => !m.killed && m.status === "working").length;
   const waitingCount = members.filter((m) => !m.killed && m.status === "waiting").length;
-  const triageCount = snap?.triage?.length || 0;
+  const triageItems = snap?.triage || [];
+  const triageCount = triageItems.filter((it) => !isTriageItemAcked(it, snap)).length;
   const hasSwarm = Boolean(snap?.swarm);
 
   const activeSwarmKey = snap?.swarm || selectedSwarmId || "default";
-  const pinnedSeqs = pinnedMap[activeSwarmKey] || [];
-  const triageItems = snap?.triage || [];
+  const serverPins = Array.isArray(snap?.pinnedSeqs) ? snap.pinnedSeqs : Array.isArray(snap?.pins) ? snap.pins : null;
+  const pinnedSeqs = serverPins !== null ? serverPins : (pinnedMap[activeSwarmKey] || []);
+  const unackedTriageItems = triageItems.filter((it) => !isTriageItemAcked(it, snap));
+
+  const refreshCheckpoints = useCallback(async (convId?: string) => {
+    const id = convId || snapRef.current?.swarm || snapRef.current?.conversationId || selectedSwarmIdRef.current || "";
+    if (!id) {
+      setCheckpoints([]);
+      return;
+    }
+    try {
+      const res = await fetchCheckpoints(id);
+      if ((selectedSwarmIdRef.current || snapRef.current?.swarm || "") !== id) return;
+      if (res && Array.isArray(res.checkpoints)) {
+        setCheckpoints(res.checkpoints);
+      }
+    } catch {
+      if ((selectedSwarmIdRef.current || snapRef.current?.swarm || "") === id) setCheckpoints([]);
+    }
+  }, []);
 
   useEffect(() => {
-    setSelectedTriageIdx((idx) => (triageItems.length ? Math.min(idx, triageItems.length - 1) : 0));
-  }, [triageItems.length, activeSwarmKey]);
+    if (!activeConvId) {
+      setCheckpoints([]);
+      return;
+    }
+    void refreshCheckpoints(activeConvId);
+  }, [activeConvId, snap?.head, refreshCheckpoints]);
+
+  useEffect(() => {
+    setSelectedTriageIdx((idx) => (unackedTriageItems.length ? Math.min(idx, unackedTriageItems.length - 1) : 0));
+  }, [unackedTriageItems.length, activeSwarmKey]);
+
+  const applyPinnedList = useCallback((swarmKey: string, list: number[]) => {
+    const normalized = [...new Set(list.filter((x) => Number.isInteger(x) && x > 0))].sort((a, b) => a - b);
+    setSnap((prev) => {
+      if (!prev || (prev.swarm !== swarmKey && prev.conversationId !== swarmKey && swarmKey !== "default")) return prev;
+      const updated = { ...prev, pinnedSeqs: normalized };
+      snapRef.current = updated;
+      return updated;
+    });
+    setPinnedMap((prev) => {
+      const next = { ...prev, [swarmKey]: normalized };
+      try {
+        localStorage.setItem("fleet-pinned-v1", JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  }, []);
 
   const handleTogglePin = useCallback(
     (seq: number) => {
-      setPinnedMap((prev) => {
-        const cur = prev[activeSwarmKey] || [];
-        const nextList = cur.includes(seq) ? cur.filter((x) => x !== seq) : [...cur, seq].sort((a, b) => a - b);
-        const next = { ...prev, [activeSwarmKey]: nextList };
-        try {
-          localStorage.setItem("fleet-pinned-v1", JSON.stringify(next));
-        } catch {}
-        return next;
-      });
+      const convId = snapRef.current?.swarm || snapRef.current?.conversationId || selectedSwarmIdRef.current || "";
+      const prevList =
+        (Array.isArray(snapRef.current?.pinnedSeqs)
+          ? snapRef.current?.pinnedSeqs
+          : Array.isArray(snapRef.current?.pins)
+            ? snapRef.current?.pins
+            : pinnedMap[activeSwarmKey]) || [];
+      const wasPinned = prevList.includes(seq);
+      const nextPinned = !wasPinned;
+      const optimisticList = nextPinned ? [...prevList, seq].sort((a, b) => a - b) : prevList.filter((x) => x !== seq);
+      applyPinnedList(activeSwarmKey, optimisticList);
+
+      if (!convId) return;
+      void postPin({ conversationId: convId, seq, pinned: nextPinned })
+        .then((res) => {
+          const synced = Array.isArray(res?.pinnedSeqs) ? res.pinnedSeqs : Array.isArray(res?.pins) ? res.pins : null;
+          if (synced) applyPinnedList(activeSwarmKey, synced);
+        })
+        .catch((err) => {
+          const status = (err as { status?: number })?.status;
+          if (status === 404) return;
+          applyPinnedList(activeSwarmKey, prevList);
+          toast.error(err instanceof Error ? err.message : "Failed to update pin");
+        });
     },
-    [activeSwarmKey],
+    [activeSwarmKey, applyPinnedList, pinnedMap],
+  );
+
+  const handleAckTriage = useCallback(
+    async (item: TriageItem, action: TriageAckAction, note?: string) => {
+      const convId = snapRef.current?.swarm || snapRef.current?.conversationId || item.conversationId || selectedSwarmIdRef.current || "";
+      if (!convId) return;
+      const untilSeq = action === "snooze" ? Math.max(snapRef.current?.head || 0, item.seq || 0) + 5 : undefined;
+      try {
+        const res = await ackTriageItem({
+          conversationId: convId,
+          triageId: item.id,
+          action,
+          ...(untilSeq !== undefined ? { untilSeq } : {}),
+          ...(note ? { note } : {}),
+        });
+        setSnap((prev) => {
+          if (!prev) return prev;
+          const nextAcks = { ...(prev.triageAcks || {}) };
+          if (action === "unack") {
+            delete nextAcks[item.id];
+          } else {
+            nextAcks[item.id] = { triageId: item.id, action, untilSeq: untilSeq ?? null, ackedAt: Date.now() };
+          }
+          const nextTriage = Array.isArray(res.triage)
+            ? res.triage
+            : (prev.triage || []).map((t) =>
+                t.id !== item.id
+                  ? t
+                  : {
+                      ...t,
+                      acked: action !== "unack",
+                      snoozed: action === "snooze",
+                      ackAction: action === "unack" ? null : action,
+                      ackState: action === "unack" ? null : action,
+                      untilSeq: action === "snooze" ? (untilSeq ?? null) : null,
+                    },
+              );
+          const updated = {
+            ...prev,
+            triage: nextTriage,
+            triageAcks: res.acks || nextAcks,
+          };
+          snapRef.current = updated;
+          return updated;
+        });
+        toast.success(action === "snooze" ? "Snoozed triage item" : action === "unack" ? "Restored triage item" : "Acknowledged triage item");
+        void refreshPortfolio();
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "Failed to update triage status");
+      }
+    },
+    [refreshPortfolio],
+  );
+
+  const handleArchiveSwarm = useCallback(
+    async (id: string, archived: boolean) => {
+      try {
+        await archiveSwarm({ conversationId: id, archived });
+        setSwarms((prev) => prev.map((s) => (s.id === id ? { ...s, archived } : s)));
+        setPortfolio((prev) => {
+          if (!prev) return prev;
+          const nextSwarms = prev.swarms.map((s) => (s.id === id ? { ...s, archived } : s));
+          const activeList = nextSwarms.filter((s) => !s.archived);
+          return {
+            ...prev,
+            swarms: nextSwarms,
+            activeSwarms: activeList.length,
+            totalCostUsd: activeList.reduce((sum, s) => sum + safeFiniteNonNeg(s.costUsd), 0),
+            totalTokens: activeList.reduce((sum, s) => sum + safeFiniteNonNeg(s.totalTokens), 0),
+          };
+        });
+        toast.success(archived ? "Swarm archived" : "Swarm unarchived");
+        void refreshPortfolio();
+        void fetchSwarms()
+          .then((listData) => {
+            if (listData?.swarms) setSwarms(listData.swarms);
+          })
+          .catch(() => {});
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "Archive action failed");
+      }
+    },
+    [refreshPortfolio],
   );
 
   const handleOpsChange = useCallback((nextOps: OperatorCommand[]) => {
@@ -619,7 +800,7 @@ export function App() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.metaKey || e.ctrlKey || e.altKey || paletteOpen || settingsOpen) return;
+      if (e.metaKey || e.ctrlKey || e.altKey || paletteOpen || settingsOpen || portfolioOpen) return;
       const target = e.target as HTMLElement | null;
       if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) || target?.isContentEditable) return;
       if (e.key === "?") {
@@ -639,11 +820,11 @@ export function App() {
         setBoardQuickFilter((cur) => order[(order.indexOf(cur) + 1) % order.length]);
         return;
       }
-      if (tab !== "triage" || triageItems.length === 0) return;
-      const item = triageItems[selectedTriageIdx];
+      if (tab !== "triage" || unackedTriageItems.length === 0) return;
+      const item = unackedTriageItems[selectedTriageIdx];
       if (e.key === "j" || e.key === "k") {
         e.preventDefault();
-        setSelectedTriageIdx((i) => Math.max(0, Math.min(triageItems.length - 1, i + (e.key === "j" ? 1 : -1))));
+        setSelectedTriageIdx((i) => Math.max(0, Math.min(unackedTriageItems.length - 1, i + (e.key === "j" ? 1 : -1))));
       } else if (e.key === "r") {
         e.preventDefault();
         setTriageReplyNonce((n) => n + 1);
@@ -660,7 +841,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [tab, triageItems, selectedTriageIdx, paletteOpen, settingsOpen, shortcutsOpen, pinnedSeqs, handleTogglePin]);
+  }, [tab, unackedTriageItems, selectedTriageIdx, paletteOpen, settingsOpen, portfolioOpen, shortcutsOpen, pinnedSeqs, handleTogglePin]);
 
   const handleSelectSwarm = (id: string) => {
     etagRef.current = "";
@@ -757,6 +938,23 @@ export function App() {
     }
   };
 
+  const activeSwarmId = selectedSwarmId || snap?.swarm || "";
+  const selectableSwarms = swarms.filter((sw) => !sw.archived || sw.id === activeSwarmId);
+  const portfolioSwarms = portfolio?.swarms?.length ? portfolio.swarms : swarms;
+  const activePortfolioSwarms = portfolioSwarms.filter((sw) => !sw.archived);
+  const portfolioSwarmCount = portfolio?.activeSwarms ?? activePortfolioSwarms.length;
+  const portfolioUrgentCount = Math.round(
+    safeFiniteNonNeg(
+      portfolio?.urgentCount,
+      activePortfolioSwarms.reduce((sum, sw) => sum + safeFiniteNonNeg(sw.triageCount), 0),
+    ),
+  );
+  const portfolioCostUsd = safeFiniteNonNeg(
+    portfolio?.totalCostUsd,
+    activePortfolioSwarms.reduce((sum, sw) => sum + safeFiniteNonNeg(sw.costUsd), 0),
+  );
+  const showPortfolioPill = Boolean(hasSwarm || portfolio || swarms.length > 0);
+
   const tabCounts: Partial<Record<TabId, number>> = {
     triage: triageCount,
     board: snap?.head || 0,
@@ -778,16 +976,16 @@ export function App() {
                 <Rocket className="h-4 w-4" />
               </span>
               <div className="min-w-0 flex-1">
-                {swarms.length > 1 ? (
+                {selectableSwarms.length > 1 ? (
                   <>
                     <h1 className="sr-only">{snap?.title || "Fleet"}</h1>
                     <select
                       aria-label="Active swarm"
-                      value={snap?.swarm || selectedSwarmId || ""}
+                      value={activeSwarmId}
                       onChange={(e) => handleSelectSwarm(e.target.value)}
                       className="h-7 w-full max-w-[320px] truncate rounded-chip border border-[var(--edge)] bg-board px-2 h2 cursor-pointer"
                     >
-                      {swarms.map((sw) => (
+                      {selectableSwarms.map((sw) => (
                         <option key={sw.id} value={sw.id}>{sw.title || sw.id} ({sw.activeCount}/{sw.memberCount})</option>
                       ))}
                     </select>
@@ -813,16 +1011,40 @@ export function App() {
             </div>
           </div>
 
-          {hasSwarm && (
-            <div className="wrap justify-between gap-2 pb-2 text-[12px] text-ink-2">
-              <div className="wrap gap-2 min-w-0 num">
-                <StatusDot state={activeCount > 0 ? "working" : waitingCount > 0 ? "waiting" : "killed"} />
-                {activeCount} working · {waitingCount} waiting <span className="text-ink-3">#{snap?.head || 0}</span>
-              </div>
-              <div className="f1">
-                {(sseConnected || deltaLive) && <Badge tone="success">Live</Badge>}
-                {snap?.member && <Badge>you: {snap.member}</Badge>}
-                <span className="inline-flex items-center rounded-chip bg-board px-2 py-1 num font-medium text-ink-2">{fmtTokens(snap?.usage?.totalTokens)} tok</span>
+          {(hasSwarm || showPortfolioPill) && (
+            <div className="wrap justify-between gap-2 pb-2 text-[12px] text-ink-2 min-w-0">
+              {hasSwarm ? (
+                <div className="wrap gap-2 min-w-0 num">
+                  <StatusDot state={activeCount > 0 ? "working" : waitingCount > 0 ? "waiting" : "killed"} />
+                  {activeCount} working · {waitingCount} waiting <span className="text-ink-3">#{snap?.head || 0}</span>
+                </div>
+              ) : (
+                <span className="text-ink-3">Portfolio overview</span>
+              )}
+              <div className="wrap gap-1.5 min-w-0">
+                {showPortfolioPill && (
+                  <button
+                    type="button"
+                    data-testid="portfolio-pill-btn"
+                    onClick={() => {
+                      setPortfolioOpen(true);
+                      void refreshPortfolio();
+                    }}
+                    className="inline-flex items-center gap-1 rounded-chip border border-hairline bg-board px-2 py-0.5 text-[12px] font-medium text-ink hover:bg-track cursor-pointer transition num max-w-full"
+                  >
+                    <Layers className="h-3 w-3 text-info shrink-0" />
+                    <span className="truncate">
+                      {portfolioSwarmCount} {portfolioSwarmCount === 1 ? "swarm" : "swarms"} · {portfolioUrgentCount} urgent · {fmtUsd(portfolioCostUsd)}
+                    </span>
+                  </button>
+                )}
+                {hasSwarm && (sseConnected || deltaLive) && <Badge tone="success">Live</Badge>}
+                {hasSwarm && snap?.member && <Badge>you: {snap.member}</Badge>}
+                {hasSwarm && (
+                  <span className="inline-flex items-center rounded-chip bg-board px-2 py-0.5 num font-medium text-ink-2">
+                    {fmtTokens(snap?.usage?.totalTokens)} tok
+                  </span>
+                )}
               </div>
             </div>
           )}
@@ -946,10 +1168,15 @@ export function App() {
               <TriageView
                 snap={snap!}
                 pinnedSeqs={pinnedSeqs}
+                worktrees={worktrees}
+                checkpoints={checkpoints}
+                createCheckpointNonce={checkpointCreateNonce}
                 selectedIdx={selectedTriageIdx}
                 replyNonce={triageReplyNonce}
                 onSelectIdx={setSelectedTriageIdx}
                 onTogglePin={handleTogglePin}
+                onAckTriage={handleAckTriage}
+                onCheckpointsChange={setCheckpoints}
                 onJumpToBoardSeq={handleJumpToBoard}
                 onCopyHandoffDigest={handleCopyDigest}
                 onExportArchive={handleExportArchive}
@@ -998,6 +1225,7 @@ export function App() {
         snap={snap}
         swarms={swarms}
         worktrees={worktrees}
+        checkpoints={checkpoints}
         onSelectTab={setTab}
         onJumpToBoard={handleJumpToBoard}
         onSelectSwarm={handleSelectSwarm}
@@ -1005,6 +1233,15 @@ export function App() {
         onOpenSettings={() => setSettingsOpen(true)}
         onOpenShortcuts={() => setShortcutsOpen(true)}
         onOpenLauncher={() => setLauncherOpen(true)}
+        onOpenPortfolio={() => {
+          setPortfolioOpen(true);
+          void refreshPortfolio();
+        }}
+        onCreateCheckpoint={() => {
+          setTab("triage");
+          setCheckpointCreateNonce((n) => n + 1);
+        }}
+        onAckTriage={handleAckTriage}
         onOpenBoardPost={() => {
           setTab("board");
           setBoardComposeNonce((n) => n + 1);
@@ -1013,6 +1250,22 @@ export function App() {
           setTab("roster");
           setRosterSpawnNonce((n) => n + 1);
         }}
+      />
+
+      <PortfolioDrawer
+        open={portfolioOpen}
+        portfolio={portfolio}
+        swarms={swarms}
+        activeSwarmId={activeSwarmId || null}
+        loading={portfolioLoading}
+        error={portfolioError}
+        onClose={() => setPortfolioOpen(false)}
+        onRefresh={() => void refreshPortfolio()}
+        onSelectSwarm={(id, nextTab) => {
+          handleSelectSwarm(id);
+          if (nextTab) setTab(nextTab);
+        }}
+        onArchiveSwarm={handleArchiveSwarm}
       />
 
       {/* New Swarm Launcher Modal */}

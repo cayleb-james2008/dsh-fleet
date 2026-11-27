@@ -11,7 +11,7 @@ import type {
   Ref,
   TextareaHTMLAttributes,
 } from "react";
-import { AlertTriangle, ArrowUpRight, CheckCircle2, ChevronDown, ChevronUp, ClipboardCopy, FileCode2, Image as ImageIcon, Pin, PinOff, RefreshCw, Send, X } from "./icons";
+import { AlertTriangle, ArrowUpRight, CheckCircle2, ChevronDown, ChevronUp, ClipboardCopy, Eye, EyeOff, FileCode2, Image as ImageIcon, Layers, Pin, PinOff, RefreshCw, Send, ShieldAlert, X } from "./icons";
 import { animatePanelEnter } from "./motion";
 import { fetchMemberTranscript, openFileInAuxPane, parseScreenshotLines, postOpAction, sendConfirmedNudge, sendSwarmControl } from "./sidecar";
 import type {
@@ -29,9 +29,13 @@ import type {
   PlanRisk,
   PlanThread,
   PlanWorkstreamStatus,
+  PortfolioResponse,
+  PortfolioUrgentItem,
   SwarmMember,
   SwarmPlan,
   SwarmSnapshot,
+  SwarmSummary,
+  TabId,
   TokenUsage,
   TranscriptFilter,
   TranscriptStep,
@@ -2308,6 +2312,316 @@ export function ForensicTranscriptDrawer({
               {loadingMore ? "Loading older steps…" : "Load older steps"}
             </Button>
           )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const GATE_BADGE_TONE: Record<string, { tone: BadgeTone; label: string }> = {
+  blocked: { tone: "danger", label: "Gate: Blocked" },
+  ready: { tone: "success", label: "Gate: Ready" },
+  verifying: { tone: "info", label: "Gate: Verifying" },
+};
+
+/** Responsive slide-over Portfolio Command Drawer across active and archived swarms. */
+export function PortfolioDrawer({
+  open,
+  portfolio,
+  swarms,
+  activeSwarmId,
+  loading,
+  error,
+  onClose,
+  onRefresh,
+  onSelectSwarm,
+  onArchiveSwarm,
+}: {
+  open: boolean;
+  portfolio: PortfolioResponse | null;
+  swarms: SwarmSummary[];
+  activeSwarmId: string | null;
+  loading: boolean;
+  error: string;
+  onClose: () => void;
+  onRefresh: () => void;
+  onSelectSwarm: (id: string, tab?: TabId) => void;
+  onArchiveSwarm: (id: string, archived: boolean) => Promise<void>;
+}) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const [showArchived, setShowArchived] = useState(false);
+  const [archivingId, setArchivingId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    animatePanelEnter(panelRef.current);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onCloseRef.current();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  if (!open) return null;
+
+  const allSwarms = portfolio?.swarms?.length ? portfolio.swarms : swarms;
+  const archivedCount = allSwarms.filter((s) => Boolean(s.archived)).length;
+  const visibleSwarms = showArchived ? allSwarms : allSwarms.filter((s) => !s.archived);
+  const activeCount = portfolio?.activeSwarms ?? allSwarms.filter((s) => !s.archived).length;
+  const totalUsd = safeFiniteNonNeg(
+    portfolio?.totalCostUsd,
+    allSwarms.filter((s) => !s.archived).reduce((sum, s) => sum + safeFiniteNonNeg(s.costUsd), 0),
+  );
+  const totalTokens = Math.round(
+    safeFiniteNonNeg(
+      portfolio?.totalTokens,
+      allSwarms.filter((s) => !s.archived).reduce((sum, s) => sum + safeFiniteNonNeg(s.totalTokens), 0),
+    ),
+  );
+  const urgentQueue: PortfolioUrgentItem[] = Array.isArray(portfolio?.urgentTriage)
+    ? portfolio.urgentTriage
+    : [];
+  const urgentCount = Math.round(safeFiniteNonNeg(portfolio?.urgentCount, urgentQueue.length));
+  const titleById = new Map(allSwarms.map((s) => [s.id, s.title || s.id]));
+
+  const toggleArchive = async (sw: SwarmSummary) => {
+    if (archivingId === sw.id) return;
+    setArchivingId(sw.id);
+    try {
+      await onArchiveSwarm(sw.id, !sw.archived);
+    } finally {
+      setArchivingId(null);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex justify-end bg-[var(--scrim)]"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="portfolio-drawer-title"
+        data-testid="portfolio-drawer"
+        className="flex h-full w-full max-w-[380px] sm:max-w-[520px] flex-col border-l border-hairline bg-surface shadow-[var(--elev-lift)] min-w-0"
+      >
+        <div className="p-3 border-b border-hairline row shrink-0 min-w-0">
+          <div className="f1 min-w-0">
+            <Layers className="h-4 w-4 text-info shrink-0" />
+            <h2 id="portfolio-drawer-title" className="h2 truncate">Portfolio command</h2>
+          </div>
+          <div className="f1 shrink-0">
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="Refresh portfolio"
+              data-testid="portfolio-refresh-btn"
+              onClick={onRefresh}
+            >
+              <RefreshCw className={cn("h-4 w-4", loading && "motion-safe:animate-spin")} />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="Close portfolio"
+              data-testid="portfolio-close-btn"
+              onClick={onClose}
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto overflow-x-hidden p-3 space-y-4 min-w-0">
+          {error && (
+            <Card className="p-2.5 border-danger bg-bad-soft text-[12px] text-danger break-words" role="alert">
+              {maskHome(error)}
+            </Card>
+          )}
+
+          {/* Aggregated Spend & Health Summary */}
+          <Card className="p-3 space-y-2 bg-board" data-testid="portfolio-summary-card">
+            <div className="wrap justify-between gap-2">
+              <div className="wrap gap-1.5">
+                <Badge tone="neutral" data-testid="portfolio-active-swarms">
+                  {activeCount} {activeCount === 1 ? "active swarm" : "active swarms"}
+                </Badge>
+                <Badge tone={urgentCount > 0 ? "danger" : "success"} data-testid="portfolio-urgent-count">
+                  {urgentCount} urgent
+                </Badge>
+              </div>
+              <span className="text-[14px] font-semibold text-ink num" data-testid="portfolio-total-usd">
+                {fmtUsd(totalUsd)}
+              </span>
+            </div>
+            <div className="row text-[12px] text-ink-2 num">
+              <span>Aggregated token spend</span>
+              <span>{fmtTokens(totalTokens)} tok</span>
+            </div>
+          </Card>
+
+          {/* Cross-Swarm Urgent Triage Queue */}
+          <section aria-labelledby="portfolio-urgent-heading" className="space-y-2" data-testid="portfolio-urgent-queue">
+            <div className="row flex-wrap gap-2">
+              <div className="f1">
+                <ShieldAlert className={cn("h-3.5 w-3.5", urgentQueue.length > 0 ? "text-danger" : "text-ink-3")} />
+                <h3 id="portfolio-urgent-heading" className="h2">Urgent queue ({urgentQueue.length})</h3>
+              </div>
+            </div>
+
+            {urgentQueue.length === 0 ? (
+              <Card className="p-2.5 bg-board text-[12px] text-ink-2">
+                No urgent triage items across active swarms.
+              </Card>
+            ) : (
+              <div className="space-y-2">
+                {urgentQueue.map((item) => {
+                  const targetSwarmId = item.swarmId || item.conversationId;
+                  const swLabel = maskHome(item.swarmTitle || titleById.get(targetSwarmId) || targetSwarmId);
+                  return (
+                    <Card
+                      key={`${targetSwarmId}-${item.id}`}
+                      data-testid={`portfolio-urgent-item-${item.id}`}
+                      className="p-2.5 space-y-1.5 min-w-0"
+                    >
+                      <div className="wrap gap-1.5">
+                        <Badge tone="danger">{humanizeStatus(item.kind)}</Badge>
+                        <Badge tone="neutral" className="max-w-full truncate">{swLabel}</Badge>
+                        {item.member && <span className="text-[12px] font-medium text-ink-2">@{item.member}</span>}
+                        {item.timestamp > 0 && <span className="t3 num ml-auto">{fmtTimeAgo(item.timestamp)}</span>}
+                      </div>
+                      <p className="text-[13px] font-medium text-ink break-words">{maskHome(item.title)}</p>
+                      {item.detail && (
+                        <p className="text-[12px] text-ink-2 break-words leading-snug">{maskHome(item.detail)}</p>
+                      )}
+                      {targetSwarmId && (
+                        <div className="pt-0.5">
+                          <Button
+                            variant="outline"
+                            data-testid={`portfolio-jump-urgent-${item.id}`}
+                            onClick={() => {
+                              onSelectSwarm(targetSwarmId, "triage");
+                              onClose();
+                            }}
+                          >
+                            Jump to swarm
+                            <ArrowUpRight />
+                          </Button>
+                        </div>
+                      )}
+                    </Card>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
+          {/* Swarm List + Gate States + Archive Toggle */}
+          <section aria-labelledby="portfolio-swarms-heading" className="space-y-2" data-testid="portfolio-swarms-list">
+            <div className="row flex-wrap gap-2">
+              <h3 id="portfolio-swarms-heading" className="h2">Swarms ({visibleSwarms.length})</h3>
+              <Button
+                variant={showArchived ? "secondary" : "outline"}
+                aria-pressed={showArchived}
+                data-testid="portfolio-show-archived"
+                onClick={() => setShowArchived((v) => !v)}
+              >
+                {showArchived ? <EyeOff /> : <Eye />}
+                {showArchived ? "Hide archived" : `Show archived${archivedCount > 0 ? ` (${archivedCount})` : ""}`}
+              </Button>
+            </div>
+
+            {visibleSwarms.length === 0 ? (
+              <Card className="p-2.5 bg-board text-[12px] text-ink-2">
+                {archivedCount > 0 ? "All swarms are archived. Show archived to inspect or restore them." : "No swarms found."}
+              </Card>
+            ) : (
+              <div className="space-y-2">
+                {visibleSwarms.map((sw) => {
+                  const isCurrent = sw.id === activeSwarmId;
+                  const gateSpec = sw.gateState ? GATE_BADGE_TONE[String(sw.gateState).toLowerCase()] : undefined;
+                  const blockedCnt = Math.round(safeFiniteNonNeg(sw.blockedCount));
+                  const failCnt = Math.round(safeFiniteNonNeg(sw.failureCount));
+                  const costVal = finiteOptNonNeg(sw.costUsd);
+                  const busy = archivingId === sw.id;
+
+                  return (
+                    <Card
+                      key={sw.id}
+                      data-testid={`portfolio-swarm-${sw.id}`}
+                      className={cn("p-2.5 space-y-2 min-w-0", isCurrent && "border-blue", sw.archived && "opacity-80")}
+                    >
+                      <div className="row flex-wrap gap-1.5 min-w-0">
+                        <div className="wrap gap-1.5 min-w-0 flex-1">
+                          <span className="text-[13px] font-semibold text-ink break-words">
+                            {maskHome(sw.title || sw.id)}
+                          </span>
+                          {isCurrent && <Badge tone="info">Active</Badge>}
+                          {sw.archived && <Badge tone="neutral">Archived</Badge>}
+                        </div>
+                        {gateSpec && (
+                          <Badge tone={gateSpec.tone} data-testid={`portfolio-gate-${sw.id}`}>
+                            {gateSpec.label}
+                          </Badge>
+                        )}
+                      </div>
+
+                      <div className="wrap gap-x-2.5 gap-y-1 text-[12px] text-ink-2 num">
+                        <span>{sw.activeCount}/{sw.memberCount} working</span>
+                        <span>#{sw.head}</span>
+                        <span>{fmtTokens(sw.totalTokens)} tok</span>
+                        {costVal !== undefined && <span className="font-medium text-ink">{fmtUsd(costVal)}</span>}
+                        {blockedCnt > 0 && <span className="text-danger">{blockedCnt} blocked</span>}
+                        {failCnt > 0 && <span className="text-danger">{failCnt} failed</span>}
+                        {sw.triageCount > 0 && <span className="text-warn">{sw.triageCount} triage</span>}
+                      </div>
+
+                      {sw.repo && (
+                        <p className="t3 mono truncate">{maskHome(sw.repo)}</p>
+                      )}
+
+                      {sw.topUrgent && (
+                        <p className="rounded-chip bg-bad-soft px-2 py-1 text-[12px] text-danger break-words">
+                          {maskHome(sw.topUrgent.title)}
+                        </p>
+                      )}
+
+                      <div className="wrap gap-1.5">
+                        <Button
+                          variant={isCurrent ? "secondary" : "primary"}
+                          data-testid={`portfolio-open-swarm-${sw.id}`}
+                          onClick={() => {
+                            onSelectSwarm(sw.id);
+                            onClose();
+                          }}
+                        >
+                          Open
+                          <ArrowUpRight />
+                        </Button>
+                        <Button
+                          variant="outline"
+                          disabled={busy}
+                          data-testid={`portfolio-archive-swarm-${sw.id}`}
+                          onClick={() => void toggleArchive(sw)}
+                        >
+                          {sw.archived ? "Unarchive" : "Archive"}
+                        </Button>
+                      </div>
+                    </Card>
+                  );
+                })}
+              </div>
+            )}
+          </section>
         </div>
       </div>
     </div>

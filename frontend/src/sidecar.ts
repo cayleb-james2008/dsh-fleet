@@ -1,17 +1,27 @@
 import type {
   BoardMessage,
+  CheckpointsListResponse,
   ControlDispatchResponse,
   ControlRequest,
+  CreateCheckpointRequest,
+  CreateCheckpointResponse,
   MentionEdge,
   NormalizedPlan,
   OpActionResponse,
   OperatorCommand,
   OperatorOpAction,
   OpsListResponse,
+  PinPostRequest,
+  PinPostResponse,
   PlanMilestone,
   PlanRisk,
   PlanThread,
   PlanWorkstream,
+  PortfolioResponse,
+  RestoreCheckpointRequest,
+  RestoreCheckpointResponse,
+  SwarmArchiveRequest,
+  SwarmArchiveResponse,
   SwarmDeltaPayload,
   SwarmPlan,
   SwarmSnapshot,
@@ -19,6 +29,9 @@ import type {
   ThemeMode,
   TranscriptFilter,
   TranscriptResponse,
+  TriageAckRequest,
+  TriageAckResponse,
+  TriageItem,
   WorktreeActionName,
   WorktreeActionPayload,
   WorktreeDiffMode,
@@ -293,6 +306,11 @@ export function mergeSwarmDelta(
     ...(delta.cost !== undefined ? { cost: delta.cost } : {}),
     ...(delta.byModel !== undefined ? { byModel: delta.byModel } : {}),
     ...(delta.unseen !== undefined ? { unseen: delta.unseen } : {}),
+    ...(delta.pinnedSeqs !== undefined ? { pinnedSeqs: delta.pinnedSeqs } : {}),
+    ...(delta.pins !== undefined ? { pins: delta.pins } : {}),
+    ...(delta.triageAcks !== undefined ? { triageAcks: delta.triageAcks } : {}),
+    ...(delta.archived !== undefined ? { archived: delta.archived } : {}),
+    ...(delta.checkpoints !== undefined ? { checkpoints: delta.checkpoints } : {}),
     ...(delta.ops !== undefined ? { ops: delta.ops } : {}),
     ...(delta.swarms !== undefined ? { swarms: delta.swarms } : {}),
     ...(delta.capabilities !== undefined ? { capabilities: delta.capabilities } : {}),
@@ -539,6 +557,83 @@ export async function postOpAction(req: {
     throw new Error(data.error || `Op action failed (${res.status})`);
   }
   return data as OpActionResponse;
+}
+
+async function postJsonConfirmed<T>(url: string, payload: Record<string, unknown>, errLabel: string): Promise<T> {
+  const res = await sidecarFetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...payload, confirm: true }),
+  });
+  const data = (await res.json().catch(() => ({}))) as { error?: string };
+  if (!res.ok) {
+    throw new Error(data.error || `${errLabel} (${res.status})`);
+  }
+  return data as T;
+}
+
+export const fetchPortfolio = (signal?: AbortSignal): Promise<PortfolioResponse> =>
+  apiJson("/api/portfolio", "Load portfolio failed", signal);
+
+export function ackTriageItem(req: TriageAckRequest): Promise<TriageAckResponse> {
+  if (!req.conversationId || !req.triageId) throw new Error("Missing swarm or triage item");
+  return postJsonConfirmed("/api/triage/ack", { ...req }, "Triage ack failed");
+}
+
+export async function postPin(req: PinPostRequest): Promise<PinPostResponse & { status?: number }> {
+  if (!req.conversationId) throw new Error("No active swarm");
+  const res = await sidecarFetch("/api/pins", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...req, confirm: true }),
+  });
+  const data = (await res.json().catch(() => ({}))) as Partial<PinPostResponse>;
+  if (!res.ok) {
+    const err = new Error(data.error || `Pin update failed (${res.status})`) as Error & { status?: number };
+    err.status = res.status;
+    throw err;
+  }
+  return data as PinPostResponse;
+}
+
+export function archiveSwarm(req: SwarmArchiveRequest): Promise<SwarmArchiveResponse> {
+  if (!req.conversationId) throw new Error("Missing swarm id");
+  return postJsonConfirmed("/api/swarm/archive", { ...req }, "Archive swarm failed");
+}
+
+export function fetchCheckpoints(conversationId: string, signal?: AbortSignal): Promise<CheckpointsListResponse> {
+  if (!conversationId) return Promise.resolve({ ok: true, conversationId: "", checkpoints: [] });
+  return apiJson(qs("/api/checkpoints", { conversationId }), "Load checkpoints failed", signal);
+}
+
+export function createCheckpoint(req: CreateCheckpointRequest): Promise<CreateCheckpointResponse> {
+  if (!req.conversationId || !req.label.trim()) throw new Error("Swarm and checkpoint label required");
+  return postJsonConfirmed(
+    "/api/checkpoints",
+    {
+      conversationId: req.conversationId,
+      label: req.label.trim(),
+      ...(req.roots?.length ? { roots: req.roots } : {}),
+    },
+    "Create checkpoint failed",
+  );
+}
+
+export function restoreCheckpoint(req: RestoreCheckpointRequest): Promise<RestoreCheckpointResponse> {
+  if (!req.conversationId || !req.checkpointId) throw new Error("Missing swarm or checkpoint");
+  return postJsonConfirmed("/api/checkpoints/restore", { ...req }, "Restore checkpoint failed");
+}
+
+export function isTriageItemAcked(item: TriageItem, snap?: Pick<SwarmSnapshot, "triageAcks" | "head"> | null): boolean {
+  if (item.acked || item.snoozed) return true;
+  const st = String(item.ackAction || item.ackState || "").toLowerCase();
+  if (st === "ack" || st === "acked" || st === "snooze" || st === "snoozed") return true;
+  const rec = snap?.triageAcks?.[item.id];
+  if (!rec || rec.action === "unack") return false;
+  if (rec.action === "snooze" && typeof rec.untilSeq === "number" && (snap?.head || 0) > rec.untilSeq) {
+    return false;
+  }
+  return true;
 }
 
 export async function startSwarmPreset(prompt: string, title: string): Promise<boolean> {
