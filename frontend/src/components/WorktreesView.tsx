@@ -231,7 +231,7 @@ function DiffHunkBox({
   return (
     <div className="rounded-chip border border-hairline bg-canvas p-2 space-y-1.5 min-w-0">
       {busy ? (
-        <p className="text-[12px] text-ink-2">Loading...</p>
+        <p className="text-[12px] text-ink-2">Loading…</p>
       ) : error && !diffEntry ? (
         <div role="alert" data-testid={`wt-diff-error-${branch}`} className="space-y-1.5 text-[12px] text-danger">
           <p className="break-words">{maskHome(error)}</p>
@@ -285,7 +285,7 @@ function DiffHunkBox({
                 onClick={onLoadMore}
                 className="h-7 px-2 text-[12px]"
               >
-                {loadingMore ? "Loading..." : error ? "Retry next 32 KiB" : "Load next 32 KiB"}
+                {loadingMore ? "Loading…" : error ? "Retry next 32 KiB" : "Load next 32 KiB"}
               </Button>
             </div>
           )}
@@ -951,7 +951,7 @@ export function WorktreesView({
                       >
                         <div className="f1 min-w-0 text-ink-2">
                           <RefreshCw className="h-3.5 w-3.5 text-info motion-safe:animate-spin shrink-0" />
-                          <span className="truncate">Running {ACTION_LABEL[pendingAction.action]}...</span>
+                          <span className="truncate">Running {ACTION_LABEL[pendingAction.action]}…</span>
                         </div>
                         <Button
                           variant="outline"

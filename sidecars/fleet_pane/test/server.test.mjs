@@ -265,7 +265,7 @@ test('install.sh --dest deploys plugin bundle cleanly and installed main.mjs boo
     const json = await health.json();
     assert.equal(json.ok, true);
     assert.equal(json.name, 'fleet');
-    assert.equal(json.version, '1.30.0');
+    assert.equal(json.version, '1.31.0');
     assert.equal(json.idleSleep, true);
     assert.equal(json.sseClients, 0);
   } finally {
