@@ -202,23 +202,23 @@ function packJsonPayload(obj, etagOverride = '') {
 }
 
 function isLoopbackHostHeader(host) {
-  if (!host) return true;
-  if (host.startsWith('127.0.0.1:') || host.startsWith('localhost:') || host === '127.0.0.1' || host === 'localhost') return true;
-  const h = String(host).trim().toLowerCase();
-  return (
-    h === '127.0.0.1' ||
-    h.startsWith('127.0.0.1:') ||
-    h === 'localhost' ||
-    h.startsWith('localhost:') ||
-    h === '[::1]' ||
-    h.startsWith('[::1]:')
-  );
+  if (!host || typeof host !== 'string') return false;
+  const m = /^(127\.0\.0\.1|localhost|\[::1\])(?::(\d{1,5}))?$/.exec(host.trim().toLowerCase());
+  if (!m) return false;
+  if (m[2] !== undefined) {
+    const port = Number(m[2]);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
+  }
+  return true;
 }
 
 function isLoopbackOrigin(origin) {
-  if (!origin) return true;
+  if (origin === undefined) return true;
+  if (typeof origin !== 'string' || !origin) return false;
   try {
     const u = new URL(origin);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+    if (u.username || u.password || u.origin !== origin) return false;
     return u.hostname === '127.0.0.1' || u.hostname === 'localhost' || u.hostname === '[::1]' || u.hostname === '::1';
   } catch {
     return false;
@@ -292,6 +292,7 @@ export function createFleetHandlers({
   };
   const worktreesPayloadCache = new Map(); // rootsKey -> { at, packed }
   let swarmsListCache = { at: 0, key: '', sig: '', swarms: [], packed: null };
+  let portfolioCache = { key: '', sig: '', packed: null };
 
   const MAX_DELTA_WAITERS = 64;
   const DELTA_MAX_WAIT_MS = 25000;
@@ -427,10 +428,6 @@ export function createFleetHandlers({
     const now = Date.now();
     const hit = !includeRaw ? swarmPayloadCache.get(cacheKey) || swarmPayloadCache.get(convKey) : null;
     if (hit) {
-      if (now - hit.checkedAt < 1000) {
-        if (query.etag && query.etag === hit.fullEtag) return hit.unchangedPacked;
-        return hit.packed;
-      }
       const fp = computeSwarmFingerprint(hit.appData, hit.swarm);
       if (fp) {
         const candidateEtag = `${hit.swarm}|${hit.member || ''}|${fp.etag}`;
@@ -1144,6 +1141,7 @@ export function createFleetHandlers({
       if (entry?.swarm === swarmId) swarmPayloadCache.delete(k);
     }
     swarmsListCache = { at: 0, key: '', sig: '', swarms: [], packed: null };
+    portfolioCache = { key: '', sig: '', packed: null };
     worktreesPayloadCache.clear();
     notifySwarmWatchersForSwarm(swarmId);
   }
@@ -1892,8 +1890,22 @@ export function createFleetHandlers({
 
   function getPortfolioPacked() {
     const appDataDirs = getAppDirs();
+    const key = appDataDirs.join('\0');
     const portfolio = getPortfolio(appDataDirs);
-    return pack(portfolio);
+    const sig = `${portfolio.activeSwarms}|${portfolio.totalCostUsd}|${portfolio.totalTokens}|${portfolio.urgentCount}|${portfolio.urgentTriage
+      .map((u) => `${u.swarmId}:${u.id}:${u.timestamp || 0}`)
+      .join(',')}|${portfolio.swarms
+      .map(
+        (s) =>
+          `${s.id}:${s.head}:${s.triageCount}:${s.blockedCount || 0}:${s.failureCount || 0}:${s.gateState || ''}:${s.archived ? 1 : 0}:${s.totalTokens}:${s.costUsd || 0}:${s.activeCount}:${s.lastActivityTs || 0}`,
+      )
+      .join(',')}`;
+    if (portfolioCache.packed && portfolioCache.key === key && portfolioCache.sig === sig) {
+      return portfolioCache.packed;
+    }
+    const packed = pack(portfolio);
+    portfolioCache = { key, sig, packed };
+    return packed;
   }
 
   function postTriageAck(body = {}) {
@@ -2290,6 +2302,21 @@ export async function createStandaloneRouter({
     const qIdx = rawUrl.indexOf('?');
     const pathname = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
     const search = qIdx === -1 ? '' : rawUrl.slice(qIdx);
+
+    if (
+      /[\0\\]|%00|%2e|%5c/i.test(pathname) ||
+      pathname.split(/\/|%2f/i).some((seg) => seg === '..' || seg === '.')
+    ) {
+      res.writeHead(400, { 'Content-Type': 'application/json', Connection: 'close', ...SECURITY_HEADERS });
+      res.end(JSON.stringify({ error: 'invalid path' }));
+      return;
+    }
+
+    if (pathname.startsWith('/api/') && !isLoopbackOrigin(req.headers.origin)) {
+      res.writeHead(403, { 'Content-Type': 'application/json', Connection: 'close', ...SECURITY_HEADERS });
+      res.end(JSON.stringify({ error: 'forbidden origin' }));
+      return;
+    }
 
     if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
       if (req.headers['if-none-match'] === assets.htmlEtag) {

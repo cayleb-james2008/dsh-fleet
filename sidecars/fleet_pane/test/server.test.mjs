@@ -1,16 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { registerHooks } from 'node:module';
 import net from 'node:net';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { startStandaloneServer } from '../main.mjs';
 import { createFleetHandlers, runSidecarApp } from '../server_core.mjs';
 import * as store from '../swarm_store.mjs';
+import * as gitProbe from '../git_probe.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, '..', '..', '..');
@@ -2741,6 +2742,465 @@ test('E3 HTTP & SidecarApp RPC: conversationId worktree discovery, swarmOwner, m
       hook?.deregister?.();
       delete globalThis.__FLEET_TEST_E3_RPC;
       delete globalThis.__FLEET_TEST_E3_COORD;
+    }
+  } finally {
+    await srv.close();
+    rmSync(baseDir, { recursive: true, force: true });
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test('H1 hardening (E1/E2): corrupt/BOM/truncated JSON recovery, sibling preservation, concurrent atomic writes, and 64-entry retention bounds', async () => {
+  const fx = setupFixtureAppData();
+  const swDir = join(fx.appData, 'brain', fx.coord, '.system_generated', 'swarm');
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+    sendMessageFn: async () => ({ ok: true }),
+  });
+
+  try {
+    const post = (path, body) =>
+      fetch(`${srv.url}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    // 1. UTF-8 BOM across members.json, plan.json, fleet_ops.json, and fleet_state.json parses cleanly
+    const BOM = '\uFEFF';
+    writeFileSync(
+      join(swDir, 'members.json'),
+      BOM +
+        JSON.stringify({
+          title: 'BOM Swarm',
+          members: {
+            coordinator: { conversation_id: fx.coord, role: 'coordinator', wake_mode: 'mentions' },
+            worker: { conversation_id: fx.worker, role: 'worker', wake_mode: 'mentions' },
+          },
+        }),
+    );
+    writeFileSync(join(swDir, 'plan.json'), BOM + JSON.stringify({ title: 'BOM Plan', goal: 'Recover cleanly' }));
+    writeFileSync(
+      join(swDir, 'fleet_ops.json'),
+      BOM +
+        JSON.stringify({
+          version: 1,
+          ops: [
+            { opId: 'op-bom-1', op: 'board_post', target: '#main', status: 'verified', payload: { text: 'ok' } },
+            { broken: true },
+            null,
+          ],
+        }),
+    );
+    writeFileSync(
+      join(swDir, 'fleet_state.json'),
+      BOM +
+        JSON.stringify({
+          pinnedSeqs: [1, 'bad', 3],
+          ackedTriage: { 'tri-1': { at: 1000, untilSeq: 5 } },
+          archived: false,
+          checkpoints: [
+            { id: 'ck-valid', label: 'Valid CK', createdAt: '2026-11-26T00:00:00.000Z', head: 1, costUsd: 0 },
+            { id: '', label: 'corrupt missing id' },
+            'truncated-entry',
+          ],
+        }),
+    );
+
+    const bomSwarm = await (await fetch(`${srv.url}/api/swarm?conversationId=${fx.coord}`)).json();
+    assert.equal(bomSwarm.title, 'BOM Swarm');
+    assert.equal(bomSwarm.plan?.title, 'BOM Plan');
+    assert.equal(bomSwarm.ops.length, 1);
+    assert.equal(bomSwarm.ops[0].opId, 'op-bom-1');
+    assert.deepEqual(bomSwarm.pinnedSeqs, [1, 3]);
+    const bomCk = await (await fetch(`${srv.url}/api/checkpoints?conversationId=${fx.coord}`)).json();
+    assert.equal(bomCk.checkpoints.length, 1);
+    assert.equal(bomCk.checkpoints[0].id, 'ck-valid');
+
+    // 2. Truncated/corrupt fleet_ops.json recovers to [] while preserving valid sibling fleet_state.json & plan.json
+    writeFileSync(join(swDir, 'fleet_ops.json'), '{"version":1,"ops":[{"opId":"op-trunc"');
+    const opsAfterTrunc = await (await fetch(`${srv.url}/api/ops?conversationId=${fx.coord}`)).json();
+    assert.deepEqual(opsAfterTrunc.ops, []);
+    const statePreserved = await (await fetch(`${srv.url}/api/checkpoints?conversationId=${fx.coord}`)).json();
+    assert.equal(statePreserved.checkpoints.length, 1);
+    assert.equal(statePreserved.checkpoints[0].id, 'ck-valid');
+
+    // 3. Truncated/corrupt fleet_state.json recovers safely while preserving valid sibling fleet_ops.json & plan.json
+    writeFileSync(
+      join(swDir, 'fleet_ops.json'),
+      JSON.stringify({ version: 1, ops: [{ opId: 'op-keep', op: 'board_post', target: '#main', status: 'verified' }] }),
+    );
+    writeFileSync(join(swDir, 'fleet_state.json'), '{"pinnedSeqs":[1,2\0\0');
+    const swarmAfterCorruptState = await (await fetch(`${srv.url}/api/swarm?conversationId=${fx.coord}`)).json();
+    assert.deepEqual(swarmAfterCorruptState.pinnedSeqs, []);
+    assert.equal(swarmAfterCorruptState.ops.length, 1);
+    assert.equal(swarmAfterCorruptState.ops[0].opId, 'op-keep');
+    assert.equal(swarmAfterCorruptState.plan?.title, 'BOM Plan');
+
+    // Oversized fleet_ops.json (> 512 KiB) falls back safely
+    writeFileSync(join(swDir, 'fleet_ops.json'), '{"version":1,"ops":[' + ' '.repeat(600 * 1024) + ']}');
+    const opsOversize = await (await fetch(`${srv.url}/api/ops?conversationId=${fx.coord}`)).json();
+    assert.deepEqual(opsOversize.ops, []);
+
+    // 4. Rapid concurrent writes across pins, acks, checkpoints, and ops -> atomic tmp+rename, zero .tmp leftovers, bounded 64-entry retention
+    writeFileSync(join(swDir, 'fleet_ops.json'), JSON.stringify({ version: 1, ops: [] }));
+    writeFileSync(join(swDir, 'fleet_state.json'), JSON.stringify({ pinnedSeqs: [], ackedTriage: {}, archived: false, checkpoints: [] }));
+
+    const concurrentStateWrites = [];
+    for (let i = 1; i <= 70; i++) {
+      concurrentStateWrites.push(post('/api/pins', { confirm: true, conversationId: fx.coord, seq: i, pinned: true }));
+      concurrentStateWrites.push(
+        post('/api/triage/ack', { confirm: true, conversationId: fx.coord, triageId: `triage-${i}`, action: 'ack' }),
+      );
+      concurrentStateWrites.push(
+        post('/api/checkpoints', { confirm: true, conversationId: fx.coord, label: `ck-${i}` }),
+      );
+    }
+    const stateResults = await Promise.all(concurrentStateWrites);
+    assert.equal(stateResults.every((r) => r.status === 200), true);
+
+    const concurrentCtrlWrites = [];
+    for (let i = 1; i <= 70; i++) {
+      concurrentCtrlWrites.push(
+        post('/api/control', {
+          confirm: true,
+          conversationId: fx.coord,
+          op: 'board_post',
+          text: `concurrent post ${i}`,
+          clientOpId: `c-${i}`,
+        }),
+      );
+    }
+    const ctrlResults = await Promise.all(concurrentCtrlWrites);
+    assert.equal(ctrlResults.every((r) => r.status === 200), true);
+
+    const finalOps = await (await fetch(`${srv.url}/api/ops?conversationId=${fx.coord}`)).json();
+    assert.equal(finalOps.ops.length, 64);
+    const finalCheckpoints = await (await fetch(`${srv.url}/api/checkpoints?conversationId=${fx.coord}`)).json();
+    assert.equal(finalCheckpoints.checkpoints.length, 64);
+
+    // Verify no leftover .tmp files in swarm dir and valid JSON on disk
+    const swarmFiles = readdirSync(swDir);
+    assert.equal(swarmFiles.some((f) => f.includes('.tmp.')), false);
+    const diskState = JSON.parse(await (await import('node:fs/promises')).readFile(join(swDir, 'fleet_state.json'), 'utf8'));
+    assert.equal(diskState.checkpoints.length, 64);
+    assert.equal(diskState.pinnedSeqs.length, 70);
+  } finally {
+    await srv.close();
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test('H1 hardening (E2): multi-swarm portfolio cache reuse, CWE-59 symlinked swarm/transcript exclusion, and bounded activity tail', async () => {
+  const dir = makeScratchDir('http-portfolio-h1-');
+  const distDir = join(dir, 'dist');
+  const appData = join(dir, 'appdata');
+  const outsideDir = join(dir, 'outside');
+  mkdirSync(distDir, { recursive: true });
+  mkdirSync(join(appData, 'brain'), { recursive: true });
+  mkdirSync(outsideDir, { recursive: true });
+  writeFileSync(join(distDir, 'index.html'), '<html><body>Fleet</body></html>');
+  writeFileSync(join(outsideDir, 'secret-transcript.jsonl'), JSON.stringify({ step_index: 0, type: 'ERROR_MESSAGE', error: 'LEAKED_OUTSIDE' }) + '\n');
+  const outsideSwarmDir = join(outsideDir, 'evil-swarm', '.system_generated', 'swarm');
+  mkdirSync(outsideSwarmDir, { recursive: true });
+  writeFileSync(
+    join(outsideSwarmDir, 'members.json'),
+    JSON.stringify({ title: 'Evil Symlink Swarm', members: { coordinator: { conversation_id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', role: 'coordinator' } } }),
+  );
+
+  let firstId = '';
+  for (let i = 1; i <= 18; i++) {
+    const hex = i.toString(16).padStart(4, '0');
+    const cid = `11111111-1111-4111-8111-${hex}00000000`;
+    const wid = `22222222-2222-4222-8222-${hex}00000000`;
+    if (!firstId) firstId = cid;
+    const swDir = join(appData, 'brain', cid, '.system_generated', 'swarm');
+    const wLogs = join(appData, 'brain', wid, '.system_generated', 'logs');
+    mkdirSync(swDir, { recursive: true });
+    mkdirSync(wLogs, { recursive: true });
+    writeFileSync(
+      join(swDir, 'members.json'),
+      JSON.stringify({
+        title: `Portfolio Swarm ${i}`,
+        members: {
+          coordinator: { conversation_id: cid, role: 'coordinator', wake_mode: 'mentions' },
+          worker: { conversation_id: wid, role: 'worker', model: 'gemini-3-pro', wake_mode: 'mentions' },
+        },
+      }),
+    );
+    writeFileSync(join(swDir, 'plan.json'), JSON.stringify({ title: `Plan ${i}`, goal: 'Scale test', repo: '/tmp/nonexistent' }));
+    writeFileSync(join(swDir, 'board.jsonl'), JSON.stringify({ seq: 1, agent: 'worker', text: `[blocked] Need review ${i}` }) + '\n');
+    if (i === 1) {
+      // Symlinked transcript.jsonl on swarm 1 -> must NOT leak outside contents via activityTail
+      symlinkSync(join(outsideDir, 'secret-transcript.jsonl'), join(wLogs, 'transcript.jsonl'));
+    } else {
+      writeFileSync(
+        join(wLogs, 'transcript.jsonl'),
+        JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', model: 'gemini-3-pro', input_tokens: 1000, output_tokens: 100 }) + '\n',
+      );
+    }
+  }
+  // Symlinked swarm directory inside brain/ -> must be excluded from scanSwarmIds/portfolio
+  symlinkSync(join(outsideDir, 'evil-swarm'), join(appData, 'brain', 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'));
+
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir,
+    appDataDir: appData,
+    defaultConversationId: firstId,
+  });
+
+  try {
+    const p1Res = await fetch(`${srv.url}/api/portfolio`);
+    assert.equal(p1Res.status, 200);
+    const p1Etag = p1Res.headers.get('etag');
+    const p1 = await p1Res.json();
+    assert.equal(p1.swarms.length, 18);
+    assert.equal(p1.activeSwarms, 18);
+    assert.equal(p1.swarms.some((s) => s.title === 'Evil Symlink Swarm'), false);
+
+    // Repeat portfolio fetch hits portfolioCache + summaryMetaCache (with plan.json statKey!) and honors ETag 304
+    const p2Res = await fetch(`${srv.url}/api/portfolio`, { headers: { 'If-None-Match': p1Etag } });
+    assert.equal(p2Res.status, 304);
+
+    // Symlinked transcript.jsonl on swarm 1 must not expose outside content in activityPeek
+    const sw1 = await (await fetch(`${srv.url}/api/swarm?conversationId=${firstId}`)).json();
+    const w1 = sw1.members.find((m) => m.name === 'worker');
+    assert.equal(w1?.activityPeek, null);
+    assert.equal(JSON.stringify(sw1).includes('LEAKED_OUTSIDE'), false);
+  } finally {
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('H1 hardening (E3 & security): git_probe timeouts, unborn repo, detached HEAD, missing branch, Unicode paths, symlinked .git, and strict Host/Origin/traversal 400/403', async () => {
+  const fx = setupFixtureAppData();
+  const baseDir = makeScratchDir('http-h1-git-sec-');
+  const unbornRepo = join(baseDir, 'repo-unborn');
+  const unicodeRepo = join(baseDir, 'repo-café');
+  const unicodeWt = join(baseDir, 'wt-données');
+  const detachedWt = join(baseDir, 'wt-detached');
+  const outsideGitDir = join(baseDir, 'outside-git');
+  const symGitRepo = join(baseDir, 'repo-sym-git');
+  const symWt = join(baseDir, 'sym-wt');
+
+  const git = (cwd, args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }).trim();
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+  });
+
+  try {
+    // 1. Strict Host-403, Origin-403 (GET & POST), and path-traversal 400 rejections
+    const sendRawHttp = (rawReq) =>
+      new Promise((resolve, reject) => {
+        const sock = net.connect(srv.port, '127.0.0.1', () => sock.write(rawReq));
+        const chunks = [];
+        sock.on('data', (c) => chunks.push(c));
+        sock.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        sock.on('error', reject);
+      });
+
+    for (const badHost of [
+      '127.0.0.1:80.evil.com',
+      'localhost:80@evil.com',
+      '[::1]evil:8080',
+      'localhost:99999',
+      'localhost:0',
+    ]) {
+      const resp = await sendRawHttp(`GET /api/health HTTP/1.1\r\nHost: ${badHost}\r\nConnection: close\r\n\r\n`);
+      assert.ok(resp.startsWith('HTTP/1.1 403'), `Expected 403 for Host ${badHost}, got: ${resp.split('\r\n')[0]}`);
+    }
+    const noHostResp = await sendRawHttp('GET /api/health HTTP/1.0\r\nConnection: close\r\n\r\n');
+    assert.ok(noHostResp.startsWith('HTTP/1.1 403'));
+
+    for (const badOrigin of [
+      'https://evil.example',
+      'http://localhost/evil',
+      `ftp://localhost:${srv.port}`,
+      `http://user@localhost:${srv.port}`,
+      'null',
+      '',
+    ]) {
+      const getRes = await fetch(`${srv.url}/api/swarm?conversationId=${fx.coord}`, { headers: { Origin: badOrigin } });
+      assert.equal(getRes.status, 403, `Expected GET 403 for Origin ${JSON.stringify(badOrigin)}`);
+      const postRes = await fetch(`${srv.url}/api/pins`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: badOrigin },
+        body: JSON.stringify({ confirm: true, conversationId: fx.coord, seq: 1, pinned: true }),
+      });
+      assert.equal(postRes.status, 403, `Expected POST 403 for Origin ${JSON.stringify(badOrigin)}`);
+    }
+
+    const okOriginRes = await fetch(`${srv.url}/api/health`, { headers: { Origin: `http://127.0.0.1:${srv.port}` } });
+    assert.equal(okOriginRes.status, 200);
+
+    for (const badPath of ['/api/../../etc/passwd', '/fonts/../index.html', '/api/health%00', '/api/swarm%2f..%2fetc']) {
+      const travResp = await sendRawHttp(`GET ${badPath} HTTP/1.1\r\nHost: 127.0.0.1:${srv.port}\r\nConnection: close\r\n\r\n`);
+      assert.ok(travResp.startsWith('HTTP/1.1 400'), `Expected 400 for path ${badPath}, got: ${travResp.split('\r\n')[0]}`);
+    }
+
+    // 2. Unborn repository (0 commits)
+    mkdirSync(unbornRepo, { recursive: true });
+    git(unbornRepo, ['init', '-b', 'main']);
+    git(unbornRepo, ['config', 'user.email', 'test@example.com']);
+    git(unbornRepo, ['config', 'user.name', 'Test']);
+    writeFileSync(join(unbornRepo, 'staged.txt'), 'staged content\n');
+    git(unbornRepo, ['add', 'staged.txt']);
+    writeFileSync(join(unbornRepo, 'untracked.txt'), 'untracked content\n');
+
+    const unbornWts = await (await fetch(`${srv.url}/api/worktrees?roots=${encodeURIComponent(unbornRepo)}`)).json();
+    assert.equal(unbornWts.roots[0].isGit, true);
+    assert.equal(unbornWts.worktrees.length, 1);
+    assert.equal(unbornWts.worktrees[0].unborn, true);
+    assert.equal(unbornWts.worktrees[0].head, '');
+    assert.equal(unbornWts.worktrees[0].clean, false);
+
+    const unbornStagedDiff = await fetch(
+      `${srv.url}/api/worktrees/diff?path=${encodeURIComponent(unbornRepo)}&file=staged.txt&mode=working`,
+    );
+    assert.equal(unbornStagedDiff.status, 200);
+    assert.ok((await unbornStagedDiff.json()).diff.includes('+staged content'));
+
+    const unbornUntrackedDiff = await fetch(
+      `${srv.url}/api/worktrees/diff?path=${encodeURIComponent(unbornRepo)}&file=untracked.txt&mode=working`,
+    );
+    assert.equal(unbornUntrackedDiff.status, 200);
+    assert.ok((await unbornUntrackedDiff.json()).diff.includes('+untracked content'));
+
+    const unbornBranchDiff = await fetch(
+      `${srv.url}/api/worktrees/diff?path=${encodeURIComponent(unbornRepo)}&file=staged.txt&mode=branch`,
+    );
+    assert.equal(unbornBranchDiff.status, 400);
+
+    const unbornCk = await (
+      await fetch(`${srv.url}/api/checkpoints`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true, conversationId: fx.coord, label: 'Unborn CK', roots: [unbornRepo] }),
+      })
+    ).json();
+    assert.equal(unbornCk.ok, true);
+    assert.equal(unbornCk.checkpoint.worktrees[0].head, '');
+
+    // 3. Unicode paths, file:// URI, detached HEAD, missing branch, and multi-byte UTF-8 pagination
+    mkdirSync(join(unicodeRepo, 'src'), { recursive: true });
+    git(unicodeRepo, ['init', '-b', 'main']);
+    git(unicodeRepo, ['config', 'user.email', 'test@example.com']);
+    git(unicodeRepo, ['config', 'user.name', 'Test']);
+    writeFileSync(join(unicodeRepo, 'src', 'données-🚀.txt'), 'init café 🚀\n');
+    git(unicodeRepo, ['add', '.']);
+    git(unicodeRepo, ['commit', '-m', 'Init unicode']);
+
+    git(unicodeRepo, ['worktree', 'add', '-b', 'feat/unicode', unicodeWt]);
+    const uniPayload = Array.from({ length: 80 }, (_, i) => `ligne-${i}-café-données-🚀`).join('\n') + '\n';
+    writeFileSync(join(unicodeWt, 'src', 'données-🚀.txt'), uniPayload);
+    git(unicodeWt, ['commit', '-am', 'Unicode diff']);
+
+    git(unicodeRepo, ['worktree', 'add', '--detach', detachedWt]);
+    writeFileSync(join(detachedWt, 'src', 'données-🚀.txt'), 'detached conflict 🚀\n');
+    git(detachedWt, ['commit', '-am', 'Detached change']);
+
+    const uniUri = pathToFileURL(unicodeRepo).href;
+    const uniProbe = await (await fetch(`${srv.url}/api/worktrees?roots=${encodeURIComponent(uniUri)}`)).json();
+    assert.equal(uniProbe.worktrees.length, 3);
+    const detInfo = uniProbe.worktrees.find((w) => w.detached);
+    assert.equal(detInfo?.mergeability, 'detached');
+    assert.equal(detInfo?.landStatus, 'detached');
+
+    // Detached worktree blocks merge/rebase with 400 detached, but supports mode=conflict diff
+    const detAct = await fetch(`${srv.url}/api/worktrees/action`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'ff_merge', path: detachedWt }),
+    });
+    assert.equal(detAct.status, 400);
+    assert.equal((await detAct.json()).status, 'detached');
+
+    // Missing branch -> 404
+    const missBrDiff = await fetch(
+      `${srv.url}/api/worktrees/diff?path=${encodeURIComponent(unicodeWt)}&file=${encodeURIComponent('src/données-🚀.txt')}&mode=branch&targetBranch=no-such-branch`,
+    );
+    assert.equal(missBrDiff.status, 404);
+
+    // Unicode file diff pagination without \303 octal escaping or split UTF-8 replacement chars
+    const uniDiff1 = await (
+      await fetch(
+        `${srv.url}/api/worktrees/diff?path=${encodeURIComponent(unicodeWt)}&file=${encodeURIComponent('src/données-🚀.txt')}&mode=branch&maxBytes=512`,
+      )
+    ).json();
+    assert.equal(uniDiff1.ok, true);
+    assert.equal(uniDiff1.hasMore, true);
+    assert.ok(uniDiff1.diff.includes('données-🚀.txt'));
+    assert.equal(uniDiff1.diff.includes('\uFFFD'), false);
+
+    // 4. Symlinked .git & symlinked worktree dir CWE-59 rejection
+    mkdirSync(outsideGitDir, { recursive: true });
+    git(outsideGitDir, ['init', '-b', 'main']);
+    mkdirSync(symGitRepo, { recursive: true });
+    symlinkSync(join(outsideGitDir, '.git'), join(symGitRepo, '.git'));
+    symlinkSync(unicodeWt, symWt);
+
+    const symProbe = await (
+      await fetch(`${srv.url}/api/worktrees?roots=${encodeURIComponent(`${symGitRepo},${symWt}`)}`)
+    ).json();
+    assert.equal(symProbe.worktrees.length, 0);
+    assert.equal(symProbe.rejected.length, 2);
+
+    const symGitDiff = await fetch(
+      `${srv.url}/api/worktrees/diff?path=${encodeURIComponent(symGitRepo)}&file=README.md`,
+    );
+    assert.equal(symGitDiff.status, 404);
+    const symGitDiffWithRoot = await fetch(
+      `${srv.url}/api/worktrees/diff?root=${encodeURIComponent(symGitRepo)}&path=${encodeURIComponent(symGitRepo)}&file=README.md`,
+    );
+    assert.equal(symGitDiffWithRoot.status, 404);
+
+    const symCk = await (
+      await fetch(`${srv.url}/api/checkpoints`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true, conversationId: fx.coord, label: 'Sym CK', roots: [symGitRepo] }),
+      })
+    ).json();
+    assert.ok(symCk.rejectedRoots.includes(symGitRepo));
+
+    // file:// URL traversal rejections
+    assert.equal(gitProbe.normalizeWorkspaceRoot('file:///tmp/%2e%2e/etc'), null);
+    assert.equal(gitProbe.normalizeWorkspaceRoot('file:///tmp/a%00b'), null);
+    assert.equal(gitProbe.normalizeWorkspaceRoot('file:///tmp/a%5cb'), null);
+
+    // 5. Real git command timeout handling via temporary slow git shim (SIGKILL + 504)
+    const binDir = join(baseDir, 'slow-bin');
+    mkdirSync(binDir, { recursive: true });
+    const shimPath = join(binDir, 'git');
+    writeFileSync(shimPath, '#!/bin/sh\nsleep 2\n');
+    chmodSync(shimPath, 0o755);
+    const origPath = process.env.PATH || '';
+    process.env.PATH = `${binDir}:${origPath}`;
+    try {
+      gitProbe.invalidateWorktreeCache();
+      const timedOutProbe = await gitProbe.probeWorktrees([unicodeRepo], { ttlMs: 0, timeoutMs: 40 });
+      assert.equal(timedOutProbe.roots[0].isGit, false);
+      assert.match(timedOutProbe.roots[0].error, /timed out/i);
+
+      const timedOutDiff = await gitProbe.probeWorktreeDiff({
+        path: unicodeWt,
+        file: 'src/données-🚀.txt',
+        mode: 'working',
+        timeoutMs: 40,
+      });
+      assert.equal(timedOutDiff.ok, false);
+      assert.equal(timedOutDiff.status, 504);
+    } finally {
+      process.env.PATH = origPath;
+      gitProbe.invalidateWorktreeCache();
     }
   } finally {
     await srv.close();
