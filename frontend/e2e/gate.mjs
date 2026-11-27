@@ -959,11 +959,16 @@ await runChecks("gate", async (check) => {
     const preTxt = await page.locator("#panel-worktrees pre").textContent();
     if (!preTxt.includes("(untracked)") || !preTxt.includes("+")) return false;
 
-    // E2 Gap #2 verification: collisions banner, branchFiles/working toggle, dry_run_merge & rebase conflict feedback
+    // E2/E3 verification: collisions banner, swarmOwner, branchFiles/working/conflict diff + pagination, squash_merge/merge_commit & @owner routing
     const wtPage = await newMockPage();
     const wtErrors = [];
     const diffModesSeen = [];
+    const diffOffsetsSeen = [];
     const actionsSeen = [];
+    const actionBodies = [];
+    const controlPosts = [];
+    let wtConvSeen = "";
+    let diffFetchCount = 0;
     let expect409 = false;
     wtPage.on("pageerror", (err) => wtErrors.push(err.message));
     wtPage.on("console", (msg) => {
@@ -973,224 +978,207 @@ await runChecks("gate", async (check) => {
       }
     });
 
-    await wtPage.route(/\/api\/worktrees(\?.*)?$/, async (route) => {
+    await wtPage.route(/\/api\/swarm(\?.*)?$/, async (route) => {
       await route.fulfill({
         status: 200,
         contentType: "application/json",
         body: JSON.stringify({
-          roots: [{ path: "/mock/repo", uri: "file:///mock/repo", isGit: true, count: 3, error: "" }],
-          collisions: [
+          conversationId: "e3-wt-swarm",
+          swarm: "e3-wt-swarm",
+          member: "coordinator",
+          etag: "e3-wt-v1",
+          id: "e3-wt-swarm",
+          title: "E3 Worktrees Gate",
+          head: 1,
+          members: [
             {
-              file: "src/shared.ts",
-              worktrees: ["/mock/alpha", "/mock/beta"],
-              branches: ["feat/alpha", "feat/beta"],
-              kind: "mixed",
+              name: "coordinator",
+              conversation_id: "e3-wt-swarm",
+              model: "gemini-3-pro",
+              role: "coordinator",
+              wake_mode: "mentions",
+              wait_since: 1,
+              last_read_seq: 1,
+              unread: 0,
+              killed: false,
+              status: "waiting",
+              steps: 1,
+              activity: "",
+              activityKind: "",
+              replied: false,
+              replyAsk: "",
+              narrator: false,
+              roleWorker: false,
+              failure: null,
+              transcriptMtime: Date.now(),
+              startedAt: new Date().toISOString(),
+              lastStepAt: new Date().toISOString(),
+              usage: { inputTokens: 100, cacheReadTokens: 0, outputTokens: 20, totalTokens: 120 },
+              posts: 1,
+              lastPostSeq: 1,
+              lastPostTime: "12:00:00",
+              lastPostTs: Date.now(),
             },
           ],
-          worktrees: [
-            {
-              id: "m-main",
-              root: "/mock/repo",
-              name: "repo",
-              path: "/mock/repo",
-              uri: "file:///mock/repo",
-              isMain: true,
-              exists: true,
-              bare: false,
-              detached: false,
-              locked: false,
-              prunable: false,
-              branch: "main",
-              head: "1111aaa",
-              clean: true,
-              landStatus: "main",
-              mergeability: "main",
-              dirtyFiles: 0,
-              untrackedFiles: 0,
-              stagedFiles: 0,
-              commits: [{ sha: "1111aaa", subject: "chore: root commit", authorTime: "10m ago" }],
-              lastCommitSha: "1111aaa",
-              lastCommitSubject: "chore: root commit",
-              lastCommitAt: Date.now(),
-            },
-            {
-              id: "m-alpha",
-              root: "/mock/repo",
-              name: "alpha",
-              path: "/mock/alpha",
-              uri: "file:///mock/alpha",
-              isMain: false,
-              exists: true,
-              bare: false,
-              detached: false,
-              locked: false,
-              prunable: false,
-              branch: "feat/alpha",
-              head: "2222bbb",
-              clean: true,
-              baseBranch: "main",
-              ahead: 1,
-              behind: 0,
-              landStatus: "ready",
-              mergeability: "clean",
-              dirtyFiles: 0,
-              untrackedFiles: 0,
-              stagedFiles: 0,
-              files: [],
-              branchFiles: ["src/shared.ts", "src/alpha.ts"],
-              commits: [{ sha: "2222bbb", subject: "feat: alpha lane", authorTime: "2m ago" }],
-              lastCommitSha: "2222bbb",
-              lastCommitSubject: "feat: alpha lane",
-              lastCommitAt: Date.now(),
-            },
-            {
-              id: "m-beta",
-              root: "/mock/repo",
-              name: "beta",
-              path: "/mock/beta",
-              uri: "file:///mock/beta",
-              isMain: false,
-              exists: true,
-              bare: false,
-              detached: false,
-              locked: false,
-              prunable: false,
-              branch: "feat/beta",
-              head: "3333ccc",
-              clean: false,
-              baseBranch: "main",
-              ahead: 1,
-              behind: 1,
-              landStatus: "dirty",
-              mergeability: "conflict",
-              conflictFiles: ["src/shared.ts"],
-              dirtyFiles: 1,
-              untrackedFiles: 0,
-              stagedFiles: 0,
-              files: [{ path: "src/shared.ts", state: "M", uri: "file:///mock/beta/src/shared.ts" }],
-              branchFiles: ["src/shared.ts"],
-              commits: [{ sha: "3333ccc", subject: "feat: beta lane", authorTime: "1m ago" }],
-              lastCommitSha: "3333ccc",
-              lastCommitSubject: "feat: beta lane",
-              lastCommitAt: Date.now(),
-            },
-          ],
-          rejected: [],
+          messages: [{ seq: 1, agent: "coordinator", text: "@all E3 worktree check", time: "12:00:00", ts: Date.now(), mentions: [], all: true }],
+          edges: [],
+          triage: [],
+          usage: { inputTokens: 100, cacheReadTokens: 0, outputTokens: 20, totalTokens: 120 },
+          capabilities: { canSendMessage: true, isSidecar: false, sseStream: false, deltaStream: false },
         }),
       });
     });
 
-    await wtPage.route("**/api/worktrees?*", async (route) => {
+    await wtPage.route("**/api/control", async (route) => {
+      const body = JSON.parse(route.request().postData() || "{}");
+      controlPosts.push(body);
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify({
-          roots: [{ path: "/mock/repo", uri: "file:///mock/repo", isGit: true, count: 3, error: "" }],
-          collisions: [
-            {
-              file: "src/shared.ts",
-              worktrees: ["/mock/alpha", "/mock/beta"],
-              branches: ["feat/alpha", "feat/beta"],
-              kind: "mixed",
-            },
-          ],
-          worktrees: [
-            {
-              id: "m-main",
-              root: "/mock/repo",
-              name: "repo",
-              path: "/mock/repo",
-              uri: "file:///mock/repo",
-              isMain: true,
-              exists: true,
-              bare: false,
-              detached: false,
-              locked: false,
-              prunable: false,
-              branch: "main",
-              head: "1111aaa",
-              clean: true,
-              landStatus: "main",
-              mergeability: "main",
-              dirtyFiles: 0,
-              untrackedFiles: 0,
-              stagedFiles: 0,
-              commits: [{ sha: "1111aaa", subject: "chore: root commit", authorTime: "10m ago" }],
-              lastCommitSha: "1111aaa",
-              lastCommitSubject: "chore: root commit",
-              lastCommitAt: Date.now(),
-            },
-            {
-              id: "m-alpha",
-              root: "/mock/repo",
-              name: "alpha",
-              path: "/mock/alpha",
-              uri: "file:///mock/alpha",
-              isMain: false,
-              exists: true,
-              bare: false,
-              detached: false,
-              locked: false,
-              prunable: false,
-              branch: "feat/alpha",
-              head: "2222bbb",
-              clean: true,
-              baseBranch: "main",
-              ahead: 1,
-              behind: 0,
-              landStatus: "ready",
-              mergeability: "clean",
-              dirtyFiles: 0,
-              untrackedFiles: 0,
-              stagedFiles: 0,
-              files: [],
-              branchFiles: ["src/shared.ts", "src/alpha.ts"],
-              commits: [{ sha: "2222bbb", subject: "feat: alpha lane", authorTime: "2m ago" }],
-              lastCommitSha: "2222bbb",
-              lastCommitSubject: "feat: alpha lane",
-              lastCommitAt: Date.now(),
-            },
-            {
-              id: "m-beta",
-              root: "/mock/repo",
-              name: "beta",
-              path: "/mock/beta",
-              uri: "file:///mock/beta",
-              isMain: false,
-              exists: true,
-              bare: false,
-              detached: false,
-              locked: false,
-              prunable: false,
-              branch: "feat/beta",
-              head: "3333ccc",
-              clean: false,
-              baseBranch: "main",
-              ahead: 1,
-              behind: 1,
-              landStatus: "dirty",
-              mergeability: "conflict",
-              conflictFiles: ["src/shared.ts"],
-              dirtyFiles: 1,
-              untrackedFiles: 0,
-              stagedFiles: 0,
-              files: [{ path: "src/shared.ts", state: "M", uri: "file:///mock/beta/src/shared.ts" }],
-              branchFiles: ["src/shared.ts"],
-              commits: [{ sha: "3333ccc", subject: "feat: beta lane", authorTime: "1m ago" }],
-              lastCommitSha: "3333ccc",
-              lastCommitSubject: "feat: beta lane",
-              lastCommitAt: Date.now(),
-            },
-          ],
-          rejected: [],
-        }),
+        body: JSON.stringify({ ok: true, op: body.op, opId: "op-wt-1", status: "dispatched", coordinatorState: { status: "waiting" } }),
       });
+    });
+
+    const mockWorktreesBody = JSON.stringify({
+      roots: [{ path: "/mock/repo", uri: "file:///mock/repo", isGit: true, count: 3, error: "" }],
+      collisions: [
+        {
+          file: "src/shared.ts",
+          worktrees: ["/mock/alpha", "/mock/beta"],
+          branches: ["feat/alpha", "feat/beta"],
+          kind: "mixed",
+        },
+      ],
+      worktrees: [
+        {
+          id: "m-main",
+          root: "/mock/repo",
+          name: "repo",
+          path: "/mock/repo",
+          uri: "file:///mock/repo",
+          isMain: true,
+          exists: true,
+          bare: false,
+          detached: false,
+          locked: false,
+          prunable: false,
+          branch: "main",
+          head: "1111aaa",
+          clean: true,
+          landStatus: "main",
+          mergeability: "main",
+          dirtyFiles: 0,
+          untrackedFiles: 0,
+          stagedFiles: 0,
+          commits: [{ sha: "1111aaa", subject: "chore: root commit", authorTime: "10m ago" }],
+          lastCommitSha: "1111aaa",
+          lastCommitSubject: "chore: root commit",
+          lastCommitAt: Date.now(),
+        },
+        {
+          id: "m-alpha",
+          root: "/mock/repo",
+          name: "alpha",
+          path: "/mock/alpha",
+          uri: "file:///mock/alpha",
+          isMain: false,
+          exists: true,
+          bare: false,
+          detached: false,
+          locked: false,
+          prunable: false,
+          branch: "feat/alpha",
+          head: "2222bbb",
+          clean: true,
+          baseBranch: "main",
+          ahead: 1,
+          behind: 0,
+          landStatus: "ready",
+          mergeability: "clean",
+          swarmOwner: { member: "alpha-dev", status: "waiting", workspaceMode: "share" },
+          dirtyFiles: 0,
+          untrackedFiles: 0,
+          stagedFiles: 0,
+          files: [],
+          branchFiles: ["src/shared.ts", "src/alpha.ts"],
+          commits: [{ sha: "2222bbb", subject: "feat: alpha lane", authorTime: "2m ago" }],
+          lastCommitSha: "2222bbb",
+          lastCommitSubject: "feat: alpha lane",
+          lastCommitAt: Date.now(),
+        },
+        {
+          id: "m-beta",
+          root: "/mock/repo",
+          name: "beta",
+          path: "/mock/beta",
+          uri: "file:///mock/beta",
+          isMain: false,
+          exists: true,
+          bare: false,
+          detached: false,
+          locked: false,
+          prunable: false,
+          branch: "feat/beta",
+          head: "3333ccc",
+          clean: false,
+          baseBranch: "main",
+          ahead: 1,
+          behind: 1,
+          landStatus: "dirty",
+          mergeability: "conflict",
+          conflictFiles: ["src/shared.ts"],
+          swarmOwner: { member: "beta-dev", status: "working", workspaceMode: "branch" },
+          dirtyFiles: 1,
+          untrackedFiles: 0,
+          stagedFiles: 0,
+          files: [{ path: "src/shared.ts", state: "M", uri: "file:///mock/beta/src/shared.ts" }],
+          branchFiles: ["src/shared.ts"],
+          commits: [{ sha: "3333ccc", subject: "feat: beta lane", authorTime: "1m ago" }],
+          lastCommitSha: "3333ccc",
+          lastCommitSubject: "feat: beta lane",
+          lastCommitAt: Date.now(),
+        },
+      ],
+      rejected: [],
+    });
+
+    await wtPage.route(/\/api\/worktrees(\?.*)?$/, async (route) => {
+      const reqUrl = new URL(route.request().url());
+      wtConvSeen = reqUrl.searchParams.get("conversationId") || wtConvSeen;
+      await route.fulfill({ status: 200, contentType: "application/json", body: mockWorktreesBody });
     });
 
     await wtPage.route(/\/api\/worktrees\/diff(\?.*)?$/, async (route) => {
       const reqUrl = new URL(route.request().url());
       const mode = reqUrl.searchParams.get("mode") || "working";
+      const offset = Number(reqUrl.searchParams.get("offset") || 0);
       diffModesSeen.push(mode);
+      diffOffsetsSeen.push(offset);
+      diffFetchCount += 1;
+      if (mode === "conflict") {
+        const isSecond = offset >= 32768;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            ok: true,
+            worktree: reqUrl.searchParams.get("worktree") || "/mock/beta",
+            file: reqUrl.searchParams.get("file") || "src/shared.ts",
+            mode: "conflict",
+            targetBranch: reqUrl.searchParams.get("targetBranch") || "main",
+            diff: isSecond ? "@@ -40 +40 @@\n+export const secondConflictChunk = true;" : "@@ -1 +1 @@\n+<<<<<<< HEAD\n+export const ours = 1;\n+=======\n+export const theirs = 2;\n+>>>>>>> feat/beta",
+            offset,
+            nextOffset: isSecond ? null : 32768,
+            hasMore: !isSecond,
+            totalBytes: 49152,
+            truncated: !isSecond,
+            untracked: false,
+            added: isSecond ? 1 : 5,
+            removed: 0,
+          }),
+        });
+        return;
+      }
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -1200,6 +1188,10 @@ await runChecks("gate", async (check) => {
           file: reqUrl.searchParams.get("file") || "src/shared.ts",
           mode,
           diff: mode === "branch" ? "@@ -1 +1 @@\n+export const committed = true;" : "@@ -1 +1 @@\n+export const dirty = true;",
+          offset: 0,
+          nextOffset: null,
+          hasMore: false,
+          totalBytes: 36,
           truncated: false,
           untracked: false,
           added: 1,
@@ -1211,6 +1203,7 @@ await runChecks("gate", async (check) => {
     await wtPage.route(/\/api\/worktrees\/action(\?.*)?$/, async (route) => {
       const body = JSON.parse(route.request().postData() || "{}");
       actionsSeen.push(body.action);
+      actionBodies.push(body);
       if (body.action === "dry_run_merge") {
         await route.fulfill({
           status: 200,
@@ -1220,7 +1213,36 @@ await runChecks("gate", async (check) => {
             action: "dry_run_merge",
             status: "conflict",
             conflicts: ["src/shared.ts"],
+            conflictFiles: ["src/shared.ts"],
             message: "Dry-run merge conflict in src/shared.ts",
+          }),
+        });
+        return;
+      }
+      if (body.action === "squash_merge") {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            ok: true,
+            action: "squash_merge",
+            status: "merged",
+            message: "Squash-merged feat/alpha into main",
+          }),
+        });
+        return;
+      }
+      if (body.action === "merge_commit") {
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: JSON.stringify({
+            ok: false,
+            action: "merge_commit",
+            status: "conflict",
+            aborted: true,
+            conflictFiles: ["src/shared.ts"],
+            message: "Merge commit aborted on src/shared.ts conflict",
           }),
         });
         return;
@@ -1247,21 +1269,51 @@ await runChecks("gate", async (check) => {
     await wtPage.waitForSelector('[data-testid="worktree-collisions-banner"]');
 
     const bannerTxt = await wtPage.locator('[data-testid="worktree-collisions-banner"]').textContent();
+    const alphaOwner = await wtPage.locator('[data-testid="wt-owner-feat/alpha"]').textContent();
+    const betaOwner = await wtPage.locator('[data-testid="wt-owner-feat/beta"]').textContent();
     const alphaMerge = await wtPage.locator('[data-testid="wt-mergeability-feat/alpha"]').textContent();
     const betaMerge = await wtPage.locator('[data-testid="wt-mergeability-feat/beta"]').textContent();
     const alphaBranchCount = await wtPage.locator('[data-testid="wt-branch-files-count-feat/alpha"]').textContent();
     const alphaCommits = await wtPage.locator('[data-testid="wt-commits-feat/alpha"]').textContent();
+
+    // Interactive conflictFiles -> mode=conflict hunk + Load next 32 KiB pagination
+    await wtPage.locator('[data-testid="wt-conflict-diff-btn-feat/beta-src/shared.ts"]').click();
+    await wtPage.waitForSelector('[data-testid="wt-card-feat/beta"] pre');
+    const conflictChunk1Txt = await wtPage.locator('[data-testid="wt-card-feat/beta"] pre').textContent();
+    await wtPage.locator('[data-testid="wt-diff-load-more-feat/beta"]').click();
+    await wtPage.waitForFunction(
+      () => (document.querySelector('[data-testid="wt-card-feat/beta"] pre')?.textContent || "").includes("secondConflictChunk"),
+    );
+    const conflictChunk2Txt = await wtPage.locator('[data-testid="wt-card-feat/beta"] pre').textContent();
 
     // Switch feat/beta to Branch Diff and open diff peek
     await wtPage.locator('[data-testid="wt-diff-mode-branch-feat/beta"]').click();
     await wtPage.locator('[data-testid="wt-card-feat/beta"] button[aria-label="Diff peek src/shared.ts"]').click();
     await wtPage.waitForSelector('[data-testid="wt-card-feat/beta"] pre');
     const branchPre = await wtPage.locator('[data-testid="wt-card-feat/beta"] pre').textContent();
+    const countBeforeAction = diffFetchCount;
 
-    // Dry-Run Merge conflict feedback
+    // Dry-Run Merge conflict feedback (must also clear stale diffByKey)
     await wtPage.locator('[data-testid="wt-action-dry-run-feat/beta"]').click();
     await wtPage.waitForSelector('[data-testid="wt-action-conflicts-feat/beta"]');
     const dryRunTxt = await wtPage.locator('[data-testid="wt-action-result-feat/beta"]').textContent();
+
+    // Re-open Branch Diff on feat/beta to confirm diffByKey was cleared after action
+    await wtPage.locator('[data-testid="wt-card-feat/beta"] button[aria-label="Diff peek src/shared.ts"]').click();
+    await wtPage.waitForSelector('[data-testid="wt-card-feat/beta"] pre');
+    const countAfterReopen = diffFetchCount;
+
+    // 1-click Send conflict to @beta-dev via /api/control
+    await wtPage.locator('[data-testid="wt-send-conflict-feat/beta"]').click();
+    await wtPage.waitForFunction(() => true);
+
+    // Squash Merge with custom commitMessage on feat/alpha
+    await wtPage.locator('[data-testid="wt-action-squash-merge-feat/alpha"]').click();
+    await wtPage.fill('[data-testid="wt-confirm-msg-feat/alpha"]', "feat: squash alpha lane");
+    await wtPage.locator('[data-testid="wt-confirm-submit-feat/alpha"]').click();
+    await wtPage.waitForFunction(
+      () => (document.querySelector('[data-testid="wt-action-result-feat/alpha"]')?.textContent || "").includes("Squash-merged feat/alpha"),
+    );
 
     // Rebase two-step confirmation & conflict feedback
     await wtPage.locator('[data-testid="wt-action-rebase-feat/beta"]').click();
@@ -1275,17 +1327,28 @@ await runChecks("gate", async (check) => {
     await wtPage.close();
 
     return (
+      wtConvSeen === "e3-wt-swarm" &&
+      alphaOwner === "@alpha-dev · waiting · share" &&
+      betaOwner === "@beta-dev · working · branch" &&
       Boolean(bannerTxt?.includes("src/shared.ts") && bannerTxt.includes("feat/alpha") && bannerTxt.includes("feat/beta")) &&
       alphaMerge === "Merge clean" &&
       betaMerge === "Merge conflict" &&
       Boolean(alphaBranchCount?.includes("2 branch files")) &&
       Boolean(alphaCommits?.includes("feat: alpha lane")) &&
+      diffModesSeen.includes("conflict") &&
       diffModesSeen.includes("branch") &&
+      diffOffsetsSeen.includes(32768) &&
+      Boolean(conflictChunk1Txt?.includes("<<<<<<< HEAD")) &&
+      Boolean(conflictChunk2Txt?.includes("secondConflictChunk")) &&
       Boolean(branchPre?.includes("committed = true")) &&
+      countAfterReopen > countBeforeAction &&
       Boolean(dryRunTxt?.includes("Dry-run merge conflict") && dryRunTxt.includes("src/shared.ts")) &&
       Boolean(rebaseTxt?.includes("Rebase aborted on src/shared.ts conflict")) &&
       actionsSeen.includes("dry_run_merge") &&
+      actionsSeen.includes("squash_merge") &&
       actionsSeen.includes("rebase") &&
+      actionBodies.some((b) => b.action === "squash_merge" && b.commitMessage === "feat: squash alpha lane") &&
+      controlPosts.some((p) => p.op === "board_post" && typeof p.text === "string" && p.text.startsWith("@beta-dev ") && p.text.includes("src/shared.ts")) &&
       wtOverflow <= 0 &&
       wtErrors.length === 0
     );

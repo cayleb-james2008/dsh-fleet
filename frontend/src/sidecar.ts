@@ -318,19 +318,51 @@ export function mergeSwarmDelta(
   };
 }
 
-export const fetchWorktrees = (roots: string[]): Promise<WorktreesPayload> =>
-  apiJson(qs("/api/worktrees", { roots: roots.join(",") }), "Worktrees failed");
+export const fetchWorktrees = (roots: string[], conversationId?: string | null): Promise<WorktreesPayload> =>
+  apiJson(
+    qs("/api/worktrees", {
+      roots: roots.length ? roots.join(",") : undefined,
+      conversationId: conversationId || undefined,
+    }),
+    "Worktrees failed",
+  );
+
+export interface FetchWorktreeDiffOptions {
+  targetBranch?: string;
+  offset?: number;
+  maxBytes?: number;
+  signal?: AbortSignal;
+}
 
 export async function fetchWorktreeDiff(
   root: string,
   worktree: string,
   file: string,
   mode: WorktreeDiffMode = "working",
+  opts: FetchWorktreeDiffOptions = {},
 ): Promise<WorktreeDiffPayload> {
-  const res = await sidecarFetch(qs("/api/worktrees/diff", { root, worktree, path: worktree, file, mode }));
+  const url = qs("/api/worktrees/diff", {
+    root,
+    worktree,
+    path: worktree,
+    file,
+    mode,
+    targetBranch: opts.targetBranch || undefined,
+    offset: typeof opts.offset === "number" && opts.offset >= 0 ? String(Math.floor(opts.offset)) : undefined,
+    maxBytes:
+      typeof opts.maxBytes === "number" && opts.maxBytes > 0
+        ? String(Math.min(32768, Math.floor(opts.maxBytes)))
+        : undefined,
+  });
+  const res = await sidecarFetch(url, opts.signal ? { signal: opts.signal } : undefined);
   const data = (await res.json().catch(() => ({}))) as Partial<WorktreeDiffPayload>;
   if (!res.ok) throw new Error(data.error || `Diff peek failed (${res.status})`);
   return data as WorktreeDiffPayload;
+}
+
+export interface RunWorktreeActionOptions {
+  commitMessage?: string;
+  deleteBranch?: boolean;
 }
 
 export async function runWorktreeAction(
@@ -338,7 +370,9 @@ export async function runWorktreeAction(
   path: string,
   targetBranch?: string,
   root?: string,
+  opts?: RunWorktreeActionOptions,
 ): Promise<WorktreeActionPayload> {
+  const cleanMsg = typeof opts?.commitMessage === "string" ? opts.commitMessage.trim() : "";
   const res = await sidecarFetch("/api/worktrees/action", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -349,6 +383,8 @@ export async function runWorktreeAction(
       worktree: path,
       ...(root ? { root } : {}),
       ...(targetBranch ? { targetBranch } : {}),
+      ...(cleanMsg ? { commitMessage: cleanMsg } : {}),
+      ...(opts?.deleteBranch !== undefined ? { deleteBranch: opts.deleteBranch } : {}),
     }),
   });
   const data = (await res.json().catch(() => ({}))) as Partial<WorktreeActionPayload>;
