@@ -810,11 +810,11 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 
 const BUTTON_VARIANTS: Record<ButtonVariant, string> = {
   primary: "bg-[var(--ink-button)] text-[var(--ink-button-fg)] border-[var(--ink-button)] shadow-[var(--elev-primary)] hover:opacity-90",
-  secondary: "bg-track text-ink border-hairline-s hover:bg-board active:bg-hairline",
+  secondary: "bg-track text-ink border-[var(--edge)] hover:bg-board active:bg-hairline",
   outline: "bg-surface text-ink border-[var(--edge)] hover:bg-board active:bg-track",
-  ghost: "bg-transparent text-ink-2 hover:bg-track hover:text-ink active:bg-hairline",
-  info: "bg-blue-soft text-info border-hairline-s hover:opacity-90",
-  danger: "bg-bad-soft text-danger border-hairline-s hover:opacity-90",
+  ghost: "bg-transparent text-ink-2 border-transparent hover:bg-track hover:text-ink active:bg-hairline",
+  info: "bg-blue-soft text-info border-[var(--edge)] hover:opacity-90",
+  danger: "bg-bad-soft text-danger border-danger hover:opacity-90",
 };
 
 const BUTTON_SIZES: Record<ButtonSize, string> = {
@@ -1369,10 +1369,22 @@ export function OperatorOpsStrip({
   onOpsUpdate?: (ops: OperatorCommand[]) => void;
   onRefreshOps?: () => void | Promise<void>;
 }) {
-  const [busyOpId, setBusyOpId] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<{ opId: string; action: OperatorOpAction } | null>(null);
+  const [refreshingOps, setRefreshingOps] = useState(false);
   const [actionError, setActionError] = useState("");
   const [showAll, setShowAll] = useState(false);
   const lockRef = useRef<string | null>(null);
+  const actionAbortRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(true);
+  const nowMs = useNowMs();
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      actionAbortRef.current?.abort();
+    };
+  }, []);
 
   const swarmConvId = snap.swarm || snap.conversationId || "";
   const allOps = Array.isArray(snap.ops) ? snap.ops : [];
@@ -1387,17 +1399,33 @@ export function OperatorOpsStrip({
   const issueCount = activeOps.filter((o) => o.status === "failed" || o.status === "timed_out").length;
   const visibleOps = showAll ? activeOps : activeOps.slice(0, 5);
 
+  const handleRefreshOpsClick = async () => {
+    if (!onRefreshOps || refreshingOps) return;
+    setRefreshingOps(true);
+    setActionError("");
+    try {
+      await onRefreshOps();
+    } finally {
+      if (mountedRef.current) setRefreshingOps(false);
+    }
+  };
+
   const runAction = async (op: OperatorCommand, action: OperatorOpAction) => {
     if (!swarmConvId || lockRef.current === op.opId) return;
+    actionAbortRef.current?.abort();
+    const ac = new AbortController();
+    actionAbortRef.current = ac;
     lockRef.current = op.opId;
-    setBusyOpId(op.opId);
+    setBusyAction({ opId: op.opId, action });
     setActionError("");
     try {
       const res: OpActionResponse = await postOpAction({
         conversationId: swarmConvId,
         opId: op.opId,
         action,
+        signal: ac.signal,
       });
+      if (!mountedRef.current || ac.signal.aborted) return;
       if (Array.isArray(res.ops)) {
         onOpsUpdate?.(res.ops);
       } else {
@@ -1419,12 +1447,16 @@ export function OperatorOpsStrip({
       }
       onRefresh?.();
     } catch (err) {
+      if (!mountedRef.current || ac.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) return;
       const msg = err instanceof Error ? err.message : "Op action failed";
       setActionError(msg);
       toast.error(msg);
     } finally {
-      lockRef.current = null;
-      setBusyOpId(null);
+      if (actionAbortRef.current === ac) actionAbortRef.current = null;
+      if (lockRef.current === op.opId) lockRef.current = null;
+      if (mountedRef.current) {
+        setBusyAction((cur) => (cur?.opId === op.opId ? null : cur));
+      }
     }
   };
 
@@ -1443,18 +1475,31 @@ export function OperatorOpsStrip({
             size="icon"
             aria-label="Refresh command queue"
             data-testid="ops-refresh-btn"
-            onClick={() => void onRefreshOps()}
+            disabled={refreshingOps}
+            onClick={() => void handleRefreshOpsClick()}
             className="h-7 w-7 min-w-7 min-h-7"
           >
-            <RefreshCw />
+            <RefreshCw className={cn(refreshingOps && "motion-safe:animate-spin")} />
           </Button>
         )}
       </div>
 
       {actionError && (
-        <p role="alert" className="rounded-chip border border-danger bg-bad-soft px-2 py-1 text-[12px] text-danger break-words">
-          {maskHome(actionError)}
-        </p>
+        <div
+          role="alert"
+          data-testid="ops-action-error"
+          className="row gap-1.5 rounded-chip border border-danger bg-bad-soft px-2 py-1 text-[12px] text-danger"
+        >
+          <span className="break-words min-w-0 flex-1">{maskHome(actionError)}</span>
+          <button
+            type="button"
+            aria-label="Dismiss command queue error"
+            onClick={() => setActionError("")}
+            className="shrink-0 rounded p-0.5 text-danger hover:opacity-80 cursor-pointer"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
       )}
 
       <div className="space-y-1.5 min-w-0">
@@ -1464,8 +1509,11 @@ export function OperatorOpsStrip({
           const isFailed = op.status === "failed";
           const isTimedOut = op.status === "timed_out";
           const isIssue = isFailed || isTimedOut;
-          const busy = busyOpId === op.opId;
+          const busy = busyAction?.opId === op.opId;
           const opLabel = OP_LABELS[op.op] || humanizeStatus(op.op);
+          const opTs = opTimeMs(op.updatedAt) || opTimeMs(op.createdAt);
+          const pendingElapsed = isPending && opTs > 0 ? fmtElapsed(opTs, nowMs) : "";
+          const pendingLong = isPending && opTs > 0 && nowMs - opTs >= 30_000;
 
           return (
             <div
@@ -1502,6 +1550,11 @@ export function OperatorOpsStrip({
                   <span className="text-[12px] font-medium text-ink truncate">{opLabel}</span>
                   {op.target && <span className="text-[12px] text-ink-2 truncate max-w-full">@{op.target}</span>}
                   <span className="t3 mono truncate max-w-[110px]" title={op.opId}>{op.opId}</span>
+                  {pendingElapsed && (
+                    <span className="t3 num" title={pendingLong ? "Still awaiting coordinator confirmation" : undefined}>
+                      {pendingElapsed}
+                    </span>
+                  )}
                 </div>
 
                 {op.resolvedSeq != null && op.resolvedSeq > 0 && onJumpToBoardSeq ? (
@@ -1516,6 +1569,12 @@ export function OperatorOpsStrip({
                   </Button>
                 ) : null}
               </div>
+
+              {pendingLong && (
+                <p className="text-[12px] text-ink-2 break-words">
+                  Awaiting coordinator confirmation. Refresh or mark verified if already landed.
+                </p>
+              )}
 
               {isIssue && (
                 <p role="alert" data-testid={`op-error-${op.opId}`} className="text-[12px] text-danger break-words">
@@ -1532,8 +1591,8 @@ export function OperatorOpsStrip({
                     onClick={() => void runAction(op, "retry")}
                     className="h-7 px-2"
                   >
-                    <RefreshCw />
-                    Retry
+                    <RefreshCw className={cn(busy && busyAction?.action === "retry" && "motion-safe:animate-spin")} />
+                    {busy && busyAction?.action === "retry" ? "Retrying..." : "Retry"}
                   </Button>
                 )}
                 {!isVerified && (
@@ -1545,7 +1604,7 @@ export function OperatorOpsStrip({
                     className="h-7 px-2"
                   >
                     <CheckCircle2 />
-                    Mark Verified
+                    {busy && busyAction?.action === "mark_verified" ? "Verifying..." : "Mark Verified"}
                   </Button>
                 )}
                 <Button
@@ -1556,7 +1615,7 @@ export function OperatorOpsStrip({
                   className="h-7 px-2"
                 >
                   <X />
-                  Dismiss
+                  {busy && busyAction?.action === "dismiss" ? "Dismissing..." : "Dismiss"}
                 </Button>
               </div>
             </div>
@@ -2443,8 +2502,12 @@ export function PortfolioDrawer({
 
         <div className="flex-1 overflow-y-auto overflow-x-hidden p-3 space-y-4 min-w-0">
           {error && (
-            <Card className="p-2.5 border-danger bg-bad-soft text-[12px] text-danger break-words" role="alert">
-              {maskHome(error)}
+            <Card className="p-2.5 border-danger bg-bad-soft text-[12px] text-danger space-y-2" role="alert" data-testid="portfolio-error-banner">
+              <p className="break-words">{maskHome(error)}</p>
+              <Button variant="outline" data-testid="portfolio-retry-btn" disabled={loading} onClick={onRefresh} className="h-7 px-2">
+                <RefreshCw className={cn(loading && "motion-safe:animate-spin")} />
+                Retry
+              </Button>
             </Card>
           )}
 
@@ -2613,7 +2676,7 @@ export function PortfolioDrawer({
                           data-testid={`portfolio-archive-swarm-${sw.id}`}
                           onClick={() => void toggleArchive(sw)}
                         >
-                          {sw.archived ? "Unarchive" : "Archive"}
+                          {sw.archived ? (busy ? "Unarchiving..." : "Unarchive") : (busy ? "Archiving..." : "Archive")}
                         </Button>
                       </div>
                     </Card>

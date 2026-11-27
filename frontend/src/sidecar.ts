@@ -76,8 +76,42 @@ export function isEmbeddedHost(): boolean {
 const sidecarFetch = (url: string, init?: RequestInit): Promise<Response> =>
   sc()?.fetch?.(url, init) ?? fetch(url, init);
 
-async function apiJson<T>(url: string, errLabel: string, signal?: AbortSignal): Promise<T> {
-  const res = await sidecarFetch(url, signal ? { signal } : undefined);
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit | undefined,
+  timeoutMs: number,
+  timeoutLabel: string,
+): Promise<Response> {
+  const outerSignal = init?.signal;
+  if (outerSignal?.aborted) {
+    throw new DOMException("The operation was aborted.", "AbortError");
+  }
+  const ac = new AbortController();
+  let timedOut = false;
+  const onOuterAbort = () => ac.abort();
+  outerSignal?.addEventListener("abort", onOuterAbort, { once: true });
+  const timer =
+    timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          ac.abort();
+        }, timeoutMs)
+      : null;
+  try {
+    return await sidecarFetch(url, { ...(init || {}), signal: ac.signal });
+  } catch (err) {
+    if (timedOut && !outerSignal?.aborted) {
+      throw new Error(`${timeoutLabel} timed out after ${Math.max(1, Math.round(timeoutMs / 1000))}s`);
+    }
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+    outerSignal?.removeEventListener("abort", onOuterAbort);
+  }
+}
+
+async function apiJson<T>(url: string, errLabel: string, signal?: AbortSignal, timeoutMs = 15_000): Promise<T> {
+  const res = await fetchWithTimeout(url, signal ? { signal } : undefined, timeoutMs, errLabel);
   if (!res.ok) throw new Error(`${errLabel} (${res.status})`);
   return res.json();
 }
@@ -120,7 +154,12 @@ export async function fetchMemberTranscript(
     limit: typeof opts.limit === "number" && opts.limit > 0 ? String(Math.min(50, Math.floor(opts.limit))) : undefined,
     filter: opts.filter || undefined,
   });
-  const res = await sidecarFetch(url, opts.signal ? { signal: opts.signal } : undefined);
+  const res = await fetchWithTimeout(
+    url,
+    opts.signal ? { signal: opts.signal } : undefined,
+    15_000,
+    "Load transcript",
+  );
   const data = (await res.json().catch(() => ({}))) as Partial<TranscriptResponse>;
   if (!res.ok) throw new Error(data.error || `Load transcript failed (${res.status})`);
   return data as TranscriptResponse;
@@ -143,7 +182,8 @@ export async function fetchSwarmDelta(
     etag: opts.etag || undefined,
     waitMs: typeof opts.waitMs === "number" && opts.waitMs >= 0 ? String(Math.floor(opts.waitMs)) : undefined,
   });
-  const res = await sidecarFetch(url, opts.signal ? { signal: opts.signal } : undefined);
+  const timeoutMs = Math.max(30_000, (opts.waitMs || 0) + 10_000);
+  const res = await fetchWithTimeout(url, opts.signal ? { signal: opts.signal } : undefined, timeoutMs, "Load swarm delta");
   if (!res.ok) throw new Error(`Load swarm delta failed (${res.status})`);
   return res.json();
 }
@@ -318,13 +358,19 @@ export function mergeSwarmDelta(
   };
 }
 
-export const fetchWorktrees = (roots: string[], conversationId?: string | null): Promise<WorktreesPayload> =>
+export const fetchWorktrees = (
+  roots: string[],
+  conversationId?: string | null,
+  signal?: AbortSignal,
+): Promise<WorktreesPayload> =>
   apiJson(
     qs("/api/worktrees", {
       roots: roots.length ? roots.join(",") : undefined,
       conversationId: conversationId || undefined,
     }),
     "Worktrees failed",
+    signal,
+    20_000,
   );
 
 export interface FetchWorktreeDiffOptions {
@@ -354,7 +400,12 @@ export async function fetchWorktreeDiff(
         ? String(Math.min(32768, Math.floor(opts.maxBytes)))
         : undefined,
   });
-  const res = await sidecarFetch(url, opts.signal ? { signal: opts.signal } : undefined);
+  const res = await fetchWithTimeout(
+    url,
+    opts.signal ? { signal: opts.signal } : undefined,
+    15_000,
+    "Diff peek",
+  );
   const data = (await res.json().catch(() => ({}))) as Partial<WorktreeDiffPayload>;
   if (!res.ok) throw new Error(data.error || `Diff peek failed (${res.status})`);
   return data as WorktreeDiffPayload;
@@ -363,6 +414,7 @@ export async function fetchWorktreeDiff(
 export interface RunWorktreeActionOptions {
   commitMessage?: string;
   deleteBranch?: boolean;
+  signal?: AbortSignal;
 }
 
 export async function runWorktreeAction(
@@ -373,20 +425,26 @@ export async function runWorktreeAction(
   opts?: RunWorktreeActionOptions,
 ): Promise<WorktreeActionPayload> {
   const cleanMsg = typeof opts?.commitMessage === "string" ? opts.commitMessage.trim() : "";
-  const res = await sidecarFetch("/api/worktrees/action", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      confirm: true,
-      action,
-      path,
-      worktree: path,
-      ...(root ? { root } : {}),
-      ...(targetBranch ? { targetBranch } : {}),
-      ...(cleanMsg ? { commitMessage: cleanMsg } : {}),
-      ...(opts?.deleteBranch !== undefined ? { deleteBranch: opts.deleteBranch } : {}),
-    }),
-  });
+  const res = await fetchWithTimeout(
+    "/api/worktrees/action",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        confirm: true,
+        action,
+        path,
+        worktree: path,
+        ...(root ? { root } : {}),
+        ...(targetBranch ? { targetBranch } : {}),
+        ...(cleanMsg ? { commitMessage: cleanMsg } : {}),
+        ...(opts?.deleteBranch !== undefined ? { deleteBranch: opts.deleteBranch } : {}),
+      }),
+      ...(opts?.signal ? { signal: opts.signal } : {}),
+    },
+    30_000,
+    "Worktree action",
+  );
   const data = (await res.json().catch(() => ({}))) as Partial<WorktreeActionPayload>;
   const conflicts = data.conflicts || data.conflictFiles || [];
   const hasConflict =
@@ -423,11 +481,16 @@ export async function sendConfirmedNudge(target: string | string[], message: str
     return { ok: true, op: "nudge", delivered: ids.length };
   }
   const body = ids.length === 1 ? { confirm: true, conversationId: ids[0], message } : { confirm: true, conversationIds: ids, message };
-  const res = await sidecarFetch("/api/nudge", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const res = await fetchWithTimeout(
+    "/api/nudge",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    20_000,
+    "Nudge",
+  );
   const data = (await res.json().catch(() => ({}))) as Partial<ControlDispatchResponse>;
   if (!res.ok) {
     throw new Error(data.error || `Nudge failed (${res.status})`);
@@ -476,18 +539,23 @@ export class PlanConflictError extends Error {
 
 export async function saveSwarmPlan(req: SavePlanRequest): Promise<SavePlanResponse> {
   if (!req.conversationId) throw new Error("No active swarm");
-  const res = await sidecarFetch("/api/plan", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      confirm: true,
-      conversationId: req.conversationId,
-      ifMatch: req.ifMatch ?? "",
-      mode: req.mode || "patch",
-      notifyCoordinator: Boolean(req.notifyCoordinator),
-      patch: req.patch,
-    }),
-  });
+  const res = await fetchWithTimeout(
+    "/api/plan",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        confirm: true,
+        conversationId: req.conversationId,
+        ifMatch: req.ifMatch ?? "",
+        mode: req.mode || "patch",
+        notifyCoordinator: Boolean(req.notifyCoordinator),
+        patch: req.patch,
+      }),
+    },
+    20_000,
+    "Save plan",
+  );
   const data = (await res.json().catch(() => ({}))) as Partial<SavePlanResponse>;
   if (res.status === 409) {
     const latest =
@@ -526,13 +594,19 @@ export class SwarmControlError extends Error {
   }
 }
 
-export async function sendSwarmControl(req: ControlRequest): Promise<ControlDispatchResponse> {
+export async function sendSwarmControl(req: ControlRequest, signal?: AbortSignal): Promise<ControlDispatchResponse> {
   if (!req.conversationId) throw new Error("No active swarm");
-  const res = await sidecarFetch("/api/control", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...req, confirm: true }),
-  });
+  const res = await fetchWithTimeout(
+    "/api/control",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...req, confirm: true }),
+      ...(signal ? { signal } : {}),
+    },
+    20_000,
+    "Control command",
+  );
   const data = (await res.json().catch(() => ({}))) as Partial<ControlDispatchResponse> & {
     dirtyFiles?: number;
     ahead?: number;
@@ -556,7 +630,12 @@ export async function sendSwarmControl(req: ControlRequest): Promise<ControlDisp
 
 export async function getOps(conversationId: string, signal?: AbortSignal): Promise<OpsListResponse> {
   if (!conversationId) return { ok: true, conversationId: "", ops: [] };
-  const res = await sidecarFetch(qs("/api/ops", { conversationId }), signal ? { signal } : undefined);
+  const res = await fetchWithTimeout(
+    qs("/api/ops", { conversationId }),
+    signal ? { signal } : undefined,
+    15_000,
+    "Load ops",
+  );
   const raw = await res.json().catch(() => ({}));
   if (!res.ok) {
     const errMsg = raw && typeof raw === "object" && "error" in raw ? String((raw as { error?: unknown }).error || "") : "";
@@ -577,18 +656,25 @@ export async function postOpAction(req: {
   conversationId: string;
   opId: string;
   action: OperatorOpAction;
+  signal?: AbortSignal;
 }): Promise<OpActionResponse> {
   if (!req.conversationId || !req.opId) throw new Error("Missing swarm or opId");
-  const res = await sidecarFetch("/api/ops/action", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      confirm: true,
-      conversationId: req.conversationId,
-      opId: req.opId,
-      action: req.action,
-    }),
-  });
+  const res = await fetchWithTimeout(
+    "/api/ops/action",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        confirm: true,
+        conversationId: req.conversationId,
+        opId: req.opId,
+        action: req.action,
+      }),
+      ...(req.signal ? { signal: req.signal } : {}),
+    },
+    20_000,
+    "Operator action",
+  );
   const data = (await res.json().catch(() => ({}))) as Partial<OpActionResponse>;
   if (!res.ok) {
     throw new Error(data.error || `Op action failed (${res.status})`);
@@ -596,34 +682,53 @@ export async function postOpAction(req: {
   return data as OpActionResponse;
 }
 
-async function postJsonConfirmed<T>(url: string, payload: Record<string, unknown>, errLabel: string): Promise<T> {
-  const res = await sidecarFetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...payload, confirm: true }),
-  });
+async function postJsonConfirmed<T>(
+  url: string,
+  payload: Record<string, unknown>,
+  errLabel: string,
+  signal?: AbortSignal,
+  timeoutMs = 20_000,
+): Promise<T> {
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...payload, confirm: true }),
+      ...(signal ? { signal } : {}),
+    },
+    timeoutMs,
+    errLabel,
+  );
   const data = (await res.json().catch(() => ({}))) as { error?: string };
   if (!res.ok) {
-    throw new Error(data.error || `${errLabel} (${res.status})`);
+    const err = new Error(data.error || `${errLabel} (${res.status})`) as Error & { status?: number };
+    err.status = res.status;
+    throw err;
   }
   return data as T;
 }
 
 export const fetchPortfolio = (signal?: AbortSignal): Promise<PortfolioResponse> =>
-  apiJson("/api/portfolio", "Load portfolio failed", signal);
+  apiJson("/api/portfolio", "Load portfolio failed", signal, 15_000);
 
-export function ackTriageItem(req: TriageAckRequest): Promise<TriageAckResponse> {
+export function ackTriageItem(req: TriageAckRequest, signal?: AbortSignal): Promise<TriageAckResponse> {
   if (!req.conversationId || !req.triageId) throw new Error("Missing swarm or triage item");
-  return postJsonConfirmed("/api/triage/ack", { ...req }, "Triage ack failed");
+  return postJsonConfirmed("/api/triage/ack", { ...req }, "Triage ack failed", signal, 15_000);
 }
 
 export async function postPin(req: PinPostRequest): Promise<PinPostResponse & { status?: number }> {
   if (!req.conversationId) throw new Error("No active swarm");
-  const res = await sidecarFetch("/api/pins", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...req, confirm: true }),
-  });
+  const res = await fetchWithTimeout(
+    "/api/pins",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...req, confirm: true }),
+    },
+    15_000,
+    "Pin update",
+  );
   const data = (await res.json().catch(() => ({}))) as Partial<PinPostResponse>;
   if (!res.ok) {
     const err = new Error(data.error || `Pin update failed (${res.status})`) as Error & { status?: number };
@@ -633,17 +738,17 @@ export async function postPin(req: PinPostRequest): Promise<PinPostResponse & { 
   return data as PinPostResponse;
 }
 
-export function archiveSwarm(req: SwarmArchiveRequest): Promise<SwarmArchiveResponse> {
+export function archiveSwarm(req: SwarmArchiveRequest, signal?: AbortSignal): Promise<SwarmArchiveResponse> {
   if (!req.conversationId) throw new Error("Missing swarm id");
-  return postJsonConfirmed("/api/swarm/archive", { ...req }, "Archive swarm failed");
+  return postJsonConfirmed("/api/swarm/archive", { ...req }, "Archive swarm failed", signal, 15_000);
 }
 
 export function fetchCheckpoints(conversationId: string, signal?: AbortSignal): Promise<CheckpointsListResponse> {
   if (!conversationId) return Promise.resolve({ ok: true, conversationId: "", checkpoints: [] });
-  return apiJson(qs("/api/checkpoints", { conversationId }), "Load checkpoints failed", signal);
+  return apiJson(qs("/api/checkpoints", { conversationId }), "Load checkpoints failed", signal, 15_000);
 }
 
-export function createCheckpoint(req: CreateCheckpointRequest): Promise<CreateCheckpointResponse> {
+export function createCheckpoint(req: CreateCheckpointRequest, signal?: AbortSignal): Promise<CreateCheckpointResponse> {
   if (!req.conversationId || !req.label.trim()) throw new Error("Swarm and checkpoint label required");
   return postJsonConfirmed(
     "/api/checkpoints",
@@ -653,12 +758,14 @@ export function createCheckpoint(req: CreateCheckpointRequest): Promise<CreateCh
       ...(req.roots?.length ? { roots: req.roots } : {}),
     },
     "Create checkpoint failed",
+    signal,
+    20_000,
   );
 }
 
-export function restoreCheckpoint(req: RestoreCheckpointRequest): Promise<RestoreCheckpointResponse> {
+export function restoreCheckpoint(req: RestoreCheckpointRequest, signal?: AbortSignal): Promise<RestoreCheckpointResponse> {
   if (!req.conversationId || !req.checkpointId) throw new Error("Missing swarm or checkpoint");
-  return postJsonConfirmed("/api/checkpoints/restore", { ...req }, "Restore checkpoint failed");
+  return postJsonConfirmed("/api/checkpoints/restore", { ...req }, "Restore checkpoint failed", signal, 20_000);
 }
 
 export function isTriageItemAcked(

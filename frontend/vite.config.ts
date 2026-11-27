@@ -96,7 +96,7 @@ function sidecarSingleFile(): Plugin {
           .replace(/\b0(\.\d+)/g, "$1");
         let minCss = "";
         for (let i = 0; i < css.length; ) {
-          if (css.startsWith("@layer base{", i) || css.startsWith("@layer utilities{", i)) {
+          if (css.startsWith("@layer base{", i) || css.startsWith("@layer components{", i) || css.startsWith("@layer utilities{", i)) {
             i = css.indexOf("{", i) + 1;
             let depth = 1;
             const start = i;

@@ -98,6 +98,9 @@ export function App() {
   const selectedSwarmIdRef = useRef<string | null>(selectedSwarmId);
   selectedSwarmIdRef.current = selectedSwarmId;
   const refreshAbortRef = useRef<AbortController | null>(null);
+  const portfolioAbortRef = useRef<AbortController | null>(null);
+  const wtAbortRef = useRef<AbortController | null>(null);
+  const cpAbortRef = useRef<AbortController | null>(null);
   const lastSwarmsFetchRef = useRef<number>(0);
 
   const [workspaceUris, setWorkspaceUris] = useState<string[]>([]);
@@ -178,19 +181,26 @@ export function App() {
     (s?.members || []).map((m) => `${m.name}:${m.status}:${m.killed ? 1 : 0}`).join(",");
 
   const refreshPortfolio = useCallback(async (signal?: AbortSignal) => {
+    portfolioAbortRef.current?.abort();
+    const ac = new AbortController();
+    portfolioAbortRef.current = ac;
+    const onOuterAbort = () => ac.abort();
+    signal?.addEventListener("abort", onOuterAbort, { once: true });
     setPortfolioLoading(true);
     try {
-      const p = await fetchPortfolio(signal);
-      if (signal?.aborted) return;
+      const p = await fetchPortfolio(ac.signal);
+      if (ac.signal.aborted) return;
       if (p && Array.isArray(p.swarms)) {
         setPortfolio(p);
         setPortfolioError("");
       }
     } catch (err) {
-      if (signal?.aborted || (err instanceof DOMException && err.name === "AbortError")) return;
+      if (ac.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) return;
       setPortfolioError(err instanceof Error ? err.message : "Failed to load portfolio");
     } finally {
-      if (!signal?.aborted) setPortfolioLoading(false);
+      signal?.removeEventListener("abort", onOuterAbort);
+      if (portfolioAbortRef.current === ac) portfolioAbortRef.current = null;
+      if (!ac.signal.aborted) setPortfolioLoading(false);
     }
   }, []);
 
@@ -217,7 +227,7 @@ export function App() {
         const [data, listData, portfolioData] = await Promise.all([
           fetchSwarmSnapshot(targetSwarmId, force ? "" : etagRef.current, ac.signal),
           fetchSwarms(ac.signal).catch(() => null),
-          fetchPortfolio().catch(() => null),
+          fetchPortfolio(ac.signal).catch(() => null),
         ]);
         if (ac.signal.aborted || selectedSwarmIdRef.current !== targetSwarmId) return;
         if (listData?.swarms) {
@@ -585,24 +595,36 @@ export function App() {
 
   const refreshWorktrees = useCallback(async () => {
     const convId = activeConvId || "";
+    wtAbortRef.current?.abort();
     if (!allRootsKey && !convId) {
+      wtAbortRef.current = null;
       setWorktrees(null);
       setWtError("");
+      setWtLoading(false);
       return;
     }
+    const ac = new AbortController();
+    wtAbortRef.current = ac;
     setWtLoading(true);
     try {
-      setWorktrees(await fetchWorktrees(allRootsKey ? allRootsKey.split("\0") : [], convId || undefined));
+      const next = await fetchWorktrees(allRootsKey ? allRootsKey.split("\0") : [], convId || undefined, ac.signal);
+      if (ac.signal.aborted) return;
+      setWorktrees(next);
       setWtError("");
     } catch (err) {
+      if (ac.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) return;
       setWtError(err instanceof Error ? err.message : "Failed to inspect worktrees");
     } finally {
-      setWtLoading(false);
+      if (wtAbortRef.current === ac) wtAbortRef.current = null;
+      if (!ac.signal.aborted) setWtLoading(false);
     }
   }, [allRootsKey, activeConvId]);
 
   useEffect(() => {
     refreshWorktrees();
+    return () => {
+      wtAbortRef.current?.abort();
+    };
   }, [refreshWorktrees]);
 
   const members = snap?.members || [];
@@ -619,27 +641,38 @@ export function App() {
 
   const refreshCheckpoints = useCallback(async (convId?: string) => {
     const id = convId || snapRef.current?.swarm || snapRef.current?.conversationId || selectedSwarmIdRef.current || "";
+    cpAbortRef.current?.abort();
     if (!id) {
+      cpAbortRef.current = null;
       setCheckpoints([]);
       return;
     }
+    const ac = new AbortController();
+    cpAbortRef.current = ac;
     try {
-      const res = await fetchCheckpoints(id);
-      if ((selectedSwarmIdRef.current || snapRef.current?.swarm || "") !== id) return;
+      const res = await fetchCheckpoints(id, ac.signal);
+      if (ac.signal.aborted || (selectedSwarmIdRef.current || snapRef.current?.swarm || "") !== id) return;
       if (res && Array.isArray(res.checkpoints)) {
         setCheckpoints(res.checkpoints);
       }
-    } catch {
+    } catch (err) {
+      if (ac.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) return;
       if ((selectedSwarmIdRef.current || snapRef.current?.swarm || "") === id) setCheckpoints([]);
+    } finally {
+      if (cpAbortRef.current === ac) cpAbortRef.current = null;
     }
   }, []);
 
   useEffect(() => {
     if (!activeConvId) {
+      cpAbortRef.current?.abort();
       setCheckpoints([]);
       return;
     }
     void refreshCheckpoints(activeConvId);
+    return () => {
+      cpAbortRef.current?.abort();
+    };
   }, [activeConvId, snap?.head, refreshCheckpoints]);
 
   useEffect(() => {
