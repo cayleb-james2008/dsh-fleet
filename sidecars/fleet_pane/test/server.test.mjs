@@ -2596,6 +2596,20 @@ test('E3 HTTP & SidecarApp RPC: conversationId worktree discovery, swarmOwner, m
     const noConvJson = await (await fetch(`${srv.url}/api/worktrees?roots=${encodeURIComponent(repoA)}`)).json();
     assert.equal(noConvJson.worktrees.find((w) => w.path === wtConflict)?.swarmOwner, undefined);
 
+    // Regression: passing explicit roots containing multiple linked worktrees of the same repo alongside conversationId must deduplicate
+    const multiRoots = [repoA, wtConflict, wtMerge, repoB].map((p) => encodeURIComponent(p)).join(',');
+    const dedupRes = await fetch(
+      `${srv.url}/api/worktrees?roots=${multiRoots}&conversationId=${encodeURIComponent(fx.coord)}`,
+    );
+    assert.equal(dedupRes.status, 200);
+    const dedupJson = await dedupRes.json();
+    assert.equal(dedupJson.roots.length, 2);
+    assert.equal(dedupJson.worktrees.length, 5);
+    assert.equal(new Set(dedupJson.worktrees.map((w) => w.path)).size, 5);
+    assert.equal(dedupJson.worktrees.filter((w) => w.path === wtConflict).length, 1);
+    assert.equal(dedupJson.worktrees.find((w) => w.path === wtConflict)?.swarmOwner?.member, 'builder');
+    assert.equal(dedupJson.worktrees.find((w) => w.path === wtMerge)?.swarmOwner?.member, 'merger');
+
     // 2. GET /api/worktrees/diff?mode=conflict + paginated <= 32 KiB
     const diffP1Res = await fetch(
       `${srv.url}/api/worktrees/diff?path=${encodeURIComponent(wtConflict)}&file=conflict.txt&mode=conflict&targetBranch=main&offset=0&maxBytes=32768`,

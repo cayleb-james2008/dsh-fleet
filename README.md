@@ -161,8 +161,8 @@ Measured under `#154` CPU isolation (`taskset -c 24-31`, 16 concurrent polling c
 | Metric | v1.28.0 | v1.29.0 | **v1.30.0** |
 | --- | --- | --- | --- |
 | Embedded sidecar UI (`/`) | `404,506 B` raw (`395.0 KiB`) / `120,652 B` gz (`117.8 KiB`) | `429,110 B` raw (`419.1 KiB`) / `127,122 B` gz (`124.1 KiB`) | **`435,483 B` raw (`425.3 KiB`) / `128,851 B` gz (`125.8 KiB`)** |
-| Cold boot & RSS (`16w` audit) | `51.07 ms` / `115.6 MB` (`ETag 304`) | `52.36 ms` / `109.61 MB` (`ETag 304`) | **`51.18 ms` / `109.01 MB` (`ETag 304`)** |
-| Cold audit HTTP (`16w` close) | `1,767.1 req/s` / `12.94 ms` p95 (`0/4,425` errors) | `1,584.9 req/s` / `14.81 ms` p95 (`0/3,975` errors) | **`1,555.5 req/s` / `15.24 ms` p95 (`0/3,903` errors)** |
+| Cold boot & RSS (`16w` audit) | `51.07 ms` / `115.6 MB` (`ETag 304`) | `52.36 ms` / `109.61 MB` (`ETag 304`) | **`49.11 ms` / `115.29 MB` (`ETag 304`)** |
+| Cold audit HTTP (`16w` close) | `1,767.1 req/s` / `12.94 ms` p95 (`0/4,425` errors) | `1,584.9 req/s` / `14.81 ms` p95 (`0/3,975` errors) | **`1,776.7 req/s` / `12.95 ms` p95 (`0/4,449` errors)** |
 | Simultaneous SSE (`x5` streams) | `5/5` (`0` drops) | `5/5` (`0` drops) | **`5/5` (`0` drops)** |
 | Raw-TCP fuzz & backend tests | `30/30` fuzz + `43/43` unit | `30/30` fuzz + `47/47` unit | **`30/30` fuzz + `49/49` unit** |
 | E2E gate, replay, and Sloplint | `69/69` + `8/8` + `28/28` live-web + `0 FAIL / 0 WARN` | `72/72` + `8/8` + `30/30` live-web + `0 FAIL / 0 WARN` | **`72/72` + `8/8` + `30/30` live-web + `0 FAIL / 0 WARN`** |

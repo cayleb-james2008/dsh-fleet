@@ -668,9 +668,29 @@ function ownerPriority(entry) {
 
 /** Probe worktrees across validated workspace roots and optional swarm context using a debounced TTL cache. */
 export async function probeWorktrees(rawRoots, { ttlMs = DEFAULT_TTL_MS, swarmContext = null } = {}) {
-  const { roots, rejected } = parseRootsInput(rawRoots);
-  const seenRoots = new Set(roots.map((r) => r.path));
+  const { roots: rawParsedRoots, rejected } = parseRootsInput(rawRoots);
+  const roots = [];
+  const seenRoots = new Set();
   const ownerCandidates = new Map(); // worktreePath -> best entry
+
+  if (rawParsedRoots.length > 0) {
+    const resolvedInput = await Promise.all(
+      rawParsedRoots.map(async (r) => ({ raw: r, resolved: await resolveGitRepoRoot(r.path) })),
+    );
+    for (const { raw, resolved } of resolvedInput) {
+      if (resolved.ok) {
+        if (!seenRoots.has(resolved.rootPath)) {
+          seenRoots.add(resolved.rootPath);
+          roots.push({ path: resolved.rootPath, uri: resolved.rootUri });
+        }
+      } else if (isSymlinkPath(join(raw.path, '.git'))) {
+        rejected.push(raw.path);
+      } else if (!seenRoots.has(raw.path)) {
+        seenRoots.add(raw.path);
+        roots.push(raw);
+      }
+    }
+  }
 
   if (swarmContext && typeof swarmContext === 'object') {
     const memberEntries = Array.isArray(swarmContext.workspaces) ? swarmContext.workspaces : [];
@@ -713,9 +733,13 @@ export async function probeWorktrees(rawRoots, { ttlMs = DEFAULT_TTL_MS, swarmCo
 
   const results = await Promise.all(roots.map((r) => probeSingleRoot(r, ttlMs)));
   const worktrees = [];
+  const seenWorktreePaths = new Set();
   const collisions = [];
+  const seenCollisionKeys = new Set();
   for (const r of results) {
     for (const wt of r.worktrees) {
+      if (seenWorktreePaths.has(wt.path)) continue;
+      seenWorktreePaths.add(wt.path);
       const owner = ownerCandidates.get(wt.path);
       worktrees.push(
         owner
@@ -730,7 +754,12 @@ export async function probeWorktrees(rawRoots, { ttlMs = DEFAULT_TTL_MS, swarmCo
           : wt,
       );
     }
-    collisions.push(...r.collisions);
+    for (const c of r.collisions) {
+      const key = `${c.file}\0${c.kind}\0${(c.worktrees || []).join('\0')}`;
+      if (seenCollisionKeys.has(key)) continue;
+      seenCollisionKeys.add(key);
+      collisions.push(c);
+    }
   }
   return {
     roots: results.map((r) => ({
