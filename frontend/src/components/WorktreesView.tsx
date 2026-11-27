@@ -700,7 +700,7 @@ export function WorktreesView({
             return (
               <Card key={wt.id} data-testid={`wt-card-${wt.branch}`} className="p-3 space-y-2">
                 <div className="flex items-start justify-between gap-2 flex-wrap">
-                  <div className="min-w-0 flex-1 space-y-1">
+                  <div className="basis-60 min-w-0 flex-1 space-y-1">
                     <div className="wrap">
                       <GitBranch className="h-3.5 w-3.5 text-info shrink-0" />
                       <span className="h2 break-all">{wt.branch}</span>
