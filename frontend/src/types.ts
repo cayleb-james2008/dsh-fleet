@@ -691,13 +691,21 @@ export type WorktreeMergeability =
   | "up_to_date"
   | "unknown";
 
-export type WorktreeDiffMode = "working" | "branch";
+export type WorktreeDiffMode = "working" | "branch" | "conflict";
 
 export type WorktreeActionName =
   | "dry_run_merge"
   | "ff_merge"
   | "rebase"
+  | "squash_merge"
+  | "merge_commit"
   | "remove_worktree";
+
+export interface WorktreeSwarmOwner {
+  member: string;
+  status: string;
+  workspaceMode?: string;
+}
 
 export interface WorktreeChangedFile {
   path: string;
@@ -754,6 +762,7 @@ export interface WorktreeInfo {
   lastCommitSha: string;
   lastCommitSubject: string;
   lastCommitAt: number;
+  swarmOwner?: WorktreeSwarmOwner;
 }
 
 export interface WorktreesPayload {
@@ -768,11 +777,16 @@ export interface WorktreeDiffPayload {
   worktree: string;
   file: string;
   mode?: WorktreeDiffMode;
+  targetBranch?: string;
   diff: string;
   truncated: boolean;
   untracked: boolean;
   added: number;
   removed: number;
+  offset?: number;
+  nextOffset?: number | null;
+  hasMore?: boolean;
+  totalBytes?: number;
   error?: string;
 }
 

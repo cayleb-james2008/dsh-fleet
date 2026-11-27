@@ -570,25 +570,36 @@ export function App() {
     };
   }, [canSse, canDelta, pollMs, activeConvId, sseNonce]);
 
-  const allRoots = [...new Set([...workspaceUris, ...manualRoots])];
+  const swarmMemberRoots = [
+    ...new Set([
+      ...(snap?.members || [])
+        .map((m) => (typeof m.workspace === "string" ? m.workspace.trim() : ""))
+        .filter(Boolean),
+      ...(typeof (snap?.plan as { repo?: string } | null)?.repo === "string"
+        ? [String((snap?.plan as { repo?: string }).repo).trim()].filter(Boolean)
+        : []),
+    ]),
+  ];
+  const allRoots = [...new Set([...workspaceUris, ...swarmMemberRoots, ...manualRoots])];
   const allRootsKey = allRoots.join("\0");
 
   const refreshWorktrees = useCallback(async () => {
-    if (!allRootsKey) {
+    const convId = activeConvId || "";
+    if (!allRootsKey && !convId) {
       setWorktrees(null);
       setWtError("");
       return;
     }
     setWtLoading(true);
     try {
-      setWorktrees(await fetchWorktrees(allRootsKey.split("\0")));
+      setWorktrees(await fetchWorktrees(allRootsKey ? allRootsKey.split("\0") : [], convId || undefined));
       setWtError("");
     } catch (err) {
       setWtError(err instanceof Error ? err.message : "Failed to inspect worktrees");
     } finally {
       setWtLoading(false);
     }
-  }, [allRootsKey]);
+  }, [allRootsKey, activeConvId]);
 
   useEffect(() => {
     refreshWorktrees();
@@ -1117,6 +1128,9 @@ export function App() {
           <div id="panel-worktrees" role="tabpanel" aria-labelledby="tab-worktrees">
             <WorktreesView
               workspaceUris={workspaceUris}
+              swarmRoots={swarmMemberRoots}
+              conversationId={activeConvId}
+              canPostControl={Boolean(snap?.capabilities?.canSendMessage)}
               payload={worktrees}
               loading={wtLoading}
               error={wtError}
@@ -1124,6 +1138,8 @@ export function App() {
               members={members}
               onAddManualRoot={(r) => setManualRoots((prev) => (prev.includes(r) ? prev : [...prev, r]))}
               onRefresh={refreshWorktrees}
+              onSwarmRefresh={() => refreshSwarm(true)}
+              onOpDispatched={handleOpDispatched}
             />
           </div>
         ) : !hasSwarm ? (

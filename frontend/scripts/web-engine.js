@@ -619,6 +619,38 @@
         lastCommitSubject: "ui: refine 380px Needs-You triage cards",
         lastCommitAt: t(25),
       },
+      {
+        id: "wt-landing",
+        root: "/workspace/fleet",
+        name: "fleet-landing",
+        path: "/workspace/scratch/fleet-landing",
+        uri: "file:///workspace/scratch/fleet-landing",
+        isMain: false,
+        exists: true,
+        bare: false,
+        detached: false,
+        locked: false,
+        prunable: false,
+        branch: "lane/non-ff-land",
+        head: "d81e40b3",
+        clean: true,
+        baseBranch: "main",
+        ahead: 2,
+        behind: 1,
+        landStatus: "rebase",
+        mergeability: "clean_merge",
+        swarmOwner: { member: "verifier", status: "waiting", workspaceMode: "branch" },
+        dirtyFiles: 0,
+        untrackedFiles: 0,
+        stagedFiles: 0,
+        branchFiles: ["docs/landing-notes.md"],
+        commits: [
+          { sha: "d81e40b3", subject: "docs: add non-FF landing checklist", authorTime: "3m ago" },
+        ],
+        lastCommitSha: "d81e40b3",
+        lastCommitSubject: "docs: add non-FF landing checklist",
+        lastCommitAt: t(140),
+      },
     ],
   };
 
@@ -2133,19 +2165,69 @@
       return jsonResp(nextRes.body, nextRes.status);
     }
     if (url.pathname === "/api/worktrees") {
+      var wtConvId = url.searchParams.get("conversationId") || COORD_ID;
+      var wtSw = findSwarmByConvId(wtConvId) || state.swarms[COORD_ID];
+      var enrichedWorktrees = state.worktrees.map(function (wt) {
+        var matchedMember = wtSw && (wtSw.members || []).find(function (m) {
+          return !m.killed && ((m.workspace && m.workspace === wt.path) || (wt.swarmOwner && wt.swarmOwner.member === m.name));
+        });
+        if (!matchedMember) return wt;
+        return Object.assign({}, wt, {
+          swarmOwner: {
+            member: matchedMember.name,
+            status: matchedMember.status || "waiting",
+            workspaceMode: (wt.swarmOwner && wt.swarmOwner.workspaceMode) || matchedMember.workspace_mode || "inherit",
+          },
+        });
+      });
       return jsonResp({
-        roots: [{ path: "/workspace/fleet", uri: "file:///workspace/fleet", isGit: true, count: state.worktrees.length, error: "" }],
-        worktrees: state.worktrees,
-        collisions: computeWorktreeCollisions(state.worktrees),
+        roots: [{ path: "/workspace/fleet", uri: "file:///workspace/fleet", isGit: true, count: enrichedWorktrees.length, error: "" }],
+        worktrees: enrichedWorktrees,
+        collisions: computeWorktreeCollisions(enrichedWorktrees),
         rejected: [],
       });
     }
     if (url.pathname === "/api/worktrees/diff") {
       var wtPath = url.searchParams.get("worktree") || url.searchParams.get("path") || "/workspace/fleet";
       var relFile = url.searchParams.get("file") || "README.md";
-      var diffMode = url.searchParams.get("mode") === "branch" ? "branch" : "working";
+      var rawMode = url.searchParams.get("mode") || "working";
+      var diffMode = rawMode === "branch" || rawMode === "conflict" ? rawMode : "working";
+      var targetBr = url.searchParams.get("targetBranch") || "main";
+      var reqOffset = Math.max(0, Math.floor(Number(url.searchParams.get("offset") || 0) || 0));
+      if (diffMode === "conflict") {
+        var conflictChunk1 =
+          "@@ -42,7 +42,13 @@\n" +
+          " export async function fetchWorktrees(roots) {\n" +
+          "+<<<<<<< HEAD (" + targetBr + ")\n" +
+          "+  return apiJson(qs(\"/api/worktrees\", { roots: roots.join(\",\") }), \"Worktrees failed\");\n" +
+          "+=======\n" +
+          "+  return apiJson(qs(\"/api/worktrees\", { roots: roots.join(\",\"), conversationId }), \"Worktrees failed\");\n" +
+          "+>>>>>>> lane/sidebar-ui";
+        var conflictChunk2 =
+          "@@ -180,4 +186,6 @@\n" +
+          "+// second 32 KiB conflict chunk from offset " + reqOffset + "\n" +
+          "+export const conflictMergedChunk = true;";
+        var isSecondChunk = reqOffset >= 32768;
+        var cBody = isSecondChunk ? conflictChunk2 : conflictChunk1;
+        return jsonResp({
+          ok: true,
+          worktree: wtPath,
+          file: relFile,
+          mode: diffMode,
+          targetBranch: targetBr,
+          diff: cBody,
+          offset: reqOffset,
+          nextOffset: isSecondChunk ? null : 32768,
+          hasMore: !isSecondChunk,
+          totalBytes: 49152,
+          truncated: !isSecondChunk,
+          untracked: false,
+          added: isSecondChunk ? 2 : 5,
+          removed: 0,
+        });
+      }
       var diffBody = diffMode === "branch"
-        ? "@@ -1,3 +1,5 @@\n export interface WorktreeChange {}\n+export type WorktreeDiffMode = \"working\" | \"branch\";\n+// committed on branch"
+        ? "@@ -1,3 +1,5 @@\n export interface WorktreeChange {}\n+export type WorktreeDiffMode = \"working\" | \"branch\" | \"conflict\";\n+// committed on branch"
         : "@@ -12,4 +12,6 @@\n-  const cached = probeCache.get(key);\n+  const realTarget = realpathSync(abs);\n+  if (!realTarget.startsWith(wtPrefix)) return { ok: false, status: 404 };\n   return capDiff(stdout, 8192);";
       return jsonResp({
         ok: true,
@@ -2153,6 +2235,10 @@
         file: relFile,
         mode: diffMode,
         diff: diffBody,
+        offset: reqOffset,
+        nextOffset: null,
+        hasMore: false,
+        totalBytes: diffBody.length,
         truncated: false,
         untracked: false,
         added: 2,
@@ -2178,6 +2264,7 @@
             action: actName,
             status: "conflict",
             conflicts: collidingFiles,
+            conflictFiles: collidingFiles,
             message: "Dry-run merge detected conflicting changes against main.",
           });
         }
@@ -2186,6 +2273,7 @@
           action: actName,
           status: "clean",
           conflicts: [],
+          conflictFiles: [],
           message: "Dry-run merge with " + (targetWt.baseBranch || "main") + " is clean.",
         });
       }
@@ -2198,6 +2286,7 @@
             status: "conflict",
             aborted: true,
             conflicts: collidingFiles,
+            conflictFiles: collidingFiles,
             message: "Rebase hit conflict and was aborted cleanly.",
           }, 409);
         }
@@ -2224,6 +2313,37 @@
           action: actName,
           status: "merged",
           message: "Fast-forward merged " + targetWt.branch + " into " + (targetWt.baseBranch || "main") + ".",
+        });
+      }
+      if (actName === "squash_merge" || actName === "merge_commit") {
+        if (targetWt.isMain) return jsonResp({ error: "Cannot merge primary worktree" }, 400);
+        if (!targetWt.clean) {
+          return jsonResp({ ok: false, action: actName, status: "dirty", message: "Worktree has uncommitted changes." }, 409);
+        }
+        if (collidingFiles.length > 0 || (targetWt.conflictFiles && targetWt.conflictFiles.length > 0)) {
+          var mergeConflicts = collidingFiles.length > 0 ? collidingFiles : targetWt.conflictFiles;
+          return jsonResp({
+            ok: false,
+            action: actName,
+            status: "conflict",
+            aborted: true,
+            conflicts: mergeConflicts,
+            conflictFiles: mergeConflicts,
+            message: (actName === "squash_merge" ? "Squash merge" : "Merge commit") + " hit conflicts and was aborted cleanly.",
+          }, 409);
+        }
+        var customMsg = typeof actBody.commitMessage === "string" ? actBody.commitMessage.trim() : "";
+        targetWt.ahead = 0;
+        targetWt.behind = 0;
+        targetWt.landStatus = "merged";
+        targetWt.mergeability = "up_to_date";
+        return jsonResp({
+          ok: true,
+          action: actName,
+          status: "merged",
+          message: (actName === "squash_merge" ? "Squash-merged " : "Merged ") +
+            targetWt.branch + " into " + (targetWt.baseBranch || "main") +
+            (customMsg ? " (" + customMsg + ")" : "") + ".",
         });
       }
       if (actName === "remove_worktree") {

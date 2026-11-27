@@ -168,10 +168,25 @@ await check("Worktrees toggles Working Changes vs Branch Diff and loads branch d
   return Boolean(cardTxt?.includes("committed on branch")) && Boolean(workingTxt?.includes("WorktreesView.tsx"));
 });
 
-await check("Worktrees Dry-Run Merge & Rebase surface conflicts and FF Merge + Remove Clean work", async () => {
+await check("Worktrees Dry-Run Merge, live conflict hunks + 32 KiB pagination, Send conflict to @owner, Squash Merge, Merge Commit, FF Merge & Remove Clean work", async () => {
+  const ownerUi = await page.locator('[data-testid="wt-owner-lane/sidebar-ui"]').textContent();
+  const ownerLand = await page.locator('[data-testid="wt-owner-lane/non-ff-land"]').textContent();
+
   await page.locator('[data-testid="wt-action-dry-run-lane/sidebar-ui"]').click();
   await page.waitForSelector('[data-testid="wt-action-conflicts-lane/sidebar-ui"]');
   const dryTxt = await page.locator('[data-testid="wt-action-result-lane/sidebar-ui"]').textContent();
+
+  await page.locator('[data-testid="wt-conflict-diff-btn-lane/sidebar-ui-frontend/src/sidecar.ts"]').click();
+  await page.waitForSelector('[data-testid="wt-card-lane/sidebar-ui"] pre');
+  const conflictChunk1 = await page.locator('[data-testid="wt-card-lane/sidebar-ui"] pre').textContent();
+  await page.locator('[data-testid="wt-diff-load-more-lane/sidebar-ui"]').click();
+  await page.waitForFunction(
+    () => (document.querySelector('[data-testid="wt-card-lane/sidebar-ui"] pre')?.textContent || "").includes("conflictMergedChunk"),
+  );
+  const conflictChunk2 = await page.locator('[data-testid="wt-card-lane/sidebar-ui"] pre').textContent();
+
+  await page.locator('[data-testid="wt-send-conflict-lane/sidebar-ui"]').click();
+  await page.waitForTimeout(100);
 
   await page.locator('[data-testid="wt-action-rebase-lane/sidebar-ui"]').click();
   await page.locator('[data-testid="wt-confirm-submit-lane/sidebar-ui"]').click();
@@ -179,6 +194,20 @@ await check("Worktrees Dry-Run Merge & Rebase surface conflicts and FF Merge + R
     () => (document.querySelector('[data-testid="wt-action-result-lane/sidebar-ui"]')?.textContent || "").includes("Rebase hit conflict"),
   );
   const rebaseTxt = await page.locator('[data-testid="wt-action-result-lane/sidebar-ui"]').textContent();
+
+  await page.locator('[data-testid="wt-action-squash-merge-lane/non-ff-land"]').click();
+  await page.fill('[data-testid="wt-confirm-msg-lane/non-ff-land"]', "docs: squash non-ff lane");
+  await page.locator('[data-testid="wt-confirm-submit-lane/non-ff-land"]').click();
+  await page.waitForFunction(
+    () => (document.querySelector('[data-testid="wt-action-result-lane/non-ff-land"]')?.textContent || "").includes("Squash-merged lane/non-ff-land"),
+  );
+
+  await page.locator('[data-testid="wt-action-merge-commit-lane/non-ff-land"]').click();
+  await page.fill('[data-testid="wt-confirm-msg-lane/non-ff-land"]', "merge: non-ff lane");
+  await page.locator('[data-testid="wt-confirm-submit-lane/non-ff-land"]').click();
+  await page.waitForFunction(
+    () => (document.querySelector('[data-testid="wt-action-result-lane/non-ff-land"]')?.textContent || "").includes("Merged lane/non-ff-land"),
+  );
 
   await page.locator('[data-testid="wt-action-ff-merge-lane/sidecar-backend"]').click();
   await page.locator('[data-testid="wt-confirm-submit-lane/sidecar-backend"]').click();
@@ -191,7 +220,17 @@ await check("Worktrees Dry-Run Merge & Rebase surface conflicts and FF Merge + R
   await page.waitForFunction(() => !document.querySelector('[data-testid="wt-card-lane/sidecar-backend"]'));
 
   const overflow380 = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+
+  await page.locator("#tab-board").click();
+  const boardTxt = await page.locator("#panel-board").textContent();
+  await page.locator("#tab-worktrees").click();
+
   return (
+    ownerUi === "@ui-dev · working · share" &&
+    ownerLand === "@verifier · waiting · branch" &&
+    Boolean(conflictChunk1?.includes("<<<<<<< HEAD")) &&
+    Boolean(conflictChunk2?.includes("conflictMergedChunk")) &&
+    Boolean(boardTxt?.includes("@ui-dev Resolve merge conflict on lane/sidebar-ui")) &&
     Boolean(dryTxt?.includes("Dry-run merge detected conflicting changes") && dryTxt.includes("frontend/src/sidecar.ts")) &&
     Boolean(rebaseTxt?.includes("Rebase hit conflict and was aborted cleanly") && rebaseTxt.includes("frontend/src/sidecar.ts")) &&
     overflow380 <= 0

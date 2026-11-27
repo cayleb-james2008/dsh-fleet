@@ -1,4 +1,4 @@
-import { useRef, useState } from "../hooks";
+import { useEffect, useRef, useState } from "../hooks";
 import {
   AlertTriangle,
   ChevronDown,
@@ -9,10 +9,12 @@ import {
   FolderGit2,
   GitBranch,
   RefreshCw,
+  Send,
   X,
 } from "../icons";
-import { fetchWorktreeDiff, openFileInAuxPane, runWorktreeAction } from "../sidecar";
+import { fetchWorktreeDiff, openFileInAuxPane, runWorktreeAction, sendSwarmControl } from "../sidecar";
 import type {
+  OperatorCommand,
   SwarmMember,
   WorktreeActionName,
   WorktreeActionPayload,
@@ -24,8 +26,24 @@ import type {
   WorktreeMergeability,
   WorktreesPayload,
 } from "../types";
-import { Badge, Button, Card, Input, cn, copyText, fmtTimeAgo, maskHome, openOrCopyPath, toast } from "../ui";
+import {
+  Badge,
+  Button,
+  Card,
+  Input,
+  cn,
+  copyText,
+  fmtTimeAgo,
+  hasControlChars,
+  maskHome,
+  notifyDispatch,
+  openOrCopyPath,
+  toDispatchedOp,
+  toast,
+} from "../ui";
 import type { BadgeTone } from "../ui";
+
+const DIFF_PAGE_BYTES = 32768;
 
 const LAND_META: Record<NonNullable<WorktreeInfo["landStatus"]>, { tone: BadgeTone; label: string; btn: string }> = {
   main: { tone: "neutral", label: "main", btn: "" },
@@ -65,8 +83,18 @@ const ACTION_LABEL: Record<WorktreeActionName, string> = {
   dry_run_merge: "Dry-Run Merge",
   ff_merge: "FF Merge",
   rebase: "Rebase",
+  squash_merge: "Squash Merge",
+  merge_commit: "Merge Commit",
   remove_worktree: "Remove Clean",
 };
+
+const REFRESHING_ACTIONS = new Set<WorktreeActionName>([
+  "ff_merge",
+  "rebase",
+  "squash_merge",
+  "merge_commit",
+  "remove_worktree",
+]);
 
 function safeLandCommand(wt: WorktreeInfo): string {
   const base = wt.baseBranch || "main";
@@ -117,27 +145,50 @@ function actionRecoveryHint(res: WorktreeActionPayload): string {
   if (res.aborted) return "Working tree restored cleanly after abort. Resolve conflicts before retrying.";
   switch (res.status) {
     case "not_ff":
-      return "Branch has diverged from base. Run Rebase first or resolve manually.";
+      return "Branch has diverged from base. Run Rebase first, or use Squash Merge / Merge Commit.";
     case "dirty":
       return "Commit or stash uncommitted changes in this worktree before retrying.";
     case "wrong_branch":
-      return "Switch the primary worktree back to the base branch before FF merge.";
+      return "Switch the primary worktree back to the base branch before merging.";
     case "unmerged":
       return "Worktree has unmerged commits or uncommitted edits.";
     case "conflict":
-      return "Resolve the listed conflicting file(s) before retrying.";
+      return "Inspect conflicting hunks below or route recovery to the worktree owner.";
     default:
       return "";
   }
 }
 
-function ownerForWorktree(wt: WorktreeInfo, members?: SwarmMember[]): SwarmMember | undefined {
-  if (!members || members.length === 0) return undefined;
+function resolveOwnerInfo(
+  wt: WorktreeInfo,
+  members?: SwarmMember[],
+): { member: string; status?: string; workspaceMode?: string } | null {
+  if (wt.swarmOwner?.member) {
+    return {
+      member: wt.swarmOwner.member,
+      status: wt.swarmOwner.status,
+      workspaceMode: wt.swarmOwner.workspaceMode,
+    };
+  }
+  if (!members || members.length === 0) return null;
   const maskedWt = maskHome(wt.path);
-  return members.find((m) => {
+  const hit = members.find((m) => {
     if (!m.workspace) return false;
     return m.workspace === wt.path || maskHome(m.workspace) === maskedWt;
   });
+  if (!hit) return null;
+  return {
+    member: hit.name,
+    status: hit.status,
+    workspaceMode: hit.workspace_mode,
+  };
+}
+
+function buildConflictDirective(owner: string, wt: WorktreeInfo, files: string[]): string {
+  const base = wt.baseBranch || "main";
+  const shown = files.slice(0, 12).join(", ");
+  const extra = files.length > 12 ? ` (+${files.length - 12} more)` : "";
+  return `@${owner} Resolve merge conflict on ${wt.branch} vs ${base} in ${maskHome(wt.path)}: ${shown}${extra}. Inspect conflict hunks, rebase onto ${base}, and post [done] when clean.`;
 }
 
 const diffLineCls = (l: string) =>
@@ -145,12 +196,165 @@ const diffLineCls = (l: string) =>
     ? "text-ok"
     : l[0] === "-" && !l.startsWith("---")
       ? "text-danger"
-      : l.startsWith("@@")
+      : l.startsWith("@@") || l.startsWith("<<<<<<<") || l.startsWith("=======") || l.startsWith(">>>>>>>")
         ? "text-info"
         : "text-ink-2";
 
+function DiffHunkBox({
+  diffEntry,
+  busy,
+  loadingMore,
+  mode,
+  branch,
+  onLoadMore,
+}: {
+  diffEntry?: WorktreeDiffPayload;
+  busy: boolean;
+  loadingMore: boolean;
+  mode: WorktreeDiffMode;
+  branch: string;
+  onLoadMore: () => void;
+}) {
+  return (
+    <div className="rounded-chip border border-hairline bg-canvas p-2 space-y-1">
+      {busy ? (
+        <p className="text-[12px] text-ink-2">Loading…</p>
+      ) : diffEntry ? (
+        <>
+          <div className="row flex-wrap gap-1 text-[12px] text-ink-2">
+            <span className="mono num">
+              +{diffEntry.added} / -{diffEntry.removed}
+              {diffEntry.untracked ? " (untracked)" : ""}
+              {mode === "branch" ? " (branch)" : mode === "conflict" ? " (conflict)" : ""}
+              {typeof diffEntry.totalBytes === "number" && diffEntry.totalBytes > 0
+                ? ` · ${Math.max(1, Math.round(diffEntry.totalBytes / 1024))} KiB`
+                : ""}
+            </span>
+            {diffEntry.hasMore ? (
+              <Badge tone="warning">More available</Badge>
+            ) : diffEntry.truncated ? (
+              <Badge tone="warning">Truncated</Badge>
+            ) : null}
+          </div>
+          <pre className="max-h-48 overflow-auto text-[12px] leading-snug mono">
+            {(diffEntry.diff || "(empty diff)").split("\n").map((line, i) => (
+              <div key={i} className={diffLineCls(line)}>
+                {line || " "}
+              </div>
+            ))}
+          </pre>
+          {diffEntry.hasMore && (
+            <div className="pt-1">
+              <Button
+                variant="outline"
+                disabled={loadingMore}
+                data-testid={`wt-diff-load-more-${branch}`}
+                onClick={onLoadMore}
+                className="h-7 px-2 text-[12px]"
+              >
+                {loadingMore ? "Loading…" : "Load next 32 KiB"}
+              </Button>
+            </div>
+          )}
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function ConflictFilesList({
+  wt,
+  files,
+  testId,
+  ariaLabel,
+  targetOwner,
+  sendingConflict,
+  openDiffKey,
+  diffByKey,
+  diffLoadingKey,
+  diffLoadingMoreKey,
+  onToggleConflictDiff,
+  onLoadMoreConflictDiff,
+  onSendConflict,
+}: {
+  wt: WorktreeInfo;
+  files: string[];
+  testId: string;
+  ariaLabel: string;
+  targetOwner: string;
+  sendingConflict: boolean;
+  openDiffKey: string | null;
+  diffByKey: Record<string, WorktreeDiffPayload>;
+  diffLoadingKey: string | null;
+  diffLoadingMoreKey: string | null;
+  onToggleConflictDiff: (file: string) => void;
+  onLoadMoreConflictDiff: (file: string) => void;
+  onSendConflict: () => void;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <ul
+        data-testid={testId}
+        aria-label={ariaLabel}
+        className="divide-y divide-hairline rounded-chip border border-hairline bg-surface px-2 py-1 text-[12px] text-ink"
+      >
+        {files.map((cf) => {
+          const key = `${wt.path}::conflict::${cf}`;
+          const diffOpen = openDiffKey === key;
+          const diffEntry = diffByKey[key];
+          const diffBusy = diffLoadingKey === key;
+          const loadingMore = diffLoadingMoreKey === key;
+          return (
+            <li key={cf} className="py-1 space-y-1">
+              <div className="row flex-wrap gap-1.5">
+                <span className="mono break-all min-w-0 flex-1">{cf}</span>
+                <Button
+                  variant="ghost"
+                  aria-label={`Conflict diff ${cf}`}
+                  aria-expanded={diffOpen}
+                  data-testid={`wt-conflict-diff-btn-${wt.branch}-${cf}`}
+                  onClick={() => onToggleConflictDiff(cf)}
+                  className="h-7 px-2 shrink-0 text-ink"
+                >
+                  {diffOpen ? <ChevronUp /> : <ChevronDown />}
+                  Conflict diff
+                </Button>
+              </div>
+              {diffOpen && (
+                <DiffHunkBox
+                  diffEntry={diffEntry}
+                  busy={diffBusy}
+                  loadingMore={loadingMore}
+                  mode="conflict"
+                  branch={wt.branch}
+                  onLoadMore={() => onLoadMoreConflictDiff(cf)}
+                />
+              )}
+            </li>
+          );
+        })}
+      </ul>
+      <div className="wrap gap-1.5">
+        <Button
+          variant="outline"
+          disabled={sendingConflict}
+          data-testid={`wt-send-conflict-${wt.branch}`}
+          onClick={onSendConflict}
+          className="h-7 px-2 text-[12px] text-ink"
+        >
+          <Send />
+          {sendingConflict ? "Sending…" : `Send conflict to @${targetOwner}`}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export function WorktreesView({
   workspaceUris,
+  swarmRoots = [],
+  conversationId = "",
+  canPostControl = false,
   payload,
   loading,
   error,
@@ -158,8 +362,13 @@ export function WorktreesView({
   members,
   onAddManualRoot,
   onRefresh,
+  onSwarmRefresh,
+  onOpDispatched,
 }: {
   workspaceUris: string[];
+  swarmRoots?: string[];
+  conversationId?: string;
+  canPostControl?: boolean;
   payload: WorktreesPayload | null;
   loading: boolean;
   error?: string;
@@ -167,21 +376,43 @@ export function WorktreesView({
   members?: SwarmMember[];
   onAddManualRoot: (root: string) => void;
   onRefresh: () => void;
+  onSwarmRefresh?: () => void;
+  onOpDispatched?: (op: OperatorCommand) => void;
 }) {
   const [rootInput, setRootInput] = useState("");
   const [openDiffKey, setOpenDiffKey] = useState<string | null>(null);
   const [diffByKey, setDiffByKey] = useState<Record<string, WorktreeDiffPayload>>({});
   const [diffLoadingKey, setDiffLoadingKey] = useState<string | null>(null);
+  const [diffLoadingMoreKey, setDiffLoadingMoreKey] = useState<string | null>(null);
   const [diffModeByWt, setDiffModeByWt] = useState<Record<string, WorktreeDiffMode>>({});
   const [confirmAction, setConfirmAction] = useState<{ wtPath: string; action: WorktreeActionName } | null>(null);
+  const [confirmCommitMsg, setConfirmCommitMsg] = useState("");
   const [busyActionKey, setBusyActionKey] = useState<string | null>(null);
   const [actionResultByWt, setActionResultByWt] = useState<Record<string, WorktreeActionPayload>>({});
+  const [sendingConflictWt, setSendingConflictWt] = useState<string | null>(null);
   const actionLockRef = useRef(false);
+  const conflictPostLockRef = useRef(false);
 
   const worktrees = payload?.worktrees || [];
   const collisions = payload?.collisions || [];
   const rootErrors = (payload?.roots || []).filter((r) => Boolean(r.error));
-  const allRoots = [...new Set([...workspaceUris, ...manualRoots])];
+  const allRoots = [...new Set([...workspaceUris, ...swarmRoots, ...manualRoots])];
+
+  const clearDiffCache = () => {
+    setDiffByKey({});
+    setOpenDiffKey(null);
+    setDiffLoadingKey(null);
+    setDiffLoadingMoreKey(null);
+  };
+
+  useEffect(() => {
+    clearDiffCache();
+  }, [payload, conversationId]);
+
+  const handleRefreshClick = () => {
+    clearDiffCache();
+    onRefresh();
+  };
 
   const getDiffMode = (wtPath: string): WorktreeDiffMode => diffModeByWt[wtPath] || "working";
 
@@ -190,7 +421,13 @@ export function WorktreesView({
     setOpenDiffKey((cur) => (cur && cur.startsWith(`${wtPath}::`) ? null : cur));
   };
 
-  const handleToggleDiff = async (root: string, worktree: string, file: string, mode: WorktreeDiffMode) => {
+  const handleToggleDiff = async (
+    root: string,
+    worktree: string,
+    file: string,
+    mode: WorktreeDiffMode,
+    targetBranch?: string,
+  ) => {
     const key = `${worktree}::${mode}::${file}`;
     if (openDiffKey === key) {
       setOpenDiffKey(null);
@@ -200,7 +437,11 @@ export function WorktreesView({
     if (diffByKey[key]) return;
     setDiffLoadingKey(key);
     try {
-      const res = await fetchWorktreeDiff(root, worktree, file, mode);
+      const res = await fetchWorktreeDiff(root, worktree, file, mode, {
+        targetBranch: mode === "conflict" ? targetBranch : undefined,
+        offset: 0,
+        maxBytes: DIFF_PAGE_BYTES,
+      });
       setDiffByKey((prev) => ({ ...prev, [key]: res }));
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to load diff");
@@ -210,24 +451,81 @@ export function WorktreesView({
     }
   };
 
-  const executeWorktreeAction = async (wt: WorktreeInfo, action: WorktreeActionName) => {
+  const handleLoadMoreDiff = async (
+    root: string,
+    worktree: string,
+    file: string,
+    mode: WorktreeDiffMode,
+    targetBranch?: string,
+  ) => {
+    const key = `${worktree}::${mode}::${file}`;
+    const existing = diffByKey[key];
+    if (!existing || !existing.hasMore || diffLoadingMoreKey === key) return;
+    const nextOffset =
+      typeof existing.nextOffset === "number" && existing.nextOffset > 0
+        ? existing.nextOffset
+        : new TextEncoder().encode(existing.diff || "").length;
+    setDiffLoadingMoreKey(key);
+    try {
+      const res = await fetchWorktreeDiff(root, worktree, file, mode, {
+        targetBranch: mode === "conflict" ? targetBranch : undefined,
+        offset: nextOffset,
+        maxBytes: DIFF_PAGE_BYTES,
+      });
+      setDiffByKey((prev) => {
+        const cur = prev[key] || existing;
+        const left = cur.diff || "";
+        const right = res.diff || "";
+        const mergedDiff = left && right ? `${left.endsWith("\n") ? left : `${left}\n`}${right}` : `${left}${right}`;
+        return {
+          ...prev,
+          [key]: {
+            ...res,
+            diff: mergedDiff,
+            added: (cur.added || 0) + (res.added || 0),
+            removed: (cur.removed || 0) + (res.removed || 0),
+            hasMore: Boolean(res.hasMore),
+            nextOffset: res.nextOffset ?? null,
+            totalBytes: res.totalBytes ?? cur.totalBytes,
+            truncated: Boolean(res.truncated && res.hasMore),
+          },
+        };
+      });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to load next diff chunk");
+    } finally {
+      setDiffLoadingMoreKey((cur) => (cur === key ? null : cur));
+    }
+  };
+
+  const executeWorktreeAction = async (wt: WorktreeInfo, action: WorktreeActionName, commitMessage = "") => {
     if (actionLockRef.current) return;
+    if (hasControlChars(commitMessage)) {
+      toast.error("Control characters are not allowed in commit message.");
+      return;
+    }
     const key = `${wt.path}::${action}`;
     actionLockRef.current = true;
     setBusyActionKey(key);
     setConfirmAction(null);
+    setConfirmCommitMsg("");
     try {
-      const res = await runWorktreeAction(action, wt.path, wt.baseBranch || "main", wt.root);
+      const cleanMsg = commitMessage.trim();
+      const res = await runWorktreeAction(action, wt.path, wt.baseBranch || "main", wt.root, {
+        ...(cleanMsg ? { commitMessage: cleanMsg } : {}),
+      });
+      clearDiffCache();
       setActionResultByWt((prev) => ({ ...prev, [wt.path]: res }));
       if (res.ok) {
         toast.success(maskHome(res.message || `${ACTION_LABEL[action]} succeeded on ${wt.branch}`));
-        if (action === "ff_merge" || action === "rebase" || action === "remove_worktree") {
+        if (REFRESHING_ACTIONS.has(action)) {
           onRefresh();
         }
       } else {
         toast.error(maskHome(res.message || `${ACTION_LABEL[action]} reported conflicts`));
       }
     } catch (err) {
+      clearDiffCache();
       const message = err instanceof Error ? err.message : "Worktree action failed";
       setActionResultByWt((prev) => ({
         ...prev,
@@ -240,11 +538,39 @@ export function WorktreesView({
     }
   };
 
+  const handleSendConflictToOwner = async (wt: WorktreeInfo, owner: string, conflictFiles: string[]) => {
+    if (conflictPostLockRef.current || !conflictFiles.length) return;
+    const directive = buildConflictDirective(owner, wt, conflictFiles);
+    if (!conversationId || !canPostControl) {
+      await copyText(directive, `Copied conflict directive for @${owner}`);
+      return;
+    }
+    conflictPostLockRef.current = true;
+    setSendingConflictWt(wt.path);
+    try {
+      const res = await sendSwarmControl({
+        op: "board_post",
+        conversationId,
+        text: directive,
+      });
+      notifyDispatch(res, `conflict directive to @${owner}`);
+      const dispatched = toDispatchedOp(res, "board_post", owner);
+      if (dispatched) onOpDispatched?.(dispatched);
+      onSwarmRefresh?.();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to send conflict directive");
+    } finally {
+      conflictPostLockRef.current = false;
+      setSendingConflictWt((cur) => (cur === wt.path ? null : cur));
+    }
+  };
+
   const handleActionClick = (wt: WorktreeInfo, action: WorktreeActionName) => {
     if (action === "dry_run_merge") {
       void executeWorktreeAction(wt, action);
       return;
     }
+    setConfirmCommitMsg("");
     setConfirmAction((cur) =>
       cur && cur.wtPath === wt.path && cur.action === action ? null : { wtPath: wt.path, action },
     );
@@ -262,7 +588,7 @@ export function WorktreesView({
     <div className="space-y-3">
       <div className="row">
         <h2 className="h2">Git worktrees ({worktrees.length})</h2>
-        <Button onClick={onRefresh} disabled={loading}>
+        <Button onClick={handleRefreshClick} disabled={loading}>
           <RefreshCw className={loading ? "motion-safe:animate-spin" : ""} />
           Refresh
         </Button>
@@ -336,7 +662,7 @@ export function WorktreesView({
         </Card>
       )}
 
-      {allRoots.length === 0 || worktrees.length === 0 ? (
+      {worktrees.length === 0 ? (
         <Card className="p-4 space-y-1 bg-board">
           <p className="text-[14px] font-medium text-ink">
             {allRoots.length === 0 ? "No open workspace folder" : loading ? "Inspecting worktrees..." : "No git worktrees detected."}
@@ -355,7 +681,9 @@ export function WorktreesView({
             const workingFiles = normalizeChangedFiles(wt.files, wt);
             const branchFiles = normalizeChangedFiles(wt.branchFiles, wt);
             const dirtyCount = wt.dirtyFiles + wt.stagedFiles + wt.untrackedFiles;
-            const owner = ownerForWorktree(wt, members);
+            const owner = resolveOwnerInfo(wt, members);
+            const ownerBadgeText = owner ? [`@${owner.member}`, owner.status, owner.workspaceMode].filter(Boolean).join(" · ") : "";
+            const targetOwner = owner?.member || "coordinator";
             const diffMode = getDiffMode(wt.path);
             const activeFiles = diffMode === "branch" ? branchFiles : workingFiles;
             const activeTruncated = diffMode === "branch" ? wt.branchFilesTruncated : wt.filesTruncated;
@@ -364,8 +692,10 @@ export function WorktreesView({
             const actionConflicts = actionRes?.conflicts || actionRes?.conflictFiles || [];
             const presetConflicts = Array.isArray(wt.conflictFiles) ? wt.conflictFiles : [];
             const confirmingHere = confirmAction?.wtPath === wt.path ? confirmAction.action : null;
+            const isCommitAction = confirmingHere === "squash_merge" || confirmingHere === "merge_commit";
             const isBusyHere = Boolean(busyActionKey && busyActionKey.startsWith(`${wt.path}::`));
             const canToggleDiffMode = !wt.isMain || branchFiles.length > 0 || workingFiles.length > 0;
+            const sendingConflictHere = sendingConflictWt === wt.path;
 
             return (
               <Card key={wt.id} data-testid={`wt-card-${wt.branch}`} className="p-3 space-y-2">
@@ -375,7 +705,15 @@ export function WorktreesView({
                       <GitBranch className="h-3.5 w-3.5 text-info shrink-0" />
                       <span className="h2 break-all">{wt.branch}</span>
                       {wt.isMain && <Badge tone="neutral">main</Badge>}
-                      {owner && <Badge tone="violet" className="max-w-full truncate">@{owner.name}</Badge>}
+                      {owner && (
+                        <Badge
+                          tone={owner.status === "working" ? "info" : "violet"}
+                          data-testid={`wt-owner-${wt.branch}`}
+                          className="max-w-full truncate"
+                        >
+                          {ownerBadgeText}
+                        </Badge>
+                      )}
                       <Badge tone={wt.clean ? "success" : "warning"}>
                         {wt.clean ? "clean" : `${dirtyCount} changed`}
                       </Badge>
@@ -455,6 +793,24 @@ export function WorktreesView({
                         Rebase
                       </Button>
                       <Button
+                        variant="outline"
+                        disabled={isBusyHere || !wt.clean}
+                        title={!wt.clean ? "Working tree must be clean before squash merge" : undefined}
+                        data-testid={`wt-action-squash-merge-${wt.branch}`}
+                        onClick={() => handleActionClick(wt, "squash_merge")}
+                      >
+                        Squash Merge
+                      </Button>
+                      <Button
+                        variant="outline"
+                        disabled={isBusyHere || !wt.clean}
+                        title={!wt.clean ? "Working tree must be clean before merge commit" : undefined}
+                        data-testid={`wt-action-merge-commit-${wt.branch}`}
+                        onClick={() => handleActionClick(wt, "merge_commit")}
+                      >
+                        Merge Commit
+                      </Button>
+                      <Button
                         variant="danger"
                         disabled={isBusyHere || !wt.clean}
                         title={!wt.clean ? "Working tree must be clean before removal" : undefined}
@@ -468,24 +824,41 @@ export function WorktreesView({
                     {confirmingHere && (
                       <div
                         data-testid={`wt-confirm-${wt.branch}`}
-                        className="row flex-wrap gap-2 rounded-chip border border-hairline bg-board px-2 py-1.5 text-[12px]"
+                        className="space-y-1.5 rounded-chip border border-hairline bg-board px-2 py-1.5 text-[12px]"
                       >
-                        <span className="text-ink">
-                          Confirm {ACTION_LABEL[confirmingHere]} on <span className="mono font-medium">{wt.branch}</span>?
-                        </span>
-                        <div className="f1 shrink-0">
-                          <Button variant="ghost" onClick={() => setConfirmAction(null)}>
-                            Cancel
-                          </Button>
-                          <Button
-                            variant={confirmingHere === "remove_worktree" ? "danger" : "primary"}
-                            disabled={isBusyHere}
-                            data-testid={`wt-confirm-submit-${wt.branch}`}
-                            onClick={() => void executeWorktreeAction(wt, confirmingHere)}
-                          >
-                            Confirm {ACTION_LABEL[confirmingHere]}
-                          </Button>
+                        <div className="row flex-wrap gap-2">
+                          <span className="text-ink">
+                            Confirm {ACTION_LABEL[confirmingHere]} on <span className="mono font-medium">{wt.branch}</span>?
+                          </span>
+                          <div className="f1 shrink-0">
+                            <Button
+                              variant="ghost"
+                              onClick={() => {
+                                setConfirmAction(null);
+                                setConfirmCommitMsg("");
+                              }}
+                            >
+                              Cancel
+                            </Button>
+                            <Button
+                              variant={confirmingHere === "remove_worktree" ? "danger" : "primary"}
+                              disabled={isBusyHere || hasControlChars(confirmCommitMsg)}
+                              data-testid={`wt-confirm-submit-${wt.branch}`}
+                              onClick={() => void executeWorktreeAction(wt, confirmingHere, isCommitAction ? confirmCommitMsg : "")}
+                            >
+                              Confirm {ACTION_LABEL[confirmingHere]}
+                            </Button>
+                          </div>
                         </div>
+                        {isCommitAction && (
+                          <Input
+                            aria-label={`Commit message for ${wt.branch}`}
+                            data-testid={`wt-confirm-msg-${wt.branch}`}
+                            placeholder={`Optional commit message for ${wt.branch}`}
+                            value={confirmCommitMsg}
+                            onChange={(e) => setConfirmCommitMsg(e.target.value)}
+                          />
+                        )}
                       </div>
                     )}
 
@@ -496,7 +869,7 @@ export function WorktreesView({
                           role={actionRes.ok ? "status" : "alert"}
                           data-testid={`wt-action-result-${wt.branch}`}
                           className={cn(
-                            "rounded-chip border px-2 py-1.5 space-y-1 text-[12px]",
+                            "rounded-chip border px-2 py-1.5 space-y-1.5 text-[12px]",
                             actionRes.ok ? "border-ok bg-ok-soft text-ink" : "border-danger bg-bad-soft text-danger",
                           )}
                         >
@@ -529,15 +902,25 @@ export function WorktreesView({
                           </div>
                           {hint && <p className="text-ink-2 break-words">{hint}</p>}
                           {actionConflicts.length > 0 && (
-                            <ul
-                              data-testid={`wt-action-conflicts-${wt.branch}`}
-                              aria-label={`Conflicting files in ${wt.branch}`}
-                              className="list-disc pl-4 mono text-[12px] text-ink space-y-0.5"
-                            >
-                              {actionConflicts.map((cf) => (
-                                <li key={cf} className="break-all">{cf}</li>
-                              ))}
-                            </ul>
+                            <ConflictFilesList
+                              wt={wt}
+                              files={actionConflicts}
+                              testId={`wt-action-conflicts-${wt.branch}`}
+                              ariaLabel={`Conflicting files in ${wt.branch}`}
+                              targetOwner={targetOwner}
+                              sendingConflict={sendingConflictHere}
+                              openDiffKey={openDiffKey}
+                              diffByKey={diffByKey}
+                              diffLoadingKey={diffLoadingKey}
+                              diffLoadingMoreKey={diffLoadingMoreKey}
+                              onToggleConflictDiff={(cf) =>
+                                void handleToggleDiff(wt.root, wt.path, cf, "conflict", wt.baseBranch || "main")
+                              }
+                              onLoadMoreConflictDiff={(cf) =>
+                                void handleLoadMoreDiff(wt.root, wt.path, cf, "conflict", wt.baseBranch || "main")
+                              }
+                              onSendConflict={() => void handleSendConflictToOwner(wt, targetOwner, actionConflicts)}
+                            />
                           )}
                         </div>
                       );
@@ -548,14 +931,28 @@ export function WorktreesView({
                 {presetConflicts.length > 0 && !actionRes && (
                   <div
                     data-testid={`wt-conflicts-${wt.branch}`}
-                    className="rounded-chip border border-danger bg-bad-soft px-2 py-1.5 text-[12px] space-y-1"
+                    className="rounded-chip border border-danger bg-bad-soft px-2 py-1.5 text-[12px] space-y-1.5"
                   >
                     <p className="font-medium text-danger">Predicted merge conflicts ({presetConflicts.length})</p>
-                    <ul className="list-disc pl-4 mono text-ink space-y-0.5">
-                      {presetConflicts.map((cf) => (
-                        <li key={cf} className="break-all">{cf}</li>
-                      ))}
-                    </ul>
+                    <ConflictFilesList
+                      wt={wt}
+                      files={presetConflicts}
+                      testId={`wt-preset-conflicts-${wt.branch}`}
+                      ariaLabel={`Predicted conflicting files in ${wt.branch}`}
+                      targetOwner={targetOwner}
+                      sendingConflict={sendingConflictHere}
+                      openDiffKey={openDiffKey}
+                      diffByKey={diffByKey}
+                      diffLoadingKey={diffLoadingKey}
+                      diffLoadingMoreKey={diffLoadingMoreKey}
+                      onToggleConflictDiff={(cf) =>
+                        void handleToggleDiff(wt.root, wt.path, cf, "conflict", wt.baseBranch || "main")
+                      }
+                      onLoadMoreConflictDiff={(cf) =>
+                        void handleLoadMoreDiff(wt.root, wt.path, cf, "conflict", wt.baseBranch || "main")
+                      }
+                      onSendConflict={() => void handleSendConflictToOwner(wt, targetOwner, presetConflicts)}
+                    />
                   </div>
                 )}
 
@@ -636,6 +1033,7 @@ export function WorktreesView({
                           const diffOpen = openDiffKey === key;
                           const diffEntry = diffByKey[key];
                           const diffBusy = diffLoadingKey === key;
+                          const loadingMore = diffLoadingMoreKey === key;
 
                           return (
                             <li key={`${diffMode}-${f.path}`} className="py-1 space-y-1">
@@ -658,7 +1056,7 @@ export function WorktreesView({
                                     variant="ghost"
                                     aria-label={`Diff peek ${f.path}`}
                                     aria-expanded={diffOpen}
-                                    onClick={() => handleToggleDiff(wt.root, wt.path, f.path, diffMode)}
+                                    onClick={() => handleToggleDiff(wt.root, wt.path, f.path, diffMode, wt.baseBranch || "main")}
                                     className="h-7 px-2"
                                   >
                                     {diffOpen ? <ChevronUp /> : <ChevronDown />}
@@ -678,29 +1076,16 @@ export function WorktreesView({
                                 </div>
                               </div>
                               {diffOpen && (
-                                <div className="rounded-chip border border-hairline bg-canvas p-2 space-y-1">
-                                  {diffBusy ? (
-                                    <p className="text-[12px] text-ink-2">Loading…</p>
-                                  ) : diffEntry ? (
-                                    <>
-                                      <div className="row flex-wrap gap-1 text-[12px] text-ink-2">
-                                        <span className="mono num">
-                                          +{diffEntry.added} / -{diffEntry.removed}
-                                          {diffEntry.untracked ? " (untracked)" : ""}
-                                          {diffMode === "branch" ? " (branch)" : ""}
-                                        </span>
-                                        {diffEntry.truncated && <Badge tone="warning">8 KB cap</Badge>}
-                                      </div>
-                                      <pre className="max-h-48 overflow-auto text-[12px] leading-snug mono">
-                                        {(diffEntry.diff || "(empty diff)").split("\n").map((line, i) => (
-                                          <div key={i} className={diffLineCls(line)}>
-                                            {line || " "}
-                                          </div>
-                                        ))}
-                                      </pre>
-                                    </>
-                                  ) : null}
-                                </div>
+                                <DiffHunkBox
+                                  diffEntry={diffEntry}
+                                  busy={diffBusy}
+                                  loadingMore={loadingMore}
+                                  mode={diffMode}
+                                  branch={wt.branch}
+                                  onLoadMore={() =>
+                                    void handleLoadMoreDiff(wt.root, wt.path, f.path, diffMode, wt.baseBranch || "main")
+                                  }
+                                />
                               )}
                             </li>
                           );
