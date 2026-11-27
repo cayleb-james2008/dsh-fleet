@@ -17,8 +17,11 @@ const MAX_DIFF_BYTES = 32768;
 const MAX_DIFF_STREAM_BYTES = 8 * 1024 * 1024;
 const MAX_COMMIT_MSG_LEN = 4096;
 const GIT_TIMEOUT_MS = 2500;
+const GIT_CONCURRENCY = 4;
 const DEFAULT_TTL_MS = 3000;
 const PROBE_CACHE_CAP = 32;
+const GIT_ENV_OVERRIDES = Object.freeze({ GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' });
+const gitExecEnv = () => ({ ...process.env, ...GIT_ENV_OVERRIDES });
 const VALID_ACTIONS = new Set([
   'dry_run_merge',
   'ff_merge',
@@ -29,6 +32,28 @@ const VALID_ACTIONS = new Set([
 ]);
 const BRANCH_NAME_RE = /^[A-Za-z0-9._/-]{1,128}$/;
 const COMMIT_MSG_CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/;
+
+function clampTimeoutMs(val, fallback = GIT_TIMEOUT_MS) {
+  if (val === undefined || val === null || val === '') return fallback;
+  const n = Number(val);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(30000, Math.max(20, Math.floor(n)));
+}
+
+async function mapWithConcurrency(items, limit, fn) {
+  if (!items.length) return [];
+  const cap = Math.max(1, Math.min(limit, items.length));
+  const out = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const idx = next++;
+      out[idx] = await fn(items[idx], idx);
+    }
+  }
+  await Promise.all(Array.from({ length: cap }, worker));
+  return out;
+}
 
 function stripTrailingSlashes(p) {
   return p.length > 1 ? p.replace(/\/+$/, '') || '/' : p;
@@ -43,36 +68,46 @@ function isSymlinkPath(p) {
 }
 
 function execGit(cwd, args, timeoutMs = GIT_TIMEOUT_MS) {
+  const effectiveTimeout = clampTimeoutMs(timeoutMs);
   return new Promise((resolve) => {
     execFile(
       'git',
-      ['-C', cwd, ...args],
-      { encoding: 'utf-8', timeout: timeoutMs, maxBuffer: 2 * 1024 * 1024 },
+      ['-c', 'core.quotepath=false', '-C', cwd, ...args],
+      { encoding: 'utf-8', timeout: effectiveTimeout, killSignal: 'SIGKILL', maxBuffer: 2 * 1024 * 1024, env: gitExecEnv() },
       (err, stdout, stderr) => {
         if (err) {
+          const timedOut = Boolean(
+            err.killed || err.signal === 'SIGKILL' || err.signal === 'SIGTERM' || err.code === 'ETIMEDOUT',
+          );
           return resolve({
             ok: false,
             code: typeof err.code === 'number' ? err.code : 1,
+            timedOut,
             stdout: stdout || '',
             stderr: stderr || '',
-            error: err.message,
+            error: timedOut ? `git command timed out after ${effectiveTimeout}ms` : err.message,
           });
         }
-        resolve({ ok: true, code: 0, stdout: stdout || '', stderr: stderr || '' });
+        resolve({ ok: true, code: 0, timedOut: false, stdout: stdout || '', stderr: stderr || '' });
       },
     );
   });
 }
 
 function execGitDiffSlice(cwd, args, startOffset = 0, cap = 8192, timeoutMs = GIT_TIMEOUT_MS) {
+  const effectiveTimeout = clampTimeoutMs(timeoutMs);
   const winStart = Math.max(0, startOffset);
   const winEnd = winStart + cap + 16;
   return new Promise((resolve) => {
-    const child = spawn('git', ['-C', cwd, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('git', ['-c', 'core.quotepath=false', '-C', cwd, ...args], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: gitExecEnv(),
+    });
     const chunks = [];
     let collected = 0;
     let totalBytes = 0;
     let streamTruncated = false;
+    let timedOut = false;
     let settled = false;
     let stderr = '';
     const finish = (ok, code = 0) => {
@@ -80,14 +115,15 @@ function execGitDiffSlice(cwd, args, startOffset = 0, cap = 8192, timeoutMs = GI
       settled = true;
       clearTimeout(timer);
       const windowBuf = chunks.length ? Buffer.concat(chunks, collected) : Buffer.alloc(0);
-      resolve({ ok, code, windowBuf, windowStart: winStart, totalBytes, streamTruncated, stderr });
+      resolve({ ok, code, timedOut, windowBuf, windowStart: winStart, totalBytes, streamTruncated, stderr });
     };
     const timer = setTimeout(() => {
+      timedOut = true;
       try {
         child.kill('SIGKILL');
       } catch {}
       finish(false, 1);
-    }, timeoutMs);
+    }, effectiveTimeout);
     timer.unref?.();
     child.stdout.on('data', (chunk) => {
       if (streamTruncated) return;
@@ -200,12 +236,13 @@ export function normalizeWorkspaceRoot(raw) {
 
   let fsPath = trimmed;
   if (trimmed.startsWith('file://')) {
-    if (/%2e/i.test(trimmed)) return null;
+    if (/%00|%2e|%2f|%5c/i.test(trimmed)) return null;
     try {
       fsPath = fileURLToPath(trimmed);
     } catch {
       return null;
     }
+    if (/[\0\\]/.test(fsPath)) return null;
   } else if (trimmed.includes('%')) {
     return null;
   }
@@ -317,15 +354,15 @@ function safeWorktreeFileUri(wtReal, relPath) {
   }
 }
 
-async function detectBaseBranch(rootPath) {
+async function detectBaseBranch(rootPath, timeoutMs = GIT_TIMEOUT_MS) {
   for (const name of ['main', 'master']) {
-    const res = await execGit(rootPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${name}`]);
+    const res = await execGit(rootPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${name}`], timeoutMs);
     if (res.ok && res.stdout.trim()) return name;
   }
-  const headRef = await execGit(rootPath, ['symbolic-ref', '--short', 'HEAD']);
+  const headRef = await execGit(rootPath, ['symbolic-ref', '--short', 'HEAD'], timeoutMs);
   const candidate = headRef.ok ? headRef.stdout.trim() : '';
   if (candidate && isSafeBranchName(candidate)) {
-    const verify = await execGit(rootPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${candidate}`]);
+    const verify = await execGit(rootPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${candidate}`], timeoutMs);
     if (verify.ok && verify.stdout.trim()) return candidate;
   }
   return '';
@@ -343,13 +380,14 @@ function parseMergeTreeOutput(res) {
   return {
     ok: false,
     clean: false,
+    timedOut: Boolean(res.timedOut),
     treeSha: '',
     conflictFiles: [],
     error: (res.stderr || res.error || 'merge-tree failed').trim(),
   };
 }
 
-async function inspectWorktree(rootPath, wt, index, baseBranch = '') {
+async function inspectWorktree(rootPath, wt, index, baseBranch = '', timeoutMs = GIT_TIMEOUT_MS) {
   let wtReal = wt.path;
   let exists = true;
   let totalBranchFiles = 0;
@@ -372,22 +410,24 @@ async function inspectWorktree(rootPath, wt, index, baseBranch = '') {
   const branchFiles = [];
   const commits = [];
   let totalChanged = 0;
-  let lastCommitSha = wt.head ? wt.head.slice(0, 8) : '';
+  const validHead = hasValidHeadSha(wt);
+  const unborn = !wt.bare && !validHead;
+  let lastCommitSha = validHead ? wt.head.slice(0, 8) : '';
   let lastCommitSubject = '';
   let lastCommitAt = 0;
   let ahead = 0;
   let behind = 0;
   const branch = wt.branch || (wt.detached ? 'detached' : 'unknown');
   const isMain = index === 0 || wtReal === rootPath;
-  const checkBranchRel = Boolean(exists && !wt.bare && !isMain && baseBranch && (wt.detached || branch !== baseBranch));
+  const checkBranchRel = Boolean(exists && !wt.bare && !isMain && !unborn && baseBranch && (wt.detached || branch !== baseBranch));
 
   if (exists && !wt.bare) {
     const [statusRes, logRes, divRes, branchFilesRes, commitsRes] = await Promise.all([
-      execGit(wtReal, ['status', '--porcelain=v1', '-z']),
-      execGit(wtReal, ['log', '-n', '1', '--format=%h%x09%s%x09%ct']),
-      checkBranchRel ? execGit(wtReal, ['rev-list', '--left-right', '--count', `${baseBranch}...HEAD`]) : Promise.resolve({ ok: false, stdout: '' }),
-      checkBranchRel ? execGit(wtReal, ['diff', '--name-only', '-z', `${baseBranch}...HEAD`]) : Promise.resolve({ ok: false, stdout: '' }),
-      checkBranchRel ? execGit(wtReal, ['log', '-n', String(MAX_RECENT_COMMITS), '--format=%h%x09%s%x09%aI', `${baseBranch}..HEAD`]) : Promise.resolve({ ok: false, stdout: '' }),
+      execGit(wtReal, ['status', '--porcelain=v1', '-z'], timeoutMs),
+      validHead ? execGit(wtReal, ['log', '-n', '1', '--format=%h%x09%s%x09%ct'], timeoutMs) : Promise.resolve({ ok: false, stdout: '' }),
+      checkBranchRel ? execGit(wtReal, ['rev-list', '--left-right', '--count', `${baseBranch}...HEAD`], timeoutMs) : Promise.resolve({ ok: false, stdout: '' }),
+      checkBranchRel ? execGit(wtReal, ['diff', '--name-only', '-z', `${baseBranch}...HEAD`], timeoutMs) : Promise.resolve({ ok: false, stdout: '' }),
+      checkBranchRel ? execGit(wtReal, ['log', '-n', String(MAX_RECENT_COMMITS), '--format=%h%x09%s%x09%aI', `${baseBranch}..HEAD`], timeoutMs) : Promise.resolve({ ok: false, stdout: '' }),
     ]);
     if (statusRes.ok && statusRes.stdout) {
       const tokens = statusRes.stdout.split('\0');
@@ -449,16 +489,18 @@ async function inspectWorktree(rootPath, wt, index, baseBranch = '') {
   let mergeability = 'clean';
   let conflictFiles = [];
 
-  if (isMain || (baseBranch && branch === baseBranch)) {
+  if (!exists) {
+    mergeability = 'unknown';
+  } else if (isMain || (baseBranch && branch === baseBranch)) {
     mergeability = 'main';
   } else if (wt.detached) {
     mergeability = 'detached';
   } else if (!clean) {
     mergeability = 'dirty';
-  } else if (!baseBranch) {
+  } else if (unborn || !baseBranch) {
     mergeability = 'unknown';
   } else if (exists && !wt.bare && baseBranch && ahead > 0) {
-    const mtRaw = await execGit(wtReal, ['merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', baseBranch, 'HEAD']);
+    const mtRaw = await execGit(wtReal, ['merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', baseBranch, 'HEAD'], timeoutMs);
     const mt = parseMergeTreeOutput(mtRaw);
     if (mt.ok && !mt.clean) {
       mergeability = 'conflict';
@@ -466,15 +508,21 @@ async function inspectWorktree(rootPath, wt, index, baseBranch = '') {
     }
   }
 
-  const landStatus = isMain || (baseBranch && branch === baseBranch)
-    ? 'main'
-    : !clean
-      ? 'dirty'
-      : ahead === 0
-        ? 'merged'
-        : behind > 0
-          ? 'rebase'
-          : 'ready';
+  const landStatus = !exists
+    ? 'unknown'
+    : isMain || (baseBranch && branch === baseBranch)
+      ? 'main'
+      : !clean
+        ? 'dirty'
+        : wt.detached
+          ? 'detached'
+          : unborn
+            ? 'unknown'
+            : ahead === 0
+              ? 'merged'
+              : behind > 0
+                ? 'rebase'
+                : 'ready';
 
   return {
     record: {
@@ -487,10 +535,11 @@ async function inspectWorktree(rootPath, wt, index, baseBranch = '') {
       exists,
       bare: wt.bare,
       detached: wt.detached,
+      unborn,
       locked: wt.locked,
       prunable: wt.prunable,
       branch,
-      head: wt.head.slice(0, 8),
+      head: validHead ? wt.head.slice(0, 8) : '',
       clean,
       baseBranch: baseBranch || '',
       ahead,
@@ -567,26 +616,47 @@ export function invalidateWorktreeCache(rootPath = '') {
   probeCache.delete(rootPath);
 }
 
-async function probeSingleRoot(root, ttlMs) {
+async function probeSingleRoot(root, ttlMs, timeoutMs = GIT_TIMEOUT_MS) {
+  const effectiveTimeout = clampTimeoutMs(timeoutMs);
+  if (isSymlinkPath(join(root.path, '.git'))) {
+    return {
+      root: root.path,
+      uri: root.uri,
+      isGit: false,
+      worktrees: [],
+      collisions: [],
+      error: 'symlinked git metadata rejected',
+    };
+  }
+  const useCache = effectiveTimeout === GIT_TIMEOUT_MS && ttlMs > 0;
   const now = Date.now();
-  const cached = probeCache.get(root.path);
-  if (cached && now - cached.at < ttlMs) return cached.promise;
+  if (useCache) {
+    const cached = probeCache.get(root.path);
+    if (cached && now - cached.at < ttlMs) return cached.promise;
+  }
 
   const promise = (async () => {
-    const res = await execGit(root.path, ['worktree', 'list', '--porcelain']);
+    const res = await execGit(root.path, ['worktree', 'list', '--porcelain'], effectiveTimeout);
     if (!res.ok) {
+      if (res.timedOut) {
+        const cur = probeCache.get(root.path);
+        if (cur && cur.promise === tracked) probeCache.delete(root.path);
+      }
       return {
         root: root.path,
         uri: root.uri,
         isGit: false,
+        timedOut: Boolean(res.timedOut),
         worktrees: [],
         collisions: [],
-        error: 'not a git repository',
+        error: res.timedOut ? res.error || 'git worktree probe timed out' : 'not a git repository',
       };
     }
-    const baseBranch = await detectBaseBranch(root.path);
+    const baseBranch = await detectBaseBranch(root.path, effectiveTimeout);
     const parsed = parsePorcelainWorktrees(res.stdout).slice(0, MAX_WORKTREES_PER_ROOT);
-    const inspected = await Promise.all(parsed.map((wt, idx) => inspectWorktree(root.path, wt, idx, baseBranch)));
+    const inspected = await mapWithConcurrency(parsed, GIT_CONCURRENCY, (wt, idx) =>
+      inspectWorktree(root.path, wt, idx, baseBranch, effectiveTimeout),
+    );
     const worktrees = [];
     const workingPathsByWt = new Map();
     for (const item of inspected) {
@@ -604,14 +674,17 @@ async function probeSingleRoot(root, ttlMs) {
     };
   })();
 
-  if (probeCache.has(root.path)) probeCache.delete(root.path);
-  else if (probeCache.size >= PROBE_CACHE_CAP) probeCache.delete(probeCache.keys().next().value);
-  const tracked = promise.catch((err) => {
-    const cur = probeCache.get(root.path);
-    if (cur && cur.promise === tracked) probeCache.delete(root.path);
-    throw err;
-  });
-  probeCache.set(root.path, { at: now, promise: tracked });
+  let tracked = promise;
+  if (useCache) {
+    if (probeCache.has(root.path)) probeCache.delete(root.path);
+    else if (probeCache.size >= PROBE_CACHE_CAP) probeCache.delete(probeCache.keys().next().value);
+    tracked = promise.catch((err) => {
+      const cur = probeCache.get(root.path);
+      if (cur && cur.promise === tracked) probeCache.delete(root.path);
+      throw err;
+    });
+    probeCache.set(root.path, { at: now, promise: tracked });
+  }
   return tracked;
 }
 
@@ -619,13 +692,13 @@ async function probeSingleRoot(root, ttlMs) {
  * Resolve a raw workspace path to its canonical git primary root (`--git-common-dir`)
  * and worktree root (`--show-toplevel`) under strict CWE-59 symlink/root confinement.
  */
-export async function resolveGitRepoRoot(rawPath) {
+export async function resolveGitRepoRoot(rawPath, timeoutMs = GIT_TIMEOUT_MS) {
   const norm = normalizeWorkspaceRoot(rawPath);
   if (!norm) return { ok: false, path: '', rootPath: '', worktreePath: '' };
   if (isSymlinkPath(join(norm.path, '.git'))) {
     return { ok: false, path: norm.path, rootPath: '', worktreePath: '' };
   }
-  const rev = await execGit(norm.path, ['rev-parse', '--show-toplevel', '--git-common-dir']);
+  const rev = await execGit(norm.path, ['rev-parse', '--show-toplevel', '--git-common-dir'], timeoutMs);
   if (!rev.ok || !rev.stdout.trim()) {
     return { ok: false, path: norm.path, rootPath: '', worktreePath: '' };
   }
@@ -649,6 +722,14 @@ export async function resolveGitRepoRoot(rawPath) {
   if (!normRoot || isSymlinkPath(join(normRoot.path, '.git'))) {
     return { ok: false, path: norm.path, rootPath: '', worktreePath: '' };
   }
+  try {
+    const realCommon = realpathSync(absCommon);
+    if (realCommon !== join(normRoot.path, '.git') && realCommon !== normRoot.path) {
+      return { ok: false, path: norm.path, rootPath: '', worktreePath: '' };
+    }
+  } catch {
+    return { ok: false, path: norm.path, rootPath: '', worktreePath: '' };
+  }
   return {
     ok: true,
     path: norm.path,
@@ -667,16 +748,18 @@ function ownerPriority(entry) {
 }
 
 /** Probe worktrees across validated workspace roots and optional swarm context using a debounced TTL cache. */
-export async function probeWorktrees(rawRoots, { ttlMs = DEFAULT_TTL_MS, swarmContext = null } = {}) {
+export async function probeWorktrees(rawRoots, { ttlMs = DEFAULT_TTL_MS, swarmContext = null, timeoutMs } = {}) {
+  const effectiveTimeout = clampTimeoutMs(timeoutMs);
   const { roots: rawParsedRoots, rejected } = parseRootsInput(rawRoots);
   const roots = [];
   const seenRoots = new Set();
   const ownerCandidates = new Map(); // worktreePath -> best entry
 
   if (rawParsedRoots.length > 0) {
-    const resolvedInput = await Promise.all(
-      rawParsedRoots.map(async (r) => ({ raw: r, resolved: await resolveGitRepoRoot(r.path) })),
-    );
+    const resolvedInput = await mapWithConcurrency(rawParsedRoots, GIT_CONCURRENCY, async (r) => ({
+      raw: r,
+      resolved: await resolveGitRepoRoot(r.path, effectiveTimeout),
+    }));
     for (const { raw, resolved } of resolvedInput) {
       if (resolved.ok) {
         if (!seenRoots.has(resolved.rootPath)) {
@@ -694,13 +777,11 @@ export async function probeWorktrees(rawRoots, { ttlMs = DEFAULT_TTL_MS, swarmCo
 
   if (swarmContext && typeof swarmContext === 'object') {
     const memberEntries = Array.isArray(swarmContext.workspaces) ? swarmContext.workspaces : [];
-    const resolvedMembers = await Promise.all(
-      memberEntries.slice(0, MAX_ROOTS * 2).map(async (m) => {
-        if (!m || typeof m.path !== 'string' || !m.path.trim()) return null;
-        const resolved = await resolveGitRepoRoot(m.path);
-        return resolved.ok ? { meta: m, resolved } : null;
-      }),
-    );
+    const resolvedMembers = await mapWithConcurrency(memberEntries.slice(0, MAX_ROOTS * 2), GIT_CONCURRENCY, async (m) => {
+      if (!m || typeof m.path !== 'string' || !m.path.trim()) return null;
+      const resolved = await resolveGitRepoRoot(m.path, effectiveTimeout);
+      return resolved.ok ? { meta: m, resolved } : null;
+    });
 
     for (const item of resolvedMembers) {
       if (!item) continue;
@@ -723,7 +804,7 @@ export async function probeWorktrees(rawRoots, { ttlMs = DEFAULT_TTL_MS, swarmCo
     }
 
     if (typeof swarmContext.repo === 'string' && swarmContext.repo.trim() && roots.length < MAX_ROOTS) {
-      const resolvedRepo = await resolveGitRepoRoot(swarmContext.repo);
+      const resolvedRepo = await resolveGitRepoRoot(swarmContext.repo, effectiveTimeout);
       if (resolvedRepo.ok && !seenRoots.has(resolvedRepo.rootPath)) {
         seenRoots.add(resolvedRepo.rootPath);
         roots.push({ path: resolvedRepo.rootPath, uri: resolvedRepo.rootUri });
@@ -731,7 +812,7 @@ export async function probeWorktrees(rawRoots, { ttlMs = DEFAULT_TTL_MS, swarmCo
     }
   }
 
-  const results = await Promise.all(roots.map((r) => probeSingleRoot(r, ttlMs)));
+  const results = await mapWithConcurrency(roots, GIT_CONCURRENCY, (r) => probeSingleRoot(r, ttlMs, effectiveTimeout));
   const worktrees = [];
   const seenWorktreePaths = new Set();
   const collisions = [];
@@ -776,7 +857,7 @@ export async function probeWorktrees(rawRoots, { ttlMs = DEFAULT_TTL_MS, swarmCo
   };
 }
 
-async function resolveConfinedWorktree({ root = '', worktree = '', path = '' } = {}) {
+async function resolveConfinedWorktree({ root = '', worktree = '', path = '', timeoutMs = GIT_TIMEOUT_MS } = {}) {
   const wtStr = typeof worktree === 'string' ? worktree.trim() : '';
   const pathStr = typeof path === 'string' ? path.trim() : '';
   if (wtStr && pathStr && wtStr !== pathStr) {
@@ -789,10 +870,16 @@ async function resolveConfinedWorktree({ root = '', worktree = '', path = '' } =
   if ((hasRoot && !normRoot) || !normWt) {
     return { ok: false, status: 400, error: 'invalid workspace root or worktree' };
   }
+  if (isSymlinkPath(join(normWt.path, '.git')) || (normRoot && isSymlinkPath(join(normRoot.path, '.git')))) {
+    return { ok: false, status: 404, error: 'symlinked git metadata rejected' };
+  }
 
   const probeDir = normRoot ? normRoot.path : normWt.path;
-  const wtList = await execGit(probeDir, ['worktree', 'list', '--porcelain']);
+  const wtList = await execGit(probeDir, ['worktree', 'list', '--porcelain'], timeoutMs);
   if (!wtList.ok) {
+    if (wtList.timedOut) {
+      return { ok: false, status: 504, error: wtList.error || 'git worktree probe timed out' };
+    }
     return { ok: false, status: 404, error: 'not a git repository' };
   }
   const allowedWts = parsePorcelainWorktrees(wtList.stdout);
@@ -829,6 +916,9 @@ async function resolveConfinedWorktree({ root = '', worktree = '', path = '' } =
     } catch {
       rootPath = allowedWts[0].path;
     }
+  }
+  if (isSymlinkPath(join(rootPath, '.git'))) {
+    return { ok: false, status: 404, error: 'symlinked primary repository metadata rejected' };
   }
   const isMain = matchedIdx === 0 || normWt.path === rootPath;
   return { ok: true, rootPath, wtPath: normWt.path, wtEntry: matchedWt, isMain };
@@ -897,7 +987,9 @@ export async function probeWorktreeDiff({
   targetBranch = '',
   offset = 0,
   maxBytes = 8192,
+  timeoutMs,
 } = {}) {
+  const effectiveTimeout = clampTimeoutMs(timeoutMs);
   const diffMode = mode === undefined || mode === '' ? 'working' : mode;
   if (diffMode !== 'working' && diffMode !== 'branch' && diffMode !== 'conflict') {
     return { ok: false, status: 400, error: 'invalid diff mode' };
@@ -922,7 +1014,7 @@ export async function probeWorktreeDiff({
     return { ok: false, status: 400, error: 'invalid path segment' };
   }
 
-  const confined = await resolveConfinedWorktree({ root, worktree, path });
+  const confined = await resolveConfinedWorktree({ root, worktree, path, timeoutMs: effectiveTimeout });
   if (!confined.ok) {
     return { ok: false, status: confined.status, error: confined.error };
   }
@@ -983,18 +1075,14 @@ export async function probeWorktreeDiff({
       return { ok: false, status: 400, error: 'Worktree has no HEAD commit' };
     }
     const wtRef = confined.wtEntry.branch || confined.wtEntry.head;
-    const mtRaw = await execGit(confined.rootPath, [
-      'merge-tree',
-      '--write-tree',
-      '--name-only',
-      '--no-messages',
-      '-z',
-      resolvedTarget,
-      wtRef,
-    ]);
+    const mtRaw = await execGit(
+      confined.rootPath,
+      ['merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', resolvedTarget, wtRef],
+      effectiveTimeout,
+    );
     const mt = parseMergeTreeOutput(mtRaw);
     if (!mt.ok) {
-      return { ok: false, status: 409, error: mt.error };
+      return { ok: false, status: mt.timedOut ? 504 : 409, error: mt.error };
     }
     if (!mt.clean && mt.conflictFiles.includes(relPath)) {
       const conflictSlice = await execGitDiffSlice(
@@ -1002,7 +1090,11 @@ export async function probeWorktreeDiff({
         ['diff', '--no-ext-diff', resolvedTarget, mt.treeSha, '--', relPath],
         startOffset,
         cap,
+        effectiveTimeout,
       );
+      if (conflictSlice.timedOut) {
+        return { ok: false, status: 504, error: 'git conflict diff timed out' };
+      }
       if (conflictSlice.ok && conflictSlice.totalBytes > 0) {
         page = sliceDiffWindow(
           conflictSlice.windowBuf,
@@ -1013,7 +1105,14 @@ export async function probeWorktreeDiff({
         );
       } else {
         // Modify/delete or rename conflict where tree kept target version: diff target vs wtRef with conflict header
-        const rawFallback = await execGit(confined.rootPath, ['diff', '--no-ext-diff', resolvedTarget, wtRef, '--', relPath]);
+        const rawFallback = await execGit(
+          confined.rootPath,
+          ['diff', '--no-ext-diff', resolvedTarget, wtRef, '--', relPath],
+          effectiveTimeout,
+        );
+        if (rawFallback.timedOut) {
+          return { ok: false, status: 504, error: 'git conflict diff timed out' };
+        }
         const note = `CONFLICT (${relPath}): conflicts between ${resolvedTarget} and ${wtRef}\n`;
         const fullBuf = Buffer.from(note + (rawFallback.ok ? rawFallback.stdout : ''), 'utf8');
         const sliceBuf = fullBuf.subarray(startOffset, startOffset + cap + 16);
@@ -1021,7 +1120,13 @@ export async function probeWorktreeDiff({
       }
     }
   } else if (diffMode === 'branch') {
-    const mbRes = await execGit(wtReal, ['merge-base', resolvedTarget, 'HEAD']);
+    if (!hasValidHeadSha(confined.wtEntry)) {
+      return { ok: false, status: 400, error: 'Worktree has no HEAD commit' };
+    }
+    const mbRes = await execGit(wtReal, ['merge-base', resolvedTarget, 'HEAD'], effectiveTimeout);
+    if (mbRes.timedOut) {
+      return { ok: false, status: 504, error: 'git merge-base timed out' };
+    }
     if (mbRes.ok && mbRes.stdout.trim()) {
       const mergeBase = mbRes.stdout.trim();
       const branchSlice = await execGitDiffSlice(
@@ -1029,7 +1134,11 @@ export async function probeWorktreeDiff({
         ['diff', '--no-ext-diff', `${mergeBase}..HEAD`, '--', relPath],
         startOffset,
         cap,
+        effectiveTimeout,
       );
+      if (branchSlice.timedOut) {
+        return { ok: false, status: 504, error: 'git branch diff timed out' };
+      }
       if (branchSlice.ok && branchSlice.totalBytes > 0) {
         page = sliceDiffWindow(
           branchSlice.windowBuf,
@@ -1041,7 +1150,16 @@ export async function probeWorktreeDiff({
       }
     }
   } else {
-    const headSlice = await execGitDiffSlice(wtReal, ['diff', 'HEAD', '--no-ext-diff', '--', relPath], startOffset, cap);
+    const headSlice = await execGitDiffSlice(
+      wtReal,
+      ['diff', 'HEAD', '--no-ext-diff', '--', relPath],
+      startOffset,
+      cap,
+      effectiveTimeout,
+    );
+    if (headSlice.timedOut) {
+      return { ok: false, status: 504, error: 'git working diff timed out' };
+    }
     if (headSlice.ok && headSlice.totalBytes > 0) {
       page = sliceDiffWindow(
         headSlice.windowBuf,
@@ -1052,9 +1170,12 @@ export async function probeWorktreeDiff({
       );
     } else {
       const [cachedRes, workRes] = await Promise.all([
-        execGitDiffSlice(wtReal, ['diff', '--cached', '--no-ext-diff', '--', relPath], 0, MAX_DIFF_BYTES),
-        execGitDiffSlice(wtReal, ['diff', '--no-ext-diff', '--', relPath], 0, MAX_DIFF_BYTES),
+        execGitDiffSlice(wtReal, ['diff', '--cached', '--no-ext-diff', '--', relPath], 0, MAX_DIFF_BYTES, effectiveTimeout),
+        execGitDiffSlice(wtReal, ['diff', '--no-ext-diff', '--', relPath], 0, MAX_DIFF_BYTES, effectiveTimeout),
       ]);
+      if (cachedRes.timedOut || workRes.timedOut) {
+        return { ok: false, status: 504, error: 'git working diff timed out' };
+      }
       const combined = [
         cachedRes.ok ? cachedRes.windowBuf.toString('utf8') : '',
         workRes.ok ? workRes.windowBuf.toString('utf8') : '',
@@ -1313,7 +1434,7 @@ export async function executeWorktreeAction({
     const mtRaw = await execGit(rootPath, ['merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', target, wtRef]);
     const mt = parseMergeTreeOutput(mtRaw);
     if (!mt.ok) {
-      return fail(409, 'error', mt.error);
+      return fail(mt.timedOut ? 504 : 409, mt.timedOut ? 'timeout' : 'error', mt.error);
     }
     const status = mt.clean ? 'clean' : 'conflict';
     const message = mt.clean
@@ -1594,9 +1715,13 @@ async function inspectCheckpointWorktree(rootPath, wt, index) {
   }
 
   let head = typeof wt.head === 'string' ? wt.head.trim() : '';
+  if (/^0+$/.test(head)) head = '';
   if (!head && !wt.bare) {
-    const headRes = await execGit(wtReal, ['rev-parse', 'HEAD']);
-    if (headRes.ok) head = headRes.stdout.trim();
+    const headRes = await execGit(wtReal, ['rev-parse', '--verify', 'HEAD']);
+    if (headRes.ok) {
+      const candidate = headRes.stdout.trim();
+      if (!/^0+$/.test(candidate)) head = candidate;
+    }
   }
   const clean = wt.bare ? true : await isWorktreeClean(wtReal);
   const branch = wt.branch || (wt.detached ? 'detached' : 'unknown');
@@ -1620,15 +1745,21 @@ export async function probeCheckpointWorktrees(rawRoots = [], extraWorktreePaths
   const { roots, rejected } = parseRootsInput(rawRoots);
   const byPath = new Map();
 
-  for (const r of roots) {
+  await mapWithConcurrency(roots, GIT_CONCURRENCY, async (r) => {
+    if (isSymlinkPath(join(r.path, '.git'))) {
+      rejected.push(r.path);
+      return;
+    }
     const res = await execGit(r.path, ['worktree', 'list', '--porcelain']);
-    if (!res.ok) continue;
+    if (!res.ok) return;
     const parsed = parsePorcelainWorktrees(res.stdout).slice(0, MAX_WORKTREES_PER_ROOT);
-    const entries = await Promise.all(parsed.map((wt, idx) => inspectCheckpointWorktree(r.path, wt, idx)));
+    const entries = await mapWithConcurrency(parsed, GIT_CONCURRENCY, (wt, idx) =>
+      inspectCheckpointWorktree(r.path, wt, idx),
+    );
     for (const item of entries) {
       if (item && !byPath.has(item.path)) byPath.set(item.path, item);
     }
-  }
+  });
 
   if (Array.isArray(extraWorktreePaths)) {
     const seenExtra = new Set();

@@ -10,7 +10,9 @@
 import { randomUUID } from 'node:crypto';
 import {
   closeSync,
+  constants as fsConstants,
   existsSync,
+  fstatSync,
   lstatSync,
   openSync,
   readFileSync,
@@ -113,6 +115,85 @@ function lruSet(cache, key, val, limit) {
   cache.set(key, val);
 }
 
+const corruptWarnCache = new Map();
+const CORRUPT_WARN_CACHE_LIMIT = 128;
+
+function warnCorruptOnce(sourceKey, reason) {
+  if (!sourceKey) return;
+  const k = `${sourceKey}\0${reason}`;
+  if (corruptWarnCache.has(k)) return;
+  lruSet(corruptWarnCache, k, 1, CORRUPT_WARN_CACHE_LIMIT);
+  console.warn(`[fleet_pane] ${sourceKey}: ${reason}`);
+}
+
+function stripJsonBom(text) {
+  if (typeof text !== 'string') return '';
+  let i = 0;
+  while (i < text.length && text.charCodeAt(i) === 0xfeff) i++;
+  return (i > 0 ? text.slice(i) : text).trim();
+}
+
+function readBoundedFdText(path, maxBytes) {
+  const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0);
+  let fd;
+  try {
+    fd = openSync(path, flags);
+    const st = fstatSync(fd);
+    if (!st.isFile()) return { ok: false, ino: st.ino, mtime: st.mtimeMs, size: st.size, isFile: false };
+    if (st.size > maxBytes) {
+      return { ok: false, tooLarge: true, ino: st.ino, mtime: st.mtimeMs, size: st.size, isFile: true };
+    }
+    const len = st.size;
+    if (len === 0) return { ok: true, text: '', ino: st.ino, mtime: st.mtimeMs, size: 0, isFile: true };
+    const buf = Buffer.allocUnsafe(len);
+    let off = 0;
+    while (off < len) {
+      const n = readSync(fd, buf, off, len - off, off);
+      if (n <= 0) break;
+      off += n;
+    }
+    // Check if file grew past maxBytes during read
+    const extra = Buffer.allocUnsafe(1);
+    if (readSync(fd, extra, 0, 1, off) > 0 && off >= maxBytes) {
+      return { ok: false, tooLarge: true, ino: st.ino, mtime: st.mtimeMs, size: off + 1, isFile: true };
+    }
+    return {
+      ok: true,
+      text: buf.toString('utf8', 0, off),
+      ino: st.ino,
+      mtime: st.mtimeMs,
+      size: off,
+      isFile: true,
+    };
+  } catch (err) {
+    return { ok: false, error: err?.code || 'ERR', ino: 0, mtime: 0, size: -1, isFile: false };
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {}
+    }
+  }
+}
+
+let atomicWriteSeq = 0;
+function atomicWriteFileSync(targetPath, content) {
+  atomicWriteSeq = (atomicWriteSeq + 1) % 1_000_000_000;
+  const tmpPath = `${targetPath}.tmp.${process.pid}.${atomicWriteSeq}.${randomUUID().slice(0, 8)}`;
+  let renamed = false;
+  try {
+    writeFileSync(tmpPath, content, 'utf-8');
+    renameSync(tmpPath, targetPath);
+    renamed = true;
+  } finally {
+    if (!renamed) {
+      try {
+        unlinkSync(tmpPath);
+      } catch {}
+    }
+  }
+}
+
 function readSmallCached(path, cache, maxBytes = VIEW_MAX_BYTES) {
   const s = statOf(path);
   if (s.size < 0 || !s.isFile) {
@@ -123,17 +204,17 @@ function readSmallCached(path, cache, maxBytes = VIEW_MAX_BYTES) {
   const key = `${s.ino}:${s.mtime}:${s.size}`;
   const hit = cache.get(path);
   if (hit && hit.key === key) {
-    lruSet(cache, path, hit, 12);
+    lruSet(cache, path, hit, 24);
     return { text: hit.text, ...s };
   }
-  let text = null;
-  try {
-    text = readFileSync(path, 'utf-8');
-  } catch {
+  const rd = readBoundedFdText(path, maxBytes);
+  if (!rd.ok) {
+    if (rd.tooLarge) return { text: null, tooLarge: true, ino: rd.ino, mtime: rd.mtime, size: rd.size, isFile: true };
     return { text: null, ...s };
   }
-  lruSet(cache, path, { key, text }, 12);
-  return { text, ...s };
+  const rKey = `${rd.ino}:${rd.mtime}:${rd.size}`;
+  lruSet(cache, path, { key: rKey, text: rd.text }, 24);
+  return { text: rd.text, ino: rd.ino, mtime: rd.mtime, size: rd.size, isFile: true };
 }
 
 const B_STEP_INDEX = Buffer.from('"step_index":');
@@ -188,6 +269,13 @@ function extractStrSpan(buf, start, end, keyBuf) {
 function streamLinesIncremental(filePath, prevMeta, onReset, onLine, { rawSpan = false } = {}) {
   const s = statOf(filePath);
   if (s.size < 0 || !s.isFile) return { exists: false, meta: null, changed: Boolean(prevMeta) };
+  try {
+    if (lstatSync(filePath).isSymbolicLink()) {
+      return { exists: false, meta: null, changed: Boolean(prevMeta) };
+    }
+  } catch {
+    return { exists: false, meta: null, changed: Boolean(prevMeta) };
+  }
 
   if (prevMeta && prevMeta.ino === s.ino && prevMeta.size === s.size && prevMeta.mtime === s.mtime) {
     return { exists: true, meta: prevMeta, changed: false };
@@ -202,7 +290,11 @@ function streamLinesIncremental(filePath, prevMeta, onReset, onLine, { rawSpan =
   if (s.size > 0) {
     let fd;
     try {
-      fd = openSync(filePath, 'r');
+      fd = openSync(filePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+      if (!fstatSync(fd).isFile()) {
+        closeSync(fd);
+        return { exists: false, meta: null, changed: Boolean(prevMeta) };
+      }
     } catch {
       return { exists: false, meta: null, changed: Boolean(prevMeta) };
     }
@@ -457,8 +549,10 @@ function pickNarrator(roster) {
 }
 
 export function parseRoster(text) {
+  const clean = stripJsonBom(text);
+  if (!clean) return null;
   try {
-    const r = JSON.parse(text);
+    const r = JSON.parse(clean);
     if (!r || typeof r !== 'object' || Array.isArray(r)) return null;
     const rawMembers = r.members && typeof r.members === 'object' && !Array.isArray(r.members) ? r.members : {};
     const members = {};
@@ -633,11 +727,18 @@ export function readTranscriptActivityTail(appData, conv) {
   }
 
   let bytesRead = 0;
-  const offset = Math.max(0, st.size - TAIL_PEEK_BYTES);
+  let offset = Math.max(0, st.size - TAIL_PEEK_BYTES);
   let fd;
   try {
-    fd = openSync(path, 'r');
-    bytesRead = readSync(fd, SHARED_CHUNK_BUF, 0, Math.min(TAIL_PEEK_BYTES, st.size), offset);
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+    const fSt = fstatSync(fd);
+    if (!fSt.isFile()) {
+      activityTailCache.delete(path);
+      return null;
+    }
+    offset = Math.max(0, fSt.size - TAIL_PEEK_BYTES);
+    const readLen = Math.min(TAIL_PEEK_BYTES, Math.max(0, fSt.size - offset));
+    bytesRead = readLen > 0 ? readSync(fd, SHARED_CHUNK_BUF, 0, readLen, offset) : 0;
   } catch {
     activityTailCache.delete(path);
     return null;
@@ -1066,7 +1167,7 @@ export function summarizeTranscript(appData, conv) {
     return NO_TRANSCRIPT;
   }
   if (!res.changed) {
-    lruSet(transcriptCache, path, state, 24);
+    lruSet(transcriptCache, path, state, 48);
     return state.result;
   }
 
@@ -1230,7 +1331,7 @@ export function summarizeTranscript(appData, conv) {
     },
   };
 
-  lruSet(transcriptCache, path, state, 24);
+  lruSet(transcriptCache, path, state, 48);
   return state.result;
 }
 
@@ -1331,7 +1432,7 @@ function parseViewJson(id, f) {
     if (f.tooLarge) error = 'too_large';
     else {
       try {
-        const v = JSON.parse(f.text ?? '');
+        const v = JSON.parse(stripJsonBom(f.text ?? ''));
         if (v && typeof v === 'object' && !Array.isArray(v)) parsed = v;
         else error = 'invalid';
       } catch {
@@ -1725,16 +1826,22 @@ function readPlan(dir) {
   const pf = readSmallCached(join(dir, 'plan.json'), smallFileCache, VIEW_MAX_BYTES);
   let raw = null;
   if (pf.size >= 0 && !pf.tooLarge) {
-    try {
-      const v = JSON.parse(pf.text ?? '');
-      if (isPlainObj(v)) raw = v;
-    } catch {
-      raw = null;
+    const clean = stripJsonBom(pf.text ?? '');
+    if (clean) {
+      try {
+        const v = JSON.parse(clean);
+        if (isPlainObj(v)) raw = v;
+        else warnCorruptOnce(join(dir, 'plan.json'), 'non-object plan JSON');
+      } catch {
+        warnCorruptOnce(join(dir, 'plan.json'), 'corrupt or truncated plan JSON');
+        raw = null;
+      }
     }
   }
   const etag = computePlanEtag(pf, pf.text);
   const plan = raw ? normalizePlan(raw, etag) : null;
-  return { plan, etag, key: etag || `${pf.mtime}:${pf.size}`, mtime: pf.mtime || 0 };
+  const statKey = `${pf.ino}:${pf.mtime}:${pf.size}`;
+  return { plan, etag, key: etag || `${pf.mtime}:${pf.size}`, statKey, mtime: pf.mtime || 0 };
 }
 
 /**
@@ -1792,12 +1899,19 @@ export function writeSwarmPlan(appData, swarmId, { ifMatch = '', mode = 'patch',
   let existingText = null;
   let existingRaw = null;
   if (pfStat.isFile && pfStat.size >= 0 && pfStat.size <= VIEW_MAX_BYTES) {
-    try {
-      existingText = readFileSync(planPath, 'utf-8');
-      const v = JSON.parse(existingText);
-      if (isPlainObj(v)) existingRaw = v;
-    } catch {
-      existingRaw = null;
+    const rd = readBoundedFdText(planPath, VIEW_MAX_BYTES);
+    if (rd.ok) {
+      existingText = rd.text;
+      const clean = stripJsonBom(existingText);
+      if (clean) {
+        try {
+          const v = JSON.parse(clean);
+          if (isPlainObj(v)) existingRaw = v;
+        } catch {
+          warnCorruptOnce(planPath, 'corrupt or truncated plan JSON before write');
+          existingRaw = null;
+        }
+      }
     }
   }
   const currentEtag = computePlanEtag(pfStat, existingText);
@@ -1942,15 +2056,7 @@ export function writeSwarmPlan(appData, swarmId, { ifMatch = '', mode = 'patch',
     return { ok: false, status: 413, error: 'Serialized plan exceeds maximum allowed size' };
   }
 
-  const tmpPath = `${planPath}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 10)}`;
-  try {
-    writeFileSync(tmpPath, serialized, 'utf-8');
-    renameSync(tmpPath, planPath);
-  } finally {
-    try {
-      if (existsSync(tmpPath)) unlinkSync(tmpPath);
-    } catch {}
-  }
+  atomicWriteFileSync(planPath, serialized);
 
   smallFileCache.delete(join(dir, 'plan.json'));
   smallFileCache.delete(planPath);
@@ -2051,18 +2157,33 @@ function normalizeOpRecord(raw) {
   };
 }
 
-function parseOpsText(text) {
-  if (!text) return [];
+function parseOpsText(text, sourceLabel = 'fleet_ops.json') {
+  const clean = stripJsonBom(text);
+  if (!clean) return [];
   try {
-    const parsed = JSON.parse(text);
-    const arr = Array.isArray(parsed) ? parsed : isPlainObj(parsed) && Array.isArray(parsed.ops) ? parsed.ops : [];
-    const out = [];
-    for (const item of arr) {
-      const rec = normalizeOpRecord(item);
-      if (rec) out.push(rec);
+    const parsed = JSON.parse(clean);
+    const arr = Array.isArray(parsed) ? parsed : isPlainObj(parsed) && Array.isArray(parsed.ops) ? parsed.ops : null;
+    if (!arr) {
+      warnCorruptOnce(sourceLabel, 'invalid fleet_ops.json root shape (expected array or { ops })');
+      return [];
     }
-    return out.slice(-OPS_RING_LIMIT);
+    const rev = [];
+    let dropped = 0;
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const rec = normalizeOpRecord(arr[i]);
+      if (rec) {
+        rev.push(rec);
+        if (rev.length >= OPS_RING_LIMIT) break;
+      } else {
+        dropped++;
+      }
+    }
+    if (dropped > 0) {
+      warnCorruptOnce(sourceLabel, `skipped ${dropped} corrupt operator op record(s)`);
+    }
+    return rev.reverse();
   } catch {
+    warnCorruptOnce(sourceLabel, 'corrupt or truncated fleet_ops.json');
     return [];
   }
 }
@@ -2130,10 +2251,14 @@ function resolveConfinedStatePath(appData, swarmId) {
 function readOpsMeta(dir, now = Date.now()) {
   const opsPath = join(dir, OPS_FILE);
   const of = readSmallCached(opsPath, smallFileCache, OPS_MAX_BYTES);
+  if (of.tooLarge) {
+    warnCorruptOnce(opsPath, `fleet_ops.json exceeds ${OPS_MAX_BYTES} byte limit`);
+    return { records: [], opsKey: `${of.ino}:${of.mtime}:${of.size}:oversize`, hasFile: true };
+  }
   if (of.size < 0 || !of.isFile) {
     return { records: [], opsKey: '0:0:-1', hasFile: false };
   }
-  const records = parseOpsText(of.text);
+  const records = parseOpsText(of.text, `${opsPath}:${of.mtime}:${of.size}`);
   let hasExpired = false;
   for (const r of records) {
     if (r.publicOp.status !== 'dispatched') continue;
@@ -2165,8 +2290,12 @@ export function readOperatorOps(appData, swarmId) {
   if (!loc.ok) return loc;
   if (loc.missing) return { ok: true, ops: [] };
   smallFileCache.delete(loc.realFile);
-  const text = readFileSync(loc.realFile, 'utf-8');
-  const records = parseOpsText(text);
+  const rd = readBoundedFdText(loc.realFile, OPS_MAX_BYTES);
+  if (!rd.ok) {
+    if (rd.tooLarge) warnCorruptOnce(loc.realFile, `fleet_ops.json exceeds ${OPS_MAX_BYTES} byte limit`);
+    return { ok: true, ops: [] };
+  }
+  const records = parseOpsText(rd.text, `${loc.realFile}:${rd.mtime}:${rd.size}`);
   return { ok: true, ops: records.map((r) => r.publicOp) };
 }
 
@@ -2176,10 +2305,11 @@ export function recordOperatorOp(appData, swarmId, entry, internalMeta = {}) {
   if (!loc.ok) return loc;
   let records = [];
   if (!loc.missing) {
-    try {
-      records = parseOpsText(readFileSync(loc.realFile, 'utf-8'));
-    } catch {
-      records = [];
+    const rd = readBoundedFdText(loc.realFile, OPS_MAX_BYTES);
+    if (rd.ok) {
+      records = parseOpsText(rd.text, `${loc.realFile}:${rd.mtime}:${rd.size}`);
+    } else if (rd.tooLarge) {
+      warnCorruptOnce(loc.realFile, `fleet_ops.json exceeds ${OPS_MAX_BYTES} byte limit`);
     }
   }
   const normalized = normalizeOpRecord({ ...entry, _meta: internalMeta });
@@ -2195,10 +2325,11 @@ export function updateOperatorOp(appData, swarmId, opId, updater) {
   if (!loc.ok) return loc;
   if (loc.missing) return { ok: false, status: 404, error: `Operator command "${opId}" not found` };
   let records = [];
-  try {
-    records = parseOpsText(readFileSync(loc.realFile, 'utf-8'));
-  } catch {
-    records = [];
+  const rd = readBoundedFdText(loc.realFile, OPS_MAX_BYTES);
+  if (rd.ok) {
+    records = parseOpsText(rd.text, `${loc.realFile}:${rd.mtime}:${rd.size}`);
+  } else if (rd.tooLarge) {
+    warnCorruptOnce(loc.realFile, `fleet_ops.json exceeds ${OPS_MAX_BYTES} byte limit`);
   }
   const idx = records.findIndex((r) => r.publicOp.opId === opId);
   if (idx < 0) return { ok: false, status: 404, error: `Operator command "${opId}" not found` };
@@ -2216,15 +2347,7 @@ export function updateOperatorOp(appData, swarmId, opId, updater) {
 
 function writeSwarmJsonAtomic(realFile, appData, swarmId, fileName, payload) {
   const serialized = JSON.stringify(payload, null, 2) + '\n';
-  const tmpPath = `${realFile}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 10)}`;
-  try {
-    writeFileSync(tmpPath, serialized, 'utf-8');
-    renameSync(tmpPath, realFile);
-  } finally {
-    try {
-      if (existsSync(tmpPath)) unlinkSync(tmpPath);
-    } catch {}
-  }
+  atomicWriteFileSync(realFile, serialized);
   smallFileCache.delete(realFile);
   smallFileCache.delete(join(swarmDir(appData, swarmId), fileName));
   summaryMetaCache.delete(`${appData}\0${swarmId}`);
@@ -2290,12 +2413,14 @@ function normalizeCheckpointRecord(raw) {
   const id = typeof raw.id === 'string' ? cleanPlanStr(raw.id, true).slice(0, 128) : '';
   const label = typeof raw.label === 'string' ? cleanPlanStr(raw.label, true).slice(0, 160) : '';
   if (!id || !label) return null;
-  const createdAt =
-    typeof raw.createdAt === 'string' && raw.createdAt
-      ? raw.createdAt
-      : typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt)
-        ? new Date(raw.createdAt).toISOString()
-        : new Date().toISOString();
+  let createdAt = '';
+  if (typeof raw.createdAt === 'string' && raw.createdAt) {
+    const cleanedTs = cleanPlanStr(raw.createdAt, true).slice(0, 64);
+    if (cleanedTs && Number.isFinite(Date.parse(cleanedTs))) createdAt = cleanedTs;
+  } else if (typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt) && raw.createdAt >= 0) {
+    createdAt = new Date(raw.createdAt).toISOString();
+  }
+  if (!createdAt) createdAt = new Date().toISOString();
   const headNum = Number(raw.head);
   const head = Number.isSafeInteger(headNum) && headNum >= 0 ? headNum : 0;
   const costUsd = roundUsd(cleanTok(raw.costUsd));
@@ -2305,12 +2430,16 @@ function normalizeCheckpointRecord(raw) {
   return { id, label, createdAt, head, costUsd, plan, members, worktrees };
 }
 
-function normalizeFleetState(raw) {
-  if (!isPlainObj(raw)) return emptyFleetState();
+function normalizeFleetState(raw, sourceLabel = '') {
+  if (!isPlainObj(raw)) {
+    if (sourceLabel) warnCorruptOnce(sourceLabel, 'invalid fleet_state.json root shape (expected object)');
+    return emptyFleetState();
+  }
   const pinSet = new Set();
   if (Array.isArray(raw.pinnedSeqs)) {
-    for (const v of raw.pinnedSeqs) {
-      const s = safeSeq(v);
+    const scanCap = Math.min(raw.pinnedSeqs.length, PIN_CAP * 4);
+    for (let i = 0; i < scanCap; i++) {
+      const s = safeSeq(raw.pinnedSeqs[i]);
       if (s > 0 && s <= MAX_SEQ_VAL) pinSet.add(s);
     }
   }
@@ -2331,17 +2460,32 @@ function normalizeFleetState(raw) {
   }
 
   const archived = Boolean(raw.archived);
-  const checkpoints = Array.isArray(raw.checkpoints)
-    ? raw.checkpoints.map(normalizeCheckpointRecord).filter(Boolean).slice(0, CHECKPOINT_CAP)
-    : [];
+  const checkpoints = [];
+  let droppedCheckpoints = 0;
+  if (Array.isArray(raw.checkpoints)) {
+    for (let i = 0; i < raw.checkpoints.length; i++) {
+      const rec = normalizeCheckpointRecord(raw.checkpoints[i]);
+      if (rec) {
+        checkpoints.push(rec);
+        if (checkpoints.length >= CHECKPOINT_CAP) break;
+      } else {
+        droppedCheckpoints++;
+      }
+    }
+  }
+  if (droppedCheckpoints > 0 && sourceLabel) {
+    warnCorruptOnce(sourceLabel, `skipped ${droppedCheckpoints} corrupt checkpoint record(s)`);
+  }
   return { pinnedSeqs, ackedTriage, archived, checkpoints };
 }
 
-function parseFleetStateText(text) {
-  if (!text) return emptyFleetState();
+function parseFleetStateText(text, sourceLabel = 'fleet_state.json') {
+  const clean = stripJsonBom(text);
+  if (!clean) return emptyFleetState();
   try {
-    return normalizeFleetState(JSON.parse(text));
+    return normalizeFleetState(JSON.parse(clean), sourceLabel);
   } catch {
+    warnCorruptOnce(sourceLabel, 'corrupt or truncated fleet_state.json');
     return emptyFleetState();
   }
 }
@@ -2349,11 +2493,15 @@ function parseFleetStateText(text) {
 function readFleetStateMeta(dir) {
   const statePath = join(dir, STATE_FILE);
   const sf = readSmallCached(statePath, smallFileCache, STATE_MAX_BYTES);
+  if (sf.tooLarge) {
+    warnCorruptOnce(statePath, `fleet_state.json exceeds ${STATE_MAX_BYTES} byte limit`);
+    return { state: emptyFleetState(), stateKey: `${sf.ino}:${sf.mtime}:${sf.size}:oversize`, hasFile: true };
+  }
   if (sf.size < 0 || !sf.isFile) {
     return { state: emptyFleetState(), stateKey: '0:0:-1', hasFile: false };
   }
   return {
-    state: parseFleetStateText(sf.text),
+    state: parseFleetStateText(sf.text, `${statePath}:${sf.mtime}:${sf.size}`),
     stateKey: `${sf.ino}:${sf.mtime}:${sf.size}`,
     hasFile: true,
   };
@@ -2372,12 +2520,12 @@ export function readFleetState(appData, swarmId) {
   if (!loc.ok) return loc;
   if (loc.missing) return { ok: true, state: emptyFleetState(), missing: true };
   smallFileCache.delete(loc.realFile);
-  try {
-    const text = readFileSync(loc.realFile, 'utf-8');
-    return { ok: true, state: parseFleetStateText(text), missing: false };
-  } catch {
+  const rd = readBoundedFdText(loc.realFile, STATE_MAX_BYTES);
+  if (!rd.ok) {
+    if (rd.tooLarge) warnCorruptOnce(loc.realFile, `fleet_state.json exceeds ${STATE_MAX_BYTES} byte limit`);
     return { ok: true, state: emptyFleetState(), missing: false };
   }
+  return { ok: true, state: parseFleetStateText(rd.text, `${loc.realFile}:${rd.mtime}:${rd.size}`), missing: false };
 }
 
 function mutateFleetState(appData, swarmId, mutator) {
@@ -2385,10 +2533,11 @@ function mutateFleetState(appData, swarmId, mutator) {
   if (!loc.ok) return loc;
   let state = emptyFleetState();
   if (!loc.missing) {
-    try {
-      state = parseFleetStateText(readFileSync(loc.realFile, 'utf-8'));
-    } catch {
-      state = emptyFleetState();
+    const rd = readBoundedFdText(loc.realFile, STATE_MAX_BYTES);
+    if (rd.ok) {
+      state = parseFleetStateText(rd.text, `${loc.realFile}:${rd.mtime}:${rd.size}`);
+    } else if (rd.tooLarge) {
+      warnCorruptOnce(loc.realFile, `fleet_state.json exceeds ${STATE_MAX_BYTES} byte limit`);
     }
   }
   const res = mutator(state, loc);
@@ -2795,11 +2944,8 @@ export function reconcileOperatorOps(appData, swarmId, { meta = null, messages =
       meta: { ...r.meta },
     }));
   } else {
-    try {
-      records = parseOpsText(readFileSync(loc.realFile, 'utf-8'));
-    } catch {
-      records = [];
-    }
+    const rd = readBoundedFdText(loc.realFile, OPS_MAX_BYTES);
+    records = rd.ok ? parseOpsText(rd.text, `${loc.realFile}:${rd.mtime}:${rd.size}`) : [];
   }
 
   if (records.length === 0) {
@@ -3282,7 +3428,7 @@ export function getSwarmMetaKeys(appData, id) {
   return {
     membersKey: `${m.ino}:${m.mtime}:${m.size}`,
     boardKey: `${b.ino}:${b.mtime}:${b.size}`,
-    planKey: `${p.mtime}:${p.size}`,
+    planKey: `${p.ino}:${p.mtime}:${p.size}`,
     stateKey: `${s.ino}:${s.mtime}:${s.size}`,
   };
 }
@@ -3584,7 +3730,7 @@ function readSwarmMeta(appData, id, now = Date.now()) {
   const trKeys = names.map((n) => `${n}:${transcripts.get(n).key}`).join(',');
   const narratorName = pickNarrator(roster);
   const vf = readView(appData, id, dir, narratorName ? roster.members[narratorName] : null);
-  const { plan, key: planKey, mtime: planMtime } = readPlan(dir);
+  const { plan, key: planKey, statKey: planStatKey, mtime: planMtime } = readPlan(dir);
   const failures = new Map(names.map((n) => [n, stepFailure(transcripts.get(n).summary, now)]));
   const stuckKeys = names
     .map((n) => {
@@ -3624,6 +3770,7 @@ function readSwarmMeta(appData, id, now = Date.now()) {
     vf,
     plan,
     planKey,
+    planStatKey,
     planMtime,
     stuckKeys,
     opsMeta,
@@ -4026,7 +4173,7 @@ function buildMembersAndTelemetry(appData, id, meta, acc, now) {
     now,
     membersKey: meta.membersKey,
     boardKey: meta.boardKey,
-    planKey: meta.planKey,
+    planKey: meta.planStatKey || meta.planKey,
     stateKey: meta.stateMeta?.stateKey || '0:0:-1',
     trKeys: meta.trKeys,
     trStatKeys,
@@ -4163,7 +4310,8 @@ function buildSwarmSummaryOnly(appData, id, now = Date.now()) {
   const roster = parseRoster(membersFile.text) || { title: '', members: {} };
   const title = roster.title || id;
   const names = Object.keys(roster.members).filter((n) => roster.members[n] && typeof roster.members[n] === 'object');
-  const { plan, key: planKey } = readPlan(dir);
+  const { plan, statKey: planStatKey } = readPlan(dir);
+  const planKey = planStatKey;
   const stateMeta = readFleetStateMeta(dir);
   const fleetState = stateMeta.state;
 
@@ -4237,9 +4385,9 @@ function buildSwarmSummaryOnly(appData, id, now = Date.now()) {
         if (hasBrk || hasShip) {
           let hit = false;
           if (hasBrk) {
-            if (/\[scale-verified\]/i.test(text)) { gateAcc.scaleC++; if (seq >= gateAcc.scaleSeq) { gateAcc.scaleSeq = seq; gateAcc.scaleText = text; } hit = true; }
-            else if (/\[verified\]/i.test(text)) { gateAcc.verC++; if (seq >= gateAcc.verSeq) { gateAcc.verSeq = seq; gateAcc.verText = text; } hit = true; }
-            else if (/\[done\]/i.test(text)) { gateAcc.doneC++; if (seq >= gateAcc.doneSeq) { gateAcc.doneSeq = seq; gateAcc.doneText = text; } hit = true; }
+            if (/\[scale-verified\]/i.test(text)) { gateAcc.scaleC++; if (seq >= gateAcc.scaleSeq) { gateAcc.scaleSeq = seq; gateAcc.scaleText = text.slice(0, 512); } hit = true; }
+            else if (/\[verified\]/i.test(text)) { gateAcc.verC++; if (seq >= gateAcc.verSeq) { gateAcc.verSeq = seq; gateAcc.verText = text.slice(0, 512); } hit = true; }
+            else if (/\[done\]/i.test(text)) { gateAcc.doneC++; if (seq >= gateAcc.doneSeq) { gateAcc.doneSeq = seq; gateAcc.doneText = text.slice(0, 512); } hit = true; }
             if (/\[blocked\]/i.test(text)) { gateAcc.blkC++; if (seq >= gateAcc.blkSeq) { gateAcc.blkSeq = seq; gateAcc.blkAgent = agent; } hit = true; }
           }
           if (hasShip && /\bshipped\b/i.test(text)) {
@@ -4258,9 +4406,9 @@ function buildSwarmSummaryOnly(appData, id, now = Date.now()) {
           lastVerifiedSeq = Math.max(lastVerifiedSeq, seq);
         }
         if (/\[blocked\]/i.test(trimmed)) {
-          latestBlockedByAgent.set(agent, { seq, agent, text: trimmed, ts, control: null });
+          latestBlockedByAgent.set(agent, { seq, agent, text: trimmed.slice(0, 1024), ts, control: null });
         } else if (/^@\S+\s+\[done\]|\[done\]/i.test(trimmed)) {
-          latestDoneByAgent.set(agent, { seq, agent, text: trimmed, ts, control: null });
+          latestDoneByAgent.set(agent, { seq, agent, text: trimmed.slice(0, 1024), ts, control: null });
         }
       },
     );
@@ -4770,12 +4918,18 @@ function scanSwarmIds(appDataDirs) {
   const seen = new Set();
   const entries = [];
   for (const appData of appDataDirs) {
-    for (const id of safeReaddir(join(appData, 'brain'))) {
-      if (seen.has(id) || !ID_RE.test(id)) continue;
-      if (existsSync(join(swarmDir(appData, id), 'members.json'))) {
+    const brainPath = join(appData, 'brain');
+    for (const id of safeReaddir(brainPath)) {
+      if (seen.has(id) || !ID_RE.test(id) || id === '.' || id === '..') continue;
+      try {
+        const swRoot = join(brainPath, id);
+        if (lstatSync(swRoot).isSymbolicLink()) continue;
+        const memPath = join(swarmDir(appData, id), 'members.json');
+        const memLst = lstatSync(memPath);
+        if (memLst.isSymbolicLink() || !memLst.isFile()) continue;
         seen.add(id);
         entries.push({ appData, id });
-      }
+      } catch {}
     }
   }
   lruSet(swarmIdsScanCache, rootKey, { at: now, entries }, 16);

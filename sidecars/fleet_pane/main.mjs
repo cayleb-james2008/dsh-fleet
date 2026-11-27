@@ -18,11 +18,13 @@ const SECURITY_HEADERS = {
 
 function isLoopbackHost(host) {
   if (!host || typeof host !== 'string') return false;
-  const h = host.toLowerCase();
-  if (h === 'localhost' || h === '127.0.0.1' || h === '[::1]') return true;
-  const col = h.lastIndexOf(':');
-  const bare = h.startsWith('[') ? (h.endsWith(']') ? h : h.slice(0, h.indexOf(']') + 1)) : col > 0 ? h.slice(0, col) : h;
-  return bare === '127.0.0.1' || bare === 'localhost' || bare === '[::1]';
+  const m = /^(127\.0\.0\.1|localhost|\[::1\])(?::(\d{1,5}))?$/.exec(host.trim().toLowerCase());
+  if (!m) return false;
+  if (m[2] !== undefined) {
+    const port = Number(m[2]);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
+  }
+  return true;
 }
 
 export async function createFleetHandlers(opts) {
