@@ -816,10 +816,41 @@ export function createFleetHandlers({
     });
   }
 
-    function getWorktreesPackedSync(query = {}) {
+    function readSwarmRoots(appDataDirs, conversationId) {
+      const conv = typeof conversationId === 'string' ? conversationId.trim() : '';
+      if (!conv || conv === '.' || conv === '..' || !ID_RE.test(conv)) return null;
+      const resolved = resolveConversationSwarm(appDataDirs, conv);
+      if (!resolved.swarm || !resolved.appData) return null;
+      const snap = buildSwarmSnapshot(resolved.appData, resolved.swarm);
+      if (!snap) return null;
+      const workspaces = (snap.members || [])
+        .filter((m) => m && typeof m.workspace === 'string' && m.workspace.trim())
+        .map((m) => ({
+          path: m.workspace.trim(),
+          member: m.name,
+          status: m.status || (m.killed ? 'killed' : 'unknown'),
+          workspaceMode: m.workspace_mode || 'inherit',
+          killed: Boolean(m.killed),
+          role: m.role || '',
+        }));
+      return {
+        swarmId: resolved.swarm,
+        repo: typeof snap.plan?.repo === 'string' ? snap.plan.repo.trim() : '',
+        workspaces,
+      };
+    }
+
+    function worktreesCacheKey(query = {}) {
       const rootsKey = typeof query.roots === 'string' ? query.roots : '';
-      if (rootsKey.length > 8192) return null;
-      const hit = worktreesPayloadCache.get(rootsKey);
+      const convKey = typeof query.conversationId === 'string' ? query.conversationId.trim() : '';
+      if (rootsKey.length > 8192 || convKey.length > 256) return null;
+      return { rootsKey, convKey, cacheKey: `${rootsKey}\0${convKey}` };
+    }
+
+    function getWorktreesPackedSync(query = {}) {
+      const parsed = worktreesCacheKey(query);
+      if (!parsed) return null;
+      const hit = worktreesPayloadCache.get(parsed.cacheKey);
       if (hit && Date.now() - hit.at < 3000) return hit.packed;
       return null;
     }
@@ -829,15 +860,20 @@ export function createFleetHandlers({
       if (rootsKey.length > 8192) {
         return pack({ roots: [], worktrees: [], collisions: [], rejected: ['roots parameter too large'], cachedTtlMs: 3000 });
       }
+      const parsed = worktreesCacheKey(query);
+      if (!parsed) {
+        return pack({ roots: [], worktrees: [], collisions: [], rejected: ['conversationId parameter too large'], cachedTtlMs: 3000 });
+      }
       const sync = getWorktreesPackedSync(query);
       if (sync) return sync;
       const now = Date.now();
+      const swarmContext = parsed.convKey ? readSwarmRoots(getAppDirs(), parsed.convKey) : null;
       const { probeWorktrees } = await getGitProbe();
-      const data = await probeWorktrees(rootsKey);
+      const data = await probeWorktrees(parsed.rootsKey, { swarmContext });
       const packed = pack(data);
-      if (worktreesPayloadCache.has(rootsKey)) worktreesPayloadCache.delete(rootsKey);
-      else if (worktreesPayloadCache.size >= 1) worktreesPayloadCache.delete(worktreesPayloadCache.keys().next().value);
-      worktreesPayloadCache.set(rootsKey, { at: now, packed });
+      if (worktreesPayloadCache.has(parsed.cacheKey)) worktreesPayloadCache.delete(parsed.cacheKey);
+      else if (worktreesPayloadCache.size >= 4) worktreesPayloadCache.delete(worktreesPayloadCache.keys().next().value);
+      worktreesPayloadCache.set(parsed.cacheKey, { at: now, packed });
       return packed;
     }
 
@@ -849,7 +885,9 @@ export function createFleetHandlers({
       path: typeof query.path === 'string' ? query.path : '',
       file: typeof query.file === 'string' ? query.file : '',
       mode: typeof query.mode === 'string' ? query.mode : 'working',
-      maxBytes: Number(query.maxBytes) || 8192,
+      targetBranch: typeof query.targetBranch === 'string' ? query.targetBranch : '',
+      offset: query.offset,
+      maxBytes: query.maxBytes,
     });
     return { status: res.status || (res.ok ? 200 : 400), packed: pack(res) };
   }
@@ -865,6 +903,9 @@ export function createFleetHandlers({
     if (!action) {
       return { status: 400, json: { ok: false, error: 'action is required' } };
     }
+    if ((action === 'squash_merge' || action === 'merge_commit') && body.confirm !== true) {
+      return { status: 400, json: { ok: false, action, error: 'Confirmation required (confirm: true)' } };
+    }
     const rawPath = typeof body.path === 'string' ? body.path : typeof body.worktree === 'string' ? body.worktree : '';
     if (!rawPath.trim()) {
       return { status: 400, json: { ok: false, action, error: 'worktree path is required' } };
@@ -878,6 +919,9 @@ export function createFleetHandlers({
     if (body.deleteBranch !== undefined && typeof body.deleteBranch !== 'boolean') {
       return { status: 400, json: { ok: false, action, error: 'deleteBranch must be a boolean' } };
     }
+    if (body.commitMessage !== undefined && typeof body.commitMessage !== 'string') {
+      return { status: 400, json: { ok: false, action, error: 'commitMessage must be a string' } };
+    }
 
     const { executeWorktreeAction } = await getGitProbe();
     const res = await executeWorktreeAction({
@@ -887,6 +931,8 @@ export function createFleetHandlers({
       worktree: typeof body.worktree === 'string' ? body.worktree : '',
       targetBranch: typeof body.targetBranch === 'string' ? body.targetBranch : '',
       deleteBranch: body.deleteBranch === true,
+      confirm: body.confirm,
+      commitMessage: typeof body.commitMessage === 'string' ? body.commitMessage : '',
     });
     worktreesPayloadCache.clear();
     return { status: res.httpStatus, json: res.payload };
@@ -1098,6 +1144,7 @@ export function createFleetHandlers({
       if (entry?.swarm === swarmId) swarmPayloadCache.delete(k);
     }
     swarmsListCache = { at: 0, key: '', sig: '', swarms: [], packed: null };
+    worktreesPayloadCache.clear();
     notifySwarmWatchersForSwarm(swarmId);
   }
 

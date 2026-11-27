@@ -13,11 +13,22 @@ const MAX_WORKTREES_PER_ROOT = 24;
 const MAX_CHANGED_FILES = 24;
 const MAX_BRANCH_FILES = 200;
 const MAX_RECENT_COMMITS = 5;
+const MAX_DIFF_BYTES = 32768;
+const MAX_DIFF_STREAM_BYTES = 8 * 1024 * 1024;
+const MAX_COMMIT_MSG_LEN = 4096;
 const GIT_TIMEOUT_MS = 2500;
 const DEFAULT_TTL_MS = 3000;
 const PROBE_CACHE_CAP = 32;
-const VALID_ACTIONS = new Set(['dry_run_merge', 'ff_merge', 'rebase', 'remove_worktree']);
+const VALID_ACTIONS = new Set([
+  'dry_run_merge',
+  'ff_merge',
+  'squash_merge',
+  'merge_commit',
+  'rebase',
+  'remove_worktree',
+]);
 const BRANCH_NAME_RE = /^[A-Za-z0-9._/-]{1,128}$/;
+const COMMIT_MSG_CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/;
 
 function stripTrailingSlashes(p) {
   return p.length > 1 ? p.replace(/\/+$/, '') || '/' : p;
@@ -53,20 +64,23 @@ function execGit(cwd, args, timeoutMs = GIT_TIMEOUT_MS) {
   });
 }
 
-function execGitBounded(cwd, args, maxBytes = 24 * 1024, timeoutMs = GIT_TIMEOUT_MS) {
+function execGitDiffSlice(cwd, args, startOffset = 0, cap = 8192, timeoutMs = GIT_TIMEOUT_MS) {
+  const winStart = Math.max(0, startOffset);
+  const winEnd = winStart + cap + 16;
   return new Promise((resolve) => {
     const child = spawn('git', ['-C', cwd, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks = [];
-    let total = 0;
-    let truncated = false;
+    let collected = 0;
+    let totalBytes = 0;
+    let streamTruncated = false;
     let settled = false;
     let stderr = '';
     const finish = (ok, code = 0) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      const stdout = Buffer.concat(chunks, Math.min(total, maxBytes)).toString('utf8');
-      resolve({ ok, code, stdout, stderr, truncated });
+      const windowBuf = chunks.length ? Buffer.concat(chunks, collected) : Buffer.alloc(0);
+      resolve({ ok, code, windowBuf, windowStart: winStart, totalBytes, streamTruncated, stderr });
     };
     const timer = setTimeout(() => {
       try {
@@ -76,28 +90,106 @@ function execGitBounded(cwd, args, maxBytes = 24 * 1024, timeoutMs = GIT_TIMEOUT
     }, timeoutMs);
     timer.unref?.();
     child.stdout.on('data', (chunk) => {
-      if (truncated) return;
-      const remaining = maxBytes - total;
-      if (chunk.length > remaining) {
-        if (remaining > 0) chunks.push(chunk.subarray(0, remaining));
-        total = maxBytes;
-        truncated = true;
+      if (streamTruncated) return;
+      const chunkStart = totalBytes;
+      let chunkEnd = chunkStart + chunk.length;
+      if (chunkEnd > MAX_DIFF_STREAM_BYTES) {
+        const keep = MAX_DIFF_STREAM_BYTES - chunkStart;
+        if (keep > 0) {
+          const clipped = chunk.subarray(0, keep);
+          totalBytes = MAX_DIFF_STREAM_BYTES;
+          chunkEnd = MAX_DIFF_STREAM_BYTES;
+          const ovStart = Math.max(chunkStart, winStart);
+          const ovEnd = Math.min(chunkEnd, winEnd);
+          if (ovEnd > ovStart) {
+            const part = clipped.subarray(ovStart - chunkStart, ovEnd - chunkStart);
+            chunks.push(part);
+            collected += part.length;
+          }
+        }
+        streamTruncated = true;
         try {
           child.kill('SIGTERM');
         } catch {}
         return;
       }
-      chunks.push(chunk);
-      total += chunk.length;
+      totalBytes = chunkEnd;
+      const ovStart = Math.max(chunkStart, winStart);
+      const ovEnd = Math.min(chunkEnd, winEnd);
+      if (ovEnd > ovStart) {
+        const part = chunk.subarray(ovStart - chunkStart, ovEnd - chunkStart);
+        chunks.push(part);
+        collected += part.length;
+      }
     });
     child.stderr.on('data', (chunk) => {
       if (stderr.length < 4096) stderr += chunk.toString('utf8');
     });
     child.on('error', () => finish(false, 1));
     child.on('close', (code) => {
-      finish(code === 0 || truncated, typeof code === 'number' ? code : 1);
+      finish(code === 0 || streamTruncated, typeof code === 'number' ? code : 1);
     });
   });
+}
+
+function sliceDiffWindow(windowBuf, windowStart, cap, totalBytes, streamTruncated = false) {
+  if (windowStart >= totalBytes || windowBuf.length === 0) {
+    return {
+      diff: '',
+      nextOffset: null,
+      hasMore: false,
+      totalBytes,
+      truncated: Boolean(streamTruncated),
+    };
+  }
+
+  let startRel = 0;
+  if (windowStart > 0) {
+    while (startRel < windowBuf.length && startRel < 3 && (windowBuf[startRel] & 0xc0) === 0x80) {
+      startRel++;
+    }
+  }
+  const actualStart = windowStart + startRel;
+  if (actualStart >= totalBytes || startRel >= windowBuf.length) {
+    return {
+      diff: '',
+      nextOffset: null,
+      hasMore: false,
+      totalBytes,
+      truncated: Boolean(streamTruncated),
+    };
+  }
+
+  const maxEndRel = Math.min(windowBuf.length, startRel + cap);
+  let endRel = maxEndRel;
+  const absEnd = windowStart + endRel;
+  if (absEnd < totalBytes && endRel > startRel) {
+    let p = endRel - 1;
+    while (p >= startRel && (windowBuf[p] & 0xc0) === 0x80) p--;
+    if (p >= startRel) {
+      const lead = windowBuf[p];
+      const seqLen = lead < 0x80 ? 1 : (lead & 0xe0) === 0xc0 ? 2 : (lead & 0xf0) === 0xe0 ? 3 : (lead & 0xf8) === 0xf0 ? 4 : 1;
+      if (p + seqLen > endRel) endRel = p;
+    }
+  }
+  if (windowStart + endRel < totalBytes && endRel > startRel) {
+    const nlPos = windowBuf.subarray(startRel, endRel).lastIndexOf(0x0a);
+    if (nlPos > Math.floor((endRel - startRel) * 0.5)) {
+      endRel = startRel + nlPos + 1;
+    }
+  }
+  if (endRel <= startRel) endRel = maxEndRel;
+
+  const actualEnd = Math.min(totalBytes, windowStart + endRel);
+  const text = windowBuf.subarray(startRel, endRel).toString('utf8').replace(/\/home\/[^/\s]+\//g, '~/');
+  const hasMore = actualEnd < totalBytes || Boolean(streamTruncated);
+  return {
+    diff: text,
+    nextOffset: actualEnd < totalBytes ? actualEnd : null,
+    hasMore,
+    totalBytes,
+    truncated: hasMore,
+  };
 }
 
 /** Validate and canonicalize a `file://` URI or absolute path into `{ uri, path }`. */
@@ -378,11 +470,11 @@ async function inspectWorktree(rootPath, wt, index, baseBranch = '') {
     ? 'main'
     : !clean
       ? 'dirty'
-      : behind > 0
-        ? 'rebase'
-        : ahead > 0
-          ? 'ready'
-          : 'merged';
+      : ahead === 0
+        ? 'merged'
+        : behind > 0
+          ? 'rebase'
+          : 'ready';
 
   return {
     record: {
@@ -523,19 +615,126 @@ async function probeSingleRoot(root, ttlMs) {
   return tracked;
 }
 
-/** Probe worktrees across validated workspace roots using a debounced TTL cache. */
-export async function probeWorktrees(rawRoots, { ttlMs = DEFAULT_TTL_MS } = {}) {
+/**
+ * Resolve a raw workspace path to its canonical git primary root (`--git-common-dir`)
+ * and worktree root (`--show-toplevel`) under strict CWE-59 symlink/root confinement.
+ */
+export async function resolveGitRepoRoot(rawPath) {
+  const norm = normalizeWorkspaceRoot(rawPath);
+  if (!norm) return { ok: false, path: '', rootPath: '', worktreePath: '' };
+  if (isSymlinkPath(join(norm.path, '.git'))) {
+    return { ok: false, path: norm.path, rootPath: '', worktreePath: '' };
+  }
+  const rev = await execGit(norm.path, ['rev-parse', '--show-toplevel', '--git-common-dir']);
+  if (!rev.ok || !rev.stdout.trim()) {
+    return { ok: false, path: norm.path, rootPath: '', worktreePath: '' };
+  }
+  const lines = rev.stdout.trim().split('\n').map((l) => l.trim()).filter(Boolean);
+  const rawTop = lines[0] || '';
+  const rawCommon = lines[1] || '';
+  if (!rawTop || !rawCommon) {
+    return { ok: false, path: norm.path, rootPath: '', worktreePath: '' };
+  }
+  const normTop = normalizeWorkspaceRoot(rawTop);
+  if (!normTop || isSymlinkPath(join(normTop.path, '.git'))) {
+    return { ok: false, path: norm.path, rootPath: '', worktreePath: '' };
+  }
+
+  const absCommon = stripTrailingSlashes(isAbsolute(rawCommon) ? rawCommon : resolve(norm.path, rawCommon));
+  if (isSymlinkPath(absCommon)) {
+    return { ok: false, path: norm.path, rootPath: '', worktreePath: '' };
+  }
+  const commonCandidate = basename(absCommon) === '.git' ? dirname(absCommon) : absCommon;
+  const normRoot = normalizeWorkspaceRoot(commonCandidate);
+  if (!normRoot || isSymlinkPath(join(normRoot.path, '.git'))) {
+    return { ok: false, path: norm.path, rootPath: '', worktreePath: '' };
+  }
+  return {
+    ok: true,
+    path: norm.path,
+    rootPath: normRoot.path,
+    rootUri: normRoot.uri,
+    worktreePath: normTop.path,
+  };
+}
+
+function ownerPriority(entry) {
+  const killed = entry.killed ? 1 : 0;
+  const inherit = entry.workspaceMode === 'inherit' || !entry.workspaceMode ? 1 : 0;
+  const coord = entry.role === 'coordinator' || entry.member === 'coordinator' ? 1 : 0;
+  const working = entry.status === 'working' ? 0 : entry.status === 'waiting' ? 1 : 2;
+  return killed * 100 + inherit * 20 + coord * 10 + working;
+}
+
+/** Probe worktrees across validated workspace roots and optional swarm context using a debounced TTL cache. */
+export async function probeWorktrees(rawRoots, { ttlMs = DEFAULT_TTL_MS, swarmContext = null } = {}) {
   const { roots, rejected } = parseRootsInput(rawRoots);
+  const seenRoots = new Set(roots.map((r) => r.path));
+  const ownerCandidates = new Map(); // worktreePath -> best entry
+
+  if (swarmContext && typeof swarmContext === 'object') {
+    const memberEntries = Array.isArray(swarmContext.workspaces) ? swarmContext.workspaces : [];
+    const resolvedMembers = await Promise.all(
+      memberEntries.slice(0, MAX_ROOTS * 2).map(async (m) => {
+        if (!m || typeof m.path !== 'string' || !m.path.trim()) return null;
+        const resolved = await resolveGitRepoRoot(m.path);
+        return resolved.ok ? { meta: m, resolved } : null;
+      }),
+    );
+
+    for (const item of resolvedMembers) {
+      if (!item) continue;
+      const { meta, resolved } = item;
+      if (!meta.killed && roots.length < MAX_ROOTS && !seenRoots.has(resolved.rootPath)) {
+        seenRoots.add(resolved.rootPath);
+        roots.push({ path: resolved.rootPath, uri: resolved.rootUri });
+      }
+      const candidate = {
+        member: String(meta.member || ''),
+        status: String(meta.status || 'unknown'),
+        workspaceMode: String(meta.workspaceMode || 'inherit'),
+        killed: Boolean(meta.killed),
+        role: String(meta.role || ''),
+      };
+      const prev = ownerCandidates.get(resolved.worktreePath);
+      if (!prev || ownerPriority(candidate) < ownerPriority(prev)) {
+        ownerCandidates.set(resolved.worktreePath, candidate);
+      }
+    }
+
+    if (typeof swarmContext.repo === 'string' && swarmContext.repo.trim() && roots.length < MAX_ROOTS) {
+      const resolvedRepo = await resolveGitRepoRoot(swarmContext.repo);
+      if (resolvedRepo.ok && !seenRoots.has(resolvedRepo.rootPath)) {
+        seenRoots.add(resolvedRepo.rootPath);
+        roots.push({ path: resolvedRepo.rootPath, uri: resolvedRepo.rootUri });
+      }
+    }
+  }
+
   const results = await Promise.all(roots.map((r) => probeSingleRoot(r, ttlMs)));
   const worktrees = [];
   const collisions = [];
   for (const r of results) {
-    worktrees.push(...r.worktrees);
+    for (const wt of r.worktrees) {
+      const owner = ownerCandidates.get(wt.path);
+      worktrees.push(
+        owner
+          ? {
+              ...wt,
+              swarmOwner: {
+                member: owner.member,
+                status: owner.status,
+                workspaceMode: owner.workspaceMode,
+              },
+            }
+          : wt,
+      );
+    }
     collisions.push(...r.collisions);
   }
   return {
     roots: results.map((r) => ({
-      path: r.path,
+      path: r.root,
       uri: r.uri,
       isGit: r.isGit,
       count: r.worktrees.length,
@@ -640,18 +839,50 @@ function checkAncestorInWorktree(wtReal, wtPrefix, abs) {
   return { ok: false, error: 'file parent missing' };
 }
 
-/** Validate worktree/file path confinement and return bounded (<=16 KB) git diff text. */
+async function resolveTargetBranch(rootPath, targetBranch) {
+  if (typeof targetBranch === 'string' && targetBranch.trim()) {
+    const candidate = targetBranch.trim();
+    if (!isSafeBranchName(candidate)) {
+      return { ok: false, status: 400, code: 'invalid', error: 'Invalid targetBranch name' };
+    }
+    const refCheck = await execGit(rootPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${candidate}`]);
+    if (!refCheck.ok || !refCheck.stdout.trim()) {
+      return { ok: false, status: 404, code: 'not_found', error: `Target branch '${candidate}' not found` };
+    }
+    return { ok: true, target: candidate };
+  }
+  const base = await detectBaseBranch(rootPath);
+  if (!base) {
+    return { ok: false, status: 400, code: 'no_base', error: 'Base branch (main/master) not found' };
+  }
+  return { ok: true, target: base };
+}
+
+/** Validate worktree/file path confinement and return paginated (<=32 KiB) git diff text. */
 export async function probeWorktreeDiff({
   root = '',
   worktree = '',
   path = '',
   file = '',
   mode = 'working',
+  targetBranch = '',
+  offset = 0,
   maxBytes = 8192,
 } = {}) {
   const diffMode = mode === undefined || mode === '' ? 'working' : mode;
-  if (diffMode !== 'working' && diffMode !== 'branch') {
+  if (diffMode !== 'working' && diffMode !== 'branch' && diffMode !== 'conflict') {
     return { ok: false, status: 400, error: 'invalid diff mode' };
+  }
+
+  let startOffset = 0;
+  if (offset !== undefined && offset !== null && offset !== '') {
+    if (typeof offset === 'boolean' || !/^\d+$/.test(String(offset).trim())) {
+      return { ok: false, status: 400, error: 'invalid offset' };
+    }
+    startOffset = Number(String(offset).trim());
+    if (!Number.isSafeInteger(startOffset) || startOffset < 0) {
+      return { ok: false, status: 400, error: 'invalid offset' };
+    }
   }
 
   const relPath = typeof file === 'string' ? file.trim() : '';
@@ -701,58 +932,151 @@ export async function probeWorktreeDiff({
     }
   }
 
-  const cap = Math.min(16384, Math.max(512, Number(maxBytes) || 8192));
-  const streamCap = cap + 4096;
-  let text = '';
+  const rawMax = Number(maxBytes);
+  const cap = Math.min(MAX_DIFF_BYTES, Math.max(512, Number.isFinite(rawMax) && rawMax > 0 ? Math.floor(rawMax) : 8192));
+  let resolvedTarget = '';
   let untracked = false;
-  let streamTruncated = false;
+  let page = { diff: '', nextOffset: null, hasMore: false, totalBytes: 0, truncated: false };
 
-  if (diffMode === 'branch') {
-    const baseBranch = await detectBaseBranch(confined.rootPath);
-    if (!baseBranch) {
-      return { ok: false, status: 400, error: 'base branch not found' };
+  if (diffMode === 'branch' || diffMode === 'conflict' || (typeof targetBranch === 'string' && targetBranch.trim())) {
+    const targetRes = await resolveTargetBranch(confined.rootPath, targetBranch);
+    if (!targetRes.ok) {
+      return { ok: false, status: targetRes.status, error: targetRes.error };
     }
-    const mbRes = await execGit(wtReal, ['merge-base', baseBranch, 'HEAD']);
+    resolvedTarget = targetRes.target;
+  }
+
+  if (diffMode === 'conflict') {
+    if (confined.isMain || confined.wtEntry.branch === resolvedTarget) {
+      return { ok: false, status: 400, error: `Cannot inspect merge conflict of ${resolvedTarget} against itself` };
+    }
+    if (!hasValidHeadSha(confined.wtEntry)) {
+      return { ok: false, status: 400, error: 'Worktree has no HEAD commit' };
+    }
+    const wtRef = confined.wtEntry.branch || confined.wtEntry.head;
+    const mtRaw = await execGit(confined.rootPath, [
+      'merge-tree',
+      '--write-tree',
+      '--name-only',
+      '--no-messages',
+      '-z',
+      resolvedTarget,
+      wtRef,
+    ]);
+    const mt = parseMergeTreeOutput(mtRaw);
+    if (!mt.ok) {
+      return { ok: false, status: 409, error: mt.error };
+    }
+    if (!mt.clean && mt.conflictFiles.includes(relPath)) {
+      const conflictSlice = await execGitDiffSlice(
+        confined.rootPath,
+        ['diff', '--no-ext-diff', resolvedTarget, mt.treeSha, '--', relPath],
+        startOffset,
+        cap,
+      );
+      if (conflictSlice.ok && conflictSlice.totalBytes > 0) {
+        page = sliceDiffWindow(
+          conflictSlice.windowBuf,
+          conflictSlice.windowStart,
+          cap,
+          conflictSlice.totalBytes,
+          conflictSlice.streamTruncated,
+        );
+      } else {
+        // Modify/delete or rename conflict where tree kept target version: diff target vs wtRef with conflict header
+        const rawFallback = await execGit(confined.rootPath, ['diff', '--no-ext-diff', resolvedTarget, wtRef, '--', relPath]);
+        const note = `CONFLICT (${relPath}): conflicts between ${resolvedTarget} and ${wtRef}\n`;
+        const fullBuf = Buffer.from(note + (rawFallback.ok ? rawFallback.stdout : ''), 'utf8');
+        const sliceBuf = fullBuf.subarray(startOffset, startOffset + cap + 16);
+        page = sliceDiffWindow(sliceBuf, startOffset, cap, fullBuf.length, false);
+      }
+    }
+  } else if (diffMode === 'branch') {
+    const mbRes = await execGit(wtReal, ['merge-base', resolvedTarget, 'HEAD']);
     if (mbRes.ok && mbRes.stdout.trim()) {
       const mergeBase = mbRes.stdout.trim();
-      const branchDiff = await execGitBounded(wtReal, ['diff', '--no-ext-diff', `${mergeBase}..HEAD`, '--', relPath], streamCap);
-      text = branchDiff.ok ? branchDiff.stdout : '';
-      streamTruncated = Boolean(branchDiff.truncated);
+      const branchSlice = await execGitDiffSlice(
+        wtReal,
+        ['diff', '--no-ext-diff', `${mergeBase}..HEAD`, '--', relPath],
+        startOffset,
+        cap,
+      );
+      if (branchSlice.ok && branchSlice.totalBytes > 0) {
+        page = sliceDiffWindow(
+          branchSlice.windowBuf,
+          branchSlice.windowStart,
+          cap,
+          branchSlice.totalBytes,
+          branchSlice.streamTruncated,
+        );
+      }
     }
   } else {
-    const diffRes = await execGitBounded(wtReal, ['diff', 'HEAD', '--no-ext-diff', '--', relPath], streamCap);
-    text = diffRes.ok ? diffRes.stdout : '';
-    streamTruncated = Boolean(diffRes.truncated);
-    if (!text) {
-      const cachedRes = await execGitBounded(wtReal, ['diff', '--cached', '--no-ext-diff', '--', relPath], streamCap);
-      const workRes = await execGitBounded(wtReal, ['diff', '--no-ext-diff', '--', relPath], streamCap);
-      text = [cachedRes.ok ? cachedRes.stdout : '', workRes.ok ? workRes.stdout : ''].filter(Boolean).join('\n');
-      streamTruncated = Boolean(cachedRes.truncated || workRes.truncated);
+    const headSlice = await execGitDiffSlice(wtReal, ['diff', 'HEAD', '--no-ext-diff', '--', relPath], startOffset, cap);
+    if (headSlice.ok && headSlice.totalBytes > 0) {
+      page = sliceDiffWindow(
+        headSlice.windowBuf,
+        headSlice.windowStart,
+        cap,
+        headSlice.totalBytes,
+        headSlice.streamTruncated,
+      );
+    } else {
+      const [cachedRes, workRes] = await Promise.all([
+        execGitDiffSlice(wtReal, ['diff', '--cached', '--no-ext-diff', '--', relPath], 0, MAX_DIFF_BYTES),
+        execGitDiffSlice(wtReal, ['diff', '--no-ext-diff', '--', relPath], 0, MAX_DIFF_BYTES),
+      ]);
+      const combined = [
+        cachedRes.ok ? cachedRes.windowBuf.toString('utf8') : '',
+        workRes.ok ? workRes.windowBuf.toString('utf8') : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+      if (combined) {
+        const fullBuf = Buffer.from(combined, 'utf8');
+        const sliceBuf = fullBuf.subarray(startOffset, startOffset + cap + 16);
+        page = sliceDiffWindow(
+          sliceBuf,
+          startOffset,
+          cap,
+          fullBuf.length,
+          Boolean(cachedRes.streamTruncated || workRes.streamTruncated),
+        );
+      }
     }
 
-    if (!text && existsOnDisk && realTarget) {
+    if (page.totalBytes === 0 && existsOnDisk && realTarget) {
       const stRes = await execGit(wtReal, ['status', '--porcelain=v1', '-z', '--', relPath]);
       if (stRes.ok && stRes.stdout.startsWith('?? ')) {
         untracked = true;
         try {
           const st = statSync(realTarget);
           if (st.isFile()) {
+            const readCap = Math.min(2 * 1024 * 1024, st.size);
             const fd = openSync(realTarget, 'r');
-            let slice = Buffer.alloc(0);
+            let rawBuf = Buffer.alloc(0);
             try {
-              const buf = Buffer.allocUnsafe(Math.min(cap, st.size));
+              const buf = Buffer.allocUnsafe(readCap);
               const n = readSync(fd, buf, 0, buf.length, 0);
-              slice = buf.subarray(0, n);
+              rawBuf = buf.subarray(0, n);
             } finally {
               closeSync(fd);
             }
-            if (slice.includes(0)) {
-              text = `+++ ${relPath}\n[binary untracked file omitted]`;
+            if (rawBuf.subarray(0, Math.min(8192, rawBuf.length)).includes(0)) {
+              const binBuf = Buffer.from(`+++ ${relPath}\n[binary untracked file omitted]`, 'utf8');
+              page = sliceDiffWindow(binBuf.subarray(startOffset, startOffset + cap + 16), startOffset, cap, binBuf.length, false);
             } else {
-              const rawText = slice.toString('utf8');
+              const rawText = rawBuf.toString('utf8');
               const bodyLines = rawText.split('\n').map((l) => `+${l}`).join('\n');
-              text = `+++ ${relPath} (untracked)\n${bodyLines}${st.size > cap ? '\n... (truncated)' : ''}`;
-              if (st.size > cap) streamTruncated = true;
+              const formatted = `+++ ${relPath} (untracked)\n${bodyLines}${st.size > readCap ? '\n... (truncated)' : ''}`;
+              const fullBuf = Buffer.from(formatted, 'utf8');
+              page = sliceDiffWindow(
+                fullBuf.subarray(startOffset, startOffset + cap + 16),
+                startOffset,
+                cap,
+                fullBuf.length,
+                st.size > readCap,
+              );
             }
           }
         } catch {}
@@ -760,19 +1084,9 @@ export async function probeWorktreeDiff({
     }
   }
 
-  text = text.replace(/\/home\/[^/\s]+\//g, '~/');
-  let truncated = streamTruncated;
-  if (Buffer.byteLength(text, 'utf8') > cap) {
-    let clipped = Buffer.from(text, 'utf8').subarray(0, cap).toString('utf8').replace(/\uFFFD+$/, '');
-    const nl = clipped.lastIndexOf('\n');
-    if (nl > cap * 0.5) clipped = clipped.slice(0, nl);
-    text = clipped;
-    truncated = true;
-  }
-
   let added = 0;
   let removed = 0;
-  for (const line of text.split('\n')) {
+  for (const line of page.diff.split('\n')) {
     if (line.startsWith('+') && !line.startsWith('+++')) added++;
     else if (line.startsWith('-') && !line.startsWith('---')) removed++;
   }
@@ -783,8 +1097,13 @@ export async function probeWorktreeDiff({
     worktree: wtReal,
     file: relPath,
     mode: diffMode,
-    diff: text,
-    truncated,
+    ...(resolvedTarget ? { targetBranch: resolvedTarget } : {}),
+    diff: page.diff,
+    offset: startOffset,
+    nextOffset: page.nextOffset,
+    hasMore: page.hasMore,
+    totalBytes: page.totalBytes,
+    truncated: page.truncated,
     untracked,
     added,
     removed,
@@ -821,7 +1140,70 @@ function hasValidHeadSha(wtEntry) {
   return /^[0-9a-f]{7,64}$/i.test(h) && !/^0+$/.test(h);
 }
 
-/** Execute a confined, shell-free git worktree action (`dry_run_merge`, `ff_merge`, `rebase`, `remove_worktree`). */
+async function checkMergePreconditions({ isMain, wtBranch, target, wtEntry, wtPath, rootPath, fail, verb }) {
+  if (isMain || wtBranch === target) {
+    return fail(400, 'invalid', `Cannot ${verb} ${target} into itself`);
+  }
+  if (wtEntry.detached || !wtBranch) {
+    return fail(400, 'detached', `Cannot ${verb} a detached worktree`);
+  }
+  if ((await hasInProgressGitOp(wtPath)) || (await hasInProgressGitOp(rootPath))) {
+    return fail(409, 'in_progress', 'Repository or worktree has an in-progress rebase or merge');
+  }
+  if (!(await isWorktreeClean(wtPath))) {
+    return fail(409, 'dirty', 'Worktree has uncommitted changes');
+  }
+  if (!(await isWorktreeClean(rootPath))) {
+    return fail(409, 'dirty', 'Primary repository has uncommitted changes');
+  }
+  const rootBranchRes = await execGit(rootPath, ['symbolic-ref', '--short', 'HEAD']);
+  const rootBranch = rootBranchRes.ok ? rootBranchRes.stdout.trim() : '';
+  if (rootBranch !== target) {
+    return fail(409, 'wrong_branch', `Primary repository is on '${rootBranch || 'detached'}', expected '${target}'`);
+  }
+  return null;
+}
+
+async function readUnmergedConflicts(cwd) {
+  const conflictRes = await execGit(cwd, ['diff', '--name-only', '--diff-filter=U', '-z']);
+  return conflictRes.ok && conflictRes.stdout
+    ? [...new Set(conflictRes.stdout.split('\0').filter(Boolean))]
+    : [];
+}
+
+async function abortAndFailConflict({ cwd, rootPath, abortCmd, extraReset = false, opRes, label, fail }) {
+  const conflicts = await readUnmergedConflicts(cwd);
+  await execGit(cwd, abortCmd, 5000);
+  if (extraReset && !(await isWorktreeClean(cwd))) {
+    await execGit(cwd, ['reset', '--merge'], 5000);
+  }
+  invalidateWorktreeCache(rootPath);
+  const message = conflicts.length
+    ? `${label} aborted due to conflicts in ${conflicts.join(', ')}`
+    : (opRes.stderr || opRes.error || `${label} failed and was aborted`).trim();
+  return fail(409, 'conflict', message, {
+    aborted: true,
+    conflicts,
+    conflictFiles: conflicts,
+    result: { aborted: true, conflicts },
+  });
+}
+
+function sanitizeCommitMessage(raw) {
+  if (raw === undefined || raw === null) return { ok: true, value: '' };
+  if (typeof raw !== 'string') return { ok: false, error: 'commitMessage must be a string' };
+  const normalized = raw.replace(/\r\n?/g, '\n');
+  if (COMMIT_MSG_CTRL_RE.test(normalized)) {
+    return { ok: false, error: 'commitMessage contains invalid control characters' };
+  }
+  const trimmed = normalized.trim();
+  if (trimmed.length > MAX_COMMIT_MSG_LEN) {
+    return { ok: false, error: `commitMessage exceeds ${MAX_COMMIT_MSG_LEN} characters` };
+  }
+  return { ok: true, value: trimmed };
+}
+
+/** Execute a confined, shell-free git worktree action (`dry_run_merge`, `ff_merge`, `squash_merge`, `merge_commit`, `rebase`, `remove_worktree`). */
 export async function executeWorktreeAction({
   action = '',
   root = '',
@@ -829,12 +1211,37 @@ export async function executeWorktreeAction({
   worktree = '',
   targetBranch = '',
   deleteBranch = false,
+  confirm = undefined,
+  commitMessage = '',
 } = {}) {
   if (!VALID_ACTIONS.has(action)) {
     return {
       ok: false,
       httpStatus: 400,
       payload: { ok: false, action: String(action || ''), status: 'invalid', message: 'Unsupported worktree action' },
+    };
+  }
+
+  if ((action === 'squash_merge' || action === 'merge_commit') && confirm !== true) {
+    return {
+      ok: false,
+      httpStatus: 400,
+      payload: {
+        ok: false,
+        action,
+        status: 'confirmation_required',
+        message: 'Confirmation required (confirm: true)',
+        error: 'Confirmation required',
+      },
+    };
+  }
+
+  const msgCheck = sanitizeCommitMessage(commitMessage);
+  if (!msgCheck.ok) {
+    return {
+      ok: false,
+      httpStatus: 400,
+      payload: { ok: false, action, status: 'invalid', message: msgCheck.error, error: msgCheck.error },
     };
   }
 
@@ -850,35 +1257,15 @@ export async function executeWorktreeAction({
   const { rootPath, wtPath, wtEntry, isMain } = confined;
   const wtBranch = wtEntry.branch || '';
 
-  let target = '';
-  if (typeof targetBranch === 'string' && targetBranch.trim()) {
-    const candidate = targetBranch.trim();
-    if (!isSafeBranchName(candidate)) {
-      return {
-        ok: false,
-        httpStatus: 400,
-        payload: { ok: false, action, status: 'invalid', message: 'Invalid targetBranch name' },
-      };
-    }
-    const refCheck = await execGit(rootPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${candidate}`]);
-    if (!refCheck.ok || !refCheck.stdout.trim()) {
-      return {
-        ok: false,
-        httpStatus: 404,
-        payload: { ok: false, action, status: 'not_found', message: `Target branch '${candidate}' not found` },
-      };
-    }
-    target = candidate;
-  } else {
-    target = await detectBaseBranch(rootPath);
-    if (!target) {
-      return {
-        ok: false,
-        httpStatus: 400,
-        payload: { ok: false, action, status: 'no_base', message: 'Base branch (main/master) not found' },
-      };
-    }
+  const targetRes = await resolveTargetBranch(rootPath, targetBranch);
+  if (!targetRes.ok) {
+    return {
+      ok: false,
+      httpStatus: targetRes.status,
+      payload: { ok: false, action, status: targetRes.code || 'invalid', message: targetRes.error },
+    };
   }
+  const target = targetRes.target;
 
   const fail = (httpStatus, status, message, extra = {}) => ({
     ok: false,
@@ -921,26 +1308,18 @@ export async function executeWorktreeAction({
   }
 
   if (action === 'ff_merge') {
-    if (isMain || wtBranch === target) {
-      return fail(400, 'invalid', `Cannot fast-forward merge ${target} into itself`);
-    }
-    if (wtEntry.detached || !wtBranch) {
-      return fail(400, 'detached', 'Cannot fast-forward merge a detached worktree');
-    }
-    if ((await hasInProgressGitOp(wtPath)) || (await hasInProgressGitOp(rootPath))) {
-      return fail(409, 'in_progress', 'Repository or worktree has an in-progress rebase or merge');
-    }
-    if (!(await isWorktreeClean(wtPath))) {
-      return fail(409, 'dirty', 'Worktree has uncommitted changes');
-    }
-    if (!(await isWorktreeClean(rootPath))) {
-      return fail(409, 'dirty', 'Primary repository has uncommitted changes');
-    }
-    const rootBranchRes = await execGit(rootPath, ['symbolic-ref', '--short', 'HEAD']);
-    const rootBranch = rootBranchRes.ok ? rootBranchRes.stdout.trim() : '';
-    if (rootBranch !== target) {
-      return fail(409, 'wrong_branch', `Primary repository is on '${rootBranch || 'detached'}', expected '${target}'`);
-    }
+    const blocked = await checkMergePreconditions({
+      isMain,
+      wtBranch,
+      target,
+      wtEntry,
+      wtPath,
+      rootPath,
+      fail,
+      verb: 'fast-forward merge',
+    });
+    if (blocked) return blocked;
+
     const mergeRes = await execGit(rootPath, ['merge', '--ff-only', wtBranch], 10000);
     if (!mergeRes.ok) {
       return fail(409, 'not_ff', (mergeRes.stderr || mergeRes.error || 'Branch cannot be fast-forward merged; rebase required').trim());
@@ -955,6 +1334,100 @@ export async function executeWorktreeAction({
         status: 'merged',
         result: { branch: wtBranch, target, stdout: mergeRes.stdout.trim() },
         message: `Fast-forwarded ${target} to ${wtBranch}`,
+      },
+    };
+  }
+
+  if (action === 'squash_merge' || action === 'merge_commit') {
+    const verb = action === 'squash_merge' ? 'squash merge' : 'merge';
+    const blocked = await checkMergePreconditions({
+      isMain,
+      wtBranch,
+      target,
+      wtEntry,
+      wtPath,
+      rootPath,
+      fail,
+      verb,
+    });
+    if (blocked) return blocked;
+
+    const alreadyMerged = await execGit(rootPath, ['merge-base', '--is-ancestor', wtBranch, target]);
+    if (alreadyMerged.ok) {
+      return fail(409, 'already_merged', `Branch '${wtBranch}' has no unmerged commits ahead of '${target}'`);
+    }
+
+    const defaultMsg =
+      action === 'squash_merge'
+        ? `Squash merge ${wtBranch} into ${target}`
+        : `Merge branch '${wtBranch}' into ${target}`;
+    const finalMsg = msgCheck.value || defaultMsg;
+
+    if (action === 'merge_commit') {
+      const mergeRes = await execGit(rootPath, ['merge', '--no-ff', '-m', finalMsg, wtBranch], 10000);
+      if (mergeRes.ok) {
+        const shaRes = await execGit(rootPath, ['rev-parse', '--short', 'HEAD']);
+        invalidateWorktreeCache(rootPath);
+        return {
+          ok: true,
+          httpStatus: 200,
+          payload: {
+            ok: true,
+            action,
+            status: 'merged',
+            result: { branch: wtBranch, target, sha: shaRes.stdout.trim(), stdout: mergeRes.stdout.trim() },
+            message: `Merged ${wtBranch} into ${target}`,
+          },
+        };
+      }
+      return abortAndFailConflict({
+        cwd: rootPath,
+        rootPath,
+        abortCmd: ['merge', '--abort'],
+        extraReset: true,
+        opRes: mergeRes,
+        label: 'Merge',
+        fail,
+      });
+    }
+
+    // squash_merge
+    const squashRes = await execGit(rootPath, ['merge', '--squash', wtBranch], 10000);
+    if (!squashRes.ok) {
+      return abortAndFailConflict({
+        cwd: rootPath,
+        rootPath,
+        abortCmd: ['reset', '--merge'],
+        opRes: squashRes,
+        label: 'Squash merge',
+        fail,
+      });
+    }
+
+    const stagedCheck = await execGit(rootPath, ['diff', '--cached', '--quiet']);
+    if (stagedCheck.ok) {
+      await execGit(rootPath, ['reset', '--merge'], 5000);
+      invalidateWorktreeCache(rootPath);
+      return fail(409, 'nothing_to_commit', `Squash merge of '${wtBranch}' produced no net changes against '${target}'`);
+    }
+
+    const commitRes = await execGit(rootPath, ['commit', '-m', finalMsg], 10000);
+    if (!commitRes.ok) {
+      await execGit(rootPath, ['reset', '--merge'], 5000);
+      invalidateWorktreeCache(rootPath);
+      return fail(409, 'error', (commitRes.stderr || commitRes.error || 'Squash commit failed and was rolled back').trim());
+    }
+    const shaRes = await execGit(rootPath, ['rev-parse', '--short', 'HEAD']);
+    invalidateWorktreeCache(rootPath);
+    return {
+      ok: true,
+      httpStatus: 200,
+      payload: {
+        ok: true,
+        action,
+        status: 'merged',
+        result: { branch: wtBranch, target, sha: shaRes.stdout.trim(), stdout: commitRes.stdout.trim() },
+        message: `Squash-merged ${wtBranch} into ${target}`,
       },
     };
   }
@@ -987,20 +1460,13 @@ export async function executeWorktreeAction({
         },
       };
     }
-    const conflictRes = await execGit(wtPath, ['diff', '--name-only', '--diff-filter=U', '-z']);
-    const conflicts = conflictRes.ok && conflictRes.stdout
-      ? [...new Set(conflictRes.stdout.split('\0').filter(Boolean))]
-      : [];
-    await execGit(wtPath, ['rebase', '--abort'], 5000);
-    invalidateWorktreeCache(rootPath);
-    const message = conflicts.length
-      ? `Rebase aborted due to conflicts in ${conflicts.join(', ')}`
-      : (rebaseRes.stderr || rebaseRes.error || 'Rebase failed and was aborted').trim();
-    return fail(409, 'conflict', message, {
-      aborted: true,
-      conflicts,
-      conflictFiles: conflicts,
-      result: { aborted: true, conflicts },
+    return abortAndFailConflict({
+      cwd: wtPath,
+      rootPath,
+      abortCmd: ['rebase', '--abort'],
+      opRes: rebaseRes,
+      label: 'Rebase',
+      fail,
     });
   }
 

@@ -2498,3 +2498,239 @@ test('Portfolio, triage ack/snooze, pins, archive, checkpoints HTTP + SidecarApp
     rmSync(fx.dir, { recursive: true, force: true });
   }
 });
+
+test('E3 HTTP & SidecarApp RPC: conversationId worktree discovery, swarmOwner, mode=conflict pagination, squash_merge & merge_commit', async () => {
+  const fx = setupFixtureAppData();
+  const baseDir = makeScratchDir('http-wt-e3-');
+  const repoA = join(baseDir, 'repo-a');
+  const repoB = join(baseDir, 'repo-b');
+  const wtSquash = join(baseDir, 'wt-squash');
+  const wtMerge = join(baseDir, 'wt-merge');
+  const wtConflict = join(baseDir, 'wt-conflict');
+  const symMemberWs = join(baseDir, 'sym-ws');
+
+  const git = (cwd, args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }).trim();
+  const srv = await startStandaloneServer({
+    port: 0,
+    distDir: fx.distDir,
+    appDataDir: fx.appData,
+    defaultConversationId: fx.coord,
+  });
+
+  try {
+    // Repo A (linked worktrees) + Repo B (plan.repo)
+    git(baseDir, ['init', '-b', 'main', repoA]);
+    git(repoA, ['config', 'user.email', 'test@example.com']);
+    git(repoA, ['config', 'user.name', 'Test']);
+    writeFileSync(join(repoA, 'conflict.txt'), 'line1\nbase\nline3\n');
+    git(repoA, ['add', '.']);
+    git(repoA, ['commit', '-m', 'Init A']);
+
+    git(baseDir, ['init', '-b', 'main', repoB]);
+    git(repoB, ['config', 'user.email', 'test@example.com']);
+    git(repoB, ['config', 'user.name', 'Test']);
+    writeFileSync(join(repoB, 'b.txt'), 'repo B\n');
+    git(repoB, ['add', '.']);
+    git(repoB, ['commit', '-m', 'Init B']);
+
+    git(repoA, ['worktree', 'add', '-b', 'feat/squash', wtSquash]);
+    git(repoA, ['worktree', 'add', '-b', 'feat/merge', wtMerge]);
+    git(repoA, ['worktree', 'add', '-b', 'feat/conflict', wtConflict]);
+    symlinkSync(wtSquash, symMemberWs);
+
+    writeFileSync(join(wtSquash, 'sq.txt'), 'squashed payload\n');
+    git(wtSquash, ['add', '.']);
+    git(wtSquash, ['commit', '-m', 'Squash work']);
+
+    writeFileSync(join(wtMerge, 'mc.txt'), 'merge commit payload\n');
+    git(wtMerge, ['add', '.']);
+    git(wtMerge, ['commit', '-m', 'Merge work']);
+
+    const featConflictBody = Array.from({ length: 650 }, (_, i) => `worker-${i}-${'z'.repeat(48)}`).join('\n') + '\n';
+    const mainConflictBody = Array.from({ length: 650 }, (_, i) => `main-${i}-${'m'.repeat(48)}`).join('\n') + '\n';
+    writeFileSync(join(wtConflict, 'conflict.txt'), featConflictBody);
+    git(wtConflict, ['commit', '-am', 'Worker conflict']);
+
+    writeFileSync(join(repoA, 'conflict.txt'), mainConflictBody);
+    git(repoA, ['commit', '-am', 'Main conflict']);
+
+    // Configure swarm with member workspaces + plan.repo + CWE-59 symlink member
+    const swDir = join(fx.appData, 'brain', fx.coord, '.system_generated', 'swarm');
+    const evilWorkerId = '33333333-3333-4333-8333-333333333333';
+    const mergeWorkerId = '44444444-4444-4444-8444-444444444444';
+    writeFileSync(
+      join(swDir, 'members.json'),
+      JSON.stringify({
+        title: 'E3 Swarm',
+        members: {
+          coordinator: { conversation_id: fx.coord, role: 'coordinator', wake_mode: 'mentions', workspace: repoA, workspace_mode: 'inherit' },
+          builder: { conversation_id: fx.worker, role: 'worker', wake_mode: 'mentions', workspace: wtConflict, workspace_mode: 'branch' },
+          merger: { conversation_id: mergeWorkerId, role: 'worker', wake_mode: 'mentions', workspace: wtMerge, workspace_mode: 'share' },
+          evil: { conversation_id: evilWorkerId, role: 'worker', wake_mode: 'mentions', workspace: symMemberWs, workspace_mode: 'branch' },
+        },
+      }),
+    );
+    writeFileSync(
+      join(swDir, 'plan.json'),
+      JSON.stringify({ title: 'E3 Plan', goal: 'Test worktrees', repo: repoB }),
+    );
+
+    // 1. GET /api/worktrees?conversationId=... auto-discovers repoA + repoB & attaches swarmOwner
+    const discRes = await fetch(`${srv.url}/api/worktrees?conversationId=${encodeURIComponent(fx.coord)}`);
+    assert.equal(discRes.status, 200);
+    const discJson = await discRes.json();
+    assert.equal(discJson.roots.length, 2);
+    assert.ok(discJson.roots.some((r) => r.path === repoA));
+    assert.ok(discJson.roots.some((r) => r.path === repoB));
+
+    const builderWt = discJson.worktrees.find((w) => w.path === wtConflict);
+    assert.equal(builderWt?.swarmOwner?.member, 'builder');
+    assert.equal(builderWt?.swarmOwner?.workspaceMode, 'branch');
+    const mergerWt = discJson.worktrees.find((w) => w.path === wtMerge);
+    assert.equal(mergerWt?.swarmOwner?.member, 'merger');
+    assert.equal(mergerWt?.swarmOwner?.workspaceMode, 'share');
+    // Symlinked evil workspace did NOT tag wtSquash
+    assert.equal(discJson.worktrees.find((w) => w.path === wtSquash)?.swarmOwner, undefined);
+
+    // Cache isolation: query with explicit roots without conversationId must NOT leak swarmOwner
+    const noConvJson = await (await fetch(`${srv.url}/api/worktrees?roots=${encodeURIComponent(repoA)}`)).json();
+    assert.equal(noConvJson.worktrees.find((w) => w.path === wtConflict)?.swarmOwner, undefined);
+
+    // 2. GET /api/worktrees/diff?mode=conflict + paginated <= 32 KiB
+    const diffP1Res = await fetch(
+      `${srv.url}/api/worktrees/diff?path=${encodeURIComponent(wtConflict)}&file=conflict.txt&mode=conflict&targetBranch=main&offset=0&maxBytes=32768`,
+    );
+    assert.equal(diffP1Res.status, 200);
+    const diffP1 = await diffP1Res.json();
+    assert.equal(diffP1.mode, 'conflict');
+    assert.equal(diffP1.hasMore, true);
+    assert.ok(diffP1.totalBytes > 32768);
+    assert.ok(Buffer.byteLength(diffP1.diff, 'utf8') <= 32768);
+
+    const diffP2Res = await fetch(
+      `${srv.url}/api/worktrees/diff?path=${encodeURIComponent(wtConflict)}&file=conflict.txt&mode=conflict&targetBranch=main&offset=${diffP1.nextOffset}&maxBytes=32768`,
+    );
+    assert.equal(diffP2Res.status, 200);
+    const diffP2 = await diffP2Res.json();
+    assert.equal(diffP2.hasMore, false);
+    assert.equal(diffP2.nextOffset, null);
+    const fullConflictDiff = diffP1.diff + diffP2.diff;
+    assert.ok(fullConflictDiff.includes('<<<<<<< main'));
+    assert.ok(fullConflictDiff.includes('>>>>>>> feat/conflict'));
+    assert.equal(git(repoA, ['status', '--porcelain']), '');
+
+    const badOffset = await fetch(
+      `${srv.url}/api/worktrees/diff?path=${encodeURIComponent(wtConflict)}&file=conflict.txt&mode=conflict&offset=-5`,
+    );
+    assert.equal(badOffset.status, 400);
+
+    // 3. POST /api/worktrees/action: confirm guard, 409 conflict abort, 200 squash_merge & merge_commit, cache invalidation
+    const postAction = (body) =>
+      fetch(`${srv.url}/api/worktrees/action`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    assert.equal((await postAction({ action: 'squash_merge', path: wtSquash })).status, 400);
+    assert.equal((await postAction({ action: 'merge_commit', path: wtMerge, confirm: false })).status, 400);
+
+    const conflictActRes = await postAction({ action: 'squash_merge', path: wtConflict, confirm: true });
+    assert.equal(conflictActRes.status, 409);
+    const conflictAct = await conflictActRes.json();
+    assert.equal(conflictAct.aborted, true);
+    assert.deepEqual(conflictAct.conflictFiles, ['conflict.txt']);
+    assert.equal(git(repoA, ['status', '--porcelain']), '');
+
+    const sqRes = await postAction({
+      action: 'squash_merge',
+      path: wtSquash,
+      confirm: true,
+      commitMessage: 'Squash landed via HTTP',
+    });
+    assert.equal(sqRes.status, 200);
+    assert.equal(existsSync(join(repoA, 'sq.txt')), true);
+
+    const mcRes = await postAction({
+      action: 'merge_commit',
+      path: wtMerge,
+      confirm: true,
+      commitMessage: 'Merge commit landed via HTTP',
+    });
+    assert.equal(mcRes.status, 200);
+    assert.equal(existsSync(join(repoA, 'mc.txt')), true);
+
+    // Cache invalidated after mutation: feat/merge now shows ahead=0 / merged
+    const afterJson = await (await fetch(`${srv.url}/api/worktrees?conversationId=${encodeURIComponent(fx.coord)}`)).json();
+    const mergedAfter = afterJson.worktrees.find((w) => w.path === wtMerge);
+    assert.equal(mergedAfter?.ahead, 0);
+    assert.equal(mergedAfter?.landStatus, 'merged');
+
+    // 4. SidecarApp RPC parity for /api/worktrees (conversationId), /api/worktrees/diff (conflict + offset), /api/worktrees/action
+    const mockSidecarUrl = new URL('data:text/javascript,' + encodeURIComponent(`
+      export class Response {
+        constructor(body, init = {}) {
+          this.body = body;
+          this.status = init.status || 200;
+          this.contentType = init.contentType || 'application/json';
+          this.headers = init.headers || {};
+        }
+      }
+      export class SidecarApp {
+        constructor() {
+          this.config = { conversationId: globalThis.__FLEET_TEST_E3_COORD || '' };
+          this.routes = new Map();
+          globalThis.__FLEET_TEST_E3_RPC = this;
+        }
+        page(p, fn) { this.routes.set('PAGE ' + p, fn); }
+        api(p, fn, method = 'GET') { this.routes.set(method + ' ' + p, fn); }
+        async sendMessage() { return { ok: true }; }
+        async run() {}
+      }
+    `));
+    globalThis.__FLEET_TEST_E3_COORD = fx.coord;
+    const hook = registerHooks({
+      resolve(specifier, ctx, next) {
+        if (specifier === 'sidecar_sdk') return { shortCircuit: true, url: mockSidecarUrl.href };
+        return next(specifier, ctx);
+      },
+    });
+    try {
+      await runSidecarApp({ appDataDir: fx.appData });
+      const app = globalThis.__FLEET_TEST_E3_RPC;
+      const rpcWts = await app.routes.get('GET /api/worktrees')({ conversationId: fx.coord });
+      assert.equal(rpcWts.status, 200);
+      const rpcWtsJson = JSON.parse(Buffer.from(rpcWts.body).toString('utf8'));
+      assert.equal(rpcWtsJson.worktrees.find((w) => w.path === wtConflict)?.swarmOwner?.member, 'builder');
+
+      const rpcDiff = await app.routes.get('GET /api/worktrees/diff')({
+        path: wtConflict,
+        file: 'conflict.txt',
+        mode: 'conflict',
+        offset: '0',
+        maxBytes: '32768',
+      });
+      assert.equal(rpcDiff.status, 200);
+      const rpcDiffJson = JSON.parse(Buffer.from(rpcDiff.body).toString('utf8'));
+      assert.equal(rpcDiffJson.mode, 'conflict');
+      assert.equal(rpcDiffJson.hasMore, true);
+
+      const rpcAct = await app.routes.get('POST /api/worktrees/action')({
+        action: 'merge_commit',
+        path: wtConflict,
+        confirm: true,
+      });
+      assert.equal(rpcAct.status, 409);
+      const rpcActJson = JSON.parse(Buffer.from(rpcAct.body).toString('utf8'));
+      assert.deepEqual(rpcActJson.conflictFiles, ['conflict.txt']);
+    } finally {
+      hook?.deregister?.();
+      delete globalThis.__FLEET_TEST_E3_RPC;
+      delete globalThis.__FLEET_TEST_E3_COORD;
+    }
+  } finally {
+    await srv.close();
+    rmSync(baseDir, { recursive: true, force: true });
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});

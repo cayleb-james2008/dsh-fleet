@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -11,6 +11,7 @@ import {
   probeMemberWorktree,
   probeWorktreeDiff,
   probeWorktrees,
+  resolveGitRepoRoot,
 } from '../git_probe.mjs';
 import {
   OPS_TIMEOUT_MS,
@@ -2643,6 +2644,176 @@ test('swarm checkpoints capture git worktree HEADs/clean flags and support CAS p
     assert.ok(resumed.prompt.includes('ws-1[running @builder]'));
     assert.ok(resumed.prompt.includes('feat/work'));
     assert.equal(resumed.directive, resumed.prompt);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('git_probe E3: resolveGitRepoRoot, swarmOwner discovery, conflict diff hunks, 32 KiB pagination, and non-FF landing', async () => {
+  const dir = makeScratchDir('git-e3-');
+  try {
+    const repoDir = join(dir, 'repo');
+    const wtSquash = join(dir, 'wt-squash');
+    const wtMerge = join(dir, 'wt-merge');
+    const wtConflict = join(dir, 'wt-conflict');
+    const symEscape = join(dir, 'sym-escape');
+    mkdirSync(join(repoDir, 'nested'), { recursive: true });
+
+    const git = (cwd, args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }).trim();
+    git(repoDir, ['init', '-b', 'main']);
+    git(repoDir, ['config', 'user.email', 'test@example.com']);
+    git(repoDir, ['config', 'user.name', 'Test User']);
+    writeFileSync(join(repoDir, 'shared.txt'), 'line1\nbase\nline3\n');
+    writeFileSync(join(repoDir, 'nested', 'mod.txt'), 'init\n');
+    git(repoDir, ['add', '.']);
+    git(repoDir, ['commit', '-m', 'Initial']);
+
+    git(repoDir, ['worktree', 'add', '-b', 'feat/squash', wtSquash]);
+    git(repoDir, ['worktree', 'add', '-b', 'feat/merge', wtMerge]);
+    git(repoDir, ['worktree', 'add', '-b', 'feat/conflict', wtConflict]);
+
+    // 1. resolveGitRepoRoot across main, linked worktree, subdir, and CWE-59 symlink rejection
+    const fromWtSubdir = await resolveGitRepoRoot(join(wtSquash, 'nested'));
+    assert.equal(fromWtSubdir.ok, true);
+    assert.equal(fromWtSubdir.rootPath, repoDir);
+    assert.equal(fromWtSubdir.worktreePath, wtSquash);
+
+    symlinkSync(wtSquash, symEscape);
+    assert.equal((await resolveGitRepoRoot(symEscape)).ok, false);
+    assert.equal((await resolveGitRepoRoot(join(dir, '..', 'repo'))).ok, false);
+
+    // 2. swarmContext auto-discovery + swarmOwner tagging without mutating probeCache
+    const discovered = await probeWorktrees('', {
+      ttlMs: 3000,
+      swarmContext: {
+        repo: '',
+        workspaces: [
+          { path: wtSquash, member: 'squash-bot', status: 'working', workspaceMode: 'branch', killed: false, role: 'worker' },
+          { path: symEscape, member: 'evil-bot', status: 'working', workspaceMode: 'branch', killed: false, role: 'worker' },
+          { path: repoDir, member: 'coordinator', status: 'waiting', workspaceMode: 'inherit', killed: false, role: 'coordinator' },
+        ],
+      },
+    });
+    assert.equal(discovered.worktrees.length, 4);
+    const squashWtInfo = discovered.worktrees.find((w) => w.path === wtSquash);
+    assert.deepEqual(squashWtInfo?.swarmOwner, { member: 'squash-bot', status: 'working', workspaceMode: 'branch' });
+    const mainWtInfo = discovered.worktrees.find((w) => w.isMain);
+    assert.deepEqual(mainWtInfo?.swarmOwner, { member: 'coordinator', status: 'waiting', workspaceMode: 'inherit' });
+
+    // Cached call without swarmContext must NOT inherit swarmOwner
+    const plainCached = await probeWorktrees([repoDir], { ttlMs: 3000 });
+    assert.equal(plainCached.worktrees.find((w) => w.path === wtSquash)?.swarmOwner, undefined);
+
+    // 3. Create diverged commits on main, feat/squash, feat/merge, and conflicted feat/conflict
+    writeFileSync(join(wtSquash, 'squash-a.txt'), 'squash one\n');
+    git(wtSquash, ['add', '.']);
+    git(wtSquash, ['commit', '-m', 'Squash 1']);
+    writeFileSync(join(wtSquash, 'squash-b.txt'), 'squash two\n');
+    git(wtSquash, ['add', '.']);
+    git(wtSquash, ['commit', '-m', 'Squash 2']);
+
+    writeFileSync(join(wtMerge, 'merge-file.txt'), 'merge branch content\n');
+    git(wtMerge, ['add', '.']);
+    git(wtMerge, ['commit', '-m', 'Merge branch commit']);
+
+    // Multi-byte UTF-8 > 40 KiB conflict hunk on feat/conflict
+    const featConflictBody = Array.from({ length: 700 }, (_, i) => `feat-${i}-héllo-${'x'.repeat(45)}`).join('\n') + '\n';
+    const mainConflictBody = Array.from({ length: 700 }, (_, i) => `main-${i}-héllo-${'y'.repeat(45)}`).join('\n') + '\n';
+    writeFileSync(join(wtConflict, 'shared.txt'), featConflictBody);
+    git(wtConflict, ['commit', '-am', 'Conflict commit']);
+
+    writeFileSync(join(repoDir, 'shared.txt'), mainConflictBody);
+    git(repoDir, ['commit', '-am', 'Advance main']);
+
+    // 4. Non-destructive mode=conflict + <=32 KiB pagination
+    const p1 = await probeWorktreeDiff({
+      path: wtConflict,
+      file: 'shared.txt',
+      mode: 'conflict',
+      targetBranch: 'main',
+      offset: 0,
+      maxBytes: 65536, // clamped to 32768
+    });
+    assert.equal(p1.ok, true);
+    assert.equal(p1.mode, 'conflict');
+    assert.equal(p1.targetBranch, 'main');
+    assert.ok(Buffer.byteLength(p1.diff, 'utf8') <= 32768);
+    assert.equal(p1.hasMore, true);
+    assert.ok(typeof p1.nextOffset === 'number' && p1.nextOffset > 0);
+    assert.ok(p1.totalBytes > 32768);
+
+    let assembled = p1.diff;
+    let cursor = p1.nextOffset;
+    let guard = 0;
+    while (cursor !== null && guard++ < 10) {
+      const nextPage = await probeWorktreeDiff({
+        path: wtConflict,
+        file: 'shared.txt',
+        mode: 'conflict',
+        offset: cursor,
+        maxBytes: 32768,
+      });
+      assert.equal(nextPage.ok, true);
+      assert.ok(Buffer.byteLength(nextPage.diff, 'utf8') <= 32768);
+      assert.equal(nextPage.diff.includes('\uFFFD'), false);
+      assembled += nextPage.diff;
+      cursor = nextPage.nextOffset;
+      if (!nextPage.hasMore) assert.equal(cursor, null);
+    }
+    assert.equal(cursor, null);
+    assert.ok(assembled.includes('<<<<<<< main'));
+    assert.ok(assembled.includes('======='));
+    assert.ok(assembled.includes('>>>>>>> feat/conflict'));
+    assert.equal(git(repoDir, ['status', '--porcelain']), '');
+    assert.equal(git(wtConflict, ['status', '--porcelain']), '');
+
+    // Invalid offset / targetBranch guards
+    assert.equal((await probeWorktreeDiff({ path: wtConflict, file: 'shared.txt', mode: 'conflict', offset: -1 })).status, 400);
+    assert.equal((await probeWorktreeDiff({ path: wtConflict, file: 'shared.txt', mode: 'conflict', targetBranch: 'missing-br' })).status, 404);
+
+    // 5. squash_merge and merge_commit require confirm: true
+    const noConfirmSq = await executeWorktreeAction({ action: 'squash_merge', path: wtSquash });
+    assert.equal(noConfirmSq.httpStatus, 400);
+    const noConfirmMc = await executeWorktreeAction({ action: 'merge_commit', path: wtMerge });
+    assert.equal(noConfirmMc.httpStatus, 400);
+
+    // 6. Conflict aborts cleanly for both merge_commit and squash_merge
+    const mcConflict = await executeWorktreeAction({ action: 'merge_commit', path: wtConflict, confirm: true });
+    assert.equal(mcConflict.httpStatus, 409);
+    assert.equal(mcConflict.payload.aborted, true);
+    assert.deepEqual(mcConflict.payload.conflictFiles, ['shared.txt']);
+    assert.equal(git(repoDir, ['status', '--porcelain']), '');
+    assert.equal(existsSync(join(repoDir, '.git', 'MERGE_HEAD')), false);
+
+    const sqConflict = await executeWorktreeAction({ action: 'squash_merge', path: wtConflict, confirm: true });
+    assert.equal(sqConflict.httpStatus, 409);
+    assert.equal(sqConflict.payload.aborted, true);
+    assert.deepEqual(sqConflict.payload.conflictFiles, ['shared.txt']);
+    assert.equal(git(repoDir, ['status', '--porcelain']), '');
+    assert.equal(existsSync(join(repoDir, '.git', 'SQUASH_MSG')), false);
+
+    // 7. Clean non-FF squash_merge and merge_commit succeed with custom commitMessage
+    const sqOk = await executeWorktreeAction({
+      action: 'squash_merge',
+      path: wtSquash,
+      confirm: true,
+      commitMessage: 'feat: land squashed feature',
+    });
+    assert.equal(sqOk.httpStatus, 200);
+    assert.equal(sqOk.payload.status, 'merged');
+    assert.equal(git(repoDir, ['log', '-n', '1', '--format=%s']), 'feat: land squashed feature');
+    assert.equal(git(repoDir, ['rev-list', '--parents', '-n', '1', 'HEAD']).split(' ').length, 2);
+
+    const mcOk = await executeWorktreeAction({
+      action: 'merge_commit',
+      path: wtMerge,
+      confirm: true,
+      commitMessage: 'Merge feat/merge cleanly',
+    });
+    assert.equal(mcOk.httpStatus, 200);
+    assert.equal(mcOk.payload.status, 'merged');
+    assert.equal(git(repoDir, ['log', '-n', '1', '--format=%s']), 'Merge feat/merge cleanly');
+    assert.equal(git(repoDir, ['rev-list', '--parents', '-n', '1', 'HEAD']).split(' ').length, 3);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
